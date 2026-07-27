@@ -179,8 +179,8 @@ Reminders, Calendar and Contacts hold their **own** grants, independent of the
 terminal — they re-execute themselves so macOS attributes the request to the
 binary rather than to whatever launched it. So look for `apple-contacts` in the
 System Settings pane, not the user's terminal app, and never suggest switching
-terminals to fix one of those three. A `brew upgrade` re-prompts once, because
-the grant is keyed to the binary path.
+terminals to fix one of those three. A `brew upgrade` sometimes asks for the
+grant again — treat that as normal, not as something broken.
 
 Notes (Full Disk Access) and Mail (Automation) are the exceptions: those two are
 still granted to the calling terminal.

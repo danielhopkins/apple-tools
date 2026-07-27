@@ -413,8 +413,10 @@ binary rather than to the terminal that launched it. Practical consequences:
   "try a different terminal"; that is not the variable it once was.
 - Each appears in System Settings under its own name (`apple-contacts`, not
   `Ghostty`). Tell the user to look for the tool, not their terminal.
-- Grants are keyed by binary **path**, so `brew upgrade` prompts once per
-  version. Rebuilding in place does not.
+- A `brew upgrade` **may** re-prompt, and may not: 26.727.8 → .9 did, .9 → .10
+  did not, at a new Cellar path both times. Rebuilding in place never has. Treat
+  a fresh prompt after an upgrade as normal rather than as a bug, and don't
+  promise either way.
 - An already-working grant skips the re-exec entirely, so this is invisible when
   everything is set up.
 
