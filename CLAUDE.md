@@ -354,10 +354,26 @@ Each tool needs a one-time TCC grant, prompted on first run **from a terminal**:
 | contacts | Privacy & Security → Contacts |
 | notes | Full Disk Access for the calling terminal (reads sqlite directly) |
 
-Grants are keyed to the binary path — rebuilding into a new location can
-re-trigger the prompt. If a tool reports an access error, the fix is for the
-**user** to run it once in their own terminal and approve the dialog; an agent
-cannot click through it.
+If a tool reports an access error, the fix is for the **user** to run it once in
+their own terminal and approve the dialog; an agent cannot click through it.
+
+**Grants belong to the tool, not the terminal** (reminders, calendar, contacts).
+Each of those re-executes itself disclaimed — `posix_spawn` with
+`responsibility_spawnattrs_setdisclaim` — so TCC attributes the request to the
+binary rather than to the terminal that launched it. Practical consequences:
+
+- They work identically from any terminal, IDE, or multiplexer. Don't suggest
+  "try a different terminal"; that is not the variable it once was.
+- Each appears in System Settings under its own name (`apple-contacts`, not
+  `Ghostty`). Tell the user to look for the tool, not their terminal.
+- Grants are keyed by binary **path**, so `brew upgrade` prompts once per
+  version. Rebuilding in place does not.
+- An already-working grant skips the re-exec entirely, so this is invisible when
+  everything is set up.
+
+`mail` and `notes` are *not* covered by this: Automation and Full Disk Access
+are still attributed to the calling terminal, so those two really do depend on
+which terminal is running.
 
 ⚠️ **macOS only prompts when the status is `notDetermined`.** Once it is anything
 else the request returns silently and no dialog ever appears. The trap is

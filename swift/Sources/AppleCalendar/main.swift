@@ -3,6 +3,7 @@ import AppleToolsVersion
 import ArgumentParser
 import EventKit
 import Foundation
+import TCCResponsibility
 
 private let store = EKEventStore()
 
@@ -10,9 +11,29 @@ private let store = EKEventStore()
 
 private let settingsPath = "System Settings → Privacy & Security → Calendars"
 
+/// Takes ownership of this process's TCC identity, unless Calendar already
+/// works.
+///
+/// Without this, macOS attributes the request to whichever terminal launched
+/// us, so the grant lands on the terminal app rather than this binary and the
+/// tool is denied under any terminal that has not itself been granted. Re-
+/// executing disclaimed keys the grant here instead. It also sidesteps the
+/// "Add Only" trap: writeOnly is a state of the *terminal's* grant, and this
+/// binary's own grant starts fresh at notDetermined, so macOS will prompt.
+///
+/// Skipped when access already works, so an existing grant is untouched. Does
+/// not return when it re-executes.
+func claimOwnTCCIdentity() {
+    let status = EKEventStore.authorizationStatus(for: .event)
+    TCCResponsibility.claimOwnIdentity(
+        unless: status == .fullAccess || status == .authorized)
+}
+
 /// Prompts for (or confirms) Calendar access. Called at the top of each command
 /// rather than at startup, so `--help` works without a TCC grant.
 func requireCalendarAccess() throws {
+    claimOwnTCCIdentity()
+
     // macOS only shows a prompt when the status is notDetermined. Once it is
     // anything else — including writeOnly ("Add Only"), which cannot read
     // events — requestFullAccessToEvents returns false without any dialog, so
@@ -347,6 +368,10 @@ struct Status: ParsableCommand {
     var json = false
 
     func run() {
+        // Re-exec too, so this reports the identity the other commands actually
+        // use. Disclaiming never prompts on its own.
+        claimOwnTCCIdentity()
+
         let status = EKEventStore.authorizationStatus(for: .event)
         let (name, usable, advice): (String, Bool, String?) = {
             switch status {

@@ -46,6 +46,12 @@ apple-mail accounts       # → Automation access for Mail
 apple-notes search        # → needs Full Disk Access for your terminal
 ```
 
+The grants belong to **the tools themselves**, not to your terminal, so they
+work the same from Terminal, iTerm, Ghostty, VS Code, or a multiplexer. That
+takes a deliberate trick — see [Permissions](#permissions) — and it is why
+`reminders`, `apple-calendar` and `apple-contacts` appear by name in System
+Settings.
+
 macOS only shows a prompt the first time; after that the request returns
 silently. Calendar has a third state worth knowing about — "Add Only"
 (`writeOnly`), which looks granted but cannot read events and is never offered
@@ -134,6 +140,46 @@ checklists that the scripting interface flattens.
 [`docs/apple-notes-api.md`](docs/apple-notes-api.md) documents the schema and the
 verified behaviors and bugs behind that, including a data-loss bug where editing
 a note's body destroys its attachments.
+
+## Permissions
+
+macOS attributes a privacy request not to the process that makes it but to the
+**responsible process** — and for a command-line tool that is the terminal app
+that launched it, not the tool. Left alone, this produces a genuinely confusing
+failure: the grant lands on Terminal.app or Ghostty, the same binary works in
+one terminal and is denied in another, and in the terminal that lacks the grant
+`requestAccess` returns "Access Denied" *immediately* — no dialog, and no entry
+in System Settings to switch on, because no record was ever created.
+
+The tools take responsibility for themselves instead. On first use, if access
+isn't already working, each one re-executes itself via `posix_spawn` with
+`responsibility_spawnattrs_setdisclaim`, which makes the new process its own
+responsible process. TCC then keys the grant to *that binary* and shows *its*
+usage description — the same mechanism browsers use to give helper processes
+distinct permissions. The SPI is resolved with `dlsym`, so if it ever
+disappears the tools quietly fall back to the old behaviour.
+
+Two consequences worth knowing:
+
+- **The grant is per-binary and per-path.** `reminders`, `apple-calendar` and
+  `apple-contacts` each get their own row in System Settings, under their own
+  name. Because TCC keys ad-hoc-signed binaries by path, a `brew upgrade`
+  installs into a new Cellar directory and prompts once more. Rebuilding in
+  place does not re-prompt.
+- **An existing terminal-keyed grant still works.** The re-execution is skipped
+  whenever access already succeeds, so nobody who has already approved their
+  terminal is disturbed, and no extra process is spawned.
+
+This also needs the usage description (`NSContactsUsageDescription` and
+friends) to be in the binary. A CLI has no bundle, so `Package.swift` embeds a
+plist into `__TEXT,__info_plist` at link time — and `make build` re-signs
+afterwards, because macOS ignores a plist that isn't covered by the signature.
+`make dist` verifies the binding and fails the build if it is missing.
+
+`apple-mail` is the exception: it drives Mail.app over AppleScript, so it needs
+Automation access, which is still attributed to the calling terminal.
+`apple-notes` reads the SQLite store directly and needs Full Disk Access for
+the terminal.
 
 ## Layout
 
