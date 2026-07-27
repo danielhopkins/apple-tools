@@ -17,6 +17,7 @@ let package = Package(
     ],
     targets: [
         .target(name: "AppleToolsVersion"),
+        .target(name: "AppleToolsStyle"),
         .executableTarget(
             name: "reminders",
             dependencies: ["RemindersLibrary"]
@@ -25,6 +26,7 @@ let package = Package(
             name: "RemindersLibrary",
             dependencies: [
                 "AppleToolsVersion",
+                "AppleToolsStyle",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
@@ -32,6 +34,7 @@ let package = Package(
             name: "apple-mail",
             dependencies: [
                 "AppleToolsVersion",
+                "AppleToolsStyle",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "Sources/AppleMail"
@@ -40,6 +43,7 @@ let package = Package(
             name: "apple-calendar",
             dependencies: [
                 "AppleToolsVersion",
+                "AppleToolsStyle",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "Sources/AppleCalendar"
@@ -48,6 +52,7 @@ let package = Package(
             name: "apple-contacts",
             dependencies: [
                 "AppleToolsVersion",
+                "AppleToolsStyle",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "Sources/AppleContacts",

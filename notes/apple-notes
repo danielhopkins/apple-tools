@@ -34,6 +34,46 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 from notestore import Color, parse_note_store
 
+
+class Style:
+    """Terminal styling, mirroring swift/Sources/AppleToolsStyle/Style.swift.
+
+    Only when stdout is a terminal, so piping stays clean. Honours NO_COLOR
+    (no-color.org) and the BSD CLICOLOR/CLICOLOR_FORCE spelling.
+    """
+
+    @staticmethod
+    def _enabled():
+        env = os.environ
+        if "NO_COLOR" in env or env.get("CLICOLOR") == "0" or env.get("TERM") == "dumb":
+            return False
+        if env.get("CLICOLOR_FORCE", "0") != "0":
+            return True
+        return sys.stdout.isatty()
+
+    enabled = None  # resolved on first use
+
+    @classmethod
+    def _wrap(cls, text, code):
+        if cls.enabled is None:
+            cls.enabled = cls._enabled()
+        if not cls.enabled or not text:
+            return text
+        return f"\033[{code}m{text}\033[0m"
+
+    @classmethod
+    def title(cls, text):
+        return cls._wrap(text, "1")
+
+    @classmethod
+    def dim(cls, text):
+        return cls._wrap(text, "2")
+
+    @classmethod
+    def identifier(cls, text):
+        return cls._wrap(text, "35")
+
+
 __version__ = "26.727.4"
 
 
@@ -518,10 +558,10 @@ def cmd_search(args):
         print("No notes found.")
         return
 
-    print(f"{'ID':>5}  Title")
-    print("-" * 60)
+    print(Style.dim(f"{'ID':>5}  Title"))
+    print(Style.dim("-" * 60))
     for note in results:
-        print(f"{note['pk']:5d}  {note['title']}")
+        print(f"{Style.identifier('%5d' % note['pk'])}  {Style.title(note['title'])}")
 
 
 def cmd_folders(args):
@@ -541,10 +581,10 @@ def cmd_folders(args):
             print(f"No notes found in folder matching '{folder_name}'.")
             return
 
-        print(f"{'ID':>5}  Title")
-        print("-" * 60)
+        print(Style.dim(f"{'ID':>5}  Title"))
+        print(Style.dim("-" * 60))
         for note in results:
-            print(f"{note['pk']:5d}  {note['title']}")
+            print(f"{Style.identifier('%5d' % note['pk'])}  {Style.title(note['title'])}")
     else:
         # List all folders
         results = list_folders()
@@ -559,10 +599,11 @@ def cmd_folders(args):
             print("No folders found.")
             return
 
-        print(f"{'ID':>5}  {'Notes':>5}  Folder")
-        print("-" * 60)
+        print(Style.dim(f"{'ID':>5}  {'Notes':>5}  Folder"))
+        print(Style.dim("-" * 60))
         for folder in results:
-            print(f"{folder['pk']:5d}  {folder['count']:5d}  {folder['title']}")
+            print(f"{Style.identifier('%5d' % folder['pk'])}  "
+                  f"{Style.dim('%5d' % folder['count'])}  {Style.title(folder['title'])}")
 
 
 def cmd_export(args):

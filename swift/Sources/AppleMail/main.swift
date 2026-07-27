@@ -7,6 +7,12 @@ struct AppleMail: AsyncParsableCommand {
   static let configuration = CommandConfiguration(
     commandName: "apple-mail",
     abstract: "Search and export Apple Mail messages",
+    discussion: """
+      Examples:
+        apple-mail accounts --json                        # addresses for --from
+        apple-mail search "invoice" --since 30 --json     # bounded search
+        apple-mail draft --to a@b.com --subject "Hi" --body "text"
+      """,
     version: appleToolsVersion,
     subcommands: [Search.self, Export.self, Accounts.self, Draft.self, Send.self]
   )
@@ -106,7 +112,17 @@ struct Accounts: AsyncParsableCommand {
 
 struct Search: AsyncParsableCommand {
   static let configuration = CommandConfiguration(
-    abstract: "Search mail messages"
+    abstract: "Search mail messages",
+    discussion: """
+      Bound every search: Mail hits a ~120s AppleScript timeout and then returns
+      an EMPTY result rather than an error, which looks identical to no matches.
+
+      Examples:
+        apple-mail search "invoice"                          # subject, default
+        apple-mail search "budget" --field all --since 30    # slower: bodies too
+        apple-mail search "" --mailbox inbox --unread --since 7 --limit 20
+        apple-mail search "alice@example.com" --field sender --since 60 --json
+      """
   )
 
   @Argument(help: "Search term")
@@ -653,7 +669,20 @@ struct ComposeOptions: ParsableArguments {
 
 struct Draft: AsyncParsableCommand {
   static let configuration = CommandConfiguration(
-    abstract: "Create a draft message (does not send)")
+    abstract: "Create a draft message (does not send)",
+    discussion: """
+      Writes to the Drafts mailbox of the account matching --from. Never sends.
+      Get the addresses --from accepts from `apple-mail accounts`; an account
+      name works too.
+
+      Examples:
+        apple-mail draft --to a@b.com --subject "Q3" --body "Here it is."
+        apple-mail draft --to a@b.com --cc c@d.com --bcc e@f.com --subject "Hi" \\
+                         --body "text" --attach ~/report.pdf
+        apple-mail draft --to a@b.com --from "dan@theinevitable.co" \\
+                         --subject "Re: budget" --body-file -   # body on stdin
+        apple-mail draft --to a@b.com --subject "Hi" --html --body "<p>Hi</p>"
+      """)
 
   @OptionGroup var compose: ComposeOptions
 

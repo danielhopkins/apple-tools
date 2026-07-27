@@ -411,6 +411,17 @@ public struct CLI: ParsableCommand {
     public static let configuration = CommandConfiguration(
         commandName: "reminders",
         abstract: "Interact with macOS Reminders from the command line",
+        discussion: """
+          Indexes come from `show` and SHIFT as items are added or completed.
+          Always re-run `show` immediately before complete/edit/delete.
+
+          Examples:
+            reminders show-lists --json
+            reminders show-all --due-date today --include-overdue --json
+            reminders add Inbox "Buy milk" --due-date "tomorrow 9am"
+            reminders add Home "Bins out" --repeat weekly --priority high
+            reminders show Inbox && reminders complete Inbox 0
+          """,
         version: appleToolsVersion,
         subcommands: [
             Add.self,

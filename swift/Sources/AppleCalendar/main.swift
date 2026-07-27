@@ -1,3 +1,4 @@
+import AppleToolsStyle
 import AppleToolsVersion
 import ArgumentParser
 import EventKit
@@ -186,7 +187,8 @@ private func describe(_ event: EKEvent) -> String {
     }
 
     let location = event.location.map { " @ \($0)" } ?? ""
-    return "\(when)  \(title)\(location)  [\(calendarName)]"
+    return "\(Style.time(when))  \(Style.title(title))\(Style.dim(location))  "
+        + Style.dim("[\(calendarName)]")
 }
 
 // MARK: - Shell completion
@@ -321,6 +323,15 @@ struct AppleCalendar: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "apple-calendar",
         abstract: "Read and write macOS Calendar events via EventKit",
+        discussion: """
+          Examples:
+            apple-calendar status                         # permission state
+            apple-calendar calendars --writable           # what accepts writes
+            apple-calendar events --days 7 --json         # next week
+            apple-calendar events --search "swim" --days 30
+            apple-calendar add "Dentist" --start "tomorrow 2pm" --duration 45
+            apple-calendar edit <id> --occurrence <occurrence> --start "3pm"
+          """,
         version: appleToolsVersion,
         subcommands: [Calendars.self, Events.self, Show.self, Add.self, Edit.self, Delete.self,
                       Status.self],
@@ -393,8 +404,9 @@ struct Calendars: ParsableCommand {
             })
         } else {
             for calendar in sorted {
-                let readonly = calendar.allowsContentModifications ? "" : " (read-only)"
-                print("\(calendar.title)\(readonly)")
+                let readonly = calendar.allowsContentModifications
+                    ? "" : Style.warning(" (read-only)")
+                print("\(Style.title(calendar.title))\(readonly)")
             }
         }
     }
@@ -402,7 +414,17 @@ struct Calendars: ParsableCommand {
 
 struct Events: ParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "List events in a date range (defaults to the next 7 days)")
+        abstract: "List events in a date range (defaults to the next 7 days)",
+        discussion: """
+          Recurring events carry an "occurrence" field in --json. Pass it back as
+          --occurrence to act on that instance rather than the series.
+
+          Examples:
+            apple-calendar events                          # next 7 days
+            apple-calendar events --days 1 --json          # today
+            apple-calendar events --from 2026-08-01 --to 2026-08-31
+            apple-calendar events --calendar Family --search "piano"
+          """)
 
     @Option(name: .long, help: "Start of range, e.g. 'today', '2026-07-27'")
     var from: DateArg?
@@ -509,7 +531,17 @@ struct Show: ParsableCommand {
 }
 
 struct Add: ParsableCommand {
-    static let configuration = CommandConfiguration(abstract: "Create an event")
+    static let configuration = CommandConfiguration(
+        abstract: "Create an event",
+        discussion: """
+          Dates take natural language or YYYY-MM-DD [HH:MM]. Default length is
+          1 hour. --calendar must match `calendars --writable`.
+
+          Examples:
+            apple-calendar add "Dentist" --start "tomorrow 2pm" --duration 45
+            apple-calendar add "Standup" --start "2026-08-03 09:00" --end "09:15"
+            apple-calendar add "Holiday" --start 2026-08-10 --all-day --calendar Family
+          """)
 
     @Argument(parsing: .remaining, help: "Event title")
     var title: [String]

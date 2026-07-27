@@ -1,3 +1,4 @@
+import AppleToolsStyle
 import AppleToolsVersion
 import ArgumentParser
 import Contacts
@@ -190,20 +191,24 @@ private func printJSON<T: Encodable>(_ value: T) {
 private func plain(_ contacts: [ContactInfo]) -> String {
     var lines: [String] = []
     for contact in contacts {
-        var header = contact.name
+        var header = Style.title(contact.name)
         if let company = contact.company, company != contact.name {
-            header += " (\(company))"
+            header += Style.dim(" (\(company))")
         }
         lines.append(header)
         for email in contact.emails ?? [] {
-            lines.append("  email  \(email.address)" + (email.label.map { "  [\($0)]" } ?? ""))
+            lines.append("  " + Style.label("email") + "  \(email.address)"
+                + (email.label.map { Style.dim("  [\($0)]") } ?? ""))
         }
         for phone in contact.phones ?? [] {
-            lines.append("  phone  \(phone.number)" + (phone.label.map { "  [\($0)]" } ?? ""))
+            lines.append("  " + Style.label("phone") + "  \(phone.number)"
+                + (phone.label.map { Style.dim("  [\($0)]") } ?? ""))
         }
         for address in contact.addresses ?? [] {
             let parts = [address.street, address.city, address.state, address.zip].compactMap { $0 }
-            if !parts.isEmpty { lines.append("  addr   \(parts.joined(separator: ", "))") }
+            if !parts.isEmpty {
+                lines.append("  " + Style.label("addr") + "   \(parts.joined(separator: ", "))")
+            }
         }
         for url in contact.urls ?? [] {
             lines.append("  url    \(url.url)")
@@ -293,6 +298,17 @@ struct AppleContacts: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "apple-contacts",
         abstract: "Read and write macOS Contacts",
+        discussion: """
+          Examples:
+            apple-contacts status                          # permission state
+            apple-contacts search "smith"                  # JSON by default
+            apple-contacts search "smith" --plain
+            apple-contacts add --first Ada --last Lovelace --email "work:ada@x.com"
+            apple-contacts edit <id> --relation "daughter:Margot Hopkins"
+            apple-contacts edit <id> --birthday 1980-04-12 --date "death:2020-05-01"
+            apple-contacts groups                          # groups + counts
+            apple-contacts groups add "Family" <contact-id>
+          """,
         version: appleToolsVersion,
         subcommands: [Search.self, Get.self, List.self, Add.self, Edit.self, Delete.self,
                       Groups.self, Status.self],
@@ -573,7 +589,20 @@ struct ContactFields: ParsableArguments {
 }
 
 struct Add: ParsableCommand {
-    static let configuration = CommandConfiguration(abstract: "Create a contact")
+    static let configuration = CommandConfiguration(
+        abstract: "Create a contact",
+        discussion: """
+          Labels are friendly names: home, work, school, other; phones also take
+          mobile, iphone, main, pager. Relations accept any of the 216 labels
+          Contacts defines (father, mother, son, daughter, spouse, niece, ...).
+
+          Examples:
+            apple-contacts add --first Ada --last Lovelace
+            apple-contacts add --first Ada --email "work:ada@x.com" \\
+                               --phone "mobile:+15551234567"
+            apple-contacts add --first Ada --company "Analytical Engines" \\
+                               --birthday 1815-12-10 --relation "daughter:Anne"
+          """)
 
     @OptionGroup var fields: ContactFields
 
@@ -609,7 +638,19 @@ struct Add: ParsableCommand {
 }
 
 struct Edit: ParsableCommand {
-    static let configuration = CommandConfiguration(abstract: "Edit an existing contact")
+    static let configuration = CommandConfiguration(
+        abstract: "Edit an existing contact",
+        discussion: """
+          Multi-value flags REPLACE rather than append: passing --email drops
+          every existing address. Read the contact with `get` first and re-pass
+          the ones to keep.
+
+          Examples:
+            apple-contacts edit <id> --company "New Co"
+            apple-contacts edit <id> --email "work:new@x.com" --email "home:old@y.com"
+            apple-contacts edit <id> --relation "father:Robert" --relation "son:Sam"
+            apple-contacts edit <id> --anniversary --06-15
+          """)
 
     @Argument(help: "Contact id, from `search --json`")
     var id: String

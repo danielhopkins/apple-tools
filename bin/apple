@@ -46,6 +46,19 @@ Other:
     apple --help        Show this message
     apple --version     Print the apple-tools version
     apple --which       Print the resolved path of each tool
+
+Examples:
+    apple notes search "budget" --json            # title search
+    apple notes export 261                        # note as Markdown
+    apple mail accounts --json                    # addresses for --from
+    apple mail search "invoice" --since 30 --json # always bound a mail search
+    apple mail draft --to a@b.com --subject "Hi" --body "text"
+    apple reminders show-all --due-date today --include-overdue --json
+    apple reminders add Inbox "Buy milk" --due-date "tomorrow 9am"
+    apple calendar events --days 7 --json         # next week
+    apple calendar add "Dentist" --start "tomorrow 2pm" --duration 45
+    apple contacts search "smith"                 # JSON by default
+    apple contacts groups                         # groups + member counts
 EOF
 }
 
