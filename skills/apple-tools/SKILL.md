@@ -170,12 +170,11 @@ user to change a setting.
   terminal. Contacts needs its own grant, plus Full Disk Access if you want
   contact notes.
 - Mail needs Automation access and Mail.app running.
-- `apple contacts groups remove` may need Automation access for Contacts. The
-  Contacts framework's remove-member call silently does nothing for an iCloud
-  group (it works for a local "On My Mac" one), so the command falls back to
-  driving Contacts.app, launching it hidden and quitting it again. It always
-  confirms the removal before reporting success. Every other contacts command
-  uses the framework directly.
+- `apple contacts groups remove` needs no extra permission. The Contacts
+  framework's remove-member call silently does nothing for an iCloud group (it
+  works for a local "On My Mac" one), so the command falls back to the legacy
+  AddressBook framework, which does work. It always confirms the removal before
+  reporting success, so trust its result rather than re-checking yourself.
 
 Reminders, Calendar and Contacts hold their **own** grants, independent of the
 terminal — they re-execute themselves so macOS attributes the request to the

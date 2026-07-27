@@ -84,6 +84,10 @@ let package = Package(
             exclude: ["Info.plist"],
             linkerSettings: [
                 .linkedLibrary("sqlite3"),
+                // Deprecated, but the only API that can remove a member from a
+                // CardDAV-backed (iCloud) group; CNSaveRequest.removeMember
+                // silently does nothing there. Used only as a fallback.
+                .linkedFramework("AddressBook"),
                 // macOS will not show the Contacts permission dialog unless the
                 // binary carries NSContactsUsageDescription. A command-line tool
                 // has no bundle, so the plist is embedded directly into the

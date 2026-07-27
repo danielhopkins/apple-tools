@@ -1,4 +1,4 @@
-import AppKit  // NSRunningApplication, to avoid leaving Contacts.app running
+import AddressBook  // deprecated, but the only thing that removes iCloud group members
 import AppleToolsStyle
 import AppleToolsVersion
 import ArgumentParser
@@ -288,81 +288,36 @@ private func isMember(_ contactId: String, of groupId: String) -> Bool {
     return members.contains { $0.identifier == contactId }
 }
 
-/// Remove a contact from a group by driving Contacts.app.
+/// Remove a contact from a group through the legacy AddressBook framework.
 ///
-/// Only needed for CardDAV-backed groups — see `GroupRemove.run()`. Contacts.app
-/// uses the same `UUID:ABPerson` identifiers we do, and its `remove … from …`
-/// works where the framework's does not.
+/// Only needed for CardDAV-backed groups — see `GroupRemove.run()`. AddressBook
+/// predates Contacts, is deprecated, and is still the only thing here that
+/// removes a member from an iCloud group. It addresses records by the same
+/// `UUID:ABPerson` / `UUID:ABGroup` identifiers Contacts hands out, so no
+/// translation is needed, and it needs no permission beyond the Contacts access
+/// this process already holds.
 ///
-/// The script takes its values through `on run argv` rather than string
-/// interpolation, so an identifier can never be interpreted as code.
-private func removeMemberViaAppleScript(contactId: String, groupId: String) throws {
-    // Contacts.app has to be running before it will answer Apple events, and
-    // AppleScript's own `launch` verb does not get there first — the send fails
-    // with -600 ("Application isn't running") before it takes effect.
-    // LaunchServices does start it, and `-g -j` keeps it background and hidden,
-    // so nothing appears on screen.
-    //
-    // Quit it again afterwards, but only if we were the one who started it:
-    // quitting an instance the user already had open could discard an edit in
-    // progress, and leaving one running is a side effect nobody asked for.
-    let contactsAppWasRunning = !NSRunningApplication
-        .runningApplications(withBundleIdentifier: "com.apple.AddressBook").isEmpty
-    defer {
-        if !contactsAppWasRunning {
-            let quit = Process()
-            quit.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            quit.arguments = ["-e", "tell application \"Contacts\" to quit"]
-            try? quit.run()
-            quit.waitUntilExit()
-        }
+/// Being deprecated, it may eventually stop working. That is why it is a
+/// fallback rather than the primary path, and why the caller confirms the
+/// membership afterwards instead of trusting the return values.
+private func removeMemberViaAddressBook(contactId: String, groupId: String) throws {
+    guard let book = ABAddressBook.shared() else {
+        throw ValidationError(
+            "could not open the AddressBook store to remove the group member.")
+    }
+    guard let group = book.record(forUniqueId: groupId) as? ABGroup else {
+        throw ValidationError("no group with id '\(groupId)' in the AddressBook store.")
+    }
+    guard let person = book.record(forUniqueId: contactId) as? ABPerson else {
+        throw ValidationError("no contact with id '\(contactId)' in the AddressBook store.")
     }
 
-    let launch = Process()
-    launch.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-    launch.arguments = ["-g", "-j", "-a", "Contacts"]
-    try? launch.run()
-    launch.waitUntilExit()
-
-    let script = """
-        on run argv
-            set contactId to item 1 of argv
-            set groupId to item 2 of argv
-            tell application "Contacts"
-                set theGroup to first group whose id is groupId
-                set thePerson to first person whose id is contactId
-                remove thePerson from theGroup
-                save
-            end tell
-        end run
-        """
-
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-    process.arguments = ["-", contactId, groupId]
-
-    let input = Pipe(), output = Pipe(), errors = Pipe()
-    process.standardInput = input
-    process.standardOutput = output
-    process.standardError = errors
-
-    try process.run()
-    input.fileHandleForWriting.write(Data(script.utf8))
-    input.fileHandleForWriting.closeFile()
-    let failure = errors.fileHandleForReading.readDataToEndOfFile()
-    _ = output.fileHandleForReading.readDataToEndOfFile()
-    process.waitUntilExit()
-
-    guard process.terminationStatus == 0 else {
-        let detail = String(data: failure, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        throw ValidationError("""
-            could not remove the contact from the group.
-            Contacts' own API fails silently at this, so this command drives
-            Contacts.app instead, which needs Automation access:
-            System Settings → Privacy & Security → Automation → Contacts.
-            osascript said: \(detail)
-            """)
+    let removed = group.removeMember(person)
+    let saved = book.save()
+    guard removed, saved else {
+        throw ValidationError(
+            "the AddressBook store refused the removal "
+            + "(removeMember: \(removed), save: \(saved)).")
     }
 }
 
@@ -1073,11 +1028,9 @@ struct GroupRemove: ParsableCommand {
         request.removeMember(member, from: target)
         try? store.execute(request)
 
-        // Only reach for Contacts.app if the framework really didn't take.
-        // That keeps local groups free of any Automation dependency, and means
-        // Contacts.app is launched only when there is no alternative.
+        // Only fall back if the modern call really didn't take.
         if isMember(member.identifier, of: target.identifier) {
-            try removeMemberViaAppleScript(
+            try removeMemberViaAddressBook(
                 contactId: member.identifier, groupId: target.identifier)
         }
 

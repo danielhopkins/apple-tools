@@ -314,20 +314,17 @@ at the call site distinguishes them:
 | `On My Mac` | local | yes |
 | an iCloud account | cardDAV | **no, silently** |
 
-So `groups remove` tries the framework first and only falls back to driving
-Contacts.app over AppleScript when the membership survived. For a local group
-nothing else happens. For an iCloud group — which is the default container on
-most machines — the fallback runs, and then:
+So `groups remove` tries `CNSaveRequest` first and, when the membership
+survives, falls back to the **legacy `AddressBook` framework**, which removes
+iCloud members correctly. That framework is deprecated but still present, uses
+the same `UUID:ABPerson` / `UUID:ABGroup` identifiers, and needs no permission
+beyond the Contacts access the tool already has — so this costs nothing extra:
+no Automation grant, no Contacts.app, no AppleScript.
 
-- Contacts.app is **launched in the background** (`open -g -j`; hidden, no
-  focus) and **quit again afterwards if it wasn't already running**.
-  AppleScript's own `launch` verb is not enough — the event fails with `-600`
-  before it takes effect.
-- It may need **Automation access for Contacts**; the error says so if it does.
-
-Either way it re-reads the membership afterwards and fails loudly if the contact
-is still in the group, rather than trusting the exit code. Don't report a
-removal as done without that confirmation.
+Because the fallback is deprecated API that could eventually stop working, the
+command re-reads the membership afterwards and fails loudly if the contact is
+still in the group rather than trusting either call's return value. Don't report
+a removal as done without that confirmation.
 
 ⚠️ **Multi-value flags replace, they don't append.** Passing `--email` on `edit`
 replaces *every* existing email on that contact. Read the contact first and
