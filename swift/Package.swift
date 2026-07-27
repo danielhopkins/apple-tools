@@ -17,7 +17,10 @@ let package = Package(
     ],
     targets: [
         .target(name: "AppleToolsVersion"),
-        .target(name: "AppleToolsStyle"),
+        .target(
+            name: "AppleToolsStyle",
+            dependencies: [.product(name: "ArgumentParser", package: "swift-argument-parser")]
+        ),
         .executableTarget(
             name: "reminders",
             dependencies: ["RemindersLibrary"]

@@ -1,9 +1,20 @@
+import AppleToolsStyle
 import AppleToolsVersion
 import ArgumentParser
 import Foundation
 
 @main
 struct AppleMail: AsyncParsableCommand {
+  /// ArgumentParser has no coloured help, so generate it, style it and print
+  /// it here rather than letting the default path emit the plain version.
+  static func main() async {
+    if let help = HelpColor.requested(root: AppleMail.self, arguments: CommandLine.arguments) {
+      print(help)
+      Foundation.exit(0)
+    }
+    await AppleMail.main(nil)
+  }
+
   static let configuration = CommandConfiguration(
     commandName: "apple-mail",
     abstract: "Search and export Apple Mail messages",

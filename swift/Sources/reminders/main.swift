@@ -1,3 +1,4 @@
+import AppleToolsStyle
 import Darwin
 import Foundation
 import RemindersLibrary
@@ -16,7 +17,10 @@ private let wantsInfoOnly = CommandLine.arguments.dropFirst().contains {
     infoOnlyArguments.contains($0)
 }
 
-if wantsInfoOnly {
+if let help = HelpColor.requested(root: CLI.self, arguments: CommandLine.arguments) {
+    print(help)
+    exit(0)
+} else if wantsInfoOnly {
     CLI.main()
 } else {
     switch Reminders.requestAccess() {

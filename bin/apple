@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-APPLE_TOOLS_VERSION="26.727.4"
+APPLE_TOOLS_VERSION="26.727.5"
 
 # Resolve the repo root even when invoked through a symlink in ~/bin.
 SOURCE="${BASH_SOURCE[0]}"
@@ -27,27 +27,36 @@ ROOT="$(cd -P "$BIN_DIR/.." && pwd)"
 SWIFT_RELEASE="$ROOT/swift/.build/release"
 SWIFT_DEBUG="$ROOT/swift/.build/debug"
 
+# Same rules as AppleToolsStyle: colour only on a terminal, NO_COLOR and
+# CLICOLOR=0 disable, CLICOLOR_FORCE enables through a pipe.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${CLICOLOR:-1}" != "0" ] \
+   && [ "${TERM:-}" != "dumb" ] || [ "${CLICOLOR_FORCE:-0}" != "0" ]; then
+    H=$'\033[1;34m'; C=$'\033[1;35m'; G=$'\033[32m'; R=$'\033[0m'
+else
+    H=""; C=""; G=""; R=""
+fi
+
 usage() {
-    cat <<'EOF'
-apple - interact with local Apple app data
+    cat <<EOF
+${C}apple${R} - interact with local Apple app data
 
-Usage: apple <tool> [args...]
+${H}USAGE:${R} ${C}apple${R} <tool> [args...]
 
-Tools:
-    notes       Search, export, and link Apple Notes       (reads NoteStore.sqlite)
-    mail        Search and export Apple Mail messages      (AppleScript)
-    reminders   Full CRUD on Reminders                     (EventKit)
-    calendar    Read and write Calendar events             (EventKit)
-    contacts    Query Contacts                             (reads AddressBook, read-only)
+${H}TOOLS:${R}
+    ${G}notes${R}       Search, export, and link Apple Notes       (reads NoteStore.sqlite)
+    ${G}mail${R}        Search, export, and draft Apple Mail       (AppleScript)
+    ${G}reminders${R}   Full CRUD on Reminders                     (EventKit)
+    ${G}calendar${R}    Read and write Calendar events             (EventKit)
+    ${G}contacts${R}    Read and write Contacts, relations, groups (Contacts framework)
 
-Every tool supports --json. Run `apple <tool> --help` for its own options.
+Every tool supports --json. Run \`apple <tool> --help\` for its own options.
 
-Other:
-    apple --help        Show this message
-    apple --version     Print the apple-tools version
-    apple --which       Print the resolved path of each tool
+${H}OTHER:${R}
+    ${G}apple --help${R}        Show this message
+    ${G}apple --version${R}     Print the apple-tools version
+    ${G}apple --which${R}       Print the resolved path of each tool
 
-Examples:
+${H}EXAMPLES:${R}
     apple notes search "budget" --json            # title search
     apple notes export 261                        # note as Markdown
     apple mail accounts --json                    # addresses for --from

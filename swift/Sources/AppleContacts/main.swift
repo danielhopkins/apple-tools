@@ -949,4 +949,11 @@ private func displayName(_ contact: CNContact) -> String {
     return contact.identifier
 }
 
+// ArgumentParser has no coloured help, so generate it, style it, and print
+// it here rather than letting .main() emit the plain version.
+if let help = HelpColor.requested(root: AppleContacts.self, arguments: CommandLine.arguments) {
+    print(help)
+    exit(0)
+}
+
 AppleContacts.main()

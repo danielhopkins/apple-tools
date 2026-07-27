@@ -60,7 +60,6 @@ EOF
 echo "  swift/Sources/AppleToolsVersion/Version.swift"
 
 stamp notes/apple-notes '__version__ = "[^"]*"' "__version__ = \"$VERSION\""
-stamp contacts/apple-contacts '__version__ = "[^"]*"' "__version__ = \"$VERSION\""
 stamp bin/apple 'APPLE_TOOLS_VERSION="[^"]*"' "APPLE_TOOLS_VERSION=\"$VERSION\""
 
 echo "Done. Rebuild with 'make build'."

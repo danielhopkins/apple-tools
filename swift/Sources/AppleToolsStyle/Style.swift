@@ -48,4 +48,19 @@ public enum Style {
 
     /// Confirmation of a completed write.
     public static func success(_ text: String) -> String { wrap(text, "32") }
+
+    // Help styling, matching Python 3.14's argparse so apple-notes and the
+    // Swift tools look like one family.
+
+    /// Section headings: OVERVIEW:, USAGE:, OPTIONS:, SUBCOMMANDS:.
+    public static func heading(_ text: String) -> String { wrap(text, "1;34") }
+
+    /// Option flags: -h, --help.
+    public static func flag(_ text: String) -> String { wrap(text, "32") }
+
+    /// Subcommand names.
+    public static func subcommand(_ text: String) -> String { wrap(text, "32") }
+
+    /// The program name in the USAGE line.
+    public static func command(_ text: String) -> String { wrap(text, "1;35") }
 }

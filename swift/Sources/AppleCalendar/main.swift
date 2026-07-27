@@ -709,4 +709,11 @@ struct Delete: ParsableCommand {
 
 // MARK: - Entry point
 
+// ArgumentParser has no coloured help, so generate it, style it, and print
+// it here rather than letting .main() emit the plain version.
+if let help = HelpColor.requested(root: AppleCalendar.self, arguments: CommandLine.arguments) {
+    print(help)
+    exit(0)
+}
+
 AppleCalendar.main()
