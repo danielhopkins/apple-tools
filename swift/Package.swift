@@ -23,7 +23,16 @@ let package = Package(
         ),
         .executableTarget(
             name: "reminders",
-            dependencies: ["RemindersLibrary"]
+            dependencies: ["RemindersLibrary"],
+            exclude: ["Info.plist"],
+            linkerSettings: [
+                .unsafeFlags([
+                    "-Xlinker", "-sectcreate",
+                    "-Xlinker", "__TEXT",
+                    "-Xlinker", "__info_plist",
+                    "-Xlinker", "Sources/reminders/Info.plist",
+                ]),
+            ]
         ),
         .target(
             name: "RemindersLibrary",
@@ -49,7 +58,16 @@ let package = Package(
                 "AppleToolsStyle",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
-            path: "Sources/AppleCalendar"
+            path: "Sources/AppleCalendar",
+            exclude: ["Info.plist"],
+            linkerSettings: [
+                .unsafeFlags([
+                    "-Xlinker", "-sectcreate",
+                    "-Xlinker", "__TEXT",
+                    "-Xlinker", "__info_plist",
+                    "-Xlinker", "Sources/AppleCalendar/Info.plist",
+                ]),
+            ]
         ),
         .executableTarget(
             name: "apple-contacts",
@@ -59,7 +77,20 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "Sources/AppleContacts",
-            linkerSettings: [.linkedLibrary("sqlite3")]
+            exclude: ["Info.plist"],
+            linkerSettings: [
+                .linkedLibrary("sqlite3"),
+                // macOS will not show the Contacts permission dialog unless the
+                // binary carries NSContactsUsageDescription. A command-line tool
+                // has no bundle, so the plist is embedded directly into the
+                // __TEXT,__info_plist section.
+                .unsafeFlags([
+                    "-Xlinker", "-sectcreate",
+                    "-Xlinker", "__TEXT",
+                    "-Xlinker", "__info_plist",
+                    "-Xlinker", "Sources/AppleContacts/Info.plist",
+                ]),
+            ]
         ),
         .testTarget(
             name: "RemindersTests",

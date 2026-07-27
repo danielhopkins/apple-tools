@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Embedded into __TEXT,__info_plist by the linker flags in Package.swift,
+	  then bound by re-signing in the Makefile. Without a usage description
+	  macOS silently refuses to show the permission dialog and the status stays
+	  notDetermined, leaving nothing to toggle in System Settings.
+	-->
+	<key>CFBundleIdentifier</key>
+	<string>com.boulderhopkins.apple-tools.reminders</string>
+	<key>CFBundleName</key>
+	<string>reminders</string>
+	<key>NSRemindersFullAccessUsageDescription</key>
+	<string>reminders reads and writes your reminders from the command line.</string>
+</dict>
+</plist>

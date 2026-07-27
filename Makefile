@@ -16,9 +16,17 @@ TARBALL     := $(DIST).tar.gz
 .PHONY: build debug install uninstall test clean check set-version bump dist tag \
         completions install-completions install-skills uninstall-skills
 
-## Build the Swift binaries (reminders, apple-mail, apple-calendar) in release mode
+## Build the Swift binaries in release mode
+##
+## The three EventKit/Contacts tools embed an Info.plist carrying their usage
+## description; the linker puts it in __TEXT,__info_plist but leaves it outside
+## the signature, and macOS ignores an unbound one. Re-signing binds it. Without
+## this, the permission dialog never appears and the status stays notDetermined.
 build:
 	cd $(SWIFT_DIR) && swift build -c release
+	@for tool in reminders apple-calendar apple-contacts; do \
+		codesign -s - -f "$(RELEASE_DIR)/$$tool" 2>/dev/null || true; \
+	done
 
 debug:
 	cd $(SWIFT_DIR) && swift build
@@ -128,6 +136,14 @@ dist: set-version completions
 	mkdir -p $(DIST)/completions $(DIST)/skills
 	cp completions/_* $(DIST)/completions/
 	cp -R skills/* $(DIST)/skills/
+	@# Bind the embedded Info.plists. `dist` links its own universal binaries,
+	@# so the re-signing done by `build` does not apply to them — without this
+	@# the shipped tools cannot show a permission dialog at all.
+	@for b in reminders apple-calendar apple-contacts; do \
+		codesign -s - -f $(DIST)/$$b 2>/dev/null || true; \
+		codesign -dv $(DIST)/$$b 2>&1 | grep -q "Info.plist entries" \
+			|| { echo "error: $$b has no bound Info.plist"; exit 1; }; \
+	done
 	@# Confirm the binaries really are universal before shipping them.
 	@for b in reminders apple-mail apple-calendar apple-contacts; do \
 		archs="$$(lipo -archs $(DIST)/$$b)"; \
