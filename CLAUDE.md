@@ -88,7 +88,7 @@ AppleScript against Mail.app. Mail must be running; large mailboxes are slow, so
 always pass `--limit` and prefer `--since`.
 
 ```
-apple mail accounts [--json]
+apple mail accounts [--json]      # names, addresses, mailboxes, enabled
 apple mail search QUERY [--account NAME] [--mailbox NAME] [--field subject|sender|content|all]
                         [--since DAYS] [--before DAYS] [--limit N]
                         [--flagged] [--unread] [--has-attachment] [--all] [--json]
@@ -99,6 +99,11 @@ apple mail draft --to ADDR [--to ...] [--cc ADDR] [--bcc ADDR]
                  [--from ACCOUNT-ADDRESS] [--html] [--attach FILE]... [--json]
 apple mail send  <same flags> --confirm
 ```
+
+**Picking the account.** `accounts` reports each account's `addresses` as well
+as its name — those addresses are exactly what `--from` accepts. `--from` also
+takes an account *name*, which matters here because the names are emoji and are
+not themselves valid senders. Run `accounts --json` rather than guessing.
 
 **Drafting.** `draft` writes to the Drafts mailbox of whichever account matches
 `--from` (your default account otherwise) and never sends. `--body-file -`
@@ -130,6 +135,12 @@ macOS 27 and pinned by `tests/test_mail_draft.py`:
 - **The `text/plain` alternative is empty.** The body lives only in the
   `text/html` part, so a plain-text-only reader sees nothing. Mail may
   regenerate the MIME on send; this is what the stored draft contains.
+- **A draft's sender is frozen once saved.** `set sender` works only on an
+  outgoing message before `save`; afterwards it errors. Moving a draft to
+  another account's Drafts *does* work, but the sender does not follow, leaving
+  a message filed under one account that would send from another. So choose the
+  account with `--from` at creation time; there is no correct after-the-fact
+  move short of rebuilding the message.
 - **Text comes back NFD.** Mail decomposes unicode, so `ü` sent as one
   codepoint returns as `u` + combining diaeresis. Normalise before comparing.
 

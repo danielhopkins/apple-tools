@@ -23,17 +23,30 @@ struct Accounts: AsyncParsableCommand {
   var json = false
 
   func run() async throws {
+    // `email addresses of acct` cannot be iterated with `repeat with` — the
+    // loop yields nothing. Coercing the whole list to string does work, so the
+    // delimiter is set explicitly and the result split on this side.
     let script = """
+      set AppleScript's text item delimiters to ","
       tell application "Mail"
         set output to ""
-        set allAccounts to every account
-        repeat with acct in allAccounts
-          set acctName to name of acct
-          set output to output & "Account: " & acctName & linefeed
+        repeat with acct in every account
+          set addrs to ""
           try
-            set mboxes to every mailbox of acct
-            repeat with mbox in mboxes
-              set output to output & "  " & name of mbox & linefeed
+            set addrs to (email addresses of acct) as string
+          end try
+          set fn to ""
+          try
+            set fn to full name of acct
+          end try
+          set en to "true"
+          try
+            set en to (enabled of acct) as string
+          end try
+          set output to output & "ACCOUNT\t" & (name of acct) & "\t" & en & "\t" & fn & "\t" & addrs & linefeed
+          try
+            repeat with mbox in (every mailbox of acct)
+              set output to output & "MAILBOX\t" & (name of mbox) & linefeed
             end repeat
           end try
         end repeat
@@ -42,32 +55,50 @@ struct Accounts: AsyncParsableCommand {
       """
     let result = try runAppleScript(script)
 
-    guard json else {
-      print(result)
-      return
-    }
-
-    // Reshape the indented "Account:" listing into [{name, mailboxes}].
     var accounts: [[String: Any]] = []
     for line in result.split(separator: "\n", omittingEmptySubsequences: true) {
-      if line.hasPrefix("Account: ") {
+      let fields = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+      guard let kind = fields.first else { continue }
+
+      if kind == "ACCOUNT", fields.count >= 5 {
+        let addresses = fields[4]
+          .split(separator: ",")
+          .map { $0.trimmingCharacters(in: .whitespaces) }
+          .filter { !$0.isEmpty }
         accounts.append([
-          "name": String(line.dropFirst("Account: ".count)),
+          "name": fields[1],
+          "enabled": fields[2] == "true",
+          "full_name": fields[3],
+          "addresses": addresses,
           "mailboxes": [String](),
         ])
-      } else if !accounts.isEmpty {
-        let mailbox = line.trimmingCharacters(in: .whitespaces)
-        if !mailbox.isEmpty {
-          var mailboxes = accounts[accounts.count - 1]["mailboxes"] as? [String] ?? []
-          mailboxes.append(mailbox)
-          accounts[accounts.count - 1]["mailboxes"] = mailboxes
-        }
+      } else if kind == "MAILBOX", fields.count >= 2, !accounts.isEmpty {
+        var mailboxes = accounts[accounts.count - 1]["mailboxes"] as? [String] ?? []
+        mailboxes.append(fields[1])
+        accounts[accounts.count - 1]["mailboxes"] = mailboxes
       }
     }
 
-    let data = try JSONSerialization.data(
-      withJSONObject: accounts, options: [.prettyPrinted, .sortedKeys])
-    print(String(data: data, encoding: .utf8) ?? "[]")
+    if json {
+      let data = try JSONSerialization.data(
+        withJSONObject: accounts, options: [.prettyPrinted, .sortedKeys])
+      print(String(data: data, encoding: .utf8) ?? "[]")
+      return
+    }
+
+    for account in accounts {
+      let name = account["name"] as? String ?? "?"
+      let addresses = (account["addresses"] as? [String] ?? []).joined(separator: ", ")
+      let disabled = (account["enabled"] as? Bool ?? true) ? "" : "  (disabled)"
+      print("\(name)\(disabled)")
+      if !addresses.isEmpty {
+        // These are the values --from accepts.
+        print("  addresses: \(addresses)")
+      }
+      for mailbox in account["mailboxes"] as? [String] ?? [] {
+        print("    \(mailbox)")
+      }
+    }
   }
 }
 
@@ -497,6 +528,22 @@ private let composeScript = """
         set html content of msg to theBody
       else
         set msg to make new outgoing message with properties {subject:theSubject, content:theBody, visible:false}
+      end if
+
+      -- --from accepts an account name as well as an address, because the
+      -- names people see can be emoji and are not valid senders.
+      -- `item 1 of (email addresses of acct)` yields nothing, the same way
+      -- iterating that list does. Coercing the list to text is the form that
+      -- works, so take the first comma-separated item off that.
+      if theSender is not "" and theSender does not contain "@" then
+        set AppleScript's text item delimiters to ","
+        repeat with acct in every account
+          if (name of acct) is theSender then
+            try
+              set theSender to text item 1 of ((email addresses of acct) as string)
+            end try
+          end if
+        end repeat
       end if
 
       tell msg

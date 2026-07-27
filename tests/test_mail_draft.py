@@ -97,6 +97,26 @@ class TestDraft(LiveMailTest):
         message = self.parsed(marker)
         self.assertIn("theinevitable.co", message["From"])
 
+    def test_from_accepts_an_account_name(self):
+        """Account display names can be emoji, which are not valid senders.
+
+        --from resolves a name to that account's first address. The list has to
+        be coerced to text to read it: both `repeat with` and `item 1 of` yield
+        nothing on `email addresses of <account>`.
+        """
+        import json as _json
+
+        _, accounts_out, _ = mail("accounts", "--json")
+        accounts = [a for a in _json.loads(accounts_out) if a["addresses"]]
+        if len(accounts) < 2:
+            self.skipTest("needs at least two accounts with addresses")
+        target = accounts[-1]
+
+        marker = self.marker("fromname")
+        mail("draft", "--to", "dan@boulderhopkins.com", "--from", target["name"],
+             "--subject", marker, "--body", "x")
+        self.assertIn(target["addresses"][0], self.parsed(marker)["From"])
+
     def test_special_characters_survive(self):
         """Values go through argv; interpolating them would break on these."""
         marker = self.marker('special "quoted" & \\ backslash')
