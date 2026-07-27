@@ -1,3 +1,4 @@
+import AppleToolsStyle
 import ArgumentParser
 import EventKit
 import Foundation
@@ -16,14 +17,53 @@ private extension EKReminder {
     }
 }
 
+private func isOverdue(_ reminder: EKReminder) -> Bool {
+    guard let due = reminder.dueDateComponents?.date else { return false }
+    return !reminder.isCompleted && due < Date()
+}
+
+/// Notes are frequently several paragraphs. Inline they swamp the list, so
+/// they go on their own dimmed line, collapsed and clipped.
+private func notesLine(_ reminder: EKReminder) -> String? {
+    guard let notes = reminder.notes else { return nil }
+    let collapsed = notes
+        .replacingOccurrences(of: "\n", with: " ")
+        .replacingOccurrences(of: "\t", with: " ")
+        .split(separator: " ", omittingEmptySubsequences: true)
+        .joined(separator: " ")
+    guard !collapsed.isEmpty else { return nil }
+
+    let limit = 100
+    let clipped = collapsed.count > limit
+        ? String(collapsed.prefix(limit)) + "…"
+        : collapsed
+    return clipped
+}
+
 private func format(_ reminder: EKReminder, at index: Int?, listName: String? = nil) -> String {
-    let dateString = formattedDueDate(from: reminder).map { " (\($0))" } ?? ""
-    let priorityString = Priority(fromInt: reminder.priority).map { " (priority: \($0))" } ?? ""
-    let listString = listName.map { "\($0): " } ?? ""
-    let notesString = reminder.notes.map { " (\($0))" } ?? ""
-    let indexString = index.map { "\($0): " } ?? ""
-    let recurrenceString = reminder.recurrenceRules?.first.map { " (repeats: \(humanRecurrence($0)))" } ?? ""
-    return "\(listString)\(indexString)\(reminder.title ?? "<unknown>")\(notesString)\(dateString)\(priorityString)\(recurrenceString)"
+    // The index is what complete/edit/delete take, so it is styled like other
+    // copyable identifiers. Overdue dates are red rather than merely relative.
+    let indexString = index.map { Style.identifier("\($0)") + ": " } ?? ""
+    let listString = listName.map { Style.dim("\($0): ") } ?? ""
+    let title = Style.title(reminder.title ?? "<unknown>")
+
+    var suffix = ""
+    if let due = formattedDueDate(from: reminder) {
+        suffix += "  " + (isOverdue(reminder) ? Style.warning("(\(due))") : Style.time("(\(due))"))
+    }
+    if let priority = Priority(fromInt: reminder.priority) {
+        let text = "(priority: \(priority))"
+        suffix += "  " + (priority == .high ? Style.warning(text) : Style.label(text))
+    }
+    if let rule = reminder.recurrenceRules?.first {
+        suffix += "  " + Style.dim("(repeats: \(humanRecurrence(rule)))")
+    }
+
+    var line = "\(listString)\(indexString)\(title)\(suffix)"
+    if let notes = notesLine(reminder) {
+        line += "\n    " + Style.dim(notes)
+    }
+    return line
 }
 
 private let recurrenceEndDateFormatter: DateFormatter = {
@@ -175,7 +215,7 @@ public final class Reminders {
             print(encodeToJson(data: self.getListNames()))
         default:
             for name in self.getListNames() {
-                print(name)
+                print(Style.title(name))
             }
         }
     }
