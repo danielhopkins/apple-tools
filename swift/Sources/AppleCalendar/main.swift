@@ -244,22 +244,36 @@ private func calendars(named names: [String]) throws -> [EKCalendar] {
     let all = store.calendars(for: .event)
     guard !names.isEmpty else { return all }
 
-    return try names.map { name in
-        guard let match = all.first(where: { $0.title.lowercased() == name.lowercased() }) else {
+    // Titles are not unique — a subscribed "Birthdays" and a writable one can
+    // coexist. Return every match rather than the first, so a read of that name
+    // covers both instead of silently showing half the events.
+    return try names.flatMap { name -> [EKCalendar] in
+        let matches = all.filter { $0.title.lowercased() == name.lowercased() }
+        guard !matches.isEmpty else {
             throw ValidationError(
                 "no calendar named '\(name)'. Available: \(all.map { $0.title }.joined(separator: ", "))")
         }
-        return match
+        return matches
     }
 }
 
 private func writableCalendar(named name: String?) throws -> EKCalendar {
     if let name {
-        let match = try calendars(named: [name])[0]
-        guard match.allowsContentModifications else {
-            throw ValidationError("calendar '\(match.title)' is read-only")
+        // Calendar titles are not unique. A subscribed read-only "Birthdays"
+        // can sit alongside a writable one of the same name, and taking the
+        // first match rejected the write as read-only even though `calendars
+        // --writable` had just offered that name. Prefer a match that actually
+        // accepts writes.
+        let matches = store.calendars(for: .event)
+            .filter { $0.title.lowercased() == name.lowercased() }
+        guard !matches.isEmpty else {
+            _ = try calendars(named: [name])  // reuse its "no calendar named" error
+            throw ValidationError("no calendar named '\(name)'")
         }
-        return match
+        guard let writable = matches.first(where: { $0.allowsContentModifications }) else {
+            throw ValidationError("calendar '\(matches[0].title)' is read-only")
+        }
+        return writable
     }
     guard let fallback = store.defaultCalendarForNewEvents else {
         throw ValidationError("no default calendar; pass --calendar")

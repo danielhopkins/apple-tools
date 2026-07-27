@@ -95,7 +95,13 @@ def target_calendar():
     writable = run_json("calendars", "--writable")
     if not writable:
         raise RuntimeError("no writable calendars available for testing")
-    return writable[0]["title"]
+
+    # Calendar titles are not unique, and --calendar matches by name: a title
+    # shared with a read-only calendar makes every assertion here ambiguous.
+    # Prefer a writable calendar whose title nothing else claims.
+    titles = [c["title"].lower() for c in run_json("calendars")]
+    unique = [c for c in writable if titles.count(c["title"].lower()) == 1]
+    return (unique or writable)[0]["title"]
 
 
 def window():

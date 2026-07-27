@@ -138,7 +138,13 @@ colleague/in-law and step variants); case, spaces and hyphens are ignored. An
 unknown label is stored as a custom one with a note on stderr — if you see that
 note, check for a typo before moving on. Dates: `--birthday` and `--anniversary`
 are built in; anything else is `--date LABEL:DATE`, e.g. `--date death:2020-05-01`.
-There is no standard death-date label, so it is stored as a custom one.
+There is no standard death-date label, so it is stored as a custom one. A
+year-less date must be passed with `=`: `--birthday=--04-13`, never
+`--birthday --04-13`, which the parser reads as a missing value.
+
+`get`, `add` and `edit` return a single JSON object; `search`, `list` and
+`groups members` return arrays. Unlabelled emails and phones have no `label`
+key at all.
 
 **Groups are managed separately.** `apple contacts groups` lists them with member
 counts; `groups add/remove GROUP CONTACT-ID` changes membership; `GROUP` takes an
@@ -164,6 +170,10 @@ user to change a setting.
   terminal. Contacts needs its own grant, plus Full Disk Access if you want
   contact notes.
 - Mail needs Automation access and Mail.app running.
+- `apple contacts groups remove` is the one contacts command that drives
+  Contacts.app, because the framework's own remove-member call silently does
+  nothing. It launches Contacts hidden in the background and may need
+  Automation access. Everything else uses the framework directly.
 
 Reminders, Calendar and Contacts hold their **own** grants, independent of the
 terminal — they re-execute themselves so macOS attributes the request to the
