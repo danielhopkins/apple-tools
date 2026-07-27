@@ -94,6 +94,7 @@ bin/apple        dispatcher
 swift/           one Swift package → reminders, apple-mail, apple-calendar
 notes/           Python: apple-notes, notestore.py decoder, live Notes.app tests
 contacts/        Python: apple-contacts
+tests/           live calendar write-path suite (gated)
 docs/            Notes API reference and behavior notes
 Formula/         Homebrew formula, mirrored into the tap on release
 VERSION          single source of truth, stamped into every tool
@@ -122,9 +123,18 @@ make dist      # universal tarball for the tap + its sha256
 make tag       # git tag vYY.MMDD.Patch
 ```
 
-`notes/run-tests` drives **live Notes.app** and creates real notes in your iCloud
-account. It's self-cleaning — every test note is prefixed `__claude_notes_test__`
-and the suite refuses to delete anything else — but it is not a casual command.
+Two live suites drive real data and are gated behind their own runners:
+
+```
+./tests/run-tests        # calendar write paths: add / edit / delete
+./notes/run-tests        # live Notes.app
+```
+
+Both are self-cleaning: every artifact is created with a `__claude_*_test__`
+prefix and the sweep refuses to delete anything without it. The calendar suite
+creates real events on a writable calendar, which syncs to your other devices;
+pick where with `APPLE_CALENDAR_TEST_CALENDAR="Personal"`. Neither is a casual
+command.
 
 ## Credits
 

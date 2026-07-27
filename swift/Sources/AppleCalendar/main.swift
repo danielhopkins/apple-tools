@@ -131,6 +131,9 @@ struct EventInfo: Encodable {
     let notes: String?
     let url: String?
     let recurring: Bool
+    /// Only set for recurring events: the value to pass back as --occurrence so
+    /// show/edit/delete act on this instance rather than the series master.
+    let occurrence: String?
     let attendees: [String]?
 }
 
@@ -149,6 +152,9 @@ private func info(_ event: EKEvent) -> EventInfo {
         notes: event.notes,
         url: event.url?.absoluteString,
         recurring: event.hasRecurrenceRules,
+        occurrence: event.hasRecurrenceRules
+            ? event.startDate.map { iso8601.string(from: $0) }
+            : nil,
         attendees: (attendees?.isEmpty ?? true) ? nil : attendees
     )
 }
@@ -212,11 +218,75 @@ private func writableCalendar(named name: String?) throws -> EKCalendar {
     return fallback
 }
 
-private func event(withId id: String) throws -> EKEvent {
-    guard let match = store.event(withIdentifier: id) else {
+/// Look up an event by identifier.
+///
+/// For a recurring event, `EKEventStore.event(withIdentifier:)` returns the
+/// *series master* — the first occurrence, which can be years before the one
+/// the caller actually saw in `events`. Passing `occurrence` resolves the
+/// specific instance instead by scanning the day it falls on.
+private func event(withId id: String, occurrence: Date? = nil) throws -> EKEvent {
+    guard let master = store.event(withIdentifier: id) else {
         throw ValidationError("no event with id '\(id)'")
     }
-    return match
+
+    guard let occurrence else { return master }
+
+    guard master.hasRecurrenceRules else {
+        // Harmless to pass --occurrence for a one-off; just don't go searching.
+        return master
+    }
+
+    let calendar = Foundation.Calendar.current
+    let dayStart = calendar.startOfDay(for: occurrence)
+    guard let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart) else {
+        throw ValidationError("could not build a search window around the occurrence date")
+    }
+
+    let predicate = store.predicateForEvents(
+        withStart: dayStart, end: dayEnd,
+        calendars: master.calendar.map { [$0] })
+
+    let instances = store.events(matching: predicate)
+        .filter { $0.eventIdentifier == id }
+
+    guard !instances.isEmpty else {
+        throw ValidationError(
+            "no occurrence of '\(master.title ?? id)' on "
+            + "\(humanDayFormatter.string(from: occurrence)). "
+            + "Use `events --json` to list real occurrences.")
+    }
+
+    // A day can hold more than one instance; take the closest start.
+    return instances.min {
+        abs($0.startDate.timeIntervalSince(occurrence))
+            < abs($1.startDate.timeIntervalSince(occurrence))
+    } ?? master
+}
+
+/// Guard the write paths against silently editing the wrong instance.
+private func resolveForWrite(
+    id: String, occurrence: DateArg?, series: Bool, verb: String
+) throws -> EKEvent {
+    let master = try event(withId: id)
+
+    guard master.hasRecurrenceRules else { return master }
+
+    if series {
+        return master
+    }
+
+    guard let occurrence else {
+        throw ValidationError(
+            """
+            '\(master.title ?? id)' is a recurring event, and this id refers to the \
+            whole series (first occurrence \
+            \(master.startDate.map { humanDayFormatter.string(from: $0) } ?? "unknown")).
+            Pass --occurrence with the instance you mean — `events --json` reports it \
+            as "occurrence" — or --series to \(verb) the series itself.
+            """)
+    }
+
+    return try event(withId: id, occurrence: occurrence.date)
 }
 
 // MARK: - Commands
@@ -379,12 +449,25 @@ struct Show: ParsableCommand {
     @Argument(help: "Event identifier, from `events --json`")
     var id: String
 
+    @Option(name: .long, help: "Which occurrence of a recurring event (its \"occurrence\" field)")
+    var occurrence: DateArg?
+
     @Flag(name: .long, help: "Output as JSON")
     var json = false
 
     func run() throws {
         try requireCalendarAccess()
-        let match = try event(withId: id)
+        let match = try event(withId: id, occurrence: occurrence?.date)
+
+        // Reads can't do damage, so surface the ambiguity instead of refusing.
+        if match.hasRecurrenceRules && occurrence == nil {
+            FileHandle.standardError.write(Data("""
+                note: this is a recurring series; showing its first occurrence. \
+                Pass --occurrence to see a specific instance.
+
+                """.utf8))
+        }
+
         if json {
             printJSON(info(match))
         } else {
@@ -494,6 +577,12 @@ struct Edit: ParsableCommand {
     @Option(name: .long, help: "New notes body (replaces existing notes)")
     var notes: String?
 
+    @Option(name: .long, help: "Which occurrence to edit (its \"occurrence\" field from `events --json`)")
+    var occurrence: DateArg?
+
+    @Flag(name: .long, help: "Target the recurring series itself rather than one occurrence")
+    var series = false
+
     @Flag(name: .long, help: "Apply to this and all future occurrences of a recurring event")
     var future = false
 
@@ -502,7 +591,8 @@ struct Edit: ParsableCommand {
 
     func run() throws {
         try requireCalendarAccess()
-        let match = try event(withId: id)
+        let match = try resolveForWrite(
+            id: id, occurrence: occurrence, series: series, verb: "edit")
 
         guard title != nil || start != nil || end != nil || location != nil || notes != nil else {
             throw ValidationError("nothing to change; pass at least one of --title/--start/--end/--location/--notes")
@@ -534,12 +624,19 @@ struct Delete: ParsableCommand {
     @Argument(help: "Event identifier, from `events --json`")
     var id: String
 
+    @Option(name: .long, help: "Which occurrence to delete (its \"occurrence\" field from `events --json`)")
+    var occurrence: DateArg?
+
+    @Flag(name: .long, help: "Target the recurring series itself rather than one occurrence")
+    var series = false
+
     @Flag(name: .long, help: "Delete this and all future occurrences of a recurring event")
     var future = false
 
     func run() throws {
         try requireCalendarAccess()
-        let match = try event(withId: id)
+        let match = try resolveForWrite(
+            id: id, occurrence: occurrence, series: series, verb: "delete")
         let title = match.title ?? "<untitled>"
         try store.remove(match, span: future ? .futureEvents : .thisEvent, commit: true)
         print("Deleted '\(title)'")

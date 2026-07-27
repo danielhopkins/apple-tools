@@ -134,13 +134,13 @@ Swift + EventKit. Read and write events.
 apple calendar calendars [--writable] [--json]
 apple calendar events [--from DATE] [--to DATE | --days N] [--calendar NAME]
                       [--search TEXT] [--json]         # default: next 7 days
-apple calendar show ID [--json]
+apple calendar show ID [--occurrence DATE] [--json]
 apple calendar add "TITLE" --start DATE [--end DATE | --duration MINUTES]
                           [--calendar NAME] [--all-day] [--location TEXT]
                           [--notes TEXT] [--url URL] [--json]
 apple calendar edit ID [--title T] [--start DATE] [--end DATE] [--location L]
-                       [--notes N] [--future] [--json]
-apple calendar delete ID [--future]
+                       [--notes N] [--occurrence DATE | --series] [--future] [--json]
+apple calendar delete ID [--occurrence DATE | --series] [--future]
 apple calendar status [--json]                # report permission state, never prompts
 ```
 
@@ -151,16 +151,21 @@ event length is 1 hour.
 Subscribed and holiday calendars are read-only — `calendars --writable` shows
 which ones accept writes.
 
-⚠️ **A recurring event's ID identifies the series, not the occurrence you saw.**
-`events` lists the Jul 27 instance, but passing that ID to `show`/`edit`/`delete`
-resolves to the series' **first** occurrence — possibly years earlier. Check
-`"recurring": true` in the JSON before writing. Without `--future` you will edit
-the first occurrence rather than the one the user meant; with `--future` from
-that master you effectively rewrite the whole series. For recurring events,
-confirm the intended scope with the user rather than inferring it.
+**Recurring events.** An event ID identifies the *series*, not the instance you
+saw — EventKit resolves it to the first occurrence, often years earlier. So:
 
-For recurring events, `--future` applies the change to this and all later
-occurrences; without it only the single occurrence changes.
+- `events --json` sets an **`occurrence`** field on recurring events. Pass it
+  straight back as `--occurrence` to act on that instance.
+- `edit` and `delete` **refuse to run** on a recurring event unless you pass
+  either `--occurrence DATE` or `--series`. They will not guess.
+- `show` without `--occurrence` returns the series master and says so on stderr.
+- `--series` targets the master deliberately; combined with `--future` that
+  rewrites the whole series.
+- `--future` applies a change to this and all later occurrences; without it only
+  the single occurrence changes.
+
+`apple calendar add` cannot create recurring events — use Reminders'
+`--repeat`, or create the series in Calendar.app.
 
 ### contacts — `apple contacts`
 

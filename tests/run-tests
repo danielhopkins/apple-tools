@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Run the live apple-tools integration suites.
+#
+# WARNING: these drive the real binaries against your real data. The calendar
+# suite creates and deletes events on a writable calendar, which syncs to your
+# other devices. Every event it creates is titled with the
+# "__claude_calendar_test__" prefix and is swept before and after each test;
+# the sweep refuses to delete anything without that prefix. Fixtures are dated
+# in the year 2099 so a stray leftover never appears in a real week view.
+#
+# Usage:
+#   ./tests/run-tests                        # everything
+#   ./tests/run-tests test_calendar_write    # one module
+#
+# Pick the calendar fixtures land on (defaults to the first writable one):
+#   APPLE_CALENDAR_TEST_CALENDAR="Personal" ./tests/run-tests
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+PY="$(command -v python3)"
+
+cd "$ROOT"
+export RUN_LIVE_CALENDAR_TESTS=1
+export PYTHONPATH="$ROOT"
+
+CAL="${APPLE_CALENDAR_TEST_CALENDAR:-<first writable>}"
+echo "Live calendar tests — fixtures go to: $CAL"
+echo "Every fixture is prefixed __claude_calendar_test__ and swept afterwards."
+echo
+
+if [ "$#" -gt 0 ]; then
+  exec "$PY" -m unittest -v "$1"
+else
+  exec "$PY" -m unittest discover -s . -p "test_*.py" -t . -v
+fi
