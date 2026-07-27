@@ -161,11 +161,12 @@ disappears the tools quietly fall back to the old behaviour.
 
 Two consequences worth knowing:
 
-- **The grant is per-binary and per-path.** `reminders`, `apple-calendar` and
+- **The grant is per-binary.** `reminders`, `apple-calendar` and
   `apple-contacts` each get their own row in System Settings, under their own
-  name. Because TCC keys ad-hoc-signed binaries by path, a `brew upgrade`
-  installs into a new Cellar directory and prompts once more. Rebuilding in
-  place does not re-prompt.
+  name. An upgrade sometimes asks again and sometimes doesn't — 26.727.8 → .9
+  re-prompted, .9 → .10 did not, both landing in a new Cellar directory — so
+  treat a fresh prompt after upgrading as expected. Rebuilding in place has
+  never re-prompted.
 - **An existing terminal-keyed grant still works.** The re-execution is skipped
   whenever access already succeeds, so nobody who has already approved their
   terminal is disturbed, and no extra process is spawned.
