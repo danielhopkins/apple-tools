@@ -48,7 +48,12 @@ class AppleTools < Formula
         apple-calendar calendars   # Calendar access
         apple-mail accounts        # Automation access for Mail
 
-        apple-contacts status      # Contacts access
+        apple-contacts list        # Contacts access
+
+      reminders, apple-calendar and apple-contacts hold their own grants rather
+      than borrowing the terminal's, so they work from any terminal and appear
+      in System Settings under their own names. That grant is keyed to the
+      binary path, so upgrading this formula prompts once more.
 
       apple-notes reads Apple's SQLite store directly, which requires Full Disk
       Access for your terminal app:

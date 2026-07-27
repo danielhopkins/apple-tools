@@ -165,5 +165,15 @@ user to change a setting.
   contact notes.
 - Mail needs Automation access and Mail.app running.
 
+Reminders, Calendar and Contacts hold their **own** grants, independent of the
+terminal — they re-execute themselves so macOS attributes the request to the
+binary rather than to whatever launched it. So look for `apple-contacts` in the
+System Settings pane, not the user's terminal app, and never suggest switching
+terminals to fix one of those three. A `brew upgrade` re-prompts once, because
+the grant is keyed to the binary path.
+
+Notes (Full Disk Access) and Mail (Automation) are the exceptions: those two are
+still granted to the calling terminal.
+
 When a tool reports an access problem, tell the user which System Settings pane
 to open. You cannot click through the dialog for them.

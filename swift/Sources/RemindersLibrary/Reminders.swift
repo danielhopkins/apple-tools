@@ -2,6 +2,7 @@ import AppleToolsStyle
 import ArgumentParser
 import EventKit
 import Foundation
+import TCCResponsibility
 
 private let Store = EKEventStore()
 private let dateFormatter = RelativeDateTimeFormatter()
@@ -183,7 +184,25 @@ private func makeRecurrenceRule(_ config: RecurrenceConfig) -> EKRecurrenceRule?
 }
 
 public final class Reminders {
+    /// Takes ownership of this process's TCC identity, unless Reminders already
+    /// works.
+    ///
+    /// Without this, macOS attributes the request to whichever terminal
+    /// launched us, so the grant lands on the terminal app rather than this
+    /// binary and the tool is denied under any terminal that has not itself
+    /// been granted. Re-executing disclaimed keys the grant here instead.
+    ///
+    /// Skipped when access already works, so an existing grant is untouched.
+    /// Does not return when it re-executes.
+    public static func claimOwnTCCIdentity() {
+        let status = EKEventStore.authorizationStatus(for: .reminder)
+        TCCResponsibility.claimOwnIdentity(
+            unless: status == .fullAccess || status == .authorized)
+    }
+
     public static func requestAccess() -> (Bool, Error?) {
+        claimOwnTCCIdentity()
+
         let semaphore = DispatchSemaphore(value: 0)
         var grantedAccess = false
         var returnError: Error? = nil

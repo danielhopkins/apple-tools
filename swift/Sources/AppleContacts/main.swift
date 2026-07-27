@@ -3,15 +3,35 @@ import AppleToolsVersion
 import ArgumentParser
 import Contacts
 import Foundation
+import TCCResponsibility
 
 private let store = CNContactStore()
 private let settingsPath = "System Settings → Privacy & Security → Contacts"
 
 // MARK: - Access
 
+/// Takes ownership of this process's TCC identity, unless Contacts already
+/// works.
+///
+/// Without this, macOS attributes the request to whichever terminal launched
+/// us, so the grant lands on Terminal.app or Ghostty and the tool is denied
+/// under any terminal that has not itself been granted — with no dialog and no
+/// entry in System Settings to fix. Re-executing disclaimed keys the grant to
+/// this binary instead, so it works from every terminal.
+///
+/// Skipped when access already works, which keeps an existing terminal-keyed
+/// grant functioning untouched and costs nothing at startup. Does not return
+/// when it re-executes.
+func claimOwnTCCIdentity() {
+    TCCResponsibility.claimOwnIdentity(
+        unless: CNContactStore.authorizationStatus(for: .contacts) == .authorized)
+}
+
 /// Prompts for (or confirms) Contacts access. Called inside each command so
 /// `--help` works without a grant.
 func requireContactsAccess() throws {
+    claimOwnTCCIdentity()
+
     // macOS only shows a dialog while the status is notDetermined; once it is
     // anything else the request returns silently, so report the real state
     // instead of asking for a grant that will never be offered.
@@ -325,6 +345,10 @@ struct Status: ParsableCommand {
     var json = false
 
     func run() {
+        // Re-exec too, so this reports the identity the other commands actually
+        // use. Disclaiming never prompts on its own.
+        claimOwnTCCIdentity()
+
         let status = CNContactStore.authorizationStatus(for: .contacts)
         let (name, usable, advice): (String, Bool, String?) = {
             switch status {

@@ -17,6 +17,7 @@ let package = Package(
     ],
     targets: [
         .target(name: "AppleToolsVersion"),
+        .target(name: "TCCResponsibility"),
         .target(
             name: "AppleToolsStyle",
             dependencies: [.product(name: "ArgumentParser", package: "swift-argument-parser")]
@@ -39,6 +40,7 @@ let package = Package(
             dependencies: [
                 "AppleToolsVersion",
                 "AppleToolsStyle",
+                "TCCResponsibility",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
@@ -56,6 +58,7 @@ let package = Package(
             dependencies: [
                 "AppleToolsVersion",
                 "AppleToolsStyle",
+                "TCCResponsibility",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "Sources/AppleCalendar",
@@ -74,6 +77,7 @@ let package = Package(
             dependencies: [
                 "AppleToolsVersion",
                 "AppleToolsStyle",
+                "TCCResponsibility",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "Sources/AppleContacts",
