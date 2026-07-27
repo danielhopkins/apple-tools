@@ -192,7 +192,7 @@ notes/           Python: apple-notes, notestore.py decoder, live Notes.app tests
 skills/          Claude skills (apple-tools, daily-brief, meeting-prep, inbox-triage)
 completions/     zsh completions
 tests/           live write-path suites: calendar, mail drafts, contacts (gated)
-docs/            Notes API reference and behavior notes
+docs/            Notes API reference, behavior notes, and prior art
 Formula/         Homebrew formula, mirrored into the tap on release
 VERSION          single source of truth, stamped into every tool
 CLAUDE.md        the same surface, written for an agent
@@ -242,6 +242,13 @@ have no undo — so its fixtures must carry `__claude_contacts_test__` as their
 the build you just made may not be the approved one; point the suite at a
 granted copy with `APPLE_CONTACTS_BIN="$(command -v apple-contacts)"`. None of
 these is a casual command.
+
+## Prior art
+
+Other projects covering the same ground — MCP servers, EventKit CLIs, Swift
+bridges — are catalogued in [`docs/prior-art.md`](docs/prior-art.md), with what
+each one verifiably does and doesn't handle. Worth a look before adding a
+feature; several of them have already met the wall you're about to.
 
 ## Credits
 

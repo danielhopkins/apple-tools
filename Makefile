@@ -132,7 +132,9 @@ dist: set-version completions
 	cp bin/apple $(DIST)/
 	cp notes/apple-notes notes/notestore.py notes/notestore.proto $(DIST)/
 	cp README.md CLAUDE.md LICENSE VERSION $(DIST)/
-	cp docs/apple-notes-api.md $(DIST)/docs/
+	@# All of docs/, not one named file: CLAUDE.md links to these, and a
+	@# release that ships the link but not the target is worse than neither.
+	cp docs/*.md $(DIST)/docs/
 	mkdir -p $(DIST)/completions $(DIST)/skills
 	cp completions/_* $(DIST)/completions/
 	cp -R skills/* $(DIST)/skills/
