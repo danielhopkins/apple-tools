@@ -64,11 +64,20 @@ instance:
 | `inbox-triage` | Turns actionable mail into reminders — proposes first, creates only on approval. |
 
 ```
-make install-skills      # symlinks skills/ into ~/.claude/skills/
+make install-skills      # symlinks skills/ into every Claude config dir found
 make uninstall-skills
 ```
 
-Symlinks, so edits in the repo take effect in the next Claude session.
+Claude reads one config dir per session, chosen by `CLAUDE_CONFIG_DIR`, and a
+machine can have several profiles. `install-skills` targets every one it finds
+(`~/.claude-personal`, `~/.claude-inevitable`, `~/.claude`) so the skills are
+there whichever profile the session runs under. Override with:
+
+```
+make install-skills CLAUDE_DIRS="$HOME/.claude-work"
+```
+
+They are symlinks, so edits in the repo take effect in the next Claude session.
 
 ## Shell completion
 

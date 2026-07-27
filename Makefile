@@ -1,7 +1,11 @@
 SWIFT_DIR   := swift
 RELEASE_DIR := $(SWIFT_DIR)/.build/release
 PREFIX      ?= $(HOME)/bin
-SKILLS_PREFIX ?= $(HOME)/.claude/skills
+# Claude reads one config dir per session, chosen by CLAUDE_CONFIG_DIR, and a
+# machine can have several profiles (personal / work). Install skills into all
+# of them so they are there whichever profile the session runs under.
+# Override with: make install-skills CLAUDE_DIRS="/path/to/.claude"
+CLAUDE_DIRS ?= $(wildcard $(HOME)/.claude-personal $(HOME)/.claude-inevitable $(HOME)/.claude)
 ZSH_COMPLETIONS ?=
 ROOT        := $(shell pwd)
 SWIFT_UNIV  := --configuration release --arch arm64 --arch x86_64
@@ -47,21 +51,31 @@ install-completions: completions
 	esac; \
 	echo "Then: rm -f ~/.zcompdump && exec zsh"
 
-## Symlink the Claude skills into ~/.claude/skills
+## Symlink the Claude skills into every Claude config dir on this machine
 install-skills:
-	@mkdir -p $(SKILLS_PREFIX)
-	@for skill in skills/*/; do \
-		name=$$(basename $$skill); \
-		ln -sfn "$(ROOT)/skills/$$name" "$(SKILLS_PREFIX)/$$name"; \
-		echo "  $(SKILLS_PREFIX)/$$name -> $(ROOT)/skills/$$name"; \
+	@if [ -z "$(CLAUDE_DIRS)" ]; then \
+		echo "error: no Claude config dir found. Pass one:"; \
+		echo "  make install-skills CLAUDE_DIRS=~/.claude"; exit 1; \
+	fi
+	@for dir in $(CLAUDE_DIRS); do \
+		mkdir -p "$$dir/skills"; \
+		for skill in skills/*/; do \
+			name=$$(basename $$skill); \
+			ln -sfn "$(ROOT)/skills/$$name" "$$dir/skills/$$name"; \
+		done; \
+		echo "  $$dir/skills/  <- $$(ls -d skills/*/ | wc -l | tr -d ' ') skills"; \
 	done
 	@echo "Installed. Skills are picked up on the next Claude Code session."
 
 uninstall-skills:
-	@for skill in skills/*/; do \
-		name=$$(basename $$skill); \
-		[ -L "$(SKILLS_PREFIX)/$$name" ] && rm -f "$(SKILLS_PREFIX)/$$name" && echo "  removed $$name"; \
-	done || true
+	@for dir in $(CLAUDE_DIRS); do \
+		for skill in skills/*/; do \
+			name=$$(basename $$skill); \
+			if [ -L "$$dir/skills/$$name" ]; then \
+				rm -f "$$dir/skills/$$name"; echo "  removed $$dir/skills/$$name"; \
+			fi; \
+		done; \
+	done
 
 ## Symlink the dispatcher and each tool into $(PREFIX)
 install: build

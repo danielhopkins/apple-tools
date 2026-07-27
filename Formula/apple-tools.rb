@@ -1,8 +1,8 @@
 class AppleTools < Formula
   desc "CLIs for local Apple app data: Notes, Mail, Reminders, Calendar, Contacts"
   homepage "https://github.com/danielhopkins/apple-tools"
-  url "https://github.com/danielhopkins/apple-tools/releases/download/v26.727.3/apple-tools-26.727.3.tar.gz"
-  sha256 "608911cf6bcd86ec413651174ef3fcc602ddea558fa2673904f32aec65a32cfa"
+  url "https://github.com/danielhopkins/apple-tools/releases/download/v26.727.4/apple-tools-26.727.4.tar.gz"
+  sha256 "ccb3b49dba681d429c117c888443d193e38f748b04003feb930f8f50a599f6f7"
   license "MIT"
 
   depends_on :macos
@@ -30,9 +30,11 @@ class AppleTools < Formula
       Claude skills are installed to:
         #{HOMEBREW_PREFIX}/share/apple-tools/skills
 
-      To make them available to Claude Code:
-        mkdir -p ~/.claude/skills
-        ln -sfn #{HOMEBREW_PREFIX}/share/apple-tools/skills/* ~/.claude/skills/
+      Link them into whichever Claude config dir you use (CLAUDE_CONFIG_DIR
+      selects one per session, and a machine may have several profiles):
+        mkdir -p "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"
+        ln -sfn #{HOMEBREW_PREFIX}/share/apple-tools/skills/* \
+                "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/"
 
       reminders-cli is superseded by this formula and ships the same `reminders`
       command. If it is still installed, linking will fail until you remove it:
