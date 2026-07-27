@@ -103,17 +103,19 @@ struct Accounts: AsyncParsableCommand {
       return
     }
 
+    // The address is what --from needs, so it leads. The mailbox list is
+    // reference material — one wrapped, dimmed line rather than a column of
+    // twelve that buries everything else.
     for account in accounts {
       let name = account["name"] as? String ?? "?"
       let addresses = (account["addresses"] as? [String] ?? []).joined(separator: ", ")
-      let disabled = (account["enabled"] as? Bool ?? true) ? "" : "  (disabled)"
-      print("\(name)\(disabled)")
-      if !addresses.isEmpty {
-        // These are the values --from accepts.
-        print("  addresses: \(addresses)")
-      }
-      for mailbox in account["mailboxes"] as? [String] ?? [] {
-        print("    \(mailbox)")
+      let disabled = (account["enabled"] as? Bool ?? true) ? "" : Style.warning("  (disabled)")
+
+      print("\(Style.title(name))  \(Style.identifier(addresses))\(disabled)")
+
+      let mailboxes = account["mailboxes"] as? [String] ?? []
+      if !mailboxes.isEmpty {
+        print("  " + Style.dim(mailboxes.joined(separator: ", ")))
       }
     }
   }
@@ -383,8 +385,6 @@ struct Search: AsyncParsableCommand {
       print("No messages found.")
       return
     }
-    let fmt = DateFormatter()
-    fmt.dateFormat = "yyyy-MM-dd HH:mm"
 
     for (i, row) in results.enumerated() {
       let subject = row["subject"] ?? "(no subject)"
@@ -396,18 +396,31 @@ struct Search: AsyncParsableCommand {
 
       let location =
         [account, mailbox].filter { !$0.isEmpty }.joined(separator: "/")
-      print("\(i + 1). \(subject)")
-      print("   From: \(from)")
-      print("   Date: \(date)  [\(location)]")
+
+      // Three lines rather than four: sender and date belong together, and the
+      // "From:"/"Date:" labels were doing less work than the layout does.
+      print("\(Style.dim("\(i + 1)."))  \(Style.title(subject))")
+      var meta = "    \(from)"
+      if !date.isEmpty {
+        meta += Style.dim("  ·  ") + Style.time(AppleMailDate.short(date))
+      }
+      if !location.isEmpty { meta += "  " + Style.dim("[\(location)]") }
+      print(meta)
       if !id.isEmpty {
-        print("   ID: \(id)")
+        print("    " + Style.identifier(id))
       }
       print()
     }
-    print("\(results.count) result(s)")
+    print(Style.dim("\(results.count) \(results.count == 1 ? "result" : "results")"))
   }
 
   func printJSON(_ results: [[String: String]]) {
+    var results = results
+    for index in results.indices {
+      if let raw = results[index]["date"], let iso = AppleMailDate.isoString(raw) {
+        results[index]["date_iso"] = iso
+      }
+    }
     let data = try! JSONSerialization.data(
       withJSONObject: results, options: [.prettyPrinted, .sortedKeys])
     print(String(data: data, encoding: .utf8)!)
@@ -482,6 +495,58 @@ struct Export: AsyncParsableCommand {
 
     FileHandle.standardError.write("Message not found: \(messageId)\n".data(using: .utf8)!)
     throw ExitCode.failure
+  }
+}
+
+// MARK: - Dates
+
+/// AppleScript hands back `date received` as a locale string like
+/// "Monday, July 27, 2026 at 2:13:37 PM". That is unreadable in a list and
+/// unsortable in JSON, so it is reparsed here using the same locale that
+/// produced it and re-emitted compactly.
+enum AppleMailDate {
+  private static let parsers: [DateFormatter] = {
+    let styles: [(DateFormatter.Style, DateFormatter.Style)] = [
+      (.full, .medium), (.full, .short), (.long, .medium), (.long, .short),
+      (.medium, .medium), (.medium, .short), (.short, .short),
+    ]
+    return styles.map { dateStyle, timeStyle in
+      let formatter = DateFormatter()
+      formatter.dateStyle = dateStyle
+      formatter.timeStyle = timeStyle
+      return formatter
+    }
+  }()
+
+  private static func parse(_ raw: String) -> Date? {
+    for parser in parsers {
+      if let date = parser.date(from: raw) { return date }
+    }
+    return nil
+  }
+
+  private static let compact: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd HH:mm"
+    return formatter
+  }()
+
+  private static let iso: ISO8601DateFormatter = {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime]
+    formatter.timeZone = .current
+    return formatter
+  }()
+
+  /// "2026-07-27 14:13", or the original string if it cannot be parsed.
+  static func short(_ raw: String) -> String {
+    parse(raw).map { compact.string(from: $0) } ?? raw
+  }
+
+  /// ISO-8601, or nil when unparseable. Emitted alongside the raw string in
+  /// JSON so callers get something sortable without guessing at the locale.
+  static func isoString(_ raw: String) -> String? {
+    parse(raw).map { iso.string(from: $0) }
   }
 }
 
