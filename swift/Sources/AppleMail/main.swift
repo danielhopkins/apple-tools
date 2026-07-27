@@ -1,3 +1,4 @@
+import AppleToolsVersion
 import ArgumentParser
 import Foundation
 
@@ -6,6 +7,7 @@ struct AppleMail: AsyncParsableCommand {
   static let configuration = CommandConfiguration(
     commandName: "apple-mail",
     abstract: "Search and export Apple Mail messages",
+    version: appleToolsVersion,
     subcommands: [Search.self, Export.self, Accounts.self]
   )
 }

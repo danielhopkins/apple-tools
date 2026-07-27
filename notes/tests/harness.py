@@ -39,7 +39,7 @@ DB_PATH = os.path.expanduser(
 
 
 # --------------------------------------------------------------------------- #
-# Reuse the real CLI's protobuf parser so tests exercise shipping code.
+# Reuse the real CLI's note parser so tests exercise shipping code.
 # The CLI file is named `apple-notes` (no .py extension), so load it by path.
 # Importing does not run main() because that is guarded by __name__.
 # --------------------------------------------------------------------------- #
@@ -261,7 +261,7 @@ def _ro_conn() -> sqlite3.Connection:
 
 
 def sqlite_note_text(pk: int) -> str | None:
-    """Return decoded note text via the CLI's protobuf parser, or None if absent."""
+    """Return decoded note text via the CLI's note parser, or None if absent."""
     conn = _ro_conn()
     try:
         row = conn.execute(

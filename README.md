@@ -19,16 +19,24 @@ Dan Daugherty (Sounder.fm)
 
 ## Install
 
-Requires Xcode (for Swift) and Python 3.
+```
+brew install danielhopkins/formulae/apple-tools
+```
+
+No runtime dependencies: the Swift binaries ship universal (arm64 + x86_64) and
+the Python tools use only the standard library, so the system `python3` is
+enough.
+
+Or from source — requires Xcode:
 
 ```
-git clone <this repo> ~/src/apple-tools
+git clone https://github.com/danielhopkins/apple-tools ~/src/apple-tools
 cd ~/src/apple-tools
 make install          # builds Swift binaries, symlinks everything into ~/bin
 ```
 
-Then run each tool once **from your terminal** to approve its macOS permission
-prompt — an agent can't click through those dialogs:
+Either way, run each tool once **from your terminal** to approve its macOS
+permission prompt — an agent can't click through those dialogs:
 
 ```
 reminders show-lists      # → Reminders access
@@ -36,10 +44,6 @@ apple-calendar calendars  # → Calendar access
 apple-mail accounts       # → Automation access for Mail
 apple-notes search        # → needs Full Disk Access for your terminal
 ```
-
-`apple-notes` additionally needs `protobuf`. Its shebang points at
-`~/.venv/bin-tools`; adjust it or `pip install -r notes/requirements.txt` into
-whichever interpreter you point it at.
 
 ## Usage
 
@@ -82,11 +86,17 @@ a note's body destroys its attachments.
 ```
 bin/apple        dispatcher
 swift/           one Swift package → reminders, apple-mail, apple-calendar
-notes/           Python: apple-notes, proto/, live Notes.app test suite
-contacts/        Python: apple-contacts (stdlib only)
+notes/           Python: apple-notes, notestore.py decoder, live Notes.app tests
+contacts/        Python: apple-contacts
 docs/            Notes API reference and behavior notes
+Formula/         Homebrew formula, mirrored into the tap on release
+VERSION          single source of truth, stamped into every tool
 CLAUDE.md        the same surface, written for an agent
 ```
+
+Both Python tools are stdlib-only. `notes/notestore.py` decodes Apple's
+protobuf note bodies directly rather than depending on the `protobuf` package,
+which is what lets the whole thing run on a stock macOS `python3`.
 
 ## Development
 
@@ -96,6 +106,14 @@ make debug     # debug binaries
 make check     # smoke-test every tool
 make test      # Swift unit tests
 make clean
+```
+
+Releases use CalVer, `YY.MMDD.Patch`:
+
+```
+make bump      # next version for today, stamped into every tool
+make dist      # universal tarball for the tap + its sha256
+make tag       # git tag vYY.MMDD.Patch
 ```
 
 `notes/run-tests` drives **live Notes.app** and creates real notes in your iCloud

@@ -77,7 +77,8 @@ search content, export candidates and grep them.
   user asked for live notes.
 - `make new attachment` **double-inserts** on macOS 27.
 
-The shebang points at `~/.venv/bin-tools` because the tool needs `protobuf`.
+Stdlib only — `notestore.py` decodes the gzipped-protobuf note body directly,
+so no virtualenv is involved.
 
 ### mail — `apple mail`
 
@@ -177,10 +178,15 @@ swift/                    one Swift package, three binaries
   Sources/AppleMail/
   Sources/AppleCalendar/
   Tests/RemindersTests/
-notes/                    Python; apple-notes, proto/, tests/ (live Notes.app suite)
-contacts/                 Python; apple-contacts (stdlib only)
+notes/                    Python; apple-notes, notestore.py, notestore.proto,
+                          tests/ (live Notes.app suite)
+contacts/                 Python; apple-contacts
 docs/apple-notes-api.md   NoteStore schema, AppleScript API, verified bugs
+Formula/apple-tools.rb    Homebrew formula
+VERSION                   CalVer YY.MMDD.Patch, stamped in by scripts/set-version
 ```
+
+Both Python tools are stdlib-only and run on the system `python3`.
 
 ## Building
 
@@ -189,7 +195,13 @@ make build      # swift build -c release → all three binaries
 make install    # symlink dispatcher + tools into ~/bin
 make check      # smoke-test that every tool responds
 make test       # Swift unit tests
+make bump       # next CalVer for today, stamped into every tool
+make dist       # universal release tarball + sha256 for the Homebrew tap
 ```
+
+Every tool reports `--version`, and they all report the same one. If they
+disagree, someone edited a version string by hand instead of running
+`make set-version`.
 
 The Notes test suite drives **live Notes.app** and creates real notes in iCloud.
 It is gated behind `notes/run-tests`, prefixes every test note with

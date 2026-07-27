@@ -1,3 +1,4 @@
+import AppleToolsVersion
 import ArgumentParser
 import EventKit
 import Foundation
@@ -192,6 +193,7 @@ struct AppleCalendar: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "apple-calendar",
         abstract: "Read and write macOS Calendar events via EventKit",
+        version: appleToolsVersion,
         subcommands: [Calendars.self, Events.self, Show.self, Add.self, Edit.self, Delete.self],
         defaultSubcommand: Events.self
     )

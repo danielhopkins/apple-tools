@@ -1,4 +1,4 @@
-#!/Users/dhopkins/.venv/bin-tools/bin/python3
+#!/usr/bin/env python3
 """
 Apple Notes CLI tool - search, export, and get URLs for Apple Notes.
 
@@ -28,7 +28,13 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from proto import notestore_pb2
+# Resolve imports relative to the real script location so the tool works when
+# invoked through a symlink (~/bin/apple-notes, Homebrew's bin shim).
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+from notestore import Color, parse_note_store
+
+__version__ = "26.727.0"
 
 
 def get_db_path():
@@ -223,53 +229,61 @@ def is_highlight_color(color):
 
 
 def parse_note_content(compressed_data):
-    """Parse the note content using protobuf and extract text with formatting."""
+    """Parse the note content and extract text with formatting.
+
+    Field numbers below come from notestore.proto:
+      Note.note_text = 2, Note.attribute_run = 5
+      AttributeRun: length=1 paragraph_style=2 font_weight=5 underlined=6
+                    strikethrough=7 link=9 color=10 attachment_info=12
+      ParagraphStyle: style_type=1 indent_amount=4 checklist=5
+      Checklist.done = 2, AttachmentInfo: identifier=1 type_uti=2
+    """
     # Decompress the gzipped protobuf data
     data = gzip.decompress(compressed_data)
 
-    # Parse using protobuf
-    note_store = notestore_pb2.NoteStoreProto()
-    note_store.ParseFromString(data)
+    note = parse_note_store(data)
+    if note is None:
+        return None, []
 
-    note = note_store.document.note
-    text = note.note_text
+    text = note.string(2, "")
 
     # Extract formatting runs with all attributes
     runs = []
-    for attr_run in note.attribute_run:
-        is_highlight = is_highlight_color(attr_run.color) if attr_run.HasField("color") else False
-        link = attr_run.link if attr_run.HasField("link") else None
+    for attr_run in note.messages(5):
+        color = attr_run.message(10)
+        is_highlight = is_highlight_color(Color(color)) if color is not None else False
+        link = attr_run.string(9)
 
         # Paragraph style info
         para_style = None
-        if attr_run.HasField("paragraph_style"):
-            ps = attr_run.paragraph_style
+        ps = attr_run.message(2)
+        if ps is not None:
+            checklist = ps.message(5)
             para_style = {
-                "style_type": ps.style_type,
-                "indent": ps.indent_amount if ps.indent_amount else 0,
-                "checklist": None,
+                "style_type": ps.int32(1, -1),  # proto default is -1
+                "indent": ps.int32(4, 0),
+                "checklist": {"done": checklist.int32(2)} if checklist is not None else None,
             }
-            if ps.HasField("checklist"):
-                para_style["checklist"] = {"done": ps.checklist.done}
 
         # Embedded object info (dividers, tables, files, images, ...). These occupy
         # a single U+FFFC object-replacement char in the text; the type comes from
         # the protobuf and a human-readable name is resolved later from the DB.
         attachment = None
-        if attr_run.HasField("attachment_info"):
-            ai = attr_run.attachment_info
+        ai = attr_run.message(12)
+        if ai is not None:
             attachment = {
-                "type_uti": ai.type_uti if ai.HasField("type_uti") else None,
-                "identifier": ai.attachment_identifier if ai.HasField("attachment_identifier") else None,
+                "type_uti": ai.string(2),
+                "identifier": ai.string(1),
             }
 
+        font_weight = attr_run.int32(5)
         runs.append({
-            "length": attr_run.length,
+            "length": attr_run.int32(1),
             "highlight": is_highlight,
             "link": link,
-            "underlined": attr_run.underlined if attr_run.HasField("underlined") else 0,
-            "strikethrough": attr_run.strikethrough if attr_run.HasField("strikethrough") else 0,
-            "bold": attr_run.font_weight == 1 if attr_run.font_weight else False,
+            "underlined": attr_run.int32(6, 0),
+            "strikethrough": attr_run.int32(7, 0),
+            "bold": font_weight == 1 if font_weight else False,
             "paragraph_style": para_style,
             "attachment": attachment,
         })
@@ -628,6 +642,10 @@ Examples:
     apple-notes export "My Note" -o out.md # Export to file
     apple-notes get-url 261                # Get applenotes:// URL
         """,
+    )
+
+    parser.add_argument(
+        "--version", action="version", version=f"apple-notes {__version__}"
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Command")

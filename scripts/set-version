@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Propagate the version in ./VERSION into every tool.
+#
+#   ./scripts/set-version            # re-stamp the current VERSION
+#   ./scripts/set-version --bump     # compute today's next version, then stamp
+#   ./scripts/set-version 26.727.1   # set VERSION explicitly, then stamp
+#
+# CalVer: YY.MMDD.Patch (MiniMusic's scheme — month unpadded, day padded, so
+# Feb 10 2026 is 26.210.0 and Jul 27 2026 is 26.727.0). Patch counts releases
+# within a single day and resets to 0 each day. Git tags carry a "v" prefix;
+# the VERSION file does not.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+bump() {
+    local yy mmdd prefix max_patch=-1 tag patch
+    yy="$(date +%y)"
+    mmdd="$(date +%-m%d)"
+    prefix="v${yy}.${mmdd}."
+
+    for tag in $(git tag -l "${prefix}*" 2>/dev/null); do
+        patch="${tag#"$prefix"}"
+        if [[ "$patch" =~ ^[0-9]+$ ]] && (( patch > max_patch )); then
+            max_patch=$patch
+        fi
+    done
+
+    echo "${yy}.${mmdd}.$(( max_patch + 1 ))"
+}
+
+case "${1:-}" in
+    --bump) bump > VERSION ;;
+    "")     ;;
+    *)      echo "$1" > VERSION ;;
+esac
+
+VERSION="$(tr -d '[:space:]' < VERSION)"
+
+if ! [[ "$VERSION" =~ ^[0-9]{2}\.[0-9]{3,4}\.[0-9]+$ ]]; then
+    echo "error: '$VERSION' is not CalVer (expected YY.MMDD.Patch, e.g. 26.727.0)" >&2
+    exit 1
+fi
+
+stamp() {
+    local file="$1" pattern="$2" replacement="$3"
+    perl -0pi -e "s/$pattern/$replacement/" "$file"
+    echo "  $file"
+}
+
+echo "Stamping $VERSION:"
+
+cat > swift/Sources/AppleToolsVersion/Version.swift <<EOF
+// Generated from the repo-root VERSION file by \`make set-version\`.
+// Do not edit by hand.
+public let appleToolsVersion = "$VERSION"
+EOF
+echo "  swift/Sources/AppleToolsVersion/Version.swift"
+
+stamp notes/apple-notes '__version__ = "[^"]*"' "__version__ = \"$VERSION\""
+stamp contacts/apple-contacts '__version__ = "[^"]*"' "__version__ = \"$VERSION\""
+stamp bin/apple 'APPLE_TOOLS_VERSION="[^"]*"' "APPLE_TOOLS_VERSION=\"$VERSION\""
+
+echo "Done. Rebuild with 'make build'."

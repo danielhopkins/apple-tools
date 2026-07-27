@@ -12,8 +12,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-PY="$HOME/.venv/bin-tools/bin/python3"   # venv that has protobuf
-[ -x "$PY" ] || PY="$(command -v python3)"
+PY="$(command -v python3)"   # stdlib only; no virtualenv needed
 
 cd "$ROOT"
 export RUN_LIVE_NOTES_TESTS=1

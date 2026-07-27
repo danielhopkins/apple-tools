@@ -15,6 +15,7 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.3.1"),
     ],
     targets: [
+        .target(name: "AppleToolsVersion"),
         .executableTarget(
             name: "reminders",
             dependencies: ["RemindersLibrary"]
@@ -22,12 +23,14 @@ let package = Package(
         .target(
             name: "RemindersLibrary",
             dependencies: [
+                "AppleToolsVersion",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
         .executableTarget(
             name: "apple-mail",
             dependencies: [
+                "AppleToolsVersion",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "Sources/AppleMail"
@@ -35,6 +38,7 @@ let package = Package(
         .executableTarget(
             name: "apple-calendar",
             dependencies: [
+                "AppleToolsVersion",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "Sources/AppleCalendar"

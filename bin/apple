@@ -12,6 +12,8 @@
 
 set -euo pipefail
 
+APPLE_TOOLS_VERSION="26.727.0"
+
 # Resolve the repo root even when invoked through a symlink in ~/bin.
 SOURCE="${BASH_SOURCE[0]}"
 while [ -L "$SOURCE" ]; do
@@ -19,7 +21,8 @@ while [ -L "$SOURCE" ]; do
     SOURCE="$(readlink "$SOURCE")"
     [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
 done
-ROOT="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
+BIN_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+ROOT="$(cd -P "$BIN_DIR/.." && pwd)"
 
 SWIFT_RELEASE="$ROOT/swift/.build/release"
 SWIFT_DEBUG="$ROOT/swift/.build/debug"
@@ -41,32 +44,56 @@ Every tool supports --json. Run `apple <tool> --help` for its own options.
 
 Other:
     apple --help        Show this message
+    apple --version     Print the apple-tools version
     apple --which       Print the resolved path of each tool
 EOF
 }
 
-# Locate a Swift binary, preferring the release build.
-swift_binary() {
-    local name="$1"
-    if [ -x "$SWIFT_RELEASE/$name" ]; then
-        echo "$SWIFT_RELEASE/$name"
-    elif [ -x "$SWIFT_DEBUG/$name" ]; then
-        echo "$SWIFT_DEBUG/$name"
-    else
-        echo "error: $name is not built. Run 'make build' in $ROOT" >&2
-        return 1
-    fi
-}
-
-resolve() {
+# Map a subcommand to the executable name it dispatches to.
+binary_name() {
     case "$1" in
-        notes)     echo "$ROOT/notes/apple-notes" ;;
-        contacts)  echo "$ROOT/contacts/apple-contacts" ;;
-        mail)      swift_binary apple-mail ;;
-        reminders) swift_binary reminders ;;
-        calendar)  swift_binary apple-calendar ;;
+        notes)     echo "apple-notes" ;;
+        mail)      echo "apple-mail" ;;
+        calendar)  echo "apple-calendar" ;;
+        contacts)  echo "apple-contacts" ;;
+        reminders) echo "reminders" ;;
         *)         return 1 ;;
     esac
+}
+
+# Find a tool, in order of preference:
+#   1. alongside this script  — an installed layout (Homebrew, `make install`)
+#   2. the source checkout    — running straight out of the repo
+#   3. $PATH                  — installed some other way
+resolve() {
+    local tool="$1" name
+    name="$(binary_name "$tool")" || return 1
+
+    if [ -x "$BIN_DIR/$name" ]; then
+        echo "$BIN_DIR/$name"
+        return 0
+    fi
+
+    local candidate
+    for candidate in \
+        "$ROOT/notes/$name" \
+        "$ROOT/contacts/$name" \
+        "$SWIFT_RELEASE/$name" \
+        "$SWIFT_DEBUG/$name"
+    do
+        if [ -x "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+
+    if candidate="$(command -v "$name" 2>/dev/null)"; then
+        echo "$candidate"
+        return 0
+    fi
+
+    echo "error: '$name' not found. Run 'make build' in $ROOT, or 'make install'." >&2
+    return 1
 }
 
 main() {
@@ -78,6 +105,10 @@ main() {
     case "$1" in
         -h|--help|help)
             usage
+            exit 0
+            ;;
+        -V|--version)
+            echo "apple-tools $APPLE_TOOLS_VERSION"
             exit 0
             ;;
         --which)
