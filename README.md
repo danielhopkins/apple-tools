@@ -11,10 +11,10 @@ Mon Jul 27, 9:00 AM–9:30 AM  Standup  [Work]
 Mon Jul 27, 2:00 PM–3:00 PM  1:1  [Work]
 Tue Jul 28, 6:00 PM–8:00 PM  Piano recital @ Boulder Public Library  [Family]
 
-$ apple contacts search "daugherty" --plain
-Dan Daugherty (Sounder.fm)
-  email  dan.daugherty@stackhawk.com  [other email]
-  phone  +17203783797  [mobile]
+$ apple contacts search "rivera" --plain
+Sam Rivera (Northwind Labs)
+  email  sam@example.com  [work]
+  phone  +15551234567  [mobile]
 ```
 
 ## Install

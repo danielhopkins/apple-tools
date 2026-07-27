@@ -3,7 +3,7 @@ class AppleTools < Formula
   homepage "https://github.com/danielhopkins/apple-tools"
   url "https://github.com/danielhopkins/apple-tools/releases/download/v26.727.0/apple-tools-26.727.0.tar.gz"
   version "26.727.0"
-  sha256 "e2ea89d66e9b69b05ecb772bed6792c3685a90aaf77d3b03c718f83f2d6c7793"
+  sha256 "9bacd45bf6fe8d19d7574581e70ebcf37fe4c329152ac2b40c5bfef75a2c7bd9"
   license "MIT"
 
   depends_on :macos

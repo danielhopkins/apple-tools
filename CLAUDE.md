@@ -95,8 +95,8 @@ apple mail export MESSAGE-ID [--account NAME]
 
 `--field` defaults to `subject`; use `--field all` when the user describes
 content rather than a subject line. `--all` widens the search to trash and junk,
-which are excluded by default. Account names in this setup include emoji — get
-exact strings from `apple mail accounts`.
+which are excluded by default. Account names can contain emoji and spaces — get
+exact strings from `apple mail accounts` rather than guessing.
 
 ### reminders — `apple reminders`
 
