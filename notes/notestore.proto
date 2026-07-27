@@ -5,9 +5,11 @@
 // This file defines the protobuf structure used by Apple Notes to store
 // note content in the ZNOTEDATA.ZDATA column of NoteStore.sqlite.
 //
-// To regenerate Python code:
-//   pip install protobuf
-//   protoc --python_out=. notestore.proto
+// This file is a REFERENCE ONLY — nothing compiles it and apple-notes does not
+// depend on the `protobuf` package. notestore.py decodes the wire format
+// directly with the standard library, reading the field numbers defined below.
+// Keep the two in sync by hand: if a field number here changes, update the
+// numbers in notestore.py and in parse_note_content()'s docstring.
 
 syntax = "proto2";
 
