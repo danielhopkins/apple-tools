@@ -98,6 +98,13 @@ content rather than a subject line. `--all` widens the search to trash and junk,
 which are excluded by default. Account names can contain emoji and spaces — get
 exact strings from `apple mail accounts` rather than guessing.
 
+⚠️ **An empty result may be a timeout.** AppleScript's event timeout is ~120s;
+when it trips, `search` prints `[]` and exits 0, which is indistinguishable from
+"no matches". A search that takes about two minutes and returns nothing has
+failed — don't report it as an empty inbox. Keep searches cheap (`--mailbox
+inbox`, tight `--since`, small `--limit`); an empty query combined with
+`--field all` greps every message body in every mailbox and will not finish.
+
 ### reminders — `apple reminders`
 
 Swift + EventKit. Full CRUD. Fork of `keith/reminders-cli` with editing and

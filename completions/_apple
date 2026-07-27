@@ -1,0 +1,55 @@
+#compdef apple
+# zsh completion for the apple-tools dispatcher.
+#
+# After the tool name this hands off to the underlying command's own completion
+# (_apple-notes, _apple-mail, ...) by rewriting words[1] and calling _normal.
+# That way `apple calendar events --<TAB>` offers exactly what
+# `apple-calendar events --<TAB>` does, with nothing duplicated here.
+
+_apple() {
+    local -a tools
+    tools=(
+        'notes:Search, export, and link Apple Notes'
+        'mail:Search and export Apple Mail messages'
+        'reminders:Read and write Reminders'
+        'calendar:Read and write Calendar events'
+        'contacts:Query Contacts'
+    )
+
+    local -a top_level
+    top_level=(
+        '--help:Show usage'
+        '--version:Print the apple-tools version'
+        '--which:Print the resolved path of each tool'
+    )
+
+    local curcontext="$curcontext" state
+    _arguments -C \
+        '1: :->tool' \
+        '*:: :->args'
+
+    case $state in
+        tool)
+            _describe -t tools 'tool' tools
+            _describe -t options 'option' top_level
+            ;;
+        args)
+            local target
+            case $words[1] in
+                notes)     target=apple-notes ;;
+                mail)      target=apple-mail ;;
+                reminders) target=reminders ;;
+                calendar)  target=apple-calendar ;;
+                contacts)  target=apple-contacts ;;
+                *)         return 1 ;;
+            esac
+
+            # Re-dispatch as if the user had typed the underlying command, so
+            # its own completion function handles the rest.
+            words[1]=$target
+            _normal
+            ;;
+    esac
+}
+
+_apple "$@"

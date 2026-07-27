@@ -34,7 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 from notestore import Color, parse_note_store
 
-__version__ = "26.727.2"
+__version__ = "26.727.3"
 
 
 def get_db_path():

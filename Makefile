@@ -1,13 +1,16 @@
 SWIFT_DIR   := swift
 RELEASE_DIR := $(SWIFT_DIR)/.build/release
 PREFIX      ?= $(HOME)/bin
+SKILLS_PREFIX ?= $(HOME)/.claude/skills
+ZSH_COMPLETIONS ?=
 ROOT        := $(shell pwd)
 SWIFT_UNIV  := --configuration release --arch arm64 --arch x86_64
 VERSION     := $(shell tr -d '[:space:]' < VERSION)
 DIST        := apple-tools-$(VERSION)
 TARBALL     := $(DIST).tar.gz
 
-.PHONY: build debug install uninstall test clean check set-version bump dist tag
+.PHONY: build debug install uninstall test clean check set-version bump dist tag \
+        completions install-completions install-skills uninstall-skills
 
 ## Build the Swift binaries (reminders, apple-mail, apple-calendar) in release mode
 build:
@@ -15,6 +18,50 @@ build:
 
 debug:
 	cd $(SWIFT_DIR) && swift build
+
+## Generate zsh completions for the ArgumentParser tools into completions/
+## (_apple, _apple-notes and _apple-contacts are hand-written and committed)
+completions: build
+	@for tool in reminders apple-mail apple-calendar; do \
+		$(RELEASE_DIR)/$$tool --generate-completion-script zsh > completions/_$$tool \
+			&& echo "  completions/_$$tool"; \
+	done
+
+## Install zsh completions somewhere already on your fpath
+install-completions: completions
+	@dir="$(ZSH_COMPLETIONS)"; \
+	if [ -z "$$dir" ]; then \
+		if [ -d "$$HOME/.oh-my-zsh/custom/completions" ]; then \
+			dir="$$HOME/.oh-my-zsh/custom/completions"; \
+		else \
+			dir="$$HOME/.zsh/completions"; \
+		fi; \
+	fi; \
+	mkdir -p "$$dir"; \
+	for f in completions/_*; do ln -sf "$(ROOT)/$$f" "$$dir/$$(basename $$f)"; done; \
+	echo "Installed completions to $$dir"; \
+	case ":$$FPATH:" in \
+		*":$$dir:"*) ;; \
+		*) echo "Add to ~/.zshrc before compinit:"; \
+		   echo "  fpath=($$dir \$$fpath)";; \
+	esac; \
+	echo "Then: rm -f ~/.zcompdump && exec zsh"
+
+## Symlink the Claude skills into ~/.claude/skills
+install-skills:
+	@mkdir -p $(SKILLS_PREFIX)
+	@for skill in skills/*/; do \
+		name=$$(basename $$skill); \
+		ln -sfn "$(ROOT)/skills/$$name" "$(SKILLS_PREFIX)/$$name"; \
+		echo "  $(SKILLS_PREFIX)/$$name -> $(ROOT)/skills/$$name"; \
+	done
+	@echo "Installed. Skills are picked up on the next Claude Code session."
+
+uninstall-skills:
+	@for skill in skills/*/; do \
+		name=$$(basename $$skill); \
+		[ -L "$(SKILLS_PREFIX)/$$name" ] && rm -f "$(SKILLS_PREFIX)/$$name" && echo "  removed $$name"; \
+	done || true
 
 ## Symlink the dispatcher and each tool into $(PREFIX)
 install: build
@@ -49,7 +96,7 @@ set-version:
 	@./scripts/set-version $(V)
 
 ## Build a release tarball for the Homebrew tap, and print its sha256
-dist: set-version
+dist: set-version completions
 	cd $(SWIFT_DIR) && swift build $(SWIFT_UNIV)
 	rm -rf $(DIST) $(TARBALL)
 	mkdir -p $(DIST)/docs
@@ -64,6 +111,9 @@ dist: set-version
 	cp contacts/apple-contacts $(DIST)/
 	cp README.md CLAUDE.md LICENSE VERSION $(DIST)/
 	cp docs/apple-notes-api.md $(DIST)/docs/
+	mkdir -p $(DIST)/completions $(DIST)/skills
+	cp completions/_* $(DIST)/completions/
+	cp -R skills/* $(DIST)/skills/
 	@# Confirm the binaries really are universal before shipping them.
 	@for b in reminders apple-mail apple-calendar; do \
 		archs="$$(lipo -archs $(DIST)/$$b)"; \

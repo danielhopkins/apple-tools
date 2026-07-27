@@ -1,0 +1,61 @@
+#compdef apple-notes
+# zsh completion for apple-notes (argparse, so hand-written).
+#
+# `export` and `get-url` take a note ID or title; completing those would mean
+# querying NoteStore.sqlite on every TAB, which is slow and needs Full Disk
+# Access, so IDs are left to the user.
+
+_apple-notes() {
+    local -a commands
+    commands=(
+        'search:Search notes by title'
+        'folders:List folders, or notes in one folder'
+        'export:Export a note to Markdown'
+        'get-url:Get the applenotes:// URL for a note'
+    )
+
+    local curcontext="$curcontext" state
+    _arguments -C \
+        '(- *)--help[Show usage]' \
+        '(- *)--version[Print the version]' \
+        '1: :->command' \
+        '*:: :->args'
+
+    case $state in
+        command)
+            _describe -t commands 'command' commands
+            ;;
+        args)
+            case $words[1] in
+                search)
+                    _arguments \
+                        '(-n --limit)'{-n,--limit}'[Max results (default 50)]:count:' \
+                        '--json[Output as JSON]' \
+                        '--help[Show usage]' \
+                        '*:search term:'
+                    ;;
+                folders)
+                    _arguments \
+                        '(-n --limit)'{-n,--limit}'[Max results (default 100)]:count:' \
+                        '--json[Output as JSON]' \
+                        '--help[Show usage]' \
+                        '*:folder name:'
+                    ;;
+                export)
+                    _arguments \
+                        '(-o --output)'{-o,--output}'[Write to a file instead of stdout]:file:_files' \
+                        '--help[Show usage]' \
+                        '1:note id, title, or applenotes:// URL:'
+                    ;;
+                get-url)
+                    _arguments \
+                        '--json[Output as JSON]' \
+                        '--help[Show usage]' \
+                        '1:note id or title:'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_apple-notes "$@"

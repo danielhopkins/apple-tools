@@ -51,6 +51,39 @@ silently. Calendar has a third state worth knowing about — "Add Only"
 an upgrade prompt. `apple calendar status` reports the real state without
 prompting; the fix is a manual toggle to "Full Access" in System Settings.
 
+## Claude skills
+
+Four skills teach Claude to use these tools, installable into any Claude Code
+instance:
+
+| Skill | What it does |
+|-------|--------------|
+| `apple-tools` | The tool surface, safety rules, and every trap. The others build on it. |
+| `daily-brief` | Today's calendar, due/overdue reminders, and mail worth reading. Read-only. |
+| `meeting-prep` | For an upcoming meeting: attendees from Contacts, recent mail, related notes. Read-only. |
+| `inbox-triage` | Turns actionable mail into reminders — proposes first, creates only on approval. |
+
+```
+make install-skills      # symlinks skills/ into ~/.claude/skills/
+make uninstall-skills
+```
+
+Symlinks, so edits in the repo take effect in the next Claude session.
+
+## Shell completion
+
+```
+make install-completions
+```
+
+Installs zsh completions for `apple` and all five tools. The dispatcher delegates
+after the tool name, so `apple calendar events --<TAB>` offers exactly what
+`apple-calendar events --<TAB>` does. `reminders show <TAB>` completes list
+names and `apple calendar --calendar <TAB>` completes calendar names, both live
+from your data.
+
+Homebrew installs these automatically.
+
 ## Usage
 
 One dispatcher fronts all five tools:
@@ -94,6 +127,8 @@ bin/apple        dispatcher
 swift/           one Swift package → reminders, apple-mail, apple-calendar
 notes/           Python: apple-notes, notestore.py decoder, live Notes.app tests
 contacts/        Python: apple-contacts
+skills/          Claude skills (apple-tools, daily-brief, meeting-prep, inbox-triage)
+completions/     zsh completions
 tests/           live calendar write-path suite (gated)
 docs/            Notes API reference and behavior notes
 Formula/         Homebrew formula, mirrored into the tap on release

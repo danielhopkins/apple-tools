@@ -14,7 +14,7 @@ import sqlite3
 import sys
 from glob import glob
 
-__version__ = "26.727.2"
+__version__ = "26.727.3"
 
 AB_BASE = os.path.expanduser("~/Library/Application Support/AddressBook")
 

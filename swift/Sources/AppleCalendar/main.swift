@@ -189,6 +189,32 @@ private func describe(_ event: EKEvent) -> String {
     return "\(when)  \(title)\(location)  [\(calendarName)]"
 }
 
+// MARK: - Shell completion
+
+/// Completion source for --calendar. Returns nothing rather than prompting when
+/// access is missing, so pressing TAB can never pop a permission dialog.
+func calendarNameCompletion(_ arguments: [String]) -> [String] {
+    switch EKEventStore.authorizationStatus(for: .event) {
+    case .fullAccess, .authorized:
+        // ':' separates the value from its description in zsh completion lists.
+        return store.calendars(for: .event)
+            .map { $0.title.replacingOccurrences(of: ":", with: "\\:") }
+    default:
+        return []
+    }
+}
+
+func writableCalendarNameCompletion(_ arguments: [String]) -> [String] {
+    switch EKEventStore.authorizationStatus(for: .event) {
+    case .fullAccess, .authorized:
+        return store.calendars(for: .event)
+            .filter { $0.allowsContentModifications }
+            .map { $0.title.replacingOccurrences(of: ":", with: "\\:") }
+    default:
+        return []
+    }
+}
+
 // MARK: - Calendar lookup
 
 private func calendars(named names: [String]) throws -> [EKCalendar] {
@@ -387,7 +413,10 @@ struct Events: ParsableCommand {
     @Option(name: .long, help: "Number of days from --from (default 7)")
     var days: Int?
 
-    @Option(name: .long, help: "Limit to these calendars (repeatable)")
+    @Option(
+        name: .long,
+        help: "Limit to these calendars (repeatable)",
+        completion: .custom(calendarNameCompletion))
     var calendar: [String] = []
 
     @Option(name: .long, help: "Only events whose title, location, or notes match")
@@ -485,7 +514,10 @@ struct Add: ParsableCommand {
     @Argument(parsing: .remaining, help: "Event title")
     var title: [String]
 
-    @Option(name: .long, help: "Calendar to add to (defaults to your default calendar)")
+    @Option(
+        name: .long,
+        help: "Calendar to add to (defaults to your default calendar)",
+        completion: .custom(writableCalendarNameCompletion))
     var calendar: String?
 
     @Option(name: .long, help: "Start time, e.g. 'tomorrow 9am'")
