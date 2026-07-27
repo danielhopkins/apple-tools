@@ -389,10 +389,12 @@ struct AppleContacts: ParsableCommand {
             apple-contacts edit <id> --birthday 1980-04-12 --date "death:2020-05-01"
             apple-contacts groups                          # groups + counts
             apple-contacts groups add "Family" <contact-id>
+            apple-contacts export <id> -o card.vcf         # vCard
+            apple-contacts export --group "Family" -o family.vcf
           """,
         version: appleToolsVersion,
         subcommands: [Search.self, Get.self, List.self, Add.self, Edit.self, Delete.self,
-                      Groups.self, Status.self],
+                      Export.self, Groups.self, Status.self],
         defaultSubcommand: Search.self)
 
     static func plainText(_ contacts: [ContactInfo]) -> String { plain(contacts) }
@@ -768,6 +770,150 @@ struct Edit: ParsableCommand {
             printJSON(info(refreshed, notes: NoteStore.allNotes()))
         } else {
             print("Updated '\(displayName(refreshed))'")
+        }
+    }
+}
+
+// MARK: - vCard
+
+/// Escape a value for a vCard property, per RFC 6350 §3.4.
+private func vCardEscaped(_ value: String) -> String {
+    value
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\n", with: "\\n")
+        .replacingOccurrences(of: "\r", with: "")
+        .replacingOccurrences(of: ",", with: "\\,")
+        .replacingOccurrences(of: ";", with: "\\;")
+}
+
+/// Fold a vCard content line to 75 octets, continuing with a leading space.
+///
+/// Folding counts octets, not characters, so this splits on UTF-8 boundaries
+/// rather than mid-sequence — an emoji or accented name in a note would
+/// otherwise be cut in half and come back as mojibake.
+private func vCardFolded(_ line: String) -> String {
+    let bytes = Array(line.utf8)
+    guard bytes.count > 75 else { return line }
+
+    var lines: [String] = []
+    var index = 0
+    var limit = 75  // subsequent lines lose one octet to the leading space
+    while index < bytes.count {
+        var end = min(index + limit, bytes.count)
+        // 0b10xxxxxx is a UTF-8 continuation byte; back up off one.
+        while end > index, end < bytes.count, bytes[end] & 0xC0 == 0x80 { end -= 1 }
+        let chunk = String(decoding: bytes[index..<end], as: UTF8.self)
+        lines.append(lines.isEmpty ? chunk : " " + chunk)
+        index = end
+        limit = 74
+    }
+    return lines.joined(separator: "\r\n")
+}
+
+/// Serialise contacts to vCard, restoring the note Contacts.framework won't give us.
+///
+/// `CNContactVCardSerialization` cannot see `CNContactNoteKey` without the
+/// entitlement Apple only grants signed apps, so a straight serialisation drops
+/// notes silently. They are read from the AddressBook SQLite store instead (the
+/// same source `get` uses) and spliced in as a NOTE property, which keeps the
+/// export lossless. Contacts are serialised one at a time so each note lands in
+/// its own card.
+private func vCardData(for contacts: [CNContact]) throws -> Data {
+    let notes = NoteStore.allNotes()
+    var output = Data()
+
+    for contact in contacts {
+        var card = try CNContactVCardSerialization.data(with: [contact])
+
+        if let note = notes[contact.identifier], !note.isEmpty,
+           var text = String(data: card, encoding: .utf8) {
+            let property = vCardFolded("NOTE:" + vCardEscaped(note))
+            // Insert before the card's terminator rather than appending, so the
+            // property stays inside BEGIN/END.
+            if let terminator = text.range(of: "END:VCARD", options: .backwards) {
+                text.replaceSubrange(
+                    terminator.lowerBound..<terminator.lowerBound,
+                    with: property + "\r\n")
+                card = Data(text.utf8)
+            }
+        }
+
+        output.append(card)
+    }
+    return output
+}
+
+struct Export: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Export contacts as a vCard (.vcf)",
+        discussion: """
+          Writes vCard 3.0, the format Contacts.app and every other address book
+          imports. Notes are included, which a plain Contacts-framework export
+          cannot do — they are read from the AddressBook store directly, so they
+          need Full Disk Access; without it everything else still exports.
+
+          Examples:
+            apple-contacts export <id>                        # vCard to stdout
+            apple-contacts export <id> -o card.vcf            # to a file
+            apple-contacts export <id> <id> -o cards.vcf      # several in one file
+            apple-contacts export --group "Family" -o fam.vcf # a whole group
+          """)
+
+    @Argument(help: "Contact ids, from `search --json`")
+    var ids: [String] = []
+
+    @Option(name: .long, help: "Export every member of this group (id or name)")
+    var group: String?
+
+    @Option(name: .shortAndLong, help: "Write to this file instead of stdout")
+    var output: String?
+
+    func validate() throws {
+        guard !ids.isEmpty || group != nil else {
+            throw ValidationError("pass at least one contact id, or --group NAME")
+        }
+    }
+
+    func run() throws {
+        try requireContactsAccess()
+
+        // vCard serialisation needs its own key set; the keys the rest of the
+        // tool fetches are not enough and the serializer throws without them.
+        let keys = [CNContactVCardSerialization.descriptorForRequiredKeys()]
+
+        var contacts: [CNContact] = []
+        if let group {
+            let target = try resolveGroup(group)
+            let predicate = CNContact.predicateForContactsInGroup(
+                withIdentifier: target.identifier)
+            contacts += (try? store.unifiedContacts(
+                matching: predicate, keysToFetch: keys)) ?? []
+        }
+        for id in ids {
+            do {
+                contacts.append(try store.unifiedContact(withIdentifier: id, keysToFetch: keys))
+            } catch {
+                throw ValidationError("no contact with id '\(id)'")
+            }
+        }
+
+        // A group and explicit ids can name the same person; don't emit twice.
+        var seen = Set<String>()
+        contacts = contacts.filter { seen.insert($0.identifier).inserted }
+
+        guard !contacts.isEmpty else {
+            throw ValidationError("nothing to export")
+        }
+
+        let data = try vCardData(for: contacts)
+
+        if let output {
+            try data.write(to: URL(fileURLWithPath: output))
+            let plural = contacts.count == 1 ? "" : "s"
+            FileHandle.standardError.write(Data(
+                "Exported \(contacts.count) contact\(plural) to: \(output)\n".utf8))
+        } else {
+            FileHandle.standardOutput.write(data)
         }
     }
 }

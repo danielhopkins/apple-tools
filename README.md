@@ -115,6 +115,7 @@ apple mail search "invoice" --field all --since 30 --json
 apple reminders show-all --due-date today --include-overdue
 apple calendar add "Dentist" --start "tomorrow 2pm" --duration 45
 apple contacts search "smith"
+apple contacts export --group "Family" -o family.vcf
 ```
 
 Each is also installed under its own name (`apple-notes`, `apple-mail`,
