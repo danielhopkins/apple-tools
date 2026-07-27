@@ -112,10 +112,14 @@ irreversible. **Prefer `draft` and let the user send it themselves** — only us
 ⚠️ Mail's compose surface is unusually buggy. These are all verified on
 macOS 27 and pinned by `tests/test_mail_draft.py`:
 
-- **You cannot delete a draft.** `delete` silently does nothing, `move` errors,
-  `set deleted status` fails, and reassigning `mailbox` reports success while
-  moving nothing. A draft you create can only be removed by hand in Mail.app —
-  so do not create drafts speculatively.
+- **Only one route removes a draft.** `delete` silently does nothing, `move`
+  errors, and `set deleted status` fails with "Connection is invalid".
+  Reassigning `mailbox of <message>` to the account's trash **does** work. The
+  trash mailbox is named differently per account type (`Deleted Messages`,
+  `Trash`, `Deleted Items`), so try each. Two traps: the Drafts enumeration is
+  stale within a single script run, so collect message ids first and move each
+  once rather than re-scanning after every move; and a move occasionally
+  reports success without taking effect, so re-check and retry.
 - **Reading recipients back is broken.** `to recipients`, `cc recipients` and
   `bcc recipients` on a saved draft all return the last-added recipient. The
   RFC822 `source` is the only trustworthy read. The headers written are correct.

@@ -7,18 +7,34 @@ scripting properties. That is not fussiness — reading `to recipients`,
 recipient for all three lists*, so a property-based test would pass while the
 message was wrong, or fail while it was right.
 
-Cleanup cannot be automated. Every route was tried against a real draft:
+Cleanup has exactly one working route. Tried against real drafts:
 
     delete <message>                    silently does nothing
     move <message> to mailbox "..."     errors
     set deleted status to true          "Connection is invalid"
-    set mailbox of <message> to ...     reports success, moves nothing
+    set mailbox of <message> to ...     WORKS
 
-The last one worked once early on and then stopped, which is worse than a
-clean failure. So sweep() is best-effort only and nothing asserts on a global
-draft count — tests scope their assertions to their own unique marker instead.
-**Drafts created by this suite accumulate and have to be deleted by hand in
-Mail.app.** That is called out in tests/run-tests before anything runs.
+Trash mailboxes are named differently per account type, hence TRASH_NAMES.
+
+Two things make the working route look broken if you get them wrong, and both
+cost real debugging time here:
+
+  1. The Drafts enumeration is stale within a single script run. A loop that
+     re-scans after each move keeps finding messages it already moved, so it
+     burns its iteration budget re-moving them and leaves the rest behind — it
+     reports dozens of "moves" and clears nothing. SWEEP collects ids first and
+     moves each exactly once.
+  2. A move occasionally reports success without taking effect. With a batch of
+     eight, seven cleared instantly and one needed another pass, so sweep()
+     repeats until the count reaches zero.
+
+Even so, sweep() is best effort and no test asserts on a global draft count —
+tests scope assertions to their own unique marker.
+
+Keep the Apple Event volume down. Mail stops responding under sustained
+scripting load: a run that swept after every test wedged it so thoroughly that
+`count of accounts` timed out (-1712) for minutes afterwards. Sweep once per
+class, not once per test.
 """
 
 import unicodedata
@@ -27,6 +43,7 @@ import email
 import os
 import subprocess
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -123,26 +140,29 @@ on run argv
   tell application "Mail"
     repeat with acct in every account
       try
-        repeat 50 times
-          set doomed to missing value
-          repeat with m in messages of (mailbox "Drafts" of acct)
-            if subject of m contains needle then
-              set doomed to m
-              exit repeat
-            end if
-          end repeat
-          if doomed is missing value then exit repeat
-          set moved to false
-          repeat with tn in {TRASH_LIST}
-            if not moved then
-              try
-                set mailbox of doomed to mailbox tn of acct
-                set moved to true
-                set n to n + 1
-              end try
-            end if
-          end repeat
-          if not moved then exit repeat
+        -- Collect every match FIRST, then move each exactly once. Re-scanning
+        -- after each move burns iterations: the moved message keeps appearing
+        -- in the enumeration within the same script run, so a rescanning loop
+        -- can exhaust its budget on messages it already handled and leave the
+        -- rest behind.
+        set doomed to {}
+        repeat with m in messages of (mailbox "Drafts" of acct)
+          if subject of m contains needle then set end of doomed to (id of m)
+        end repeat
+        repeat with mid in doomed
+          try
+            set m to (first message of (mailbox "Drafts" of acct) whose id is mid)
+            set moved to false
+            repeat with tn in {TRASH_LIST}
+              if not moved then
+                try
+                  set mailbox of m to mailbox tn of acct
+                  set moved to true
+                  set n to n + 1
+                end try
+              end if
+            end repeat
+          end try
         end repeat
       end try
     end repeat
@@ -161,13 +181,23 @@ def count_drafts(marker=TEST_PREFIX):
     return int(osascript(COUNT_DRAFTS, marker))
 
 
-def sweep(marker=TEST_PREFIX):
-    """Best effort. Mail may report success and move nothing; see the module
-    docstring. Never assert on the result."""
-    try:
-        return int(osascript(SWEEP, marker))
-    except AssertionError:
-        return 0
+def sweep(marker=TEST_PREFIX, passes=2):
+    """Move matching drafts to trash. Returns the number moved.
+
+    Repeated because a move occasionally reports success without taking
+    effect — with a batch of 8, seven cleared instantly and one needed another
+    pass. Still best effort: never assert on the result.
+    """
+    moved = 0
+    for _ in range(passes):
+        try:
+            moved += int(osascript(SWEEP, marker))
+        except AssertionError:
+            break
+        if count_drafts(marker) == 0:
+            break
+        time.sleep(1)
+    return moved
 
 
 def same_text(left, right):
@@ -196,8 +226,13 @@ class LiveMailTest(unittest.TestCase):
     def tearDownClass(cls):
         sweep()
 
-    def tearDown(self):
-        sweep()
+    # Deliberately NO per-test tearDown sweep. Each sweep is several Apple
+    # Events, and Mail stops answering entirely under sustained load — a
+    # per-test sweep across 19 tests wedged it badly enough that even
+    # `count of accounts` timed out for minutes afterwards. Sweeping once per
+    # class keeps the event volume an order of magnitude lower; tests scope
+    # their assertions to their own marker, so they do not need a clean
+    # mailbox between cases.
 
     # -- helpers ----------------------------------------------------------- #
 

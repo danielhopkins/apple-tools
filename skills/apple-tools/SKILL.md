@@ -101,11 +101,12 @@ around it.
 describing content rather than a subject line. Trash and junk are excluded
 unless you pass `--all`.
 
-**Drafting email is where you are most useful — and drafts cannot be deleted.**
-`apple mail draft` writes to Drafts and never sends. But Mail's AppleScript
-cannot remove a draft afterwards by any route, so **never create one
-speculatively or as a trial**. Get the content right, then write it once. Pass
-long bodies via `--body-file -` on stdin.
+**Drafting email is where you are most useful.** `apple mail draft` writes to
+Drafts and never sends. Pass long bodies via `--body-file -` on stdin.
+
+There is no `apple mail delete`, so a draft you create is the user's to remove.
+Get the content right and write it once rather than iterating in their Drafts
+folder.
 
 `apple mail send` exists but refuses to run without `--confirm`. Default to
 drafting and let the user send. Only use `send` if they asked you to send in
