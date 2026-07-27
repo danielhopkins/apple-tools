@@ -141,6 +141,7 @@ apple calendar add "TITLE" --start DATE [--end DATE | --duration MINUTES]
 apple calendar edit ID [--title T] [--start DATE] [--end DATE] [--location L]
                        [--notes N] [--future] [--json]
 apple calendar delete ID [--future]
+apple calendar status [--json]                # report permission state, never prompts
 ```
 
 Dates accept natural language (`tomorrow 2pm`) or `YYYY-MM-DD [HH:MM]`. Default
@@ -223,3 +224,10 @@ Grants are keyed to the binary path — rebuilding into a new location can
 re-trigger the prompt. If a tool reports an access error, the fix is for the
 **user** to run it once in their own terminal and approve the dialog; an agent
 cannot click through it.
+
+⚠️ **macOS only prompts when the status is `notDetermined`.** Once it is anything
+else the request returns silently and no dialog ever appears. The trap is
+Calendar's `writeOnly` ("Add Only") state: it looks granted, but cannot read
+events, and macOS will not offer to upgrade it. `apple calendar status` reports
+the real state without prompting — run it before concluding a grant is missing.
+The remedy is always a manual toggle in System Settings, never a retry.

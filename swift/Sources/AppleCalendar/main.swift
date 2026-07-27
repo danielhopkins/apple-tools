@@ -7,9 +7,42 @@ private let store = EKEventStore()
 
 // MARK: - Access
 
+private let settingsPath = "System Settings → Privacy & Security → Calendars"
+
 /// Prompts for (or confirms) Calendar access. Called at the top of each command
 /// rather than at startup, so `--help` works without a TCC grant.
 func requireCalendarAccess() throws {
+    // macOS only shows a prompt when the status is notDetermined. Once it is
+    // anything else — including writeOnly ("Add Only"), which cannot read
+    // events — requestFullAccessToEvents returns false without any dialog, so
+    // report what is actually wrong instead of asking for a grant that will
+    // never be offered.
+    let status = EKEventStore.authorizationStatus(for: .event)
+    switch status {
+    case .fullAccess, .authorized:
+        return
+    case .writeOnly:
+        throw ValidationError(
+            """
+            calendar access is set to "Add Only", which cannot read events.
+            macOS will not prompt to upgrade this, so change it by hand:
+            \(settingsPath) → set this terminal to "Full Access".
+            """)
+    case .denied:
+        throw ValidationError(
+            """
+            calendar access was denied. macOS will not prompt again, so re-enable it in:
+            \(settingsPath)
+            """)
+    case .restricted:
+        throw ValidationError(
+            "calendar access is restricted by a device policy or parental controls.")
+    case .notDetermined:
+        break  // fall through and prompt
+    @unknown default:
+        break
+    }
+
     let semaphore = DispatchSemaphore(value: 0)
     var granted = false
     var returnError: Error?
@@ -23,8 +56,7 @@ func requireCalendarAccess() throws {
     guard granted else {
         let detail = returnError.map { ": \($0.localizedDescription)" } ?? ""
         throw ValidationError(
-            "you need to grant calendar access\(detail)\n"
-            + "Grant it in System Settings → Privacy & Security → Calendars.")
+            "calendar access was not granted\(detail)\nGrant it in \(settingsPath).")
     }
 }
 
@@ -194,9 +226,47 @@ struct AppleCalendar: ParsableCommand {
         commandName: "apple-calendar",
         abstract: "Read and write macOS Calendar events via EventKit",
         version: appleToolsVersion,
-        subcommands: [Calendars.self, Events.self, Show.self, Add.self, Edit.self, Delete.self],
+        subcommands: [Calendars.self, Events.self, Show.self, Add.self, Edit.self, Delete.self,
+                      Status.self],
         defaultSubcommand: Events.self
     )
+}
+
+struct Status: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Report Calendar permission state without requesting it")
+
+    @Flag(name: .long, help: "Output as JSON")
+    var json = false
+
+    func run() {
+        let status = EKEventStore.authorizationStatus(for: .event)
+        let (name, usable, advice): (String, Bool, String?) = {
+            switch status {
+            case .fullAccess:    return ("fullAccess", true, nil)
+            case .authorized:    return ("authorized", true, nil)
+            case .writeOnly:     return ("writeOnly", false,
+                "Set to \"Full Access\" in \(settingsPath); \"Add Only\" cannot read events.")
+            case .denied:        return ("denied", false, "Re-enable in \(settingsPath).")
+            case .restricted:    return ("restricted", false, "Blocked by device policy.")
+            case .notDetermined: return ("notDetermined", false,
+                "Run any command to trigger the permission prompt.")
+            @unknown default:    return ("unknown", false, nil)
+            }
+        }()
+
+        if json {
+            var payload: [String: Any] = ["status": name, "usable": usable]
+            payload["advice"] = advice
+            let data = try? JSONSerialization.data(
+                withJSONObject: payload.compactMapValues { $0 },
+                options: [.prettyPrinted, .sortedKeys])
+            print(data.flatMap { String(data: $0, encoding: .utf8) } ?? "{}")
+        } else {
+            print("Calendar access: \(name)\(usable ? "" : "  (cannot read events)")")
+            if let advice { print(advice) }
+        }
+    }
 }
 
 struct Calendars: ParsableCommand {

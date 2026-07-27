@@ -45,6 +45,12 @@ apple-mail accounts       # → Automation access for Mail
 apple-notes search        # → needs Full Disk Access for your terminal
 ```
 
+macOS only shows a prompt the first time; after that the request returns
+silently. Calendar has a third state worth knowing about — "Add Only"
+(`writeOnly`), which looks granted but cannot read events and is never offered
+an upgrade prompt. `apple calendar status` reports the real state without
+prompting; the fix is a manual toggle to "Full Access" in System Settings.
+
 ## Usage
 
 One dispatcher fronts all five tools:
