@@ -9,30 +9,52 @@
 # in the year 2099 so a stray leftover never appears in a real week view.
 #
 # Usage:
-#   ./tests/run-tests                        # everything
+#   ./tests/run-tests                        # calendar only
+#   ./tests/run-tests --mail                 # + the mail draft suite
+#   ./tests/run-tests --contacts             # + the contacts write suite
 #   ./tests/run-tests test_calendar_write    # one module
 #
 # Pick the calendar fixtures land on (defaults to the first writable one):
 #   APPLE_CALENDAR_TEST_CALENDAR="Personal" ./tests/run-tests
+#
+# Point the contacts suite at a specific binary (see below):
+#   APPLE_CONTACTS_BIN="$(command -v apple-contacts)" ./tests/run-tests --contacts
 
 set -euo pipefail
 
-# The mail suite is opt-in on top of the calendar one. It creates real drafts
-# and sweeps them to the trash mailbox afterwards, where they stay until you
-# empty it.
+# The mail and contacts suites are opt-in on top of the calendar one. Mail
+# creates real drafts and sweeps them to trash, where they stay until you empty
+# it. Contacts creates real contacts and groups, which sync to every device on
+# the account and have no undo — hence a separate flag and a stricter sweep.
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 PY="$(command -v python3)"
 
 cd "$ROOT"
 export RUN_LIVE_CALENDAR_TESTS=1
-if [ "${1:-}" = "--mail" ]; then
-  export RUN_LIVE_MAIL_TESTS=1
-  shift
-  echo "Mail draft tests ENABLED — creates ~15 drafts prefixed"
-  echo "__claude_mail_test__ and moves them to trash afterwards. Cleanup is"
-  echo "best-effort; if any survive, delete them by hand in Mail.app."
-fi
+while [ "$#" -gt 0 ]; do
+  case "${1:-}" in
+    --mail)
+      export RUN_LIVE_MAIL_TESTS=1
+      shift
+      echo "Mail draft tests ENABLED — creates ~15 drafts prefixed"
+      echo "__claude_mail_test__ and moves them to trash afterwards. Cleanup is"
+      echo "best-effort; if any survive, delete them by hand in Mail.app."
+      ;;
+    --contacts)
+      export RUN_LIVE_CONTACTS_TESTS=1
+      shift
+      echo "Contacts write tests ENABLED — creates real contacts and groups"
+      echo "whose first name / name is exactly __claude_contacts_test__, and"
+      echo "deletes them afterwards. Contact writes SYNC TO EVERY DEVICE and"
+      echo "there is no undo. The sweep only ever deletes exact-prefix matches."
+      echo
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
 export PYTHONPATH="$ROOT"
 
 CAL="${APPLE_CALENDAR_TEST_CALENDAR:-<first writable>}"

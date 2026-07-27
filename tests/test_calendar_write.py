@@ -171,9 +171,16 @@ class TestValidation(LiveCalendarTest):
     def test_read_only_calendar_is_rejected(self):
         """Subscribed/holiday calendars must refuse writes rather than fail oddly."""
         all_calendars = run_json("calendars")
-        read_only = [c for c in all_calendars if not c["allowsModification"]]
+        # A read-only calendar that shares its title with a writable one is not
+        # a valid fixture here: --calendar resolves such a name to the writable
+        # instance, so the write is meant to succeed.
+        writable_titles = {c["title"].lower()
+                           for c in all_calendars if c["allowsModification"]}
+        read_only = [c for c in all_calendars
+                     if not c["allowsModification"]
+                     and c["title"].lower() not in writable_titles]
         if not read_only:
-            self.skipTest("no read-only calendars on this machine")
+            self.skipTest("no unambiguously read-only calendars on this machine")
 
         code, _, err = run(
             "add", self.title("read-only"),

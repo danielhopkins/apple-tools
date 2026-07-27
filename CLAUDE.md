@@ -209,6 +209,13 @@ event length is 1 hour.
 Subscribed and holiday calendars are read-only — `calendars --writable` shows
 which ones accept writes.
 
+⚠️ **Calendar titles are not unique.** A subscribed read-only "Birthdays" can
+sit alongside a writable one of the same name. `--calendar NAME` therefore
+matches *every* calendar with that name when reading, and prefers a writable
+one when writing — otherwise `calendars --writable` would offer a name that
+`add` then rejected as read-only. When it matters which one you got, use the
+`calendar` field on each event rather than assuming the name is unambiguous.
+
 **Recurring events.** An event ID identifies the *series*, not the instance you
 saw — EventKit resolves it to the first occurrence, often years earlier. So:
 
@@ -286,6 +293,30 @@ Search matches first/middle/last/nickname/company/department/job title/full name
 email addresses, and phone numbers (digits only, so `7205551234` finds
 `+1 (720) 555-1234`). **JSON is the default**; pass `--plain` for human output.
 
+**Output shapes.** `get`, `add` and `edit` return a single JSON **object**;
+`search`, `list` and `groups members` return **arrays**. An unlabelled email,
+phone or URL omits the `label` key rather than emitting `null`. The JSON keys
+for the name affixes are `prefix` and `suffix`, though the flags are
+`--name-prefix` / `--name-suffix`.
+
+⚠️ **`--MM-DD` needs `=`.** `--birthday --04-13` fails, because the parser reads
+the value as the next flag. Write `--birthday=--04-13`, and likewise for
+`--anniversary` and `--date`.
+
+⚠️ **`groups remove` drives Contacts.app over AppleScript.**
+`CNSaveRequest.removeMember` is a silent no-op on macOS 27 — it saves without
+error and the membership is unchanged. That was verified three ways (unified
+contact, identifier-predicate fetch at `unifyResults = false`, and the group's
+own member objects); all three succeed and change nothing. Consequences for
+this one subcommand, unlike every other contacts write:
+
+- It **launches Contacts.app** in the background (`open -g -j`), hidden and
+  without focus, and leaves it running. AppleScript's own `launch` verb is not
+  enough — the event fails with `-600` before it takes effect.
+- It may need **Automation access for Contacts**; the error says so if it does.
+- It re-reads the membership afterwards and fails loudly if the contact is
+  still in the group, rather than trusting the exit code.
+
 ⚠️ **Multi-value flags replace, they don't append.** Passing `--email` on `edit`
 replaces *every* existing email on that contact. Read the contact first and
 re-pass the ones to keep.
@@ -341,6 +372,22 @@ The Notes test suite drives **live Notes.app** and creates real notes in iCloud.
 It is gated behind `notes/run-tests`, prefixes every test note with
 `__claude_notes_test__`, and refuses to delete anything else. Don't run it
 casually.
+
+The `tests/` suites drive the real binaries against real data, each behind its
+own flag:
+
+```
+./tests/run-tests              # calendar writes (25 tests)
+./tests/run-tests --mail       # + mail drafts (19)
+./tests/run-tests --contacts   # + contacts writes (28)
+```
+
+Contacts fixtures have `__claude_contacts_test__` as their **exact** first name
+and the sweep refuses anything else — contact writes sync everywhere and cannot
+be undone, so never loosen that to a prefix match. Set `APPLE_CONTACTS_BIN` to
+run against a specific binary; TCC grants are per path, so the copy you just
+built may not be the approved one, and an unapproved one hangs on XPC rather
+than failing cleanly.
 
 ## Permissions
 

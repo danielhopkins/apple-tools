@@ -189,7 +189,7 @@ swift/           one Swift package → reminders, apple-mail, apple-calendar, ap
 notes/           Python: apple-notes, notestore.py decoder, live Notes.app tests
 skills/          Claude skills (apple-tools, daily-brief, meeting-prep, inbox-triage)
 completions/     zsh completions
-tests/           live calendar write-path suite (gated)
+tests/           live write-path suites: calendar, mail drafts, contacts (gated)
 docs/            Notes API reference and behavior notes
 Formula/         Homebrew formula, mirrored into the tap on release
 VERSION          single source of truth, stamped into every tool
@@ -219,18 +219,27 @@ make dist      # universal tarball for the tap + its sha256
 make tag       # git tag vYY.MMDD.Patch
 ```
 
-Two live suites drive real data and are gated behind their own runners:
+The live suites drive real data and are gated behind their own runners, each
+opting in to one more surface:
 
 ```
-./tests/run-tests        # calendar write paths: add / edit / delete
-./notes/run-tests        # live Notes.app
+./tests/run-tests              # calendar write paths       (25 tests)
+./tests/run-tests --mail       # + mail drafts              (19)
+./tests/run-tests --contacts   # + contacts writes          (28)
+./notes/run-tests              # live Notes.app
 ```
 
-Both are self-cleaning: every artifact is created with a `__claude_*_test__`
+All are self-cleaning: every artifact is created with a `__claude_*_test__`
 prefix and the sweep refuses to delete anything without it. The calendar suite
 creates real events on a writable calendar, which syncs to your other devices;
-pick where with `APPLE_CALENDAR_TEST_CALENDAR="Personal"`. Neither is a casual
-command.
+pick where with `APPLE_CALENDAR_TEST_CALENDAR="Personal"`.
+
+The contacts suite is the sharpest of them — contact writes sync everywhere and
+have no undo — so its fixtures must carry `__claude_contacts_test__` as their
+*exact* first name, not merely start with it. TCC grants are per binary path, so
+the build you just made may not be the approved one; point the suite at a
+granted copy with `APPLE_CONTACTS_BIN="$(command -v apple-contacts)"`. None of
+these is a casual command.
 
 ## Credits
 

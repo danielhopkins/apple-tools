@@ -273,6 +273,80 @@ private func contact(withId id: String) throws -> CNContact {
     }
 }
 
+/// Whether a contact is currently in a group.
+private func isMember(_ contactId: String, of groupId: String) -> Bool {
+    let predicate = CNContact.predicateForContactsInGroup(withIdentifier: groupId)
+    let members = (try? store.unifiedContacts(
+        matching: predicate,
+        keysToFetch: [CNContactIdentifierKey as CNKeyDescriptor])) ?? []
+    return members.contains { $0.identifier == contactId }
+}
+
+/// Remove a contact from a group by driving Contacts.app.
+///
+/// `CNSaveRequest.removeMember` is a silent no-op on macOS 27: it saves without
+/// error and the membership is unchanged. That was verified three ways — with a
+/// unified contact, with an identifier-predicate fetch at `unifyResults = false`,
+/// and with the group's own member objects — all of which execute cleanly and
+/// change nothing. Contacts.app's AppleScript interface does work, and uses the
+/// same `UUID:ABPerson` identifiers, so drive that instead.
+///
+/// The script takes its values through `on run argv` rather than string
+/// interpolation, so an identifier can never be interpreted as code.
+private func removeMemberViaAppleScript(contactId: String, groupId: String) throws {
+    // Contacts.app has to be running before it will answer Apple events, and
+    // AppleScript's own `launch` verb does not get there first — the send fails
+    // with -600 ("Application isn't running") before it takes effect.
+    // LaunchServices does start it, and `-g -j` keeps it background and hidden,
+    // so nothing appears on screen.
+    let launch = Process()
+    launch.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+    launch.arguments = ["-g", "-j", "-a", "Contacts"]
+    try? launch.run()
+    launch.waitUntilExit()
+
+    let script = """
+        on run argv
+            set contactId to item 1 of argv
+            set groupId to item 2 of argv
+            tell application "Contacts"
+                set theGroup to first group whose id is groupId
+                set thePerson to first person whose id is contactId
+                remove thePerson from theGroup
+                save
+            end tell
+        end run
+        """
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+    process.arguments = ["-", contactId, groupId]
+
+    let input = Pipe(), output = Pipe(), errors = Pipe()
+    process.standardInput = input
+    process.standardOutput = output
+    process.standardError = errors
+
+    try process.run()
+    input.fileHandleForWriting.write(Data(script.utf8))
+    input.fileHandleForWriting.closeFile()
+    let failure = errors.fileHandleForReading.readDataToEndOfFile()
+    _ = output.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+
+    guard process.terminationStatus == 0 else {
+        let detail = String(data: failure, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        throw ValidationError("""
+            could not remove the contact from the group.
+            Contacts' own API fails silently at this, so this command drives
+            Contacts.app instead, which needs Automation access:
+            System Settings → Privacy & Security → Automation → Contacts.
+            osascript said: \(detail)
+            """)
+    }
+}
+
 /// Matches names, company, nickname, emails and phone numbers — the same
 /// surface the SQLite implementation searched.
 private func matches(_ contact: CNContact, _ needle: String) -> Bool {
@@ -308,6 +382,19 @@ struct OutputOptions: ParsableArguments {
             print(contacts.isEmpty ? "No contacts found" : AppleContacts.plainText(contacts))
         } else {
             printJSON(contacts)
+        }
+    }
+
+    /// Emit a single contact as a JSON *object*.
+    ///
+    /// `search` and `list` return arrays; `add` and `edit` return one object.
+    /// `get` used to return an array of one, so anything consuming this tool
+    /// had to handle both shapes for what is obviously a single record.
+    func emitOne(_ contact: ContactInfo) {
+        if self.plain {
+            print(AppleContacts.plainText([contact]))
+        } else {
+            printJSON(contact)
         }
     }
 }
@@ -409,7 +496,7 @@ struct Get: ParsableCommand {
     func run() throws {
         try requireContactsAccess()
         let match = try contact(withId: id)
-        output.emit([info(match, notes: NoteStore.allNotes(), groups: groupNames(for: id))])
+        output.emitOne(info(match, notes: NoteStore.allNotes(), groups: groupNames(for: id)))
     }
 }
 
@@ -957,9 +1044,16 @@ struct GroupRemove: ParsableCommand {
         let target = try resolveGroup(group)
         let member = try contact(withId: contactId)
 
-        let request = CNSaveRequest()
-        request.removeMember(member, from: target)
-        try store.execute(request)
+        try removeMemberViaAppleScript(
+            contactId: member.identifier, groupId: target.identifier)
+
+        // This operation has a history of reporting success while doing
+        // nothing, so confirm it rather than trusting the exit code.
+        guard !isMember(member.identifier, of: target.identifier) else {
+            throw ValidationError(
+                "'\(displayName(member))' is still a member of '\(target.name)'. "
+                + "Nothing was changed.")
+        }
         print("Removed '\(displayName(member))' from '\(target.name)'. The contact was not deleted.")
     }
 }
@@ -971,6 +1065,22 @@ private func displayName(_ contact: CNContact) -> String {
     if !name.isEmpty { return name }
     if !contact.organizationName.isEmpty { return contact.organizationName }
     return contact.identifier
+}
+
+// Claim the TCC identity before anything can write to stdout or stderr.
+//
+// The re-exec runs the whole command again in the child, so any output the
+// parent has already produced appears twice. `validate()` runs before
+// `requireContactsAccess()` and warns about unrecognised relation labels, which
+// is exactly such a case — doing this here instead keeps the parent silent.
+//
+// Arguments that only print something never touch the store, so they skip the
+// re-exec entirely and cost no extra process.
+let infoOnlyArguments: Set<String> = [
+    "-h", "--help", "help", "--version", "--generate-completion-script",
+]
+if !CommandLine.arguments.dropFirst().contains(where: { infoOnlyArguments.contains($0) }) {
+    claimOwnTCCIdentity()
 }
 
 // ArgumentParser has no coloured help, so generate it, style it, and print

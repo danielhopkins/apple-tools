@@ -77,13 +77,51 @@ enum Labels {
     }
 
     /// Suggestions for an unrecognised relation, for error messages.
+    ///
+    /// Substring matching alone is not enough: it catches "sister" inside
+    /// "youngerSister", but a plain typo like "fathr" shares no substring with
+    /// "father" and produced no suggestion at all — which is the case the hint
+    /// exists for. So fall back to edit distance when nothing matches by
+    /// substring.
     static func nearestRelations(to name: String, limit: Int = 6) -> [String] {
         let needle = normalize(name)
         guard !needle.isEmpty else { return [] }
-        return ContactRelations.names
+
+        let substring = ContactRelations.names
             .filter { $0.lowercased().contains(needle) || needle.contains($0.lowercased()) }
+        if !substring.isEmpty {
+            return substring.prefix(limit).map { $0.lowercased() }
+        }
+
+        // Allow roughly one edit per three characters, so short labels are not
+        // matched to everything and long ones still tolerate a slip.
+        let budget = max(1, needle.count / 3)
+        return ContactRelations.names
+            .map { (name: $0, distance: editDistance(needle, $0.lowercased())) }
+            .filter { $0.distance <= budget }
+            .sorted { ($0.distance, $0.name) < ($1.distance, $1.name) }
             .prefix(limit)
-            .map { $0.lowercased() }
+            .map { $0.name.lowercased() }
+    }
+
+    /// Levenshtein distance, two rows at a time.
+    private static func editDistance(_ a: String, _ b: String) -> Int {
+        let a = Array(a), b = Array(b)
+        if a.isEmpty { return b.count }
+        if b.isEmpty { return a.count }
+
+        var previous = Array(0...b.count)
+        var current = [Int](repeating: 0, count: b.count + 1)
+
+        for i in 1...a.count {
+            current[0] = i
+            for j in 1...b.count {
+                let substitution = previous[j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1)
+                current[j] = min(previous[j] + 1, current[j - 1] + 1, substitution)
+            }
+            swap(&previous, &current)
+        }
+        return previous[b.count]
     }
 }
 
