@@ -1,0 +1,688 @@
+#!/Users/dhopkins/.venv/bin-tools/bin/python3
+"""
+Apple Notes CLI tool - search, export, and get URLs for Apple Notes.
+
+Protobuf definitions from:
+https://github.com/threeplanetssoftware/apple_cloud_notes_parser
+
+Usage:
+    apple-notes search [SEARCH TERM]   # Search notes by title
+    apple-notes folders                # List all folders
+    apple-notes folders [FOLDER NAME]  # List notes in a folder
+    apple-notes export [ID]            # Export note to markdown
+    apple-notes get-url [ID]           # Get applenotes:// URL for a note
+    apple-notes --help
+"""
+
+import sqlite3
+import gzip
+import json
+import os
+import sys
+import argparse
+import re
+from pathlib import Path
+
+# Add the proto directory to the path (resolve symlinks so this works when
+# invoked via a symlink, e.g. ~/bin/apple-notes -> this file)
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+
+from proto import notestore_pb2
+
+
+def get_db_path():
+    """Get the Apple Notes database path"""
+    return os.path.expanduser(
+        "~/Library/Group Containers/group.com.apple.notes/NoteStore.sqlite"
+    )
+
+
+def search_notes(term=None, limit=50):
+    """Search notes by title or list recent notes."""
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    if term:
+        cursor.execute(
+            """
+            SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, n.ZMODIFICATIONDATE1
+            FROM ZICCLOUDSYNCINGOBJECT n
+            WHERE n.ZTITLE1 IS NOT NULL
+            AND n.ZMARKEDFORDELETION = 0
+            AND n.ZTITLE1 LIKE ?
+            ORDER BY n.ZMODIFICATIONDATE1 DESC
+            LIMIT ?
+        """,
+            (f"%{term}%", limit),
+        )
+    else:
+        cursor.execute(
+            """
+            SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, n.ZMODIFICATIONDATE1
+            FROM ZICCLOUDSYNCINGOBJECT n
+            WHERE n.ZTITLE1 IS NOT NULL
+            AND n.ZMARKEDFORDELETION = 0
+            ORDER BY n.ZMODIFICATIONDATE1 DESC
+            LIMIT ?
+        """,
+            (limit,),
+        )
+
+    results = []
+    for row in cursor.fetchall():
+        results.append(
+            {"pk": row[0], "title": row[1], "identifier": row[2], "modified": row[3]}
+        )
+
+    conn.close()
+    return results
+
+
+def list_folders():
+    """List all folders in Apple Notes."""
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT f.Z_PK, f.ZTITLE2, COUNT(n.Z_PK) as note_count
+        FROM ZICCLOUDSYNCINGOBJECT f
+        LEFT JOIN ZICCLOUDSYNCINGOBJECT n ON n.ZFOLDER = f.Z_PK
+            AND n.ZMARKEDFORDELETION = 0
+            AND n.ZTITLE1 IS NOT NULL
+        WHERE f.ZTITLE2 IS NOT NULL
+        AND f.ZMARKEDFORDELETION = 0
+        GROUP BY f.Z_PK, f.ZTITLE2
+        ORDER BY f.ZTITLE2
+    """
+    )
+
+    results = []
+    for row in cursor.fetchall():
+        results.append({"pk": row[0], "title": row[1], "count": row[2]})
+
+    conn.close()
+    return results
+
+
+def search_by_folder(folder_name, limit=100):
+    """Search notes in a specific folder."""
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, n.ZMODIFICATIONDATE1, f.ZTITLE2
+        FROM ZICCLOUDSYNCINGOBJECT n
+        JOIN ZICCLOUDSYNCINGOBJECT f ON n.ZFOLDER = f.Z_PK
+        WHERE f.ZTITLE2 LIKE ?
+        AND n.ZMARKEDFORDELETION = 0
+        AND n.ZTITLE1 IS NOT NULL
+        ORDER BY n.ZMODIFICATIONDATE1 DESC
+        LIMIT ?
+    """,
+        (f"%{folder_name}%", limit),
+    )
+
+    results = []
+    for row in cursor.fetchall():
+        results.append(
+            {
+                "pk": row[0],
+                "title": row[1],
+                "identifier": row[2],
+                "modified": row[3],
+                "folder": row[4],
+            }
+        )
+
+    conn.close()
+    return results
+
+
+def find_note(identifier):
+    """Find a note by title, ID, or Apple Notes link"""
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    # Check if it's a numeric ID
+    if identifier.isdigit():
+        cursor.execute(
+            """
+            SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, nd.ZDATA
+            FROM ZICCLOUDSYNCINGOBJECT n
+            JOIN ZICNOTEDATA nd ON nd.ZNOTE = n.Z_PK
+            WHERE n.Z_PK = ?
+        """,
+            (int(identifier),),
+        )
+    # Check if it's an Apple Notes link (applenotes://...)
+    elif identifier.startswith("applenotes://"):
+        match = re.search(r"applenotes://[^/]+/([^/]+)", identifier)
+        if match:
+            note_id = match.group(1)
+            cursor.execute(
+                """
+                SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, nd.ZDATA
+                FROM ZICCLOUDSYNCINGOBJECT n
+                JOIN ZICNOTEDATA nd ON nd.ZNOTE = n.Z_PK
+                WHERE n.ZIDENTIFIER = ?
+            """,
+                (note_id,),
+            )
+        else:
+            conn.close()
+            return None
+    else:
+        # Search by title (exact match first, then partial)
+        cursor.execute(
+            """
+            SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, nd.ZDATA
+            FROM ZICCLOUDSYNCINGOBJECT n
+            JOIN ZICNOTEDATA nd ON nd.ZNOTE = n.Z_PK
+            WHERE n.ZTITLE1 = ?
+        """,
+            (identifier,),
+        )
+
+        result = cursor.fetchone()
+        if not result:
+            # Try partial match
+            cursor.execute(
+                """
+                SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, nd.ZDATA
+                FROM ZICCLOUDSYNCINGOBJECT n
+                JOIN ZICNOTEDATA nd ON nd.ZNOTE = n.Z_PK
+                WHERE n.ZTITLE1 LIKE ?
+            """,
+                (f"%{identifier}%",),
+            )
+
+    result = cursor.fetchone()
+    conn.close()
+    return result
+
+
+def is_highlight_color(color):
+    """Check if a color represents a highlight (yellow-ish background)."""
+    if color is None:
+        return False
+    # Apple Notes uses yellow highlight: high red, high green, low blue
+    # Typical values: red~1.0, green~0.95, blue~0.55, alpha~1.0
+    return (
+        color.red > 0.9
+        and color.green > 0.8
+        and color.blue < 0.7
+        and color.alpha > 0.5
+    )
+
+
+def parse_note_content(compressed_data):
+    """Parse the note content using protobuf and extract text with formatting."""
+    # Decompress the gzipped protobuf data
+    data = gzip.decompress(compressed_data)
+
+    # Parse using protobuf
+    note_store = notestore_pb2.NoteStoreProto()
+    note_store.ParseFromString(data)
+
+    note = note_store.document.note
+    text = note.note_text
+
+    # Extract formatting runs with all attributes
+    runs = []
+    for attr_run in note.attribute_run:
+        is_highlight = is_highlight_color(attr_run.color) if attr_run.HasField("color") else False
+        link = attr_run.link if attr_run.HasField("link") else None
+
+        # Paragraph style info
+        para_style = None
+        if attr_run.HasField("paragraph_style"):
+            ps = attr_run.paragraph_style
+            para_style = {
+                "style_type": ps.style_type,
+                "indent": ps.indent_amount if ps.indent_amount else 0,
+                "checklist": None,
+            }
+            if ps.HasField("checklist"):
+                para_style["checklist"] = {"done": ps.checklist.done}
+
+        # Embedded object info (dividers, tables, files, images, ...). These occupy
+        # a single U+FFFC object-replacement char in the text; the type comes from
+        # the protobuf and a human-readable name is resolved later from the DB.
+        attachment = None
+        if attr_run.HasField("attachment_info"):
+            ai = attr_run.attachment_info
+            attachment = {
+                "type_uti": ai.type_uti if ai.HasField("type_uti") else None,
+                "identifier": ai.attachment_identifier if ai.HasField("attachment_identifier") else None,
+            }
+
+        runs.append({
+            "length": attr_run.length,
+            "highlight": is_highlight,
+            "link": link,
+            "underlined": attr_run.underlined if attr_run.HasField("underlined") else 0,
+            "strikethrough": attr_run.strikethrough if attr_run.HasField("strikethrough") else 0,
+            "bold": attr_run.font_weight == 1 if attr_run.font_weight else False,
+            "paragraph_style": para_style,
+            "attachment": attachment,
+        })
+
+    return text, runs
+
+
+# A single U+FFFC object-replacement char marks each embedded object in note text.
+OBJECT_REPLACEMENT_CHAR = "￼"
+# Notes encodes a horizontal-rule / divider as an inline-text attachment.
+DIVIDER_UTI = "com.apple.notes.inlinetextattachment.dividerline"
+
+
+def get_attachment_labels(identifiers):
+    """Map attachment ZIDENTIFIER -> human label (filename/title/url) from the DB."""
+    identifiers = [i for i in identifiers if i]
+    if not identifiers:
+        return {}
+
+    conn = sqlite3.connect(get_db_path())
+    cursor = conn.cursor()
+    placeholders = ",".join("?" * len(identifiers))
+    cursor.execute(
+        f"""
+        SELECT ZIDENTIFIER, ZTYPEUTI, ZFILENAME, ZTITLE, ZURLSTRING, ZALTTEXT
+        FROM ZICCLOUDSYNCINGOBJECT
+        WHERE ZIDENTIFIER IN ({placeholders})
+        """,
+        identifiers,
+    )
+
+    labels = {}
+    for ident, _uti, filename, title, url, alt in cursor.fetchall():
+        # Prefer the most human-friendly non-empty field.
+        for candidate in (filename, title, alt, url):
+            if candidate and candidate.strip():
+                labels[ident] = candidate.strip()
+                break
+    conn.close()
+    return labels
+
+
+def embedded_object_markdown(attachment, labels):
+    """Render an embedded object (the U+FFFC placeholder) as markdown."""
+    if not attachment:
+        return "[attachment]"
+
+    uti = attachment.get("type_uti") or ""
+    if uti == DIVIDER_UTI:
+        return "---"
+
+    label = labels.get(attachment.get("identifier"))
+    if not label:
+        if uti.startswith("com.apple.notes.inlinetextattachment."):
+            label = uti.rsplit(".", 1)[-1]  # e.g. hashtag, mention
+        elif uti == "com.apple.notes.table":
+            label = "table"
+        else:
+            label = uti or "attachment"
+    return f"[attachment: {label}]"
+
+
+def apply_formatting(text, runs, attachment_labels=None):
+    """Apply markdown formatting based on attribute runs."""
+    if not runs:
+        return text
+
+    labels = attachment_labels or {}
+
+    # Build character-level formatting map
+    char_formats = []
+    position = 0
+    for run in runs:
+        for i in range(run["length"]):
+            char_formats.append({
+                "highlight": run["highlight"],
+                "bold": run["bold"],
+                "link": run["link"],
+                "strikethrough": run["strikethrough"],
+                "underlined": run["underlined"],
+                "paragraph_style": run["paragraph_style"],
+                "attachment": run.get("attachment"),
+            })
+        position += run["length"]
+
+    # Process text line by line for paragraph-level formatting
+    lines = text.split('\n')
+    result_lines = []
+    char_idx = 0
+
+    for line in lines:
+        if not line:
+            result_lines.append("")
+            char_idx += 1  # account for newline
+            continue
+
+        line_start_idx = char_idx
+
+        # Get paragraph style from first char of line
+        para_style = None
+        if char_idx < len(char_formats):
+            para_style = char_formats[char_idx].get("paragraph_style")
+
+        # A divider sits alone on its line; remember it so we can pad it with a
+        # blank line (otherwise "text\n---" is parsed as a setext heading).
+        is_divider_line = (
+            line == OBJECT_REPLACEMENT_CHAR
+            and char_idx < len(char_formats)
+            and (char_formats[char_idx].get("attachment") or {}).get("type_uti") == DIVIDER_UTI
+        )
+
+        # Apply inline formatting to the line
+        formatted_chars = []
+        in_bold = False
+        in_highlight = False
+
+        for i, char in enumerate(line):
+            if char_idx + i >= len(char_formats):
+                formatted_chars.append(char)
+                continue
+
+            fmt = char_formats[char_idx + i]
+
+            # Embedded objects (dividers, tables, files, ...) are a single U+FFFC
+            # placeholder; substitute a readable markdown rendering for them.
+            if char == OBJECT_REPLACEMENT_CHAR:
+                formatted_chars.append(embedded_object_markdown(fmt.get("attachment"), labels))
+                continue
+
+            # Handle bold transitions
+            if fmt["bold"] and not in_bold:
+                formatted_chars.append("**")
+                in_bold = True
+            elif not fmt["bold"] and in_bold:
+                formatted_chars.append("**")
+                in_bold = False
+
+            # Handle highlight transitions
+            if fmt["highlight"] and not in_highlight:
+                formatted_chars.append("==")
+                in_highlight = True
+            elif not fmt["highlight"] and in_highlight:
+                formatted_chars.append("==")
+                in_highlight = False
+
+            formatted_chars.append(char)
+
+        # Close any open formatting at end of line
+        if in_bold:
+            formatted_chars.append("**")
+        if in_highlight:
+            formatted_chars.append("==")
+
+        formatted_line = "".join(formatted_chars)
+
+        # Apply paragraph-level formatting
+        if para_style:
+            style_type = para_style.get("style_type", -1)
+            indent = para_style.get("indent", 0)
+            checklist = para_style.get("checklist")
+
+            # Style types (from Apple Notes):
+            # 0 = title, 1 = heading, 2 = subheading, 4 = monospace
+            # 100 = bullet list, 101 = dashed list, 102 = numbered list
+            # 103 = checklist
+            if style_type == 1:  # Heading
+                formatted_line = f"## {formatted_line}"
+            elif style_type == 2:  # Subheading
+                formatted_line = f"### {formatted_line}"
+            elif style_type == 4:  # Monospace
+                formatted_line = f"`{formatted_line}`"
+            elif style_type == 100:  # Bullet list
+                prefix = "  " * indent + "- "
+                formatted_line = prefix + formatted_line
+            elif style_type == 101:  # Dashed list
+                prefix = "  " * indent + "- "
+                formatted_line = prefix + formatted_line
+            elif style_type == 102:  # Numbered list
+                prefix = "  " * indent + "1. "
+                formatted_line = prefix + formatted_line
+            elif style_type == 103:  # Checklist
+                if checklist and checklist.get("done"):
+                    prefix = "  " * indent + "- [x] "
+                else:
+                    prefix = "  " * indent + "- [ ] "
+                formatted_line = prefix + formatted_line
+
+        # Keep a divider as a proper thematic break by padding with a blank line.
+        if is_divider_line and result_lines and result_lines[-1] != "":
+            result_lines.append("")
+
+        result_lines.append(formatted_line)
+        char_idx += len(line) + 1  # +1 for newline
+
+    return "\n".join(result_lines)
+
+
+def format_as_markdown(title, text, links=None):
+    """Format the note text as markdown"""
+    lines = text.split("\n")
+
+    # Check if the first line is the title
+    if lines and lines[0].strip() == title:
+        lines = lines[1:]
+        # Skip leading empty lines after title
+        while lines and not lines[0].strip():
+            lines = lines[1:]
+
+    # Reconstruct with title as header
+    markdown = f"# {title}\n\n"
+    markdown += "\n".join(lines)
+
+    # Ensure file ends with newline
+    if not markdown.endswith("\n"):
+        markdown += "\n"
+
+    return markdown
+
+
+def cmd_search(args):
+    """Handle search command"""
+    term = " ".join(args.term) if args.term else None
+    results = search_notes(term, limit=args.limit)
+
+    if getattr(args, "json", False):
+        print(json.dumps(
+            [{"id": n["pk"], "title": n["title"]} for n in results],
+            indent=2, ensure_ascii=False))
+        return
+
+    if not results:
+        print("No notes found.")
+        return
+
+    print(f"{'ID':>5}  Title")
+    print("-" * 60)
+    for note in results:
+        print(f"{note['pk']:5d}  {note['title']}")
+
+
+def cmd_folders(args):
+    """Handle folders command"""
+    if args.name:
+        # Search notes in a specific folder
+        folder_name = " ".join(args.name)
+        results = search_by_folder(folder_name, limit=args.limit)
+
+        if getattr(args, "json", False):
+            print(json.dumps(
+                [{"id": n["pk"], "title": n["title"]} for n in results],
+                indent=2, ensure_ascii=False))
+            return
+
+        if not results:
+            print(f"No notes found in folder matching '{folder_name}'.")
+            return
+
+        print(f"{'ID':>5}  Title")
+        print("-" * 60)
+        for note in results:
+            print(f"{note['pk']:5d}  {note['title']}")
+    else:
+        # List all folders
+        results = list_folders()
+
+        if getattr(args, "json", False):
+            print(json.dumps(
+                [{"id": f["pk"], "title": f["title"], "count": f["count"]} for f in results],
+                indent=2, ensure_ascii=False))
+            return
+
+        if not results:
+            print("No folders found.")
+            return
+
+        print(f"{'ID':>5}  {'Notes':>5}  Folder")
+        print("-" * 60)
+        for folder in results:
+            print(f"{folder['pk']:5d}  {folder['count']:5d}  {folder['title']}")
+
+
+def cmd_export(args):
+    """Handle export command"""
+    result = find_note(args.identifier)
+
+    if not result:
+        print(f"Note not found: {args.identifier}", file=sys.stderr)
+        sys.exit(1)
+
+    pk, title, identifier, compressed_data = result
+    print(f"Found note: {title} (ID: {pk})", file=sys.stderr)
+
+    # Parse the note content using protobuf
+    text, runs = parse_note_content(compressed_data)
+
+    if not text:
+        print("Failed to parse note content", file=sys.stderr)
+        sys.exit(1)
+
+    # Resolve human-readable labels for embedded objects (attachments, files, ...).
+    attachment_labels = get_attachment_labels(
+        [r["attachment"]["identifier"] for r in runs if r.get("attachment")]
+    )
+
+    # Apply formatting (highlights, embedded objects)
+    formatted_text = apply_formatting(text, runs, attachment_labels)
+
+    # Format as markdown
+    markdown = format_as_markdown(title, formatted_text)
+
+    # Output to stdout or file
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write(markdown)
+        print(f"Exported to: {args.output}", file=sys.stderr)
+    else:
+        print(markdown)
+
+
+def cmd_get_url(args):
+    """Handle get-url command"""
+    result = find_note(args.identifier)
+
+    if not result:
+        print(f"Note not found: {args.identifier}", file=sys.stderr)
+        sys.exit(1)
+
+    pk, title, identifier, _ = result
+
+    if not identifier:
+        print(f"Note has no identifier: {title}", file=sys.stderr)
+        sys.exit(1)
+
+    url = f"applenotes://note/{identifier}"
+    if getattr(args, "json", False):
+        print(json.dumps({"id": pk, "title": title, "url": url}, indent=2, ensure_ascii=False))
+    else:
+        print(url)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="apple-notes",
+        description="Apple Notes CLI - search, export, and get URLs",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Protobuf definitions from:
+  https://github.com/threeplanetssoftware/apple_cloud_notes_parser
+
+Examples:
+    apple-notes search                     # List recent notes
+    apple-notes search "meeting"           # Search by title
+    apple-notes folders                    # List all folders
+    apple-notes folders Piano              # List notes in Piano folder
+    apple-notes export 261                 # Export note ID 261 to stdout
+    apple-notes export "My Note" -o out.md # Export to file
+    apple-notes get-url 261                # Get applenotes:// URL
+        """,
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Command")
+
+    # search command
+    search_parser = subparsers.add_parser("search", help="Search notes by title")
+    search_parser.add_argument(
+        "term", nargs="*", help="Search term (optional, lists recent if omitted)"
+    )
+    search_parser.add_argument(
+        "--limit", "-n", type=int, default=50, help="Max results (default: 50)"
+    )
+    search_parser.add_argument("--json", action="store_true", help="Output as JSON")
+
+    # folders command
+    folders_parser = subparsers.add_parser(
+        "folders", help="List folders or search notes in a folder"
+    )
+    folders_parser.add_argument(
+        "name", nargs="*", help="Folder name (optional, lists all folders if omitted)"
+    )
+    folders_parser.add_argument(
+        "--limit", "-n", type=int, default=100, help="Max results (default: 100)"
+    )
+    folders_parser.add_argument("--json", action="store_true", help="Output as JSON")
+
+    # export command
+    export_parser = subparsers.add_parser(
+        "export", help="Export note to markdown with highlights"
+    )
+    export_parser.add_argument(
+        "identifier", help="Note ID, title, or applenotes:// URL"
+    )
+    export_parser.add_argument("-o", "--output", help="Output file (default: stdout)")
+
+    # get-url command
+    url_parser = subparsers.add_parser("get-url", help="Get applenotes:// URL for note")
+    url_parser.add_argument("identifier", help="Note ID or title")
+    url_parser.add_argument("--json", action="store_true", help="Output as JSON")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+
+    if args.command == "search":
+        cmd_search(args)
+    elif args.command == "folders":
+        cmd_folders(args)
+    elif args.command == "export":
+        cmd_export(args)
+    elif args.command == "get-url":
+        cmd_get_url(args)
+
+
+if __name__ == "__main__":
+    main()

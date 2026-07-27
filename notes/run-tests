@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Run the live Apple Notes integration test suite.
+#
+# WARNING: these tests drive the real Notes.app and briefly create/delete notes
+# in your iCloud account (they sync to your other devices). Every test note is
+# named with the "__claude_notes_test__" prefix and is swept on teardown; test
+# notes that are soft-deleted land in Recently Deleted and auto-purge in ~30 days.
+#
+# Usage:
+#   ./run-tests                 # run everything, verbose
+#   ./run-tests test_attachments  # run a single test module
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+PY="$HOME/.venv/bin-tools/bin/python3"   # venv that has protobuf
+[ -x "$PY" ] || PY="$(command -v python3)"
+
+cd "$ROOT"
+export RUN_LIVE_NOTES_TESTS=1
+
+if [ "$#" -gt 0 ]; then
+  exec "$PY" -m unittest -v "tests.$1"
+else
+  exec "$PY" -m unittest discover -s tests -t . -v
+fi

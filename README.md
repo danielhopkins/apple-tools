@@ -1,0 +1,112 @@
+# apple-tools
+
+Command-line access to local Apple app data — **Notes, Mail, Reminders,
+Calendar, Contacts** — built so an agent (or a shell) can work with real data
+without an intermediary service. Everything is local: no network calls, no API
+keys, no sync layer.
+
+```
+$ apple calendar events --days 3
+Mon Jul 27, 9:00 AM–9:30 AM  Standup  [Work]
+Mon Jul 27, 2:00 PM–3:00 PM  1:1  [Work]
+Tue Jul 28, 6:00 PM–8:00 PM  Piano recital @ Boulder Public Library  [Family]
+
+$ apple contacts search "daugherty" --plain
+Dan Daugherty (Sounder.fm)
+  email  dan.daugherty@stackhawk.com  [other email]
+  phone  +17203783797  [mobile]
+```
+
+## Install
+
+Requires Xcode (for Swift) and Python 3.
+
+```
+git clone <this repo> ~/src/apple-tools
+cd ~/src/apple-tools
+make install          # builds Swift binaries, symlinks everything into ~/bin
+```
+
+Then run each tool once **from your terminal** to approve its macOS permission
+prompt — an agent can't click through those dialogs:
+
+```
+reminders show-lists      # → Reminders access
+apple-calendar calendars  # → Calendar access
+apple-mail accounts       # → Automation access for Mail
+apple-notes search        # → needs Full Disk Access for your terminal
+```
+
+`apple-notes` additionally needs `protobuf`. Its shebang points at
+`~/.venv/bin-tools`; adjust it or `pip install -r notes/requirements.txt` into
+whichever interpreter you point it at.
+
+## Usage
+
+One dispatcher fronts all five tools:
+
+```
+apple notes search "budget" --json
+apple mail search "invoice" --field all --since 30 --json
+apple reminders show-all --due-date today --include-overdue
+apple calendar add "Dentist" --start "tomorrow 2pm" --duration 45
+apple contacts search "smith"
+```
+
+Each is also installed under its own name (`apple-notes`, `apple-mail`,
+`reminders`, `apple-calendar`, `apple-contacts`). Run `apple <tool> --help` for
+full options, or `apple --which` to see what resolves where.
+
+**Every tool accepts `--json`.** Plain-text output is for humans and its shape
+isn't guaranteed; JSON is.
+
+## What each tool does
+
+| Tool | Backed by | Capability |
+|------|-----------|------------|
+| `notes` | `NoteStore.sqlite` + protobuf | Search titles, list folders, export notes as Markdown, deep links. Read-only. |
+| `mail` | AppleScript / Mail.app | Search by subject, sender, or content with date and flag filters; export a message. Read-only. |
+| `reminders` | EventKit | Full CRUD: add, edit, complete, delete, lists, priorities, recurrence, natural-language dates. |
+| `calendar` | EventKit | List and search events, create, edit, delete; recurring-event spans. |
+| `contacts` | AddressBook sqlite | Search by name, company, email, or phone. Opened read-only. |
+
+The Notes reader decodes Apple's gzipped-protobuf note bodies directly rather
+than going through AppleScript, so it preserves highlights, headings, lists, and
+checklists that the scripting interface flattens.
+[`docs/apple-notes-api.md`](docs/apple-notes-api.md) documents the schema and the
+verified behaviors and bugs behind that, including a data-loss bug where editing
+a note's body destroys its attachments.
+
+## Layout
+
+```
+bin/apple        dispatcher
+swift/           one Swift package → reminders, apple-mail, apple-calendar
+notes/           Python: apple-notes, proto/, live Notes.app test suite
+contacts/        Python: apple-contacts (stdlib only)
+docs/            Notes API reference and behavior notes
+CLAUDE.md        the same surface, written for an agent
+```
+
+## Development
+
+```
+make build     # release binaries
+make debug     # debug binaries
+make check     # smoke-test every tool
+make test      # Swift unit tests
+make clean
+```
+
+`notes/run-tests` drives **live Notes.app** and creates real notes in your iCloud
+account. It's self-cleaning — every test note is prefixed `__claude_notes_test__`
+and the suite refuses to delete anything else — but it is not a casual command.
+
+## Credits
+
+- `reminders` is a fork of [keith/reminders-cli](https://github.com/keith/reminders-cli), with editing and recurrence added.
+- Notes protobuf definitions from [apple_cloud_notes_parser](https://github.com/threeplanetssoftware/apple_cloud_notes_parser) (MIT).
+
+## License
+
+MIT — see [LICENSE](LICENSE).

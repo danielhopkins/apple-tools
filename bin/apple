@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# apple - single entry point for the apple-tools CLIs.
+#
+#   apple notes search "budget"
+#   apple mail search --from alice@example.com
+#   apple reminders show-lists --json
+#   apple calendar events --days 3 --json
+#   apple contacts search "smith"
+#
+# Each subcommand forwards every remaining argument to the underlying tool, so
+# `apple notes --help` is exactly `apple-notes --help`.
+
+set -euo pipefail
+
+# Resolve the repo root even when invoked through a symlink in ~/bin.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+ROOT="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
+
+SWIFT_RELEASE="$ROOT/swift/.build/release"
+SWIFT_DEBUG="$ROOT/swift/.build/debug"
+
+usage() {
+    cat <<'EOF'
+apple - interact with local Apple app data
+
+Usage: apple <tool> [args...]
+
+Tools:
+    notes       Search, export, and link Apple Notes       (reads NoteStore.sqlite)
+    mail        Search and export Apple Mail messages      (AppleScript)
+    reminders   Full CRUD on Reminders                     (EventKit)
+    calendar    Read and write Calendar events             (EventKit)
+    contacts    Query Contacts                             (reads AddressBook, read-only)
+
+Every tool supports --json. Run `apple <tool> --help` for its own options.
+
+Other:
+    apple --help        Show this message
+    apple --which       Print the resolved path of each tool
+EOF
+}
+
+# Locate a Swift binary, preferring the release build.
+swift_binary() {
+    local name="$1"
+    if [ -x "$SWIFT_RELEASE/$name" ]; then
+        echo "$SWIFT_RELEASE/$name"
+    elif [ -x "$SWIFT_DEBUG/$name" ]; then
+        echo "$SWIFT_DEBUG/$name"
+    else
+        echo "error: $name is not built. Run 'make build' in $ROOT" >&2
+        return 1
+    fi
+}
+
+resolve() {
+    case "$1" in
+        notes)     echo "$ROOT/notes/apple-notes" ;;
+        contacts)  echo "$ROOT/contacts/apple-contacts" ;;
+        mail)      swift_binary apple-mail ;;
+        reminders) swift_binary reminders ;;
+        calendar)  swift_binary apple-calendar ;;
+        *)         return 1 ;;
+    esac
+}
+
+main() {
+    if [ $# -eq 0 ]; then
+        usage
+        exit 0
+    fi
+
+    case "$1" in
+        -h|--help|help)
+            usage
+            exit 0
+            ;;
+        --which)
+            for tool in notes mail reminders calendar contacts; do
+                printf '%-10s %s\n' "$tool" "$(resolve "$tool" 2>&1 || true)"
+            done
+            exit 0
+            ;;
+    esac
+
+    local tool="$1"
+    shift
+
+    local target
+    if ! target="$(resolve "$tool")"; then
+        echo "error: unknown tool '$tool'" >&2
+        echo >&2
+        usage >&2
+        exit 1
+    fi
+
+    exec "$target" "$@"
+}
+
+main "$@"
