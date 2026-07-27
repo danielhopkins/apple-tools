@@ -13,6 +13,7 @@ import unittest
 from contacts_harness import (
     TEST_PREFIX,
     LiveContactsTest,
+    find_test_contacts,
     find_test_groups,
     run,
     run_json,
@@ -284,6 +285,47 @@ class Groups(LiveContactsTest):
         # `groups` is a list of names; Contacts has no reverse lookup, so only
         # `get` populates it.
         self.assertIn(self.group_name("Reported"), fetched.get("groups", []))
+
+
+class LocalContainerGroups(LiveContactsTest):
+    """Group removal through the framework, which only works for some containers.
+
+    `CNSaveRequest.removeMember` saves without error and changes nothing for a
+    CardDAV-backed (iCloud) group, but does the right thing for a local one. So
+    `groups remove` tries the framework first and only falls back to driving
+    Contacts.app when the membership survived. This covers the framework half;
+    the Groups class above covers the fallback, since the default container here
+    is CardDAV.
+    """
+
+    CONTAINER = "On My Mac"
+
+    def local_or_skip(self, *args):
+        code, out, err = run(*args, check=False)
+        if code != 0:
+            self.skipTest(f"no usable local container: {err.strip()}")
+        return out
+
+    def test_remove_member_from_a_local_group(self):
+        name = f"{TEST_PREFIX} Local"
+        self.local_or_skip("groups", "create", name, "--container", self.CONTAINER)
+        groups = [g for g in find_test_groups() if g["name"] == name]
+        self.assertEqual(len(groups), 1)
+        group = groups[0]
+
+        self.local_or_skip(
+            "add", "--first", TEST_PREFIX, "--last", "LocalMember",
+            "--container", self.CONTAINER, "--json")
+        contact = [c for c in find_test_contacts()
+                   if c["last_name"] == "LocalMember"][0]
+
+        run("groups", "add", group["id"], contact["id"])
+        self.assertEqual(len(run_json("groups", "members", group["id"])), 1)
+
+        run("groups", "remove", group["id"], contact["id"])
+        self.assertEqual(run_json("groups", "members", group["id"]), [])
+        # The contact itself survives, as for any other group removal.
+        self.assertTrue(self.exists(contact["id"]))
 
 
 class Deletion(LiveContactsTest):

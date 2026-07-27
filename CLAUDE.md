@@ -303,19 +303,31 @@ for the name affixes are `prefix` and `suffix`, though the flags are
 the value as the next flag. Write `--birthday=--04-13`, and likewise for
 `--anniversary` and `--date`.
 
-⚠️ **`groups remove` drives Contacts.app over AppleScript.**
-`CNSaveRequest.removeMember` is a silent no-op on macOS 27 — it saves without
-error and the membership is unchanged. That was verified three ways (unified
-contact, identifier-predicate fetch at `unifyResults = false`, and the group's
-own member objects); all three succeed and change nothing. Consequences for
-this one subcommand, unlike every other contacts write:
+⚠️ **`groups remove` depends on which account the group lives in.**
+`CNSaveRequest.removeMember` saves without error and changes *nothing* for a
+**CardDAV-backed (iCloud) group**, while working correctly for a **local ("On My
+Mac") group**. Same code, same objects — only the container differs, and nothing
+at the call site distinguishes them:
 
-- It **launches Contacts.app** in the background (`open -g -j`), hidden and
-  without focus, and leaves it running. AppleScript's own `launch` verb is not
-  enough — the event fails with `-600` before it takes effect.
+| Container | Type | Member removed |
+|-----------|------|----------------|
+| `On My Mac` | local | yes |
+| an iCloud account | cardDAV | **no, silently** |
+
+So `groups remove` tries the framework first and only falls back to driving
+Contacts.app over AppleScript when the membership survived. For a local group
+nothing else happens. For an iCloud group — which is the default container on
+most machines — the fallback runs, and then:
+
+- Contacts.app is **launched in the background** (`open -g -j`; hidden, no
+  focus) and **quit again afterwards if it wasn't already running**.
+  AppleScript's own `launch` verb is not enough — the event fails with `-600`
+  before it takes effect.
 - It may need **Automation access for Contacts**; the error says so if it does.
-- It re-reads the membership afterwards and fails loudly if the contact is
-  still in the group, rather than trusting the exit code.
+
+Either way it re-reads the membership afterwards and fails loudly if the contact
+is still in the group, rather than trusting the exit code. Don't report a
+removal as done without that confirmation.
 
 ⚠️ **Multi-value flags replace, they don't append.** Passing `--email` on `edit`
 replaces *every* existing email on that contact. Read the contact first and

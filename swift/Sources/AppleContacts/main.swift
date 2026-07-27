@@ -1,3 +1,4 @@
+import AppKit  // NSRunningApplication, to avoid leaving Contacts.app running
 import AppleToolsStyle
 import AppleToolsVersion
 import ArgumentParser
@@ -274,9 +275,14 @@ private func contact(withId id: String) throws -> CNContact {
 }
 
 /// Whether a contact is currently in a group.
+/// Whether a contact is currently in a group.
+///
+/// Reads through a fresh store: this is used to confirm a write that has just
+/// happened, and a reused store would be the obvious thing to blame if the
+/// answer were ever stale.
 private func isMember(_ contactId: String, of groupId: String) -> Bool {
     let predicate = CNContact.predicateForContactsInGroup(withIdentifier: groupId)
-    let members = (try? store.unifiedContacts(
+    let members = (try? CNContactStore().unifiedContacts(
         matching: predicate,
         keysToFetch: [CNContactIdentifierKey as CNKeyDescriptor])) ?? []
     return members.contains { $0.identifier == contactId }
@@ -284,12 +290,9 @@ private func isMember(_ contactId: String, of groupId: String) -> Bool {
 
 /// Remove a contact from a group by driving Contacts.app.
 ///
-/// `CNSaveRequest.removeMember` is a silent no-op on macOS 27: it saves without
-/// error and the membership is unchanged. That was verified three ways — with a
-/// unified contact, with an identifier-predicate fetch at `unifyResults = false`,
-/// and with the group's own member objects — all of which execute cleanly and
-/// change nothing. Contacts.app's AppleScript interface does work, and uses the
-/// same `UUID:ABPerson` identifiers, so drive that instead.
+/// Only needed for CardDAV-backed groups — see `GroupRemove.run()`. Contacts.app
+/// uses the same `UUID:ABPerson` identifiers we do, and its `remove … from …`
+/// works where the framework's does not.
 ///
 /// The script takes its values through `on run argv` rather than string
 /// interpolation, so an identifier can never be interpreted as code.
@@ -299,6 +302,22 @@ private func removeMemberViaAppleScript(contactId: String, groupId: String) thro
     // with -600 ("Application isn't running") before it takes effect.
     // LaunchServices does start it, and `-g -j` keeps it background and hidden,
     // so nothing appears on screen.
+    //
+    // Quit it again afterwards, but only if we were the one who started it:
+    // quitting an instance the user already had open could discard an edit in
+    // progress, and leaving one running is a side effect nobody asked for.
+    let contactsAppWasRunning = !NSRunningApplication
+        .runningApplications(withBundleIdentifier: "com.apple.AddressBook").isEmpty
+    defer {
+        if !contactsAppWasRunning {
+            let quit = Process()
+            quit.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            quit.arguments = ["-e", "tell application \"Contacts\" to quit"]
+            try? quit.run()
+            quit.waitUntilExit()
+        }
+    }
+
     let launch = Process()
     launch.executableURL = URL(fileURLWithPath: "/usr/bin/open")
     launch.arguments = ["-g", "-j", "-a", "Contacts"]
@@ -1044,8 +1063,23 @@ struct GroupRemove: ParsableCommand {
         let target = try resolveGroup(group)
         let member = try contact(withId: contactId)
 
-        try removeMemberViaAppleScript(
-            contactId: member.identifier, groupId: target.identifier)
+        // The framework first — it works, but only for some containers.
+        // `CNSaveRequest.removeMember` saves without error and changes nothing
+        // for a CardDAV-backed (iCloud) group, while doing the right thing for
+        // a local "On My Mac" one. Same code, same objects, different result
+        // per container; nothing about the call site distinguishes them, so
+        // just try it and check.
+        let request = CNSaveRequest()
+        request.removeMember(member, from: target)
+        try? store.execute(request)
+
+        // Only reach for Contacts.app if the framework really didn't take.
+        // That keeps local groups free of any Automation dependency, and means
+        // Contacts.app is launched only when there is no alternative.
+        if isMember(member.identifier, of: target.identifier) {
+            try removeMemberViaAppleScript(
+                contactId: member.identifier, groupId: target.identifier)
+        }
 
         // This operation has a history of reporting success while doing
         // nothing, so confirm it rather than trusting the exit code.
