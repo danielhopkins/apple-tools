@@ -26,7 +26,7 @@ debug:
 ## Generate zsh completions for the ArgumentParser tools into completions/
 ## (_apple, _apple-notes and _apple-contacts are hand-written and committed)
 completions: build
-	@for tool in reminders apple-mail apple-calendar; do \
+	@for tool in reminders apple-mail apple-calendar apple-contacts; do \
 		$(RELEASE_DIR)/$$tool --generate-completion-script zsh > completions/_$$tool \
 			&& echo "  completions/_$$tool"; \
 	done
@@ -82,7 +82,7 @@ install: build
 	@mkdir -p $(PREFIX)
 	ln -sf $(ROOT)/bin/apple $(PREFIX)/apple
 	ln -sf $(ROOT)/notes/apple-notes $(PREFIX)/apple-notes
-	ln -sf $(ROOT)/contacts/apple-contacts $(PREFIX)/apple-contacts
+	ln -sf $(ROOT)/$(RELEASE_DIR)/apple-contacts $(PREFIX)/apple-contacts
 	ln -sf $(ROOT)/$(RELEASE_DIR)/apple-mail $(PREFIX)/apple-mail
 	ln -sf $(ROOT)/$(RELEASE_DIR)/apple-calendar $(PREFIX)/apple-calendar
 	ln -sf $(ROOT)/$(RELEASE_DIR)/reminders $(PREFIX)/reminders
@@ -119,17 +119,17 @@ dist: set-version completions
 	cp "$$(cd $(SWIFT_DIR) && swift build $(SWIFT_UNIV) --show-bin-path)"/reminders \
 	   "$$(cd $(SWIFT_DIR) && swift build $(SWIFT_UNIV) --show-bin-path)"/apple-mail \
 	   "$$(cd $(SWIFT_DIR) && swift build $(SWIFT_UNIV) --show-bin-path)"/apple-calendar \
+	   "$$(cd $(SWIFT_DIR) && swift build $(SWIFT_UNIV) --show-bin-path)"/apple-contacts \
 	   $(DIST)/
 	cp bin/apple $(DIST)/
 	cp notes/apple-notes notes/notestore.py notes/notestore.proto $(DIST)/
-	cp contacts/apple-contacts $(DIST)/
 	cp README.md CLAUDE.md LICENSE VERSION $(DIST)/
 	cp docs/apple-notes-api.md $(DIST)/docs/
 	mkdir -p $(DIST)/completions $(DIST)/skills
 	cp completions/_* $(DIST)/completions/
 	cp -R skills/* $(DIST)/skills/
 	@# Confirm the binaries really are universal before shipping them.
-	@for b in reminders apple-mail apple-calendar; do \
+	@for b in reminders apple-mail apple-calendar apple-contacts; do \
 		archs="$$(lipo -archs $(DIST)/$$b)"; \
 		case "$$archs" in \
 			*arm64*) ;; \

@@ -77,7 +77,6 @@ resolve() {
     local candidate
     for candidate in \
         "$ROOT/notes/$name" \
-        "$ROOT/contacts/$name" \
         "$SWIFT_RELEASE/$name" \
         "$SWIFT_DEBUG/$name"
     do

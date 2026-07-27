@@ -48,9 +48,14 @@ class AppleTools < Formula
         apple-calendar calendars   # Calendar access
         apple-mail accounts        # Automation access for Mail
 
-      apple-notes and apple-contacts read Apple's SQLite stores directly, which
-      requires Full Disk Access for your terminal app:
+        apple-contacts status      # Contacts access
+
+      apple-notes reads Apple's SQLite store directly, which requires Full Disk
+      Access for your terminal app:
       System Settings -> Privacy & Security -> Full Disk Access
+
+      apple-contacts also reads that store for contact notes, which the Contacts
+      framework cannot expose without an Apple-granted entitlement.
     EOS
   end
 

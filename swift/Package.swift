@@ -10,6 +10,7 @@ let package = Package(
         .executable(name: "reminders", targets: ["reminders"]),
         .executable(name: "apple-mail", targets: ["apple-mail"]),
         .executable(name: "apple-calendar", targets: ["apple-calendar"]),
+        .executable(name: "apple-contacts", targets: ["apple-contacts"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.3.1"),
@@ -42,6 +43,15 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "Sources/AppleCalendar"
+        ),
+        .executableTarget(
+            name: "apple-contacts",
+            dependencies: [
+                "AppleToolsVersion",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "Sources/AppleContacts",
+            linkerSettings: [.linkedLibrary("sqlite3")]
         ),
         .testTarget(
             name: "RemindersTests",

@@ -21,7 +21,7 @@ these tools is that the edge cases are already handled.
 | `apple mail` | accounts, message search, message bodies | no |
 | `apple reminders` | lists, items, due dates | **yes** |
 | `apple calendar` | calendars, events | **yes** |
-| `apple contacts` | names, emails, phones, addresses | no |
+| `apple contacts` | names, emails, phones, addresses, notes | **yes** (except notes) |
 
 ## Rules
 
@@ -29,9 +29,10 @@ these tools is that the edge cases are already handled.
    humans and its layout is not stable. (`contacts` is JSON by default; pass
    `--plain` there for human output.)
 2. **Confirm before writing.** `reminders add/edit/complete/delete`,
-   `calendar add/edit/delete`, and `reminders new-list` all touch real data that
-   syncs to the user's other devices. If the user did not clearly ask for the
-   write, describe what you are about to do and wait.
+   `calendar add/edit/delete`, `contacts add/edit/delete`, and
+   `reminders new-list` all touch real data that syncs to the user's other
+   devices. If the user did not clearly ask for the write, describe what you are
+   about to do and wait. Contact deletion in particular has no undo.
 3. **Never guess an identifier.** Run the corresponding `show`/`search`/`events`
    command first and use what it returns.
 4. **Report empty results as empty.** "No events today" is a real answer. Do not
@@ -69,8 +70,13 @@ apple calendar calendars --writable --json
 apple calendar events --days 7 --json
 apple calendar add "Dentist" --start "tomorrow 2pm" --duration 45
 
-# Contacts
-apple contacts search "smith"             # JSON by default
+# Contacts — JSON by default; add/edit/delete are real writes
+apple contacts search "smith"
+apple contacts edit <id> --company "New Co" --phone "mobile:+15551234567"
+apple contacts edit <id> --relation "daughter:Margot Hopkins"
+apple contacts edit <id> --birthday 1980-04-12 --date "death:2020-05-01"
+apple contacts groups                          # list groups with counts
+apple contacts groups add "Family" <contact-id>
 ```
 
 ## Traps that will bite you
@@ -105,6 +111,28 @@ mailbox and will not finish).
 **Note search is title-only.** To search note *content*, export candidates and
 grep them.
 
+**Contact multi-value flags replace, they don't append.** `contacts edit --email`
+replaces every email on that contact. Read it first with `get`, then re-pass the
+addresses to keep alongside the new one. Same for `--phone` and `--url`.
+
+**Relations and dates.** `--relation father:"Robert Hopkins"` accepts any of the
+216 relation labels Contacts defines (father/mother/son/daughter/spouse/niece/
+colleague/in-law and step variants); case, spaces and hyphens are ignored. An
+unknown label is stored as a custom one with a note on stderr — if you see that
+note, check for a typo before moving on. Dates: `--birthday` and `--anniversary`
+are built in; anything else is `--date LABEL:DATE`, e.g. `--date death:2020-05-01`.
+There is no standard death-date label, so it is stored as a custom one.
+
+**Groups are managed separately.** `apple contacts groups` lists them with member
+counts; `groups add/remove GROUP CONTACT-ID` changes membership; `GROUP` takes an
+id or an unambiguous name. Deleting a group does not delete its contacts, and
+removing a member does not either — say so if the user seems to expect otherwise.
+Only `get` reports a contact's group membership; `search` and `list` omit it.
+
+**Contact notes cannot be written.** They are readable, but writing needs an
+Apple-granted entitlement no CLI can hold, so `--note` is rejected. Tell the user
+to edit the note in Contacts.app rather than trying another route.
+
 ## Permission errors
 
 macOS only shows a permission prompt the first time; after that a request
@@ -114,8 +142,10 @@ user to change a setting.
 - `apple calendar status` reports Calendar's real state without prompting.
   Watch for `writeOnly` ("Add Only"): it looks granted but cannot read events,
   and macOS will never offer to upgrade it.
-- Notes and Contacts read SQLite directly, so they need Full Disk Access for
-  the calling terminal.
+- `apple contacts status` does the same for Contacts.
+- Notes reads SQLite directly, so it needs Full Disk Access for the calling
+  terminal. Contacts needs its own grant, plus Full Disk Access if you want
+  contact notes.
 - Mail needs Automation access and Mail.app running.
 
 When a tool reports an access problem, tell the user which System Settings pane

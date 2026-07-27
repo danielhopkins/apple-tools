@@ -22,6 +22,7 @@ installed via `make install`.
 | This week's events | `apple calendar events --days 7 --json` |
 | Add an event | `apple calendar add "Dentist" --start "tomorrow 2pm" --duration 45` |
 | Find a person | `apple contacts search "smith" --json` |
+| Update a contact | `apple contacts edit <id> --company "New Co"` |
 
 **Every tool supports `--json`.** Prefer it — the plain output is for humans and
 its shape is not stable. Use `apple --which` to see which binary each name
@@ -31,9 +32,10 @@ resolves to.
 
 1. **`--json` for anything you parse.** Plain-text layouts change; JSON keys don't.
 2. **Reads are free, writes are not.** `notes export`, `mail search`, `contacts
-   search`, `calendar events`, `reminders show*` only read. Anything that
-   creates, edits, completes, or deletes touches the user's real data — confirm
-   with them first unless they clearly asked for the write.
+   search/get/list`, `calendar events`, `reminders show*` only read. Anything
+   that creates, edits, completes, or deletes touches the user's real data —
+   confirm with them first unless they clearly asked for the write. Contacts
+   writes sync to every device and there is no undo.
 3. **Never edit a note that has attachments.** See the Notes section; one body
    write destroys every attachment on the note. This is unrecoverable.
 4. **IDs are per-tool and not interchangeable.** Notes use integer PKs, Mail uses
@@ -176,38 +178,100 @@ saw — EventKit resolves it to the first occurrence, often years earlier. So:
 
 ### contacts — `apple contacts`
 
-Read-only Python over the AddressBook sqlite stores. Opens them with a read-only
-URI, so it cannot modify contacts. Searches **every** source database and merges
-results, so contacts from multiple accounts all appear.
+Swift + Contacts framework (`CNContactStore`). Full CRUD.
 
 ```
 apple contacts search TERM [--limit N] [--plain]   # default limit 25
 apple contacts get ID [--plain]
 apple contacts list [--limit N] [--plain]          # default limit 100
+apple contacts add [FIELDS] [--container NAME] [--json]
+apple contacts edit ID [FIELDS] [--json]
+apple contacts delete ID
+apple contacts status [--json]                     # permission state, never prompts
+
+apple contacts groups                              # list, with member counts
+apple contacts groups create NAME [--container ID]
+apple contacts groups rename GROUP NEW-NAME
+apple contacts groups delete GROUP
+apple contacts groups members GROUP [--plain]
+apple contacts groups add GROUP CONTACT-ID
+apple contacts groups remove GROUP CONTACT-ID
 ```
 
-Matches against first/last/nickname/company/full name **and** email addresses and
-phone numbers. Returns all emails, phones, and postal addresses with their
-labels. **JSON is the default here**; pass `--plain` for human output.
+`GROUP` accepts a group id **or** an unambiguous group name.
+
+FIELDS, shared by `add` and `edit`:
+
+```
+--first --middle --last --name-prefix --name-suffix --nickname
+--company --department --job-title
+--birthday YYYY-MM-DD|--MM-DD
+--anniversary YYYY-MM-DD|--MM-DD
+--email    [LABEL:]ADDRESS   repeatable
+--phone    [LABEL:]NUMBER    repeatable
+--url      [LABEL:]URL       repeatable
+--relation LABEL:NAME        repeatable
+--date     LABEL:DATE        repeatable
+```
+
+Labels are friendly names: `home`, `work`, `school`, `other`, plus `mobile`,
+`iphone`, `main`, `pager` for phones. `--email work:a@b.com`. Unlabelled values
+are accepted for email/phone/url.
+
+**Relations.** `--relation father:"Robert Hopkins"`. All 216 relation labels the
+Contacts SDK defines are accepted — `father`, `mother`, `son`, `daughter`,
+`brother`, `sister`, `spouse`, `partner`, `grandfather`, `niece`, `colleague`,
+and so on, including in-law and step variants. Matching ignores case, spaces and
+hyphens, so `younger-sister` and `youngerSister` both work. An unrecognised
+label is still stored, as a custom label, with a note on stderr suggesting near
+matches — so a typo like `fathr` is visible rather than silent.
+
+**Dates.** `--birthday` and `--anniversary` are the two Contacts models
+natively. Everything else is a labelled date: `--date death:2020-05-01`,
+`--date graduation:--06-15`. There is no death-date constant in the SDK — only
+`anniversary` — so a death date is stored as a custom label, which is what
+Contacts.app does for user-created date labels too. `--MM-DD` records a day with
+no year.
+
+Search matches first/middle/last/nickname/company/department/job title/full name,
+email addresses, and phone numbers (digits only, so `7205551234` finds
+`+1 (720) 555-1234`). **JSON is the default**; pass `--plain` for human output.
+
+⚠️ **Multi-value flags replace, they don't append.** Passing `--email` on `edit`
+replaces *every* existing email on that contact. Read the contact first and
+re-pass the ones to keep.
+
+⚠️ **`--note` is not writable, by construction.** Reading a note works, but
+writing needs the `com.apple.developer.contacts.notes` entitlement, which Apple
+grants only to signed apps on request — no CLI can hold it. Notes are read
+straight from the AddressBook SQLite store instead. Note edits must happen in
+Contacts.app.
+
+⚠️ **`delete` is permanent.** Unlike Notes there is no Recently Deleted, and the
+deletion syncs everywhere. Always confirm with the user first. Deleting a
+*group* keeps its contacts; removing a member keeps the contact too.
+
+`get` reports a contact's `groups`; `search` and `list` don't, because Contacts
+has no reverse lookup and it would mean scanning every group per contact.
 
 ## Layout
 
 ```
 bin/apple                 dispatcher — routes to the tools below
-swift/                    one Swift package, three binaries
+swift/                    one Swift package, four binaries
   Sources/reminders/      + RemindersLibrary/
   Sources/AppleMail/
   Sources/AppleCalendar/
+  Sources/AppleContacts/  + Notes.swift (SQLite note reader)
   Tests/RemindersTests/
 notes/                    Python; apple-notes, notestore.py, notestore.proto,
                           tests/ (live Notes.app suite)
-contacts/                 Python; apple-contacts
 docs/apple-notes-api.md   NoteStore schema, AppleScript API, verified bugs
 Formula/apple-tools.rb    Homebrew formula
 VERSION                   CalVer YY.MMDD.Patch, stamped in by scripts/set-version
 ```
 
-Both Python tools are stdlib-only and run on the system `python3`.
+`apple-notes` is the only Python tool left; stdlib-only, runs on the system `python3`.
 
 ## Building
 
@@ -238,7 +302,8 @@ Each tool needs a one-time TCC grant, prompted on first run **from a terminal**:
 | reminders | Privacy & Security → Reminders |
 | calendar | Privacy & Security → Calendars |
 | mail | Privacy & Security → Automation → Mail |
-| notes, contacts | Full Disk Access for the calling terminal (reads sqlite directly) |
+| contacts | Privacy & Security → Contacts |
+| notes | Full Disk Access for the calling terminal (reads sqlite directly) |
 
 Grants are keyed to the binary path — rebuilding into a new location can
 re-trigger the prompt. If a tool reports an access error, the fix is for the

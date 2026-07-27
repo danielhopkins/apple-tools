@@ -41,6 +41,7 @@ permission prompt — an agent can't click through those dialogs:
 ```
 reminders show-lists      # → Reminders access
 apple-calendar calendars  # → Calendar access
+apple-contacts list       # → Contacts access
 apple-mail accounts       # → Automation access for Mail
 apple-notes search        # → needs Full Disk Access for your terminal
 ```
@@ -50,6 +51,11 @@ silently. Calendar has a third state worth knowing about — "Add Only"
 (`writeOnly`), which looks granted but cannot read events and is never offered
 an upgrade prompt. `apple calendar status` reports the real state without
 prompting; the fix is a manual toggle to "Full Access" in System Settings.
+`apple contacts status` does the same for Contacts.
+
+`apple-contacts` reads contact *notes* straight from the AddressBook SQLite
+store, because `CNContactNoteKey` needs an Apple-granted entitlement no CLI can
+hold — so it wants Full Disk Access too, but only for that one field.
 
 ## Claude skills
 
@@ -120,7 +126,7 @@ isn't guaranteed; JSON is.
 | `mail` | AppleScript / Mail.app | Search by subject, sender, or content with date and flag filters; export a message. Read-only. |
 | `reminders` | EventKit | Full CRUD: add, edit, complete, delete, lists, priorities, recurrence, natural-language dates. |
 | `calendar` | EventKit | List and search events, create, edit, delete; recurring-event spans. |
-| `contacts` | AddressBook sqlite | Search by name, company, email, or phone. Opened read-only. |
+| `contacts` | Contacts framework | Search by name, company, email, or phone; create, edit, delete. Notes are read-only. |
 
 The Notes reader decodes Apple's gzipped-protobuf note bodies directly rather
 than going through AppleScript, so it preserves highlights, headings, lists, and
@@ -133,9 +139,8 @@ a note's body destroys its attachments.
 
 ```
 bin/apple        dispatcher
-swift/           one Swift package → reminders, apple-mail, apple-calendar
+swift/           one Swift package → reminders, apple-mail, apple-calendar, apple-contacts
 notes/           Python: apple-notes, notestore.py decoder, live Notes.app tests
-contacts/        Python: apple-contacts
 skills/          Claude skills (apple-tools, daily-brief, meeting-prep, inbox-triage)
 completions/     zsh completions
 tests/           live calendar write-path suite (gated)
@@ -145,9 +150,10 @@ VERSION          single source of truth, stamped into every tool
 CLAUDE.md        the same surface, written for an agent
 ```
 
-Both Python tools are stdlib-only. `notes/notestore.py` decodes Apple's
-protobuf note bodies directly rather than depending on the `protobuf` package,
-which is what lets the whole thing run on a stock macOS `python3`.
+`apple-notes` is the one remaining Python tool and is stdlib-only:
+`notes/notestore.py` decodes Apple's protobuf note bodies directly rather than
+depending on the `protobuf` package, which is what lets it run on a stock macOS
+`python3`.
 
 ## Development
 

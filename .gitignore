@@ -11,3 +11,4 @@ bin/apple-calendar
 completions/_reminders
 completions/_apple-mail
 completions/_apple-calendar
+completions/_apple-contacts
