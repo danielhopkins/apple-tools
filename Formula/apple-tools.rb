@@ -2,7 +2,6 @@ class AppleTools < Formula
   desc "CLIs for local Apple app data: Notes, Mail, Reminders, Calendar, Contacts"
   homepage "https://github.com/danielhopkins/apple-tools"
   url "https://github.com/danielhopkins/apple-tools/releases/download/v26.727.0/apple-tools-26.727.0.tar.gz"
-  version "26.727.0"
   sha256 "9bacd45bf6fe8d19d7574581e70ebcf37fe4c329152ac2b40c5bfef75a2c7bd9"
   license "MIT"
 
@@ -22,6 +21,11 @@ class AppleTools < Formula
 
   def caveats
     <<~EOS
+      reminders-cli is superseded by this formula and ships the same `reminders`
+      command. If it is still installed, linking will fail until you remove it:
+
+        brew uninstall reminders-cli && brew link apple-tools
+
       Each tool needs a one-time macOS permission grant, prompted on first run
       from a terminal. Run these once and approve each dialog:
 
