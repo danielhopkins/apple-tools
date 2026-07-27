@@ -17,11 +17,24 @@
 
 set -euo pipefail
 
+# The mail suite is opt-in on top of the calendar one: it creates drafts, and
+# Mail's AppleScript cannot delete them — the sweep can only move them to the
+# trash mailbox, where they stay until you empty it.
+
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 PY="$(command -v python3)"
 
 cd "$ROOT"
 export RUN_LIVE_CALENDAR_TESTS=1
+if [ "${1:-}" = "--mail" ]; then
+  export RUN_LIVE_MAIL_TESTS=1
+  shift
+  echo "Mail draft tests ENABLED."
+  echo "WARNING: Mail's AppleScript cannot delete drafts — delete, move, deleted"
+  echo "status and mailbox reassignment all fail or silently no-op. The ~15"
+  echo "drafts this creates are prefixed __claude_mail_test__ and must be"
+  echo "deleted BY HAND in Mail.app afterwards."
+fi
 export PYTHONPATH="$ROOT"
 
 CAL="${APPLE_CALENDAR_TEST_CALENDAR:-<first writable>}"

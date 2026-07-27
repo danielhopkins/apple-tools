@@ -93,7 +93,41 @@ apple mail search QUERY [--account NAME] [--mailbox NAME] [--field subject|sende
                         [--since DAYS] [--before DAYS] [--limit N]
                         [--flagged] [--unread] [--has-attachment] [--all] [--json]
 apple mail export MESSAGE-ID [--account NAME]
+
+apple mail draft --to ADDR [--to ...] [--cc ADDR] [--bcc ADDR]
+                 --subject TEXT [--body TEXT | --body-file FILE|-]
+                 [--from ACCOUNT-ADDRESS] [--html] [--attach FILE]... [--json]
+apple mail send  <same flags> --confirm
 ```
+
+**Drafting.** `draft` writes to the Drafts mailbox of whichever account matches
+`--from` (your default account otherwise) and never sends. `--body-file -`
+reads the body from stdin, which is the easiest way to pass long or generated
+text. Attachments are validated before anything is composed.
+
+`send` refuses to run without `--confirm`, because sending is immediate and
+irreversible. **Prefer `draft` and let the user send it themselves** — only use
+`send` when they have explicitly asked you to send, in that turn.
+
+⚠️ Mail's compose surface is unusually buggy. These are all verified on
+macOS 27 and pinned by `tests/test_mail_draft.py`:
+
+- **You cannot delete a draft.** `delete` silently does nothing, `move` errors,
+  `set deleted status` fails, and reassigning `mailbox` reports success while
+  moving nothing. A draft you create can only be removed by hand in Mail.app —
+  so do not create drafts speculatively.
+- **Reading recipients back is broken.** `to recipients`, `cc recipients` and
+  `bcc recipients` on a saved draft all return the last-added recipient. The
+  RFC822 `source` is the only trustworthy read. The headers written are correct.
+- **The body is always wrapped in `<blockquote type="cite">`.** Mail does this
+  to any programmatically set body — `content`, `html content` and visible
+  compose windows alike. The quote styling is neutralised inline, so it renders
+  normally, but the markup is there and some clients may treat it as quoted.
+- **The `text/plain` alternative is empty.** The body lives only in the
+  `text/html` part, so a plain-text-only reader sees nothing. Mail may
+  regenerate the MIME on send; this is what the stored draft contains.
+- **Text comes back NFD.** Mail decomposes unicode, so `ü` sent as one
+  codepoint returns as `u` + combining diaeresis. Normalise before comparing.
 
 `--field` defaults to `subject`; use `--field all` when the user describes
 content rather than a subject line. `--all` widens the search to trash and junk,

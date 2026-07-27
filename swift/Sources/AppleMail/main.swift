@@ -8,7 +8,7 @@ struct AppleMail: AsyncParsableCommand {
     commandName: "apple-mail",
     abstract: "Search and export Apple Mail messages",
     version: appleToolsVersion,
-    subcommands: [Search.self, Export.self, Accounts.self]
+    subcommands: [Search.self, Export.self, Accounts.self, Draft.self, Send.self]
   )
 }
 
@@ -427,12 +427,250 @@ struct Export: AsyncParsableCommand {
   }
 }
 
+// MARK: - Compose
+
+/// Creating a message is the least reliable corner of Mail's AppleScript
+/// interface. What follows is what actually works, established empirically:
+///
+///  * `save` on an outgoing message reliably produces a draft, filed in the
+///    Drafts mailbox of whichever account matches `sender`.
+///  * Values must be passed as argv. Interpolating them into the script breaks
+///    on quotes and backslashes, and would let message text run as AppleScript.
+///  * File paths must be coerced to aliases OUTSIDE the `tell application
+///    "Mail"` block. Inside it, `POSIX file` resolves in Mail's own context and
+///    fails with -1728.
+///  * Attachments go into `content of msg` `at after the last paragraph`, and
+///    only after the body is set.
+///  * Reading `to recipients` / `cc recipients` / `bcc recipients` back off a
+///    saved draft is BROKEN — all three return the last-added recipient. The
+///    RFC822 `source` is the only trustworthy read. Nothing here relies on the
+///    property read; the tests parse `source`.
+///  * Mail wraps any programmatically set body in
+///    `<blockquote type="cite">`, with the quote styling neutralised inline.
+///    This happens for `content`, for `html content` and for visible compose
+///    windows alike — there is no way to avoid it from AppleScript.
+private let composeScript = """
+  on run argv
+    set theSubject to item 1 of argv
+    set theBody to item 2 of argv
+    set theSender to item 3 of argv
+    set bodyIsHTML to (item 4 of argv is "1")
+    set theAction to item 5 of argv
+
+    set i to 6
+    set toList to {}
+    set n to (item i of argv) as integer
+    set i to i + 1
+    repeat n times
+      set end of toList to item i of argv
+      set i to i + 1
+    end repeat
+
+    set ccList to {}
+    set n to (item i of argv) as integer
+    set i to i + 1
+    repeat n times
+      set end of ccList to item i of argv
+      set i to i + 1
+    end repeat
+
+    set bccList to {}
+    set n to (item i of argv) as integer
+    set i to i + 1
+    repeat n times
+      set end of bccList to item i of argv
+      set i to i + 1
+    end repeat
+
+    -- Resolve attachments to aliases here, outside the Mail tell block.
+    set fileList to {}
+    set n to (item i of argv) as integer
+    set i to i + 1
+    repeat n times
+      set end of fileList to ((POSIX file (item i of argv)) as alias)
+      set i to i + 1
+    end repeat
+
+    tell application "Mail"
+      if bodyIsHTML then
+        set msg to make new outgoing message with properties {subject:theSubject, visible:false}
+        set html content of msg to theBody
+      else
+        set msg to make new outgoing message with properties {subject:theSubject, content:theBody, visible:false}
+      end if
+
+      tell msg
+        if theSender is not "" then set sender to theSender
+        repeat with a in toList
+          make new to recipient at end of to recipients with properties {address:a}
+        end repeat
+        repeat with a in ccList
+          make new cc recipient at end of cc recipients with properties {address:a}
+        end repeat
+        repeat with a in bccList
+          make new bcc recipient at end of bcc recipients with properties {address:a}
+        end repeat
+      end tell
+
+      repeat with f in fileList
+        tell content of msg
+          make new attachment with properties {file name:f} at after the last paragraph
+        end tell
+        delay 0.4
+      end repeat
+
+      if theAction is "send" then
+        send msg
+        return "sent"
+      else
+        save msg
+        return "saved|" & (subject of msg) & "|" & (sender of msg)
+      end if
+    end tell
+  end run
+  """
+
+struct ComposeOptions: ParsableArguments {
+  @Option(name: .long, help: "Recipient address. Repeat for several.")
+  var to: [String] = []
+
+  @Option(name: .long, help: "Cc address. Repeat for several.")
+  var cc: [String] = []
+
+  @Option(name: .long, help: "Bcc address. Repeat for several.")
+  var bcc: [String] = []
+
+  @Option(name: .long, help: "Subject line")
+  var subject: String = ""
+
+  @Option(name: .long, help: "Message body")
+  var body: String?
+
+  @Option(name: .long, help: "Read the body from a file, or '-' for stdin")
+  var bodyFile: String?
+
+  @Flag(name: .long, help: "Treat the body as HTML")
+  var html = false
+
+  @Option(name: .long, help: "Send from this account address; defaults to your default account")
+  var from: String?
+
+  @Option(name: .long, help: "File to attach. Repeat for several.")
+  var attach: [String] = []
+
+  /// Resolves --body / --body-file, validates attachments, and returns the
+  /// argv vector the compose script expects.
+  func arguments(action: String) throws -> [String] {
+    if body != nil && bodyFile != nil {
+      throw ValidationError("pass either --body or --body-file, not both")
+    }
+
+    var text = body ?? ""
+    if let bodyFile {
+      if bodyFile == "-" {
+        let data = FileHandle.standardInput.readDataToEndOfFile()
+        text = String(data: data, encoding: .utf8) ?? ""
+      } else {
+        guard let contents = try? String(contentsOfFile: bodyFile, encoding: .utf8) else {
+          throw ValidationError("could not read --body-file '\(bodyFile)'")
+        }
+        text = contents
+      }
+    }
+
+    guard !to.isEmpty || !cc.isEmpty || !bcc.isEmpty else {
+      throw ValidationError("no recipients; pass at least one --to, --cc or --bcc")
+    }
+
+    // Validate attachments up front. A path that fails inside the script aborts
+    // it midway and leaves an orphan draft behind.
+    var paths: [String] = []
+    for path in attach {
+      let expanded = (path as NSString).expandingTildeInPath
+      var isDirectory: ObjCBool = false
+      guard FileManager.default.fileExists(atPath: expanded, isDirectory: &isDirectory),
+            !isDirectory.boolValue else {
+        throw ValidationError("attachment not found (or is a directory): \(path)")
+      }
+      paths.append(URL(fileURLWithPath: expanded).standardizedFileURL.path)
+    }
+
+    var argv = [subject, text, from ?? "", html ? "1" : "0", action]
+    argv.append(String(to.count));  argv.append(contentsOf: to)
+    argv.append(String(cc.count));  argv.append(contentsOf: cc)
+    argv.append(String(bcc.count)); argv.append(contentsOf: bcc)
+    argv.append(String(paths.count)); argv.append(contentsOf: paths)
+    return argv
+  }
+}
+
+struct Draft: AsyncParsableCommand {
+  static let configuration = CommandConfiguration(
+    abstract: "Create a draft message (does not send)")
+
+  @OptionGroup var compose: ComposeOptions
+
+  @Flag(name: .long, help: "Output as JSON")
+  var json = false
+
+  func run() async throws {
+    let argv = try compose.arguments(action: "save")
+    let result = try runAppleScript(composeScript, arguments: argv)
+
+    let parts = result.split(separator: "|", maxSplits: 2).map(String.init)
+    let subject = parts.count > 1 ? parts[1] : compose.subject
+    let sender = parts.count > 2 ? parts[2] : ""
+
+    if json {
+      let payload: [String: Any] = [
+        "status": "saved", "subject": subject, "sender": sender,
+        "to": compose.to, "cc": compose.cc, "bcc": compose.bcc,
+        "attachments": compose.attach.count,
+      ]
+      let data = try JSONSerialization.data(
+        withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+      print(String(data: data, encoding: .utf8) ?? "{}")
+    } else {
+      print("Draft saved: \(subject.isEmpty ? "(no subject)" : subject)")
+      if !sender.isEmpty { print("  from: \(sender)") }
+      let recipients = compose.to + compose.cc.map { "cc:" + $0 } + compose.bcc.map { "bcc:" + $0 }
+      print("  to:   \(recipients.joined(separator: ", "))")
+      print("It is in your Drafts mailbox — review it in Mail before sending.")
+    }
+  }
+}
+
+struct Send: AsyncParsableCommand {
+  static let configuration = CommandConfiguration(
+    abstract: "Send a message immediately (requires --confirm)")
+
+  @OptionGroup var compose: ComposeOptions
+
+  @Flag(name: .long, help: "Required. Sending cannot be undone.")
+  var confirm = false
+
+  func run() async throws {
+    guard confirm else {
+      throw ValidationError("""
+        refusing to send without --confirm. Sending is immediate and irreversible.
+        Prefer `apple mail draft` with the same flags, review it in Mail, and send by hand.
+        """)
+    }
+    let argv = try compose.arguments(action: "send")
+    _ = try runAppleScript(composeScript, arguments: argv)
+    print("Sent to: \(compose.to.joined(separator: ", "))")
+  }
+}
+
 // MARK: - AppleScript Helper
 
-func runAppleScript(_ source: String) throws -> String {
+func runAppleScript(_ source: String, arguments: [String] = []) throws -> String {
   let process = Process()
   process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-  process.arguments = ["-e", source]
+  // Values go through argv, never string-interpolated into the script. Quotes,
+  // backslashes, newlines, emoji and non-ASCII all survive verbatim, and there
+  // is no way for message text to be parsed as AppleScript.
+  process.arguments = ["-e", source] + arguments
 
   let stdout = Pipe()
   let stderr = Pipe()

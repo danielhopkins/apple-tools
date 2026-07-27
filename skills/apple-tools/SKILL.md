@@ -18,7 +18,7 @@ these tools is that the edge cases are already handled.
 | Tool | Reads | Writes |
 |------|-------|--------|
 | `apple notes` | titles, folders, note bodies as Markdown | no |
-| `apple mail` | accounts, message search, message bodies | no |
+| `apple mail` | accounts, message search, message bodies | **drafts** (send is guarded) |
 | `apple reminders` | lists, items, due dates | **yes** |
 | `apple calendar` | calendars, events | **yes** |
 | `apple contacts` | names, emails, phones, addresses, notes | **yes** (except notes) |
@@ -57,6 +57,7 @@ apple notes export 261                    # body as Markdown
 
 # Mail — bound every search; see the timeout trap below
 apple mail accounts --json
+apple mail draft --to a@b.com --subject "Re: Q3" --body-file -   # body on stdin
 apple mail search "invoice" --mailbox inbox --since 30 --limit 20 --json
 apple mail export <message-id>
 
@@ -99,6 +100,21 @@ around it.
 **Mail search defaults to subject only.** Use `--field all` when the user is
 describing content rather than a subject line. Trash and junk are excluded
 unless you pass `--all`.
+
+**Drafting email is where you are most useful — and drafts cannot be deleted.**
+`apple mail draft` writes to Drafts and never sends. But Mail's AppleScript
+cannot remove a draft afterwards by any route, so **never create one
+speculatively or as a trial**. Get the content right, then write it once. Pass
+long bodies via `--body-file -` on stdin.
+
+`apple mail send` exists but refuses to run without `--confirm`. Default to
+drafting and let the user send. Only use `send` if they asked you to send in
+that same turn — it is immediate and irreversible.
+
+Two things to tell the user rather than be surprised by: the body is wrapped in
+a `<blockquote type="cite">` by Mail itself (styling neutralised, renders
+normally), and the `text/plain` alternative is empty so plain-text-only readers
+see nothing until Mail regenerates the MIME on send.
 
 **Mail search can time out and look like an empty result.** AppleScript's event
 timeout is ~120 seconds, and when it trips, the search returns `[]` with exit
