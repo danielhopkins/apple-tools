@@ -367,6 +367,7 @@ swift/                    one Swift package, four binaries
 notes/                    Python; apple-notes, notestore.py, notestore.proto,
                           tests/ (live Notes.app suite)
 docs/apple-notes-api.md   NoteStore schema, AppleScript API, verified bugs
+docs/prior-art.md         other projects solving this; check before building
 Formula/apple-tools.rb    Homebrew formula
 VERSION                   CalVer YY.MMDD.Patch, stamped in by scripts/set-version
 ```
