@@ -23,6 +23,7 @@ installed via `make install`.
 | Add an event | `apple calendar add "Dentist" --start "tomorrow 2pm" --duration 45` |
 | Find a person | `apple contacts search "smith" --json` |
 | Update a contact | `apple contacts edit <id> --company "New Co"` |
+| Export contacts | `apple contacts export --group "Family" -o family.vcf` |
 
 **Every tool supports `--json`.** Prefer it — the plain output is for humans and
 its shape is not stable. Use `apple --which` to see which binary each name
@@ -243,6 +244,7 @@ apple contacts list [--limit N] [--plain]          # default limit 100
 apple contacts add [FIELDS] [--container NAME] [--json]
 apple contacts edit ID [FIELDS] [--json]
 apple contacts delete ID
+apple contacts export ID... [--group GROUP] [-o FILE]   # vCard 3.0
 apple contacts status [--json]                     # permission state, never prompts
 
 apple contacts groups                              # list, with member counts
@@ -292,6 +294,15 @@ no year.
 Search matches first/middle/last/nickname/company/department/job title/full name,
 email addresses, and phone numbers (digits only, so `7205551234` finds
 `+1 (720) 555-1234`). **JSON is the default**; pass `--plain` for human output.
+
+**Exporting.** `export` writes vCard 3.0 — what Contacts.app and every other
+address book imports. Takes any number of ids, `--group NAME` for a whole group,
+or both (a contact named twice is written once). Goes to stdout unless `-o`.
+
+Unlike a plain Contacts-framework export it **includes notes**, read from the
+AddressBook store and spliced in as a folded, escaped `NOTE` property — so it
+needs Full Disk Access for that one field, and without it everything else still
+exports. Verified by round-tripping a real 514-character note byte-for-byte.
 
 **Output shapes.** `get`, `add` and `edit` return a single JSON **object**;
 `search`, `list` and `groups members` return **arrays**. An unlabelled email,

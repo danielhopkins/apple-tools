@@ -8,6 +8,8 @@ Every fixture is created with TEST_PREFIX as its first name and swept after
 each test. See contacts_harness for the safety rules.
 """
 
+import os
+import tempfile
 import unittest
 
 from contacts_harness import (
@@ -326,6 +328,77 @@ class LocalContainerGroups(LiveContactsTest):
         self.assertEqual(run_json("groups", "members", group["id"]), [])
         # The contact itself survives, as for any other group removal.
         self.assertTrue(self.exists(contact["id"]))
+
+
+class VCardExport(LiveContactsTest):
+    """`export` is read-only, but it runs here because it needs fixtures."""
+
+    def cards(self, text):
+        """Number of vCards in a serialised blob."""
+        return text.count("BEGIN:VCARD")
+
+    def test_export_writes_a_vcard_to_stdout(self):
+        created = self.add("Card", "--email", "work:card@example.invalid")
+        _, out, _ = run("export", created["id"])
+        self.assertEqual(self.cards(out), 1)
+        self.assertIn("END:VCARD", out)
+        self.assertIn("VERSION:3.0", out)
+        self.assertIn("card@example.invalid", out)
+
+    def test_export_preserves_relations_and_birthday(self):
+        created = self.add(
+            "Rich", "--birthday", "1980-03-04", "--relation", "father:Robert Test")
+        _, out, _ = run("export", created["id"])
+        self.assertIn("BDAY:1980-03-04", out)
+        self.assertIn("Robert Test", out)
+        # The relation label rides along as an X-ABLabel rather than being lost.
+        self.assertIn("X-ABLabel", out)
+
+    def test_export_to_a_file(self):
+        created = self.add("File")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.vcf")
+            _, _, err = run("export", created["id"], "-o", path)
+            self.assertIn("Exported 1 contact", err)
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(self.cards(handle.read()), 1)
+
+    def test_export_several_ids_into_one_file(self):
+        first = self.add("One")
+        second = self.add("Two")
+        _, out, _ = run("export", first["id"], second["id"])
+        self.assertEqual(self.cards(out), 2)
+
+    def test_export_a_whole_group(self):
+        name = f"{TEST_PREFIX} Export"
+        run("groups", "create", name)
+        group = [g for g in find_test_groups() if g["name"] == name][0]
+        for suffix in ("GroupA", "GroupB"):
+            member = self.add(suffix)
+            run("groups", "add", group["id"], member["id"])
+
+        _, out, _ = run("export", "--group", name)
+        self.assertEqual(self.cards(out), 2)
+
+    def test_a_contact_named_twice_is_exported_once(self):
+        name = f"{TEST_PREFIX} Dedupe"
+        run("groups", "create", name)
+        group = [g for g in find_test_groups() if g["name"] == name][0]
+        member = self.add("Both")
+        run("groups", "add", group["id"], member["id"])
+
+        _, out, _ = run("export", member["id"], "--group", name)
+        self.assertEqual(self.cards(out), 1)
+
+    def test_export_needs_something_to_export(self):
+        code, _, err = run("export", check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("--group", err)
+
+    def test_export_rejects_an_unknown_id(self):
+        code, _, err = run("export", "not-a-real-id:ABPerson", check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("no contact", err.lower())
 
 
 class Deletion(LiveContactsTest):

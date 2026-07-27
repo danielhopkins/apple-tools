@@ -146,6 +146,11 @@ year-less date must be passed with `=`: `--birthday=--04-13`, never
 `groups members` return arrays. Unlabelled emails and phones have no `label`
 key at all.
 
+**Exporting.** `apple contacts export <id>... [--group NAME] [-o file.vcf]`
+writes vCard 3.0 — use it when the user wants to share, back up, or move
+contacts rather than read them. It includes notes, which a plain vCard export
+would drop. Without `-o` the vCard goes to stdout.
+
 **Groups are managed separately.** `apple contacts groups` lists them with member
 counts; `groups add/remove GROUP CONTACT-ID` changes membership; `GROUP` takes an
 id or an unambiguous name. Deleting a group does not delete its contacts, and
