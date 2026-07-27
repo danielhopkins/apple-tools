@@ -151,6 +151,14 @@ event length is 1 hour.
 Subscribed and holiday calendars are read-only — `calendars --writable` shows
 which ones accept writes.
 
+⚠️ **A recurring event's ID identifies the series, not the occurrence you saw.**
+`events` lists the Jul 27 instance, but passing that ID to `show`/`edit`/`delete`
+resolves to the series' **first** occurrence — possibly years earlier. Check
+`"recurring": true` in the JSON before writing. Without `--future` you will edit
+the first occurrence rather than the one the user meant; with `--future` from
+that master you effectively rewrite the whole series. For recurring events,
+confirm the intended scope with the user rather than inferring it.
+
 For recurring events, `--future` applies the change to this and all later
 occurrences; without it only the single occurrence changes.
 
