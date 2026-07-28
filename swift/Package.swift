@@ -11,6 +11,7 @@ let package = Package(
         .executable(name: "apple-mail", targets: ["apple-mail"]),
         .executable(name: "apple-calendar", targets: ["apple-calendar"]),
         .executable(name: "apple-contacts", targets: ["apple-contacts"]),
+        .executable(name: "apple-messages", targets: ["apple-messages"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.3.1"),
@@ -18,6 +19,9 @@ let package = Package(
     targets: [
         .target(name: "AppleToolsVersion"),
         .target(name: "TCCResponsibility"),
+        // Query parsing shared by mail and messages, so the two cannot drift on
+        // what `budget review` means.
+        .target(name: "AppleToolsSearch"),
         .target(
             name: "AppleToolsStyle",
             dependencies: [.product(name: "ArgumentParser", package: "swift-argument-parser")]
@@ -46,6 +50,7 @@ let package = Package(
         ),
         .target(
             name: "MailLibrary",
+            dependencies: ["AppleToolsSearch"],
             linkerSettings: [
                 // Mail's Envelope Index is a SQLite database; reading it directly
                 // is what lets search skip AppleScript entirely.
@@ -113,9 +118,33 @@ let package = Package(
             name: "RemindersTests",
             dependencies: ["RemindersLibrary"]
         ),
+        .target(
+            name: "MessagesLibrary",
+            dependencies: ["AppleToolsSearch"],
+            linkerSettings: [
+                // chat.db is read directly, the same way MailLibrary reads the
+                // Envelope Index. Messages exposes no AppleScript read path to
+                // fall back to, so this is the only route to history.
+                .linkedLibrary("sqlite3"),
+            ]
+        ),
+        .executableTarget(
+            name: "apple-messages",
+            dependencies: [
+                "AppleToolsVersion",
+                "AppleToolsStyle",
+                "MessagesLibrary",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "Sources/AppleMessages"
+        ),
         .testTarget(
             name: "MailTests",
-            dependencies: ["MailLibrary"]
+            dependencies: ["MailLibrary", "AppleToolsSearch"]
+        ),
+        .testTarget(
+            name: "MessagesTests",
+            dependencies: ["MessagesLibrary"]
         ),
     ]
 )

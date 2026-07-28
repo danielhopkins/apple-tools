@@ -107,12 +107,13 @@ Homebrew installs these automatically.
 
 ## Usage
 
-One dispatcher fronts all five tools:
+One dispatcher fronts all six tools:
 
 ```
 apple notes search "budget" --json
 apple mail search "invoice" --json
 apple mail search "budget" --field content --json      # full-text over bodies
+apple messages search "dinner" --since 30 --json       # whole chat history
 apple reminders show-all --due-date today --include-overdue
 apple calendar add "Dentist" --start "tomorrow 2pm" --duration 45
 apple contacts search "smith"
@@ -120,7 +121,7 @@ apple contacts export --group "Family" -o family.vcf
 ```
 
 Each is also installed under its own name (`apple-notes`, `apple-mail`,
-`reminders`, `apple-calendar`, `apple-contacts`). Run `apple <tool> --help` for
+`apple-messages`, `reminders`, `apple-calendar`, `apple-contacts`). Run `apple <tool> --help` for
 full options, or `apple --which` to see what resolves where.
 
 `apple status` reports every tool's permission state in one table, never
@@ -132,6 +133,7 @@ $ apple status
 TOOL       PERMISSION             OK
 notes      Full Disk Access       ✓
 mail       Automation → Mail      ✓
+messages   Full Disk Access       ✓
 reminders  Reminders              ✓
 calendar   Calendars              ✓
 contacts   Contacts               ✓
@@ -152,6 +154,7 @@ isn't guaranteed; JSON is.
 |------|-----------|------------|
 | `notes` | `NoteStore.sqlite` + protobuf | Search titles, list folders, export notes as Markdown, deep links. Read-only. |
 | `mail` | `Envelope Index` + `.emlx` (reads), AppleScript (writes) | Search by subject, sender, or full body text with date and flag filters; export a message; draft and send. |
+| `messages` | `chat.db` | Search and export iMessage/SMS/RCS history, list conversations, save attachments. Read-only. |
 | `reminders` | EventKit | Full CRUD: add, edit, complete, delete, lists, priorities, recurrence, natural-language dates. |
 | `calendar` | EventKit | List and search events, create, edit, delete; recurring-event spans. |
 | `contacts` | Contacts framework | Search by name, company, email, or phone; create, edit, delete. Notes are read-only. |
@@ -167,6 +170,14 @@ closed. It also makes `--field content` a real full-text search over decoded
 message bodies (~9s worst case across the whole store), which the AppleScript
 path could not finish at all. See
 [`docs/apple-mail-store.md`](docs/apple-mail-store.md).
+
+Messages is read the same way, from `~/Library/Messages/chat.db`. The catch
+there is that about 4% of a long-lived store keeps its body not in the `text`
+column but in an archived `NSAttributedString` — 1,921 ordinary messages on a
+103,250-message store, which a plain `SELECT text` drops without any error.
+`apple-messages` decodes that NeXT typedstream format directly; the decoder is
+verified against the 99,023 rows that carry both columns, matching 99,022 of
+them. See [`docs/apple-messages-store.md`](docs/apple-messages-store.md).
 [`docs/apple-notes-api.md`](docs/apple-notes-api.md) documents the schema and the
 verified behaviors and bugs behind that, including a data-loss bug where editing
 a note's body destroys its attachments.
@@ -207,17 +218,19 @@ plist into `__TEXT,__info_plist` at link time — and `make build` re-signs
 afterwards, because macOS ignores a plist that isn't covered by the signature.
 `make dist` verifies the binding and fails the build if it is missing.
 
-`apple-mail` and `apple-notes` are the exceptions, and both are attributed to
-the calling terminal rather than the binary. `apple-notes` needs Full Disk
-Access. `apple-mail` needs Full Disk Access to read (search, export, accounts)
-and Automation → Mail to write (draft, send) — two grants for two halves, and
-`apple mail status` reports them separately.
+`apple-mail`, `apple-messages` and `apple-notes` are the exceptions, and all
+three are attributed to the calling terminal rather than the binary.
+`apple-notes` and `apple-messages` need Full Disk Access — they read
+`NoteStore.sqlite` and `chat.db` directly. `apple-mail` needs Full Disk Access
+to read (search, export, accounts) and Automation → Mail to write (draft, send)
+— two grants for two halves, and `apple mail status` reports them separately.
 
 ## Layout
 
 ```
 bin/apple        dispatcher
-swift/           one Swift package → reminders, apple-mail, apple-calendar, apple-contacts
+swift/           one Swift package → reminders, apple-mail, apple-messages,
+                 apple-calendar, apple-contacts
 notes/           Python: apple-notes, notestore.py decoder, live Notes.app tests
 skills/          Claude skills (apple-tools, daily-brief, meeting-prep, inbox-triage)
 completions/     zsh completions

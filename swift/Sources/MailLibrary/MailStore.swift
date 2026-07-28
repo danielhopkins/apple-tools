@@ -1,3 +1,4 @@
+import AppleToolsSearch
 import Foundation
 
 /// Search and export against the on-disk mail store: the Envelope Index for

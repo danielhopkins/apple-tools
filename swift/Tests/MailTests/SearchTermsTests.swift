@@ -1,6 +1,6 @@
 import XCTest
 
-@testable import MailLibrary
+@testable import AppleToolsSearch
 
 /// Query parsing. The bug being pinned here is a silent one: before this,
 /// `budget review` was a single substring and matched 0 messages on a store

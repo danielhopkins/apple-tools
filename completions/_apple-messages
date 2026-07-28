@@ -1,0 +1,169 @@
+#compdef apple-messages
+
+__apple-messages_complete() {
+    local -ar non_empty_completions=("${@:#(|:*)}")
+    local -ar empty_completions=("${(M)@:#(|:*)}")
+    _describe -V '' non_empty_completions -- empty_completions -P $'\'\''
+}
+
+__apple-messages_custom_complete() {
+    local -a completions
+    completions=("${(@f)"$("${command_name}" "${@}" "${command_line[@]}")"}")
+    if [[ "${#completions[@]}" -gt 1 ]]; then
+        __apple-messages_complete "${completions[@]:0:-1}"
+    fi
+}
+
+__apple-messages_cursor_index_in_current_word() {
+    if [[ -z "${QIPREFIX}${IPREFIX}${PREFIX}" ]]; then
+        printf 0
+    else
+        printf %s "${#${(z)LBUFFER}[-1]}"
+    fi
+}
+
+_apple-messages() {
+    emulate -RL zsh -G
+    setopt extendedglob nullglob numericglobsort
+    unsetopt aliases banghist
+
+    local -xr SAP_SHELL=zsh
+    local -x SAP_SHELL_VERSION
+    SAP_SHELL_VERSION="$(builtin emulate zsh -c 'printf %s "${ZSH_VERSION}"')"
+    local -r SAP_SHELL_VERSION
+
+    local context state state_descr line
+    local -A opt_args
+
+    local -r command_name="${words[1]}"
+    local -ar command_line=("${words[@]}")
+    local -ir current_word_index="$((CURRENT - 1))"
+
+    local -i ret=1
+    local -ar arg_specs=(
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+        '(-): :->command'
+        '(-)*:: :->arg'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+    case "${state}" in
+    command)
+        local -ar subcommands=(
+            'chats:List conversations, most recently active first'
+            'search:Search message bodies'
+            'export:Print one conversation as a transcript, oldest first'
+            'attachments:List or save the files in a conversation'
+            'status:Report permission state without requesting it'
+            'help:Show subcommand help information.'
+        )
+        _describe -V subcommand subcommands && ret=0
+        ;;
+    arg)
+        case "${words[1]}" in
+        chats|search|export|attachments|status|help)
+            "_apple-messages_${words[1]}" && ret=0
+            ;;
+        esac
+        ;;
+    esac
+
+    return "${ret}"
+}
+
+_apple-messages_chats() {
+    local -i ret=1
+    local -ar arg_specs=(
+        ':search:'
+        '--limit[Maximum chats to list]:limit:'
+        '--json[Output as JSON]'
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+_apple-messages_search() {
+    local -i ret=1
+    local -ar arg_specs=(
+        ':query:'
+        '--chat[Restrict to one conversation (id, name, or handle)]:chat:'
+        '--handle[Restrict to messages with this handle (phone or email)]:handle:'
+        '--since[Only messages from the last N days]:since:'
+        '--before[Only messages older than N days]:before:'
+        '--limit[Maximum results]:limit:'
+        '--from-me[Only messages you sent]'
+        '--to-me[Only messages you received]'
+        '--has-attachment[Only messages carrying an attachment]'
+        '--include-events[Include joins, leaves and renames]'
+        '--json[Output as JSON]'
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+_apple-messages_export() {
+    local -i ret=1
+    local -ar arg_specs=(
+        ':chat:'
+        '--limit[Only the most recent N messages]:limit:'
+        '--include-events[Include joins, leaves and renames]'
+        '--json[Output as JSON]'
+        '(--output -o)'{--output,-o}'[Write to a file instead of stdout]:output:'
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+_apple-messages_attachments() {
+    local -i ret=1
+    local -ar arg_specs=(
+        ':chat:'
+        '--save[Copy the files into this directory]:save:'
+        '--skip-stickers[Skip stickers]'
+        '--limit[Only the most recent N messages]:limit:'
+        '--json[Output as JSON]'
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+_apple-messages_status() {
+    local -i ret=1
+    local -ar arg_specs=(
+        '--json[Output as JSON]'
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+_apple-messages_help() {
+    local -i ret=1
+    local -ar arg_specs=(
+        '*:subcommands:'
+        '--version[Show the version.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+if [[ "${funcstack[1]}" = _apple-messages ]]; then
+    _apple-messages "${@}"
+else
+    compdef _apple-messages apple-messages
+fi

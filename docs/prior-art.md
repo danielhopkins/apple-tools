@@ -28,9 +28,12 @@ MCP server over Messages, Notes, Contacts, Mail, Reminders, Calendar, Maps.
 By far the most adopted (3.1k stars) and **archived on 2026-01-01**, last pushed
 2025-08-11. Treat as a museum piece, not a dependency.
 
-Worth it for: **Messages** and **Maps**, the two surfaces nothing here covers.
-Messages is the interesting one — `chat.db` is readable the same way
-`NoteStore.sqlite` is.
+Worth it for: **Maps**, now the only surface nothing here covers. Messages was
+the other one until we built it — `chat.db` is readable the same way
+`NoteStore.sqlite` is, and [`apple-messages-store.md`](apple-messages-store.md)
+records what that took. Its per-app implementation is still unread, so whether
+it decodes `attributedBody` at all is unknown; a Messages reader that does not
+is missing ~4% of a long-lived store without saying so.
 
 *Not verified:* its per-app implementation. The README doesn't say and the file
 listing (`utils/{calendar,contacts,mail,maps,message,notes,reminders}.ts`)
@@ -139,14 +142,16 @@ load-bearing here:
   silent no-op for iCloud groups and works for local ones; the legacy
   `AddressBook` framework handles both. No surveyed project implements contact
   groups at all.
-- **Verified write paths.** 37 contacts + 25 calendar + 19 mail + 11 unit tests
+- **Verified write paths.** 37 contacts + 25 calendar + 19 mail + 27 unit tests
   against real data. The nearest peer has ~13 assertions.
+- **A decoder checked against ground truth.** 99,023 messages carry both a
+  plain-text and an archived body, so the archived reader could be validated
+  row by row rather than spot-checked: 99,022 exact matches.
 - **The trap list in [CLAUDE.md](../CLAUDE.md)** — every entry cost a real
   debugging session and is pinned by a test.
 
 ## Open ideas sourced from here
 
-- **Messages** (`chat.db`) — the clearest gap; apple-mcp covers it, we don't.
 - **vCard import** — we export, `ical` shows import is expected.
 - **Append-vs-replace for multi-value fields** — see claude-apple-bridges above.
 - **App-bundle TCC identity** — `apple-pim`'s `helper/` as an alternative to
@@ -154,6 +159,12 @@ load-bearing here:
 - ~~**Read mail from the store rather than AppleScript**~~ — done, taken from
   `apple-pim`. This is the file's one clear payoff so far: reading a peer's
   source turned a 154s search into a 0.04s one.
+- ~~**Messages** (`chat.db`)~~ — done. The payoff was not the SQLite reading,
+  which is routine, but the two things only visible against real data: the
+  `attributedBody` typedstream holding 1,921 otherwise-invisible messages, and
+  the fact that searching two body sources under one `LIMIT` silently returns
+  the wrong answer.
+- **Maps** — the last surface apple-mcp covered that we do not.
 - **A body index.** Content search re-reads and re-decodes 3.4 GB every time.
   Mail's own `Protected Index Journals` may already hold something usable; if
   not, a local SQLite FTS table over decoded bodies would make it instant, at

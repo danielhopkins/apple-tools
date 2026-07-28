@@ -45,6 +45,7 @@ ${H}USAGE:${R} ${C}apple${R} <tool> [args...]
 ${H}TOOLS:${R}
     ${G}notes${R}       Search, export, and link Apple Notes       (reads NoteStore.sqlite)
     ${G}mail${R}        Search, export, and draft Apple Mail       (reads Mail's own store)
+    ${G}messages${R}    Search and export iMessage/SMS history     (reads chat.db)
     ${G}reminders${R}   Full CRUD on Reminders                     (EventKit)
     ${G}calendar${R}    Read and write Calendar events             (EventKit)
     ${G}contacts${R}    Read and write Contacts, relations, groups (Contacts framework)
@@ -64,6 +65,9 @@ ${H}EXAMPLES:${R}
     apple mail search "invoice" --json            # whole store, milliseconds
     apple mail search "budget" --field content    # full-text over bodies
     apple mail draft --to a@b.com --subject "Hi" --body "text"
+    apple messages chats --json                   # conversations, recent first
+    apple messages search "dinner" --since 30     # whole store, milliseconds
+    apple messages export 8 --limit 50            # one conversation
     apple reminders show-all --due-date today --include-overdue --json
     apple reminders add Inbox "Buy milk" --due-date "tomorrow 9am"
     apple calendar events --days 7 --json         # next week
@@ -78,6 +82,7 @@ binary_name() {
     case "$1" in
         notes)     echo "apple-notes" ;;
         mail)      echo "apple-mail" ;;
+        messages)  echo "apple-messages" ;;
         calendar)  echo "apple-calendar" ;;
         contacts)  echo "apple-contacts" ;;
         reminders) echo "reminders" ;;
@@ -142,7 +147,7 @@ status_report() {
     [ "${1:-}" = "--json" ] && want_json=1
 
     local payload="" tool bin js
-    for tool in notes mail reminders calendar contacts; do
+    for tool in notes mail messages reminders calendar contacts; do
         if ! bin="$(resolve "$tool" 2>/dev/null)"; then
             payload+="$tool"$'\t'$'\x1f'"not installed"$'\x1e'
             continue
@@ -168,6 +173,9 @@ META = {
     # drafts and sends. `usable` is true when either works, so the detail line
     # below is what says which half is missing.
     "mail":      ("Full Disk Access + Automation", "terminal"),
+    # Reads chat.db directly, so Full Disk Access for the calling terminal.
+    # Automation is reported too but gates nothing today: there is no write path.
+    "messages":  ("Full Disk Access",    "terminal"),
     "reminders": ("Reminders",           "tool"),
     "calendar":  ("Calendars",           "tool"),
     "contacts":  ("Contacts",            "tool"),
@@ -248,7 +256,7 @@ main() {
             exit 0
             ;;
         --which)
-            for tool in notes mail reminders calendar contacts; do
+            for tool in notes mail messages reminders calendar contacts; do
                 printf '%-10s %s\n' "$tool" "$(resolve "$tool" 2>&1 || true)"
             done
             exit 0

@@ -1,6 +1,6 @@
 ---
 name: apple-tools
-description: Read and write the user's local Apple app data — Notes, Mail, Reminders, Calendar, Contacts — through the `apple` CLI. Use whenever the user refers to their own notes, email, reminders, todos, calendar, meetings, schedule, or contacts ("what's on my calendar", "find that email from", "remind me to", "look up their number", "search my notes"). Everything runs locally against real data, so writes need care.
+description: Read and write the user's local Apple app data — Notes, Mail, Messages, Reminders, Calendar, Contacts — through the `apple` CLI. Use whenever the user refers to their own notes, email, texts, iMessages, reminders, todos, calendar, meetings, schedule, or contacts ("what's on my calendar", "find that email from", "what did they text me", "remind me to", "look up their number", "search my notes"). Everything runs locally against real data, so writes need care.
 ---
 
 # apple-tools
@@ -13,12 +13,13 @@ Check availability with `apple --version`. If the command is missing, say so
 rather than falling back to AppleScript or `osascript` by hand; the point of
 these tools is that the edge cases are already handled.
 
-## The five tools
+## The six tools
 
 | Tool | Reads | Writes |
 |------|-------|--------|
 | `apple notes` | titles, folders, note bodies as Markdown | no |
 | `apple mail` | accounts, message search, message bodies | **drafts** (send is guarded) |
+| `apple messages` | conversations, message search, attachments | no |
 | `apple reminders` | lists, items, due dates | **yes** |
 | `apple calendar` | calendars, events | **yes** |
 | `apple contacts` | names, emails, phones, addresses, notes | **yes** (except notes) |
@@ -43,7 +44,7 @@ these tools is that the edge cases are already handled.
 Each tool documents itself. Prefer this over guessing flags:
 
 ```bash
-apple --help              # the five tools
+apple --help              # the six tools
 apple calendar --help     # subcommands
 apple calendar add --help # every flag, with defaults
 ```
@@ -66,6 +67,14 @@ apple mail attachments <message-id> --save ~/Downloads   # get the files
 apple mail draft --to a@b.com --subject "Q3" --body "..." --json   # → message_id
 apple mail draft --to a@b.com --subject "Q3" --body "..." --replace <message-id>
 apple mail delete-draft <message-id>
+
+# Messages — reads chat.db; works with Messages.app closed. Read-only.
+apple messages chats --json                      # conversations, recent first
+apple messages chats "boulder" --json            # find one by name or handle
+apple messages search "dinner" --since 30 --json # whole history, ~0.1s
+apple messages search "bikes" --chat 8 --json    # within one conversation
+apple messages export 8 --limit 50               # transcript, oldest first
+apple messages attachments 8 --save ~/Downloads
 
 # Reminders
 apple reminders show-lists --json
@@ -107,6 +116,24 @@ around it.
 describing what an email *said*, or `--field all` for subject, sender and body
 together. Both are cheap enough to reach for — see below. Trash and junk are
 excluded unless you pass `--all`.
+
+**Messages is read-only and searches the whole history.** `apple messages
+search` uses the same AND-of-substrings rule as mail, so the advice above
+applies: two or three distinctive words, not a sentence.
+
+Refer to a conversation by the numeric `id` from `apple messages chats`, not by
+its title — **most group chats are unnamed**, so the title is a fallback list of
+participants and is not stable. An ambiguous reference errors and lists the
+candidates rather than guessing.
+
+**Handles are phone numbers and emails, never names.** Messages has no contact
+lookup. If the user asks "what did Sarah text me", find her number with `apple
+contacts search "Sarah" --json` first, then pass it as `--handle`.
+
+Not every row is a text: check the `kind` field, which is `message`, `tapback`,
+`systemEvent`, or `appMessage`. Group joins and renames are excluded unless you
+pass `--include-events`. A message with no `text` but a populated `attachments`
+list is a photo or video, not an empty message.
 
 **A mail query is an AND of terms.** `budget review` finds messages containing
 both words anywhere, in any order. Double-quote to require adjacency:
@@ -220,7 +247,7 @@ macOS only shows a permission prompt the first time; after that a request
 returns silently. So an access error is never something to retry — it needs the
 user to change a setting.
 
-**Run `apple status --json` first.** It reports all five tools at once, never
+**Run `apple status --json` first.** It reports all six tools at once, never
 prompts, and exits non-zero if anything is unusable. Each entry carries the
 System Settings `pane` to send the user to, and `granted_to`: `tool` means the
 grant works from any terminal, `terminal` means it may not.
@@ -229,9 +256,9 @@ grant works from any terminal, `terminal` means it may not.
   Watch for `writeOnly` ("Add Only"): it looks granted but cannot read events,
   and macOS will never offer to upgrade it.
 - `apple contacts status` does the same for Contacts.
-- Notes reads SQLite directly, so it needs Full Disk Access for the calling
-  terminal. Contacts needs its own grant, plus Full Disk Access if you want
-  contact notes.
+- Notes and Messages read SQLite directly, so both need Full Disk Access for
+  the calling terminal. Contacts needs its own grant, plus Full Disk Access if
+  you want contact notes.
 - Mail needs Automation access and Mail.app running.
 - `apple contacts groups remove` needs no extra permission. The Contacts
   framework's remove-member call silently does nothing for an iCloud group (it
