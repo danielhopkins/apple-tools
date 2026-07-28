@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-APPLE_TOOLS_VERSION="26.727.15"
+APPLE_TOOLS_VERSION="26.728.0"
 
 # Resolve the repo root even when invoked through a symlink in ~/bin.
 SOURCE="${BASH_SOURCE[0]}"
@@ -44,7 +44,7 @@ ${H}USAGE:${R} ${C}apple${R} <tool> [args...]
 
 ${H}TOOLS:${R}
     ${G}notes${R}       Search, export, and link Apple Notes       (reads NoteStore.sqlite)
-    ${G}mail${R}        Search, export, and draft Apple Mail       (AppleScript)
+    ${G}mail${R}        Search, export, and draft Apple Mail       (reads Mail's own store)
     ${G}reminders${R}   Full CRUD on Reminders                     (EventKit)
     ${G}calendar${R}    Read and write Calendar events             (EventKit)
     ${G}contacts${R}    Read and write Contacts, relations, groups (Contacts framework)
@@ -61,7 +61,8 @@ ${H}EXAMPLES:${R}
     apple notes search "budget" --json            # title search
     apple notes export 261                        # note as Markdown
     apple mail accounts --json                    # addresses for --from
-    apple mail search "invoice" --since 30 --json # always bound a mail search
+    apple mail search "invoice" --json            # whole store, milliseconds
+    apple mail search "budget" --field content    # full-text over bodies
     apple mail draft --to a@b.com --subject "Hi" --body "text"
     apple reminders show-all --due-date today --include-overdue --json
     apple reminders add Inbox "Buy milk" --due-date "tomorrow 9am"
@@ -85,12 +86,25 @@ binary_name() {
 }
 
 # Find a tool, in order of preference:
+#   0. $APPLE_TOOLS_BIN       — an explicit override dir (`make dev` sets this)
 #   1. alongside this script  — an installed layout (Homebrew, `make install`)
 #   2. the source checkout    — running straight out of the repo
 #   3. $PATH                  — installed some other way
+#
+# The override exists because the installed copy and the checkout can disagree,
+# and following a symlink back to bin/apple lands BIN_DIR in the repo either
+# way — so "alongside this script" cannot express "use the dev build". It also
+# has to name every tool, not just the ones being worked on: a dev dir that
+# resolves four tools and lets the fifth fall through to a stale build is worse
+# than one that is wrong consistently.
 resolve() {
     local tool="$1" name
     name="$(binary_name "$tool")" || return 1
+
+    if [ -n "${APPLE_TOOLS_BIN:-}" ] && [ -x "$APPLE_TOOLS_BIN/$name" ]; then
+        echo "$APPLE_TOOLS_BIN/$name"
+        return 0
+    fi
 
     if [ -x "$BIN_DIR/$name" ]; then
         echo "$BIN_DIR/$name"
@@ -150,7 +164,10 @@ want_json = sys.argv[1] == "1"
 # is useful: three of these are per-tool, two are per-terminal.
 META = {
     "notes":     ("Full Disk Access",    "terminal"),
-    "mail":      ("Automation → Mail", "terminal"),
+    # Two grants, two halves: Full Disk Access reads the mail store, Automation
+    # drafts and sends. `usable` is true when either works, so the detail line
+    # below is what says which half is missing.
+    "mail":      ("Full Disk Access + Automation", "terminal"),
     "reminders": ("Reminders",           "tool"),
     "calendar":  ("Calendars",           "tool"),
     "contacts":  ("Contacts",            "tool"),
@@ -187,12 +204,12 @@ colour = (sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 def paint(text, code):
     return "\033[%sm%s\033[0m" % (code, text) if colour else text
 
-print(paint("%-10s %-22s %s" % ("TOOL", "PERMISSION", "OK"), "1;34"))
+print(paint("%-10s %-30s %s" % ("TOOL", "PERMISSION", "OK"), "1;34"))
 problems = []
 for name, info in records:
     pane = META.get(name, ("", ""))[0]
     ok = info.get("usable") is True
-    print("%-10s %-22s %s" % (
+    print("%-10s %-30s %s" % (
         paint(name, "1;35"), pane,
         paint("✓", "32") if ok else paint("✗", "31")))
     if not ok:

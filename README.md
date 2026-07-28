@@ -111,7 +111,8 @@ One dispatcher fronts all five tools:
 
 ```
 apple notes search "budget" --json
-apple mail search "invoice" --field all --since 30 --json
+apple mail search "invoice" --json
+apple mail search "budget" --field content --json      # full-text over bodies
 apple reminders show-all --due-date today --include-overdue
 apple calendar add "Dentist" --start "tomorrow 2pm" --duration 45
 apple contacts search "smith"
@@ -150,7 +151,7 @@ isn't guaranteed; JSON is.
 | Tool | Backed by | Capability |
 |------|-----------|------------|
 | `notes` | `NoteStore.sqlite` + protobuf | Search titles, list folders, export notes as Markdown, deep links. Read-only. |
-| `mail` | AppleScript / Mail.app | Search by subject, sender, or content with date and flag filters; export a message. Read-only. |
+| `mail` | `Envelope Index` + `.emlx` (reads), AppleScript (writes) | Search by subject, sender, or full body text with date and flag filters; export a message; draft and send. |
 | `reminders` | EventKit | Full CRUD: add, edit, complete, delete, lists, priorities, recurrence, natural-language dates. |
 | `calendar` | EventKit | List and search events, create, edit, delete; recurring-event spans. |
 | `contacts` | Contacts framework | Search by name, company, email, or phone; create, edit, delete. Notes are read-only. |
@@ -158,6 +159,14 @@ isn't guaranteed; JSON is.
 The Notes reader decodes Apple's gzipped-protobuf note bodies directly rather
 than going through AppleScript, so it preserves highlights, headings, lists, and
 checklists that the scripting interface flattens.
+
+Mail reads work the same way — straight off Mail's own SQLite index and the
+`.emlx` files on disk. On a 41,000-message store the same subject search takes
+**0.04s** that way and **154s** through AppleScript, and it works with Mail.app
+closed. It also makes `--field content` a real full-text search over decoded
+message bodies (~9s worst case across the whole store), which the AppleScript
+path could not finish at all. See
+[`docs/apple-mail-store.md`](docs/apple-mail-store.md).
 [`docs/apple-notes-api.md`](docs/apple-notes-api.md) documents the schema and the
 verified behaviors and bugs behind that, including a data-loss bug where editing
 a note's body destroys its attachments.
@@ -198,10 +207,11 @@ plist into `__TEXT,__info_plist` at link time — and `make build` re-signs
 afterwards, because macOS ignores a plist that isn't covered by the signature.
 `make dist` verifies the binding and fails the build if it is missing.
 
-`apple-mail` is the exception: it drives Mail.app over AppleScript, so it needs
-Automation access, which is still attributed to the calling terminal.
-`apple-notes` reads the SQLite store directly and needs Full Disk Access for
-the terminal.
+`apple-mail` and `apple-notes` are the exceptions, and both are attributed to
+the calling terminal rather than the binary. `apple-notes` needs Full Disk
+Access. `apple-mail` needs Full Disk Access to read (search, export, accounts)
+and Automation → Mail to write (draft, send) — two grants for two halves, and
+`apple mail status` reports them separately.
 
 ## Layout
 
@@ -212,7 +222,7 @@ notes/           Python: apple-notes, notestore.py decoder, live Notes.app tests
 skills/          Claude skills (apple-tools, daily-brief, meeting-prep, inbox-triage)
 completions/     zsh completions
 tests/           live write-path suites: calendar, mail drafts, contacts (gated)
-docs/            Notes API reference, behavior notes, and prior art
+docs/            Notes API and Mail store references, behavior notes, prior art
 Formula/         Homebrew formula, mirrored into the tap on release
 VERSION          single source of truth, stamped into every tool
 CLAUDE.md        the same surface, written for an agent

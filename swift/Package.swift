@@ -44,11 +44,20 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
+        .target(
+            name: "MailLibrary",
+            linkerSettings: [
+                // Mail's Envelope Index is a SQLite database; reading it directly
+                // is what lets search skip AppleScript entirely.
+                .linkedLibrary("sqlite3"),
+            ]
+        ),
         .executableTarget(
             name: "apple-mail",
             dependencies: [
                 "AppleToolsVersion",
                 "AppleToolsStyle",
+                "MailLibrary",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "Sources/AppleMail"
@@ -103,6 +112,10 @@ let package = Package(
         .testTarget(
             name: "RemindersTests",
             dependencies: ["RemindersLibrary"]
+        ),
+        .testTarget(
+            name: "MailTests",
+            dependencies: ["MailLibrary"]
         ),
     ]
 )

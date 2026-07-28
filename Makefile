@@ -13,8 +13,19 @@ VERSION     := $(shell tr -d '[:space:]' < VERSION)
 DIST        := apple-tools-$(VERSION)
 TARBALL     := $(DIST).tar.gz
 
+# `make dev` shades these tools with the local debug build; every other tool is
+# symlinked to whatever is already installed, so its TCC grant is untouched.
+# reminders/calendar/contacts are deliberately not in this list: they disclaim,
+# so their grant is bound to the binary's path and a debug build at a new path
+# re-prompts. mail and notes are attributed to the calling terminal, so shading
+# them costs nothing. Override to work on one of the others:
+#   make dev DEV_TOOLS="apple-contacts"
+DEV_TOOLS ?= apple-mail apple-notes
+DEVBIN    := $(ROOT)/.dev-bin
+
 .PHONY: build debug install uninstall test clean check set-version bump dist tag \
-        completions install-completions install-skills uninstall-skills
+        completions install-completions install-skills uninstall-skills \
+        dev dev-off dev-path
 
 ## Build the Swift binaries in release mode
 ##
@@ -99,6 +110,53 @@ install: build
 uninstall:
 	rm -f $(PREFIX)/apple $(PREFIX)/apple-notes $(PREFIX)/apple-contacts \
 	      $(PREFIX)/apple-mail $(PREFIX)/apple-calendar $(PREFIX)/reminders
+
+## Build debug and shade the installed tools with it, for fast iteration.
+##
+## ~/bin is *after* /opt/homebrew/bin on a normal PATH, so `make install`
+## cannot override a brew install — hence a separate dir you put first.
+## Re-run after every edit; the debug build is a couple of seconds.
+dev: debug
+	@mkdir -p $(DEVBIN)
+	@# The dispatcher is a wrapper rather than a symlink: bin/apple resolves
+	@# its own directory by following symlinks back to the checkout, so a
+	@# symlinked dispatcher would look for tools in bin/ and never see this
+	@# dir. APPLE_TOOLS_BIN is the documented way to say "look here first".
+	@printf '#!/usr/bin/env bash\nexport APPLE_TOOLS_BIN="%s"\nexec "%s/bin/apple" "$$@"\n' \
+		"$(DEVBIN)" "$(ROOT)" > $(DEVBIN)/apple
+	@chmod +x $(DEVBIN)/apple
+	@for name in $(DEV_TOOLS); do \
+		case "$$name" in \
+			apple-notes) src="$(ROOT)/notes/apple-notes" ;; \
+			*)           src="$(ROOT)/$(SWIFT_DIR)/.build/debug/$$name" ;; \
+		esac; \
+		if [ ! -x "$$src" ]; then echo "error: no such tool '$$name'"; exit 1; fi; \
+		ln -sf "$$src" "$(DEVBIN)/$$name"; \
+		echo "  dev    $$name"; \
+	done
+	@# Everything not being worked on points at the installed copy, so
+	@# `apple status` stays truthful and no grant gets re-prompted.
+	@for name in apple-notes apple-mail apple-calendar apple-contacts reminders; do \
+		case " $(DEV_TOOLS) " in *" $$name "*) continue ;; esac; \
+		if installed="$$(command -v $$name 2>/dev/null)"; then \
+			ln -sf "$$installed" "$(DEVBIN)/$$name"; \
+			echo "  system $$name  ($$installed)"; \
+		else \
+			rm -f "$(DEVBIN)/$$name"; \
+			echo "  MISSING $$name  (not installed; 'apple $$name' will fail)"; \
+		fi; \
+	done
+	@echo
+	@echo "Put this first on PATH (once per shell, or in ~/.zshrc):"
+	@echo "  export PATH=\"$(DEVBIN):\$$PATH\""
+
+## Print just the export line, for `eval "$(make -s dev-path)"`
+dev-path:
+	@echo 'export PATH="$(DEVBIN):$$PATH"'
+
+dev-off:
+	rm -rf $(DEVBIN)
+	@echo "Removed $(DEVBIN). Open a new shell, or strip it from PATH."
 
 ## Swift unit tests. The Notes suite drives live Notes.app; run notes/run-tests by hand.
 test:

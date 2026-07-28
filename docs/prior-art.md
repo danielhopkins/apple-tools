@@ -49,7 +49,38 @@ repo.
 The `helper/` bundle is worth reading if we ever revisit TCC: an app bundle is
 the other way to get a stable TCC identity, versus the disclaim trick we use.
 
-*Not verified:* anything about its behaviour. Assessed from repo structure only.
+*Verified by reading `swift/Sources/MailCLI/` — and we took the idea:*
+
+- **Its mail reads do not use AppleScript.** `EnvelopeIndex.swift` opens
+  `~/Library/Mail/V*/MailData/Envelope Index` read-only and joins
+  `messages`/`message_global_data`/`subjects`/`addresses`/`mailboxes`;
+  `EmlxReader.swift` parses bodies off disk. A `--engine auto|sqlite|jxa` flag
+  runs SQLite first and falls back to JXA on any throw. This is a better idea
+  than anything we had for mail and **we now do the same** — see
+  [`apple-mail-store.md`](apple-mail-store.md). Their `emlxSubpath` digit
+  scheme is correct; we re-derived it against a real store and it matches.
+- **No `responsibility_spawnattrs_setdisclaim`** anywhere in the repo, so its
+  Full Disk Access is terminal-attributed, same as ours.
+
+Where we went further, having hit these on real data:
+
+- **Content search.** They punt `--field content` back to JXA because the index
+  has no bodies (`SQLiteEngine.swift:154`). We scan the `.emlx` files instead,
+  concurrently and newest-first with early exit — full-text over a 41k store in
+  ~9s worst case. This was the biggest win available and they left it.
+- **WAL staleness.** Opening the index with `immutable=1` silently hides
+  everything in the write-ahead log, which on this machine was 2.2 MB of the
+  most recent mail. We open `mode=ro` so SQLite replays it, treat `immutable=1`
+  as a fallback, and report the result as stale when we use it.
+- **Account names.** They read `ZACCOUNTDESCRIPTION` from the child account row
+  in `Accounts4.sqlite`; on this machine that is empty for every IMAP account
+  and the real name lives on `ZPARENTACCOUNT`. Without the join you get UUIDs
+  where the user expects names.
+- **Trash/junk spellings.** Theirs lists junk names only; trash is
+  `Deleted Messages` / `Deleted Items` / `[Gmail]/Trash` depending on account
+  type, and missing one leaks deleted mail into results.
+
+*Still not verified:* its calendar, reminders and contacts behaviour.
 
 ### claude-apple-bridges — closest to us in intent
 
@@ -120,6 +151,13 @@ load-bearing here:
 - **Append-vs-replace for multi-value fields** — see claude-apple-bridges above.
 - **App-bundle TCC identity** — `apple-pim`'s `helper/` as an alternative to
   disclaiming.
+- ~~**Read mail from the store rather than AppleScript**~~ — done, taken from
+  `apple-pim`. This is the file's one clear payoff so far: reading a peer's
+  source turned a 154s search into a 0.04s one.
+- **A body index.** Content search re-reads and re-decodes 3.4 GB every time.
+  Mail's own `Protected Index Journals` may already hold something usable; if
+  not, a local SQLite FTS table over decoded bodies would make it instant, at
+  the cost of staleness and a cache to invalidate.
 
 ## Refreshing this
 

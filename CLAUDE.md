@@ -14,7 +14,8 @@ installed via `make install`.
 | Search notes | `apple notes search "budget" --json` |
 | Read a note | `apple notes export 261` |
 | List note folders | `apple notes folders --json` |
-| Search mail | `apple mail search "invoice" --field all --since 30 --json` |
+| Search mail | `apple mail search "invoice" --json` |
+| Full-text mail search | `apple mail search "budget" --field content --json` |
 | Read an email | `apple mail export <message-id>` |
 | List mail accounts | `apple mail accounts --json` |
 | Today's reminders | `apple reminders show-all --due-date today --include-overdue --json` |
@@ -101,15 +102,18 @@ so no virtualenv is involved.
 
 ### mail — `apple mail`
 
-AppleScript against Mail.app. Mail must be running; large mailboxes are slow, so
-always pass `--limit` and prefer `--since`.
+**Reads go to the files, writes go through AppleScript.** `search`, `export` and
+`accounts` read Mail's own SQLite index and the `.emlx` files on disk, so they
+work with Mail.app closed and return in milliseconds. `draft` and `send` still
+drive Mail.app.
 
 ```
 apple mail accounts [--json]      # names, addresses, mailboxes, enabled
 apple mail search QUERY [--account NAME] [--mailbox NAME] [--field subject|sender|content|all]
                         [--since DAYS] [--before DAYS] [--limit N]
-                        [--flagged] [--unread] [--has-attachment] [--all] [--json]
-apple mail export MESSAGE-ID [--account NAME]
+                        [--flagged] [--unread] [--has-attachment] [--attachment-names]
+                        [--all] [--json]
+apple mail export MESSAGE-ID [--account NAME] [--json] [--raw]
 
 apple mail draft --to ADDR [--to ...] [--cc ADDR] [--bcc ADDR]
                  --subject TEXT [--body TEXT | --body-file FILE|-]
@@ -117,10 +121,83 @@ apple mail draft --to ADDR [--to ...] [--cc ADDR] [--bcc ADDR]
 apple mail send  <same flags> --confirm
 ```
 
+All three read commands take `--engine auto|filesystem|applescript`. Leave it
+alone; `auto` uses the files and falls back to AppleScript when it can't (no
+Full Disk Access, or a message whose body Mail hasn't downloaded yet).
+`--engine filesystem` fails loudly instead of falling back, which is what you
+want when diagnosing.
+
+Measured on a 41k-message store, same binary, same query, Mail running:
+`--engine filesystem` 0.04s, `--engine applescript` 154s.
+
+**Searching is now cheap — search widely.** No `--limit`/`--since` discipline is
+required, and there is no timeout to trip. The default covers every mailbox
+except trash and junk (`--all` adds those), not the handful the AppleScript path
+managed.
+
+**`--field content` is real full-text search** over decoded message bodies, and
+is the one mode that opens files. It finds text inside base64 and
+quoted-printable parts that a raw `grep` over `~/Library/Mail` cannot see.
+`--field all` means subject, sender *and* body.
+
+It walks newest-first and stops as soon as `--limit` is filled, so a normal
+search reads a small fraction of the store — but a term with **fewer matches
+than `--limit`** has to read everything, because there is no way to know the
+next match does not exist without looking. On a 40k-message store:
+
+| Search | Bodies read | Time |
+|---|---|---|
+| any `--field subject` / `sender` | **0** | 0.04s |
+| `--field content invoice --limit 20` | 768 | 0.2s |
+| `--field content <no matches>` | 39,976 | 9.8s |
+| ...`--since 90` | 1,521 | 0.39s |
+| ...`--mailbox inbox` | 15 | 0.03s |
+
+`--since`, `--mailbox`, `--account`, `--unread`, `--flagged` and
+`--has-attachment` all narrow the candidate set **in SQL, before any file is
+opened**, so they are the lever for a body search that is taking too long. The
+scan depth is always reported on stderr (`note: scanned N message bodies of M
+candidates`) — a full scan is never silent.
+
+**A query is an AND of terms.** `budget review` matches messages containing
+both words anywhere, in any order — not the literal string. Double-quote to
+require adjacency: `"budget review"` is one phrase. On a real store the
+difference is `budget review` → 346 results, `"budget review"` → 0. Terms may
+land in different fields under `--field all`: one in the subject, another in the
+body.
+
+⚠️ **Matching is substring, not word-boundary.** `quarter` matches inside
+`quarterly` and `headquarters`; there is no stemming, no relevance ranking (the
+order is by date), and no boolean operators beyond the implicit AND.
+
+**Attachments are not searched at all by default** — not their contents, and
+not their filenames. A search for "invoice" should find messages *about*
+invoices, not every message that happens to carry an `invoice.pdf`. Pass
+`--attachment-names` to also match filenames; it comes from the index, so it
+costs nothing. Attachment **contents are never searched**, with or without the
+flag: a `text/*` part marked `Content-Disposition: attachment` is skipped, and
+non-text parts (PDF, images) are never decoded. There is no PDF text
+extraction.
+
+`export --raw` writes the RFC 822 source; `export --json` gives structured
+headers, recipients, attachment names and body. Both need the file-system
+engine.
+
+See [`docs/apple-mail-store.md`](docs/apple-mail-store.md) for the schema, the
+`.emlx` layout, and the traps in reading them.
+
 **Picking the account.** `accounts` reports each account's `addresses` as well
 as its name — those addresses are exactly what `--from` accepts. `--from` also
 takes an account *name*, which matters here because the names are emoji and are
 not themselves valid senders. Run `accounts --json` rather than guessing.
+
+⚠️ **`accounts` is the one read command that still prefers Mail.app**, because
+only Mail knows whether an account is `enabled`, and its account names are what
+`--from` matches. It asks Mail when Mail is already running and reads the store
+when it is not — rather than launching Mail just to list accounts, which is
+what it used to do. Consequence: **the file-system answer has no `enabled`
+key**, so read it as `account.get("enabled", True)`. It also lists the local
+"On My Mac" store, which the AppleScript path omits.
 
 **Drafting.** `draft` writes to the Drafts mailbox of whichever account matches
 `--from` (your default account otherwise) and never sends. `--body-file -`
@@ -161,17 +238,25 @@ macOS 27 and pinned by `tests/test_mail_draft.py`:
 - **Text comes back NFD.** Mail decomposes unicode, so `ü` sent as one
   codepoint returns as `u` + combining diaeresis. Normalise before comparing.
 
-`--field` defaults to `subject`; use `--field all` when the user describes
-content rather than a subject line. `--all` widens the search to trash and junk,
-which are excluded by default. Account names can contain emoji and spaces — get
-exact strings from `apple mail accounts` rather than guessing.
+`--field` defaults to `subject`; use `--field all` or `--field content` when the
+user describes content rather than a subject line. `--all` widens the search to
+trash and junk, which are excluded by default — except when `--mailbox trash`
+asks for them by name, which is honoured. Account names can contain emoji and
+spaces — get exact strings from `apple mail accounts` rather than guessing.
 
-⚠️ **An empty result may be a timeout.** AppleScript's event timeout is ~120s;
-when it trips, `search` prints `[]` and exits 0, which is indistinguishable from
-"no matches". A search that takes about two minutes and returns nothing has
-failed — don't report it as an empty inbox. Keep searches cheap (`--mailbox
-inbox`, tight `--since`, small `--limit`); an empty query combined with
-`--field all` greps every message body in every mailbox and will not finish.
+⚠️ **The timeout trap applies only to `--engine applescript`.** AppleScript's
+event timeout is ~120s; when it trips, `search` prints `[]` and exits 0, which
+is indistinguishable from "no matches". If you ever see a search take about two
+minutes and return nothing, it failed — don't report it as an empty inbox. The
+file-system engine has no such mode: it either answers or errors. If `auto`
+fell back it says so on stderr, so read stderr before believing an empty result.
+
+⚠️ **Mailbox names are not unique** — three accounts can each have an `Archive`.
+Every result carries both `account` and `mailbox`; use the pair.
+
+⚠️ **A message can be in the index but not on disk** when Mail hasn't downloaded
+the body. `export` says so explicitly rather than reporting the message missing,
+and `auto` falls back to AppleScript, which can still fetch it.
 
 ### reminders — `apple reminders`
 
@@ -376,13 +461,14 @@ has no reverse lookup and it would mean scanning every group per contact.
 bin/apple                 dispatcher — routes to the tools below
 swift/                    one Swift package, four binaries
   Sources/reminders/      + RemindersLibrary/
-  Sources/AppleMail/
+  Sources/AppleMail/      + MailLibrary/ (Envelope Index reader, .emlx/MIME)
   Sources/AppleCalendar/
   Sources/AppleContacts/  + Notes.swift (SQLite note reader)
-  Tests/RemindersTests/
+  Tests/RemindersTests/ MailTests/
 notes/                    Python; apple-notes, notestore.py, notestore.proto,
                           tests/ (live Notes.app suite)
 docs/apple-notes-api.md   NoteStore schema, AppleScript API, verified bugs
+docs/apple-mail-store.md  Envelope Index schema, .emlx layout, verified traps
 docs/prior-art.md         other projects solving this; check before building
 Formula/apple-tools.rb    Homebrew formula
 VERSION                   CalVer YY.MMDD.Patch, stamped in by scripts/set-version
@@ -393,13 +479,29 @@ VERSION                   CalVer YY.MMDD.Patch, stamped in by scripts/set-versio
 ## Building
 
 ```
-make build      # swift build -c release → all three binaries
+make build      # swift build -c release → all four binaries
 make install    # symlink dispatcher + tools into ~/bin
+make dev        # debug build, shaded ahead of the installed copy — see below
 make check      # smoke-test that every tool responds
 make test       # Swift unit tests
 make bump       # next CalVer for today, stamped into every tool
 make dist       # universal release tarball + sha256 for the Homebrew tap
 ```
+
+**Iterating on a tool.** `~/bin` is normally *after* `/opt/homebrew/bin` on
+PATH, so `make install` cannot override a Homebrew install. `make dev` builds
+debug (~2s) into `.dev-bin/` and prints the line to put that dir first:
+
+```
+make dev && eval "$(make -s dev-path)"
+```
+
+It shades `apple-mail` and `apple-notes` only, and symlinks the other three to
+the installed copies. That is deliberate: reminders/calendar/contacts disclaim,
+so their TCC grant is bound to the binary's path and a debug build at a new path
+re-prompts for permission. mail and notes are attributed to the terminal, so
+shading them is free. To work on one of the others, `make dev
+DEV_TOOLS="apple-contacts"` and accept the re-prompt. `make dev-off` removes it.
 
 Every tool reports `--version`, and they all report the same one. If they
 disagree, someone edited a version string by hand instead of running
@@ -434,9 +536,16 @@ Each tool needs a one-time TCC grant, prompted on first run **from a terminal**:
 |------|-------|
 | reminders | Privacy & Security → Reminders |
 | calendar | Privacy & Security → Calendars |
-| mail | Privacy & Security → Automation → Mail |
+| mail | Full Disk Access to read; Automation → Mail to draft/send |
 | contacts | Privacy & Security → Contacts |
 | notes | Full Disk Access for the calling terminal (reads sqlite directly) |
+
+`mail` needs **two different grants for two different halves**. Full Disk Access
+lets it read the index and message files — that covers `search`, `export` and
+`accounts`. Automation → Mail is only for `draft` and `send`. `apple mail
+status` reports both and counts the tool usable if either is present, so "mail
+✓" can mean reads work and sending does not. Check the detail line before
+concluding which half is broken.
 
 `apple status` reports all five at once without prompting — start there rather
 than running each tool to see which one errors.
@@ -462,7 +571,8 @@ binary rather than to the terminal that launched it. Practical consequences:
 
 `mail` and `notes` are *not* covered by this: Automation and Full Disk Access
 are still attributed to the calling terminal, so those two really do depend on
-which terminal is running.
+which terminal is running. This now covers mail's read path too — reading the
+Envelope Index needs Full Disk Access for whatever terminal launched the tool.
 
 ⚠️ **macOS only prompts when the status is `notDetermined`.** Once it is anything
 else the request returns silently and no dialog ever appears. The trap is

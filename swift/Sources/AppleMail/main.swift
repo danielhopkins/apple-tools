@@ -1,8 +1,102 @@
+import AppKit  // NSWorkspace, to see whether Mail is running before talking to it
 import AppleToolsStyle
 import AppleToolsVersion
 import ArgumentParser
 import CoreServices  // AEDeterminePermissionToAutomateTarget, for `status`
 import Foundation
+import MailLibrary
+
+/// Which implementation a read command uses.
+///
+/// `filesystem` reads Mail's own SQLite index and the .emlx files on disk; it
+/// needs Full Disk Access, works with Mail closed, and answers a whole-store
+/// search in milliseconds. `applescript` drives Mail.app; it needs Automation
+/// → Mail and Mail running, and hits a ~120s event timeout that returns an
+/// empty list rather than an error. `auto` prefers the first and falls back to
+/// the second, which matters for messages the index knows about but whose body
+/// has not been downloaded.
+enum MailEngine: String, ExpressibleByArgument, CaseIterable {
+  case auto
+  case filesystem
+  case applescript
+}
+
+func warn(_ message: String) {
+  FileHandle.standardError.write("\(message)\n".data(using: .utf8)!)
+}
+
+/// Whether Mail.app is up. Checked before any `tell application "Mail"`, which
+/// would otherwise launch it as a side effect of a read-only command.
+func isMailRunning() -> Bool {
+  NSWorkspace.shared.runningApplications.contains { $0.bundleIdentifier == "com.apple.mail" }
+}
+
+/// Common rendering for both engines, so the two paths cannot drift apart in
+/// what they print.
+enum MailOutput {
+  static let compactDate: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd HH:mm"
+    return formatter
+  }()
+
+  static let isoDate: ISO8601DateFormatter = {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime]
+    return formatter
+  }()
+
+  static func table(_ messages: [MessageSummary]) {
+    if messages.isEmpty {
+      print("No messages found.")
+      return
+    }
+    for (offset, message) in messages.enumerated() {
+      let subject = message.subject.isEmpty ? "(no subject)" : message.subject
+      let location = [message.account, message.mailbox]
+        .filter { !$0.isEmpty }.joined(separator: "/")
+
+      print("\(Style.dim("\(offset + 1)."))  \(Style.title(subject))")
+      var meta = "    \(message.from)"
+      if let date = message.date {
+        meta += Style.dim("  ·  ") + Style.time(compactDate.string(from: date))
+      }
+      if !location.isEmpty { meta += "  " + Style.dim("[\(location)]") }
+      var badges: [String] = []
+      if message.unread { badges.append("unread") }
+      if message.flagged { badges.append("flagged") }
+      if message.attachmentCount > 0 { badges.append("\(message.attachmentCount) attached") }
+      if !badges.isEmpty { meta += "  " + Style.dim("(" + badges.joined(separator: ", ") + ")") }
+      print(meta)
+      if !message.id.isEmpty { print("    " + Style.identifier(message.id)) }
+      print()
+    }
+    print(Style.dim("\(messages.count) \(messages.count == 1 ? "result" : "results")"))
+  }
+
+  static func json(_ messages: [MessageSummary]) {
+    let payload = messages.map { message -> [String: Any] in
+      var row: [String: Any] = [
+        "id": message.id,
+        "subject": message.subject,
+        "from": message.from,
+        "account": message.account,
+        "mailbox": message.mailbox,
+        "unread": message.unread,
+        "flagged": message.flagged,
+        "attachments": message.attachmentCount,
+      ]
+      if let date = message.date {
+        row["date"] = compactDate.string(from: date)
+        row["date_iso"] = isoDate.string(from: date)
+      }
+      return row
+    }
+    let data = try! JSONSerialization.data(
+      withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+    print(String(data: data, encoding: .utf8)!)
+  }
+}
 
 @main
 struct AppleMail: AsyncParsableCommand {
@@ -62,7 +156,7 @@ struct Status: AsyncParsableCommand {
       AEDisposeDesc(&target)
     }
 
-    let (name, usable, advice): (String, Bool, String?) = {
+    let (automation, automationOK, automationAdvice): (String, Bool, String?) = {
       switch code {
       case noErr:
         return ("authorized", true, nil)
@@ -80,14 +174,66 @@ struct Status: AsyncParsableCommand {
       }
     }()
 
+    // Reads no longer need Automation at all: the file-system engine covers
+    // search, export and accounts, and only draft/send still drive Mail. So
+    // the tool is usable when *either* grant is in place, and reporting only
+    // the Automation state would call a working install broken.
+    var indexPath: String?
+    var indexCount: Int?
+    var indexStale = false
+    var indexError: String?
+    do {
+      let store = try MailStore()
+      indexPath = store.databasePath.path
+      indexCount = try? store.index.messageCount()
+      indexStale = store.isStale
+    } catch {
+      indexError = error.localizedDescription
+    }
+    let fileSystemOK = indexPath != nil
+
+    let usable = fileSystemOK || automationOK
+    let advice: String? = {
+      if fileSystemOK && automationOK { return nil }
+      if fileSystemOK {
+        return "Reads work. Drafting and sending need Automation → Mail: \(automationAdvice ?? "")"
+          .trimmingCharacters(in: .whitespaces)
+      }
+      if automationOK {
+        return "Drafting works, but reads fall back to slow AppleScript. Grant Full Disk "
+          + "Access to this terminal to read Mail's index directly."
+      }
+      return
+        "No access. Grant Full Disk Access for reads, and Automation → Mail for drafting. "
+        + (automationAdvice ?? "")
+    }()
+
     if json {
-      var payload: [String: Any] = ["status": name, "usable": usable]
+      var fileSystem: [String: Any] = ["readable": fileSystemOK, "stale": indexStale]
+      if let indexPath { fileSystem["path"] = indexPath }
+      if let indexCount { fileSystem["messages"] = indexCount }
+      if let indexError { fileSystem["error"] = indexError }
+
+      var payload: [String: Any] = [
+        "status": fileSystemOK ? (automationOK ? "authorized" : "readOnly") : automation,
+        "usable": usable,
+        "automation": automation,
+        "filesystem": fileSystem,
+      ]
       if let advice { payload["advice"] = advice }
       let data = try? JSONSerialization.data(
         withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
       print(data.flatMap { String(data: $0, encoding: .utf8) } ?? "{}")
     } else {
-      print("Mail automation: \(name)\(usable ? "" : "  (cannot drive Mail)")")
+      print("Mail automation (draft/send): \(automation)")
+      if let indexPath {
+        let count = indexCount.map { " — \($0) messages" } ?? ""
+        print("Mail index (search/export):  readable\(count)")
+        print("  \(indexPath)")
+        if indexStale { print("  warning: reading a stale snapshot; the write-ahead log was skipped.") }
+      } else {
+        print("Mail index (search/export):  unreadable — \(indexError ?? "unknown")")
+      }
       if let advice { print(advice) }
     }
   }
@@ -95,13 +241,73 @@ struct Status: AsyncParsableCommand {
 
 struct Accounts: AsyncParsableCommand {
   static let configuration = CommandConfiguration(
-    abstract: "List Mail accounts and mailboxes"
+    abstract: "List Mail accounts and mailboxes",
+    discussion: """
+      Mail.app is authoritative here — only it knows whether an account is
+      enabled, and its account names are what --from matches. So when Mail is
+      already running this asks Mail. When it is not, this reads the on-disk
+      store instead rather than launching Mail just to list accounts; the names
+      come from the system Accounts database and the `enabled` field is omitted
+      because the store does not record it.
+      """
   )
 
   @Flag(name: .long, help: "Output as JSON")
   var json = false
 
+  @Option(name: .long, help: "Read engine: auto, filesystem, applescript")
+  var engine: MailEngine = .auto
+
   func run() async throws {
+    // `tell application "Mail"` launches Mail when it is not running, which
+    // turns `accounts` into a multi-second app launch (and, on a cold Mail, a
+    // hang). Only pay that when Mail is already up.
+    let useFileSystem =
+      engine == .filesystem || (engine == .auto && !isMailRunning())
+    if useFileSystem {
+      do {
+        try runFileSystem()
+        return
+      } catch {
+        if engine == .filesystem { throw error }
+        warn("note: file-system accounts unavailable (\(error.localizedDescription))")
+      }
+    }
+    try runAppleScript_()
+  }
+
+  private func runFileSystem() throws {
+    let store = try MailStore()
+    let accounts = store.accountSummaries()
+
+    if json {
+      let payload = accounts.map { account -> [String: Any] in
+        var row: [String: Any] = [
+          "name": account.name,
+          "addresses": [account.address].compactMap { $0 },
+          "mailboxes": account.mailboxes,
+          "type": account.scheme,
+          "id": account.uuid,
+        ]
+        row["full_name"] = ""
+        return row
+      }
+      let data = try JSONSerialization.data(
+        withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+      print(String(data: data, encoding: .utf8) ?? "[]")
+      return
+    }
+
+    for account in accounts {
+      let address = account.address ?? ""
+      print("\(Style.title(account.name))  \(Style.identifier(address))")
+      if !account.mailboxes.isEmpty {
+        print("  " + Style.dim(account.mailboxes.joined(separator: ", ")))
+      }
+    }
+  }
+
+  private func runAppleScript_() throws {
     // `email addresses of acct` cannot be iterated with `repeat with` — the
     // loop yields nothing. Coercing the whole list to string does work, so the
     // delimiter is set explicitly and the result split on this side.
@@ -189,14 +395,21 @@ struct Search: AsyncParsableCommand {
   static let configuration = CommandConfiguration(
     abstract: "Search mail messages",
     discussion: """
-      Bound every search: Mail hits a ~120s AppleScript timeout and then returns
-      an EMPTY result rather than an error, which looks identical to no matches.
+      Reads Mail's own index and message files directly, so a search covers
+      every mailbox, runs in milliseconds, and works with Mail.app closed. That
+      needs Full Disk Access; without it this falls back to driving Mail over
+      AppleScript, which is slow enough to need --since and --limit and returns
+      an EMPTY list rather than an error when it times out.
+
+      --field content greps message bodies, which the AppleScript path could
+      never finish. It reads files, so it is the one slow mode; narrowing with
+      --since or --mailbox helps, but is no longer required.
 
       Examples:
         apple-mail search "invoice"                          # subject, default
-        apple-mail search "budget" --field all --since 30    # slower: bodies too
-        apple-mail search "" --mailbox inbox --unread --since 7 --limit 20
-        apple-mail search "alice@example.com" --field sender --since 60 --json
+        apple-mail search "budget" --field content           # full-text
+        apple-mail search "" --mailbox inbox --unread --limit 20
+        apple-mail search "alice@example.com" --field sender --json
       """
   )
 
@@ -233,16 +446,97 @@ struct Search: AsyncParsableCommand {
   @Flag(name: .long, help: "Include trash and junk in search")
   var all: Bool = false
 
+  @Flag(
+    name: .long,
+    help: "Also match attachment filenames (contents are never searched)")
+  var attachmentNames: Bool = false
+
   @Flag(name: .long, help: "Output as JSON")
   var json: Bool = false
 
+  @Option(name: .long, help: "Read engine: auto, filesystem, applescript")
+  var engine: MailEngine = .auto
+
   func run() async throws {
-    let results = try searchAppleScript()
-    if json {
-      printJSON(results)
-    } else {
-      printTable(results)
+    if engine != .applescript {
+      do {
+        try runFileSystem()
+        return
+      } catch {
+        // --engine filesystem is a request for that engine specifically, so a
+        // silent fallback would hide exactly what the caller asked to see.
+        if engine == .filesystem { throw error }
+        warn("note: file-system search unavailable (\(error.localizedDescription))")
+        warn("note: falling back to AppleScript — slower, and Mail.app must be running.")
+      }
     }
+
+    if field == "content" || field == "all" {
+      warn(
+        "note: AppleScript body search reads every message one at a time and usually "
+          + "times out. Grant Full Disk Access to use the file-system engine instead.")
+    }
+    // searchAppleScript sorts on Mail's locale date *string* ("Monday, July
+    // 27, 2026 at ..."), which orders alphabetically — so April sorts above
+    // July. Re-sort once the strings have been parsed into real dates.
+    let results = try searchAppleScript()
+    emit(
+      results.compactMap(Search.summary(fromAppleScript:))
+        .sorted { ($0.date ?? .distantPast) > ($1.date ?? .distantPast) })
+  }
+
+  private func emit(_ messages: [MessageSummary]) {
+    if json {
+      MailOutput.json(messages)
+    } else {
+      MailOutput.table(messages)
+    }
+  }
+
+  private func runFileSystem() throws {
+    let store = try MailStore()
+    if store.isStale {
+      warn(
+        "warning: could not replay Mail's write-ahead log, so results may be missing "
+          + "recently received mail. Quitting Mail.app and retrying usually fixes this.")
+    }
+
+    var request = SearchRequest(query: query, field: field, limit: limit)
+    request.account = account
+    request.mailbox = mailbox
+    request.since = since.map { Date(timeIntervalSinceNow: -Double($0) * 86_400) }
+    request.before = before.map { Date(timeIntervalSinceNow: -Double($0) * 86_400) }
+    request.flaggedOnly = flagged
+    request.unreadOnly = unread
+    request.withAttachmentsOnly = hasAttachment
+    request.includeTrashAndJunk = all
+    request.matchAttachmentNames = attachmentNames
+
+    let result = try store.search(request)
+    emit(result.messages)
+
+    // A body search that read 40,000 files and found nothing is a different
+    // event from one that read 12, and the difference is invisible otherwise.
+    if result.bodiesRead > 0 {
+      warn("note: scanned \(result.bodiesRead) message bodies of \(result.candidates) candidates.")
+    }
+  }
+
+  /// The AppleScript path still returns loose strings; map them onto the same
+  /// shape the file-system path produces so output is identical either way.
+  static func summary(fromAppleScript row: [String: String]) -> MessageSummary? {
+    MessageSummary(
+      rowid: 0,
+      id: row["id"] ?? "",
+      subject: row["subject"] ?? "",
+      from: row["from"] ?? "",
+      date: row["date"].flatMap(AppleMailDate.date(from:)),
+      account: row["account"] ?? "",
+      mailbox: row["mailbox"] ?? "",
+      mailboxURL: "",
+      unread: false,
+      flagged: false,
+      attachmentCount: 0)
   }
 
   // Unified mailbox names that Mail.app supports natively (cross-account)
@@ -442,51 +736,6 @@ struct Search: AsyncParsableCommand {
     return results
   }
 
-  func printTable(_ results: [[String: String]]) {
-    if results.isEmpty {
-      print("No messages found.")
-      return
-    }
-
-    for (i, row) in results.enumerated() {
-      let subject = row["subject"] ?? "(no subject)"
-      let from = row["from"] ?? ""
-      let date = row["date"] ?? ""
-      let mailbox = row["mailbox"] ?? ""
-      let account = row["account"] ?? ""
-      let id = row["id"] ?? ""
-
-      let location =
-        [account, mailbox].filter { !$0.isEmpty }.joined(separator: "/")
-
-      // Three lines rather than four: sender and date belong together, and the
-      // "From:"/"Date:" labels were doing less work than the layout does.
-      print("\(Style.dim("\(i + 1)."))  \(Style.title(subject))")
-      var meta = "    \(from)"
-      if !date.isEmpty {
-        meta += Style.dim("  ·  ") + Style.time(AppleMailDate.short(date))
-      }
-      if !location.isEmpty { meta += "  " + Style.dim("[\(location)]") }
-      print(meta)
-      if !id.isEmpty {
-        print("    " + Style.identifier(id))
-      }
-      print()
-    }
-    print(Style.dim("\(results.count) \(results.count == 1 ? "result" : "results")"))
-  }
-
-  func printJSON(_ results: [[String: String]]) {
-    var results = results
-    for index in results.indices {
-      if let raw = results[index]["date"], let iso = AppleMailDate.isoString(raw) {
-        results[index]["date_iso"] = iso
-      }
-    }
-    let data = try! JSONSerialization.data(
-      withJSONObject: results, options: [.prettyPrinted, .sortedKeys])
-    print(String(data: data, encoding: .utf8)!)
-  }
 }
 
 // MARK: - Export
@@ -502,7 +751,87 @@ struct Export: AsyncParsableCommand {
   @Option(name: .long, help: "Account name")
   var account: String?
 
+  @Flag(name: .long, help: "Output as JSON")
+  var json: Bool = false
+
+  @Flag(name: .long, help: "Print the raw RFC 822 source instead of the rendered message")
+  var raw: Bool = false
+
+  @Option(name: .long, help: "Read engine: auto, filesystem, applescript")
+  var engine: MailEngine = .auto
+
   func run() async throws {
+    if engine != .applescript {
+      do {
+        try runFileSystem()
+        return
+      } catch {
+        if engine == .filesystem { throw error }
+        warn("note: file-system export unavailable (\(error.localizedDescription))")
+      }
+    }
+    if raw || json {
+      // Mail's AppleScript surface exposes neither, so promising them here
+      // would mean silently returning something else.
+      throw ValidationError("--raw and --json need the file-system engine (Full Disk Access).")
+    }
+    try runAppleScript_()
+  }
+
+  private func runFileSystem() throws {
+    let store = try MailStore()
+    let message = try store.export(messageID: messageId, account: account)
+
+    if raw {
+      FileHandle.standardOutput.write(message.source)
+      return
+    }
+
+    if json {
+      var payload: [String: Any] = [
+        "id": message.summary.id,
+        "subject": message.summary.subject,
+        "from": message.summary.from,
+        "to": message.to,
+        "cc": message.cc,
+        "account": message.summary.account,
+        "mailbox": message.summary.mailbox,
+        "unread": message.summary.unread,
+        "flagged": message.summary.flagged,
+        "attachments": message.attachments,
+        "body": message.body,
+        "headers": message.rawHeaders,
+      ]
+      if let date = message.summary.date {
+        payload["date"] = MailOutput.compactDate.string(from: date)
+        payload["date_iso"] = MailOutput.isoDate.string(from: date)
+      }
+      if let replyTo = message.replyTo { payload["reply_to"] = replyTo }
+      let data = try JSONSerialization.data(
+        withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+      print(String(data: data, encoding: .utf8) ?? "{}")
+      return
+    }
+
+    // Same layout the AppleScript path prints, so switching engines does not
+    // change what a caller has to parse.
+    print("Subject: \(message.summary.subject)")
+    print("From: \(message.summary.from)")
+    if let date = message.summary.date {
+      print("Date: \(MailOutput.compactDate.string(from: date))")
+    }
+    print("To: \(message.to.joined(separator: ", "))")
+    if !message.cc.isEmpty { print("Cc: \(message.cc.joined(separator: ", "))") }
+    print("Account: \(message.summary.account)")
+    print("Mailbox: \(message.summary.mailbox)")
+    if !message.attachments.isEmpty {
+      print("Attachments: \(message.attachments.joined(separator: ", "))")
+    }
+    print()
+    print(message.body)
+  }
+
+  private func runAppleScript_() throws {
     let accounts: [String]
     if let account = account {
       accounts = [account]
@@ -586,6 +915,10 @@ enum AppleMailDate {
     }
     return nil
   }
+
+  /// Exposed so the AppleScript path can hand back a real `Date` and share the
+  /// file-system path's formatting.
+  static func date(from raw: String) -> Date? { parse(raw) }
 
   private static let compact: DateFormatter = {
     let formatter = DateFormatter()
