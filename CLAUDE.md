@@ -38,10 +38,12 @@ apple status            # table, plus advice for anything broken
 apple status --json     # {tool: {status, usable, advice, pane, granted_to}}
 ```
 
-`granted_to` is the part worth reading: `tool` means the grant follows the
-binary and works from any terminal; `terminal` means it belongs to whatever
-launched it, so it can work in one terminal and not another. Each tool also
-answers `status` on its own.
+The table is a ✓/✗ per tool; anything failing gets a line naming the exact state
+(`denied`, `writeOnly`, `notDetermined`, `mailNotRunning`) and the fix. The JSON
+carries that per tool, plus `granted_to`: `tool` means the grant follows the
+binary and works from any terminal, `terminal` means it belongs to whatever
+launched it — so never suggest switching terminals for a `tool` one. Each tool
+also answers `status` on its own.
 
 ## Rules
 

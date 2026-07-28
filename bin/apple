@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-APPLE_TOOLS_VERSION="26.727.14"
+APPLE_TOOLS_VERSION="26.727.15"
 
 # Resolve the repo root even when invoked through a symlink in ~/bin.
 SOURCE="${BASH_SOURCE[0]}"
@@ -187,22 +187,25 @@ colour = (sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 def paint(text, code):
     return "\033[%sm%s\033[0m" % (code, text) if colour else text
 
-print(paint("%-10s %-22s %-14s %s" % ("TOOL", "PANE", "GRANTED TO", "STATE"), "1;34"))
+print(paint("%-10s %-22s %s" % ("TOOL", "PERMISSION", "OK"), "1;34"))
 problems = []
 for name, info in records:
-    pane, scope = META.get(name, ("", ""))
-    state = info.get("status", "unknown")
+    pane = META.get(name, ("", ""))[0]
     ok = info.get("usable") is True
-    print("%-10s %-22s %-14s %s" % (
-        paint(name, "1;35"), pane, scope,
-        paint(state, "32" if ok else "31")))
+    print("%-10s %-22s %s" % (
+        paint(name, "1;35"), pane,
+        paint("✓", "32") if ok else paint("✗", "31")))
     if not ok:
-        problems.append((name, info.get("advice")))
+        problems.append((name, info.get("status", "unknown"), info.get("advice")))
 
 if problems:
+    # The exact state (denied, writeOnly, notDetermined, ...) matters when
+    # something is wrong and is noise when nothing is, so it lives here rather
+    # than in a column everyone has to read past.
     print()
-    for name, advice in problems:
-        print("%s: %s" % (paint(name, "1;35"), advice or "not usable"))
+    for name, state, advice in problems:
+        detail = " — %s" % advice if advice else ""
+        print("%s: %s%s" % (paint(name, "1;35"), state, detail))
 else:
     print()
     print(paint("All tools have the access they need.", "32"))
