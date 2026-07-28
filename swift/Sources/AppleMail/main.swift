@@ -1,6 +1,7 @@
 import AppleToolsStyle
 import AppleToolsVersion
 import ArgumentParser
+import CoreServices  // AEDeterminePermissionToAutomateTarget, for `status`
 import Foundation
 
 @main
@@ -25,11 +26,72 @@ struct AppleMail: AsyncParsableCommand {
         apple-mail draft --to a@b.com --subject "Hi" --body "text"
       """,
     version: appleToolsVersion,
-    subcommands: [Search.self, Export.self, Accounts.self, Draft.self, Send.self]
+    subcommands: [Search.self, Export.self, Accounts.self, Draft.self, Send.self, Status.self]
   )
 }
 
 // MARK: - Accounts
+
+struct Status: AsyncParsableCommand {
+  static let configuration = CommandConfiguration(
+    abstract: "Report Mail automation state without requesting it"
+  )
+
+  @Flag(name: .long, help: "Output as JSON")
+  var json = false
+
+  func run() async throws {
+    let settingsPath = "System Settings → Privacy & Security → Automation"
+
+    // AEDeterminePermissionToAutomateTarget is the only way to read Automation
+    // state without side effects: askUserIfNeeded = false means it reports
+    // rather than prompts. Sending a real Apple Event to find out would trigger
+    // the very dialog a status command must not trigger.
+    var target = AEAddressDesc()
+    let bundleID = "com.apple.mail"
+    let created = bundleID.withCString { pointer in
+      AECreateDesc(
+        typeApplicationBundleID, pointer, strlen(pointer), &target)
+    }
+
+    // AECreateDesc returns OSErr (Int16), the permission call OSStatus (Int32).
+    var code = OSStatus(created)
+    if created == noErr {
+      code = AEDeterminePermissionToAutomateTarget(
+        &target, typeWildCard, typeWildCard, false)
+      AEDisposeDesc(&target)
+    }
+
+    let (name, usable, advice): (String, Bool, String?) = {
+      switch code {
+      case noErr:
+        return ("authorized", true, nil)
+      case OSStatus(errAEEventNotPermitted):
+        return ("denied", false, "Re-enable Mail under \(settingsPath).")
+      case OSStatus(errAEEventWouldRequireUserConsent):
+        return ("notDetermined", false,
+                "Run any mail command from a terminal to trigger the prompt.")
+      case OSStatus(procNotFound):
+        // Automation state cannot be determined while the target is not
+        // running; this says nothing about whether the grant exists.
+        return ("mailNotRunning", false, "Open Mail.app, then check again.")
+      default:
+        return ("unknown(\(code))", false, nil)
+      }
+    }()
+
+    if json {
+      var payload: [String: Any] = ["status": name, "usable": usable]
+      if let advice { payload["advice"] = advice }
+      let data = try? JSONSerialization.data(
+        withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+      print(data.flatMap { String(data: $0, encoding: .utf8) } ?? "{}")
+    } else {
+      print("Mail automation: \(name)\(usable ? "" : "  (cannot drive Mail)")")
+      if let advice { print(advice) }
+    }
+  }
+}
 
 struct Accounts: AsyncParsableCommand {
   static let configuration = CommandConfiguration(

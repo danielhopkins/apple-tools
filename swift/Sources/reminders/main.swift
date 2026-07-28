@@ -11,6 +11,10 @@ private let infoOnlyArguments: Set<String> = [
     "-h", "--help", "help",
     "--version",
     "--generate-completion-script",
+    // `status` reports the permission state and must never ask for it —
+    // requesting access here would make the one command you run to diagnose a
+    // missing grant be the thing that prompts for it.
+    "status",
 ]
 
 private let wantsInfoOnly = CommandLine.arguments.dropFirst().contains {

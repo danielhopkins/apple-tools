@@ -29,6 +29,20 @@ installed via `make install`.
 its shape is not stable. Use `apple --which` to see which binary each name
 resolves to.
 
+**Check permissions before diagnosing an access failure.** `apple status`
+reports all five in one table, never prompts, and exits non-zero if anything is
+unusable:
+
+```
+apple status            # table, plus advice for anything broken
+apple status --json     # {tool: {status, usable, advice, pane, granted_to}}
+```
+
+`granted_to` is the part worth reading: `tool` means the grant follows the
+binary and works from any terminal; `terminal` means it belongs to whatever
+launched it, so it can work in one terminal and not another. Each tool also
+answers `status` on its own.
+
 ## Rules
 
 1. **`--json` for anything you parse.** Plain-text layouts change; JSON keys don't.
@@ -421,6 +435,9 @@ Each tool needs a one-time TCC grant, prompted on first run **from a terminal**:
 | mail | Privacy & Security → Automation → Mail |
 | contacts | Privacy & Security → Contacts |
 | notes | Full Disk Access for the calling terminal (reads sqlite directly) |
+
+`apple status` reports all five at once without prompting — start there rather
+than running each tool to see which one errors.
 
 If a tool reports an access error, the fix is for the **user** to run it once in
 their own terminal and approve the dialog; an agent cannot click through it.

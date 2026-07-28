@@ -1,5 +1,6 @@
 import AppleToolsVersion
 import ArgumentParser
+import EventKit
 import Foundation
 
 private let reminders = Reminders()
@@ -16,6 +17,46 @@ struct FormatOptions: ParsableArguments {
     var json = false
 
     var resolved: OutputFormat { self.json ? .json : self.format }
+}
+
+private struct Status: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Report Reminders permission state without requesting it")
+
+    @Flag(name: .long, help: "Output as JSON")
+    var json = false
+
+    func run() {
+        // Claim our own TCC identity first, or this reports the terminal's
+        // grant rather than the one every other command actually uses.
+        Reminders.claimOwnTCCIdentity()
+
+        let settingsPath = "System Settings → Privacy & Security → Reminders"
+        let (name, usable, advice): (String, Bool, String?) = {
+            switch EKEventStore.authorizationStatus(for: .reminder) {
+            case .fullAccess:    return ("fullAccess", true, nil)
+            case .authorized:    return ("authorized", true, nil)
+            case .writeOnly:     return ("writeOnly", false,
+                "Set to full access in \(settingsPath); add-only cannot read reminders.")
+            case .denied:        return ("denied", false, "Re-enable in \(settingsPath).")
+            case .restricted:    return ("restricted", false, "Blocked by device policy.")
+            case .notDetermined: return ("notDetermined", false,
+                "Run any command to trigger the permission prompt.")
+            @unknown default:    return ("unknown", false, nil)
+            }
+        }()
+
+        if json {
+            var payload: [String: Any] = ["status": name, "usable": usable]
+            if let advice { payload["advice"] = advice }
+            let data = try? JSONSerialization.data(
+                withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+            print(data.flatMap { String(data: $0, encoding: .utf8) } ?? "{}")
+        } else {
+            print("Reminders access: \(name)\(usable ? "" : "  (cannot read reminders)")")
+            if let advice { print(advice) }
+        }
+    }
 }
 
 private struct ShowLists: ParsableCommand {
@@ -433,6 +474,7 @@ public struct CLI: ParsableCommand {
             ShowLists.self,
             NewList.self,
             ShowAll.self,
+            Status.self,
         ]
     )
 

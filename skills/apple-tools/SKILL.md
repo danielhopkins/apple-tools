@@ -167,6 +167,11 @@ macOS only shows a permission prompt the first time; after that a request
 returns silently. So an access error is never something to retry — it needs the
 user to change a setting.
 
+**Run `apple status --json` first.** It reports all five tools at once, never
+prompts, and exits non-zero if anything is unusable. Each entry carries the
+System Settings `pane` to send the user to, and `granted_to`: `tool` means the
+grant works from any terminal, `terminal` means it may not.
+
 - `apple calendar status` reports Calendar's real state without prompting.
   Watch for `writeOnly` ("Add Only"): it looks granted but cannot read events,
   and macOS will never offer to upgrade it.

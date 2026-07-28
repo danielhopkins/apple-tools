@@ -122,6 +122,24 @@ Each is also installed under its own name (`apple-notes`, `apple-mail`,
 `reminders`, `apple-calendar`, `apple-contacts`). Run `apple <tool> --help` for
 full options, or `apple --which` to see what resolves where.
 
+`apple status` reports every tool's permission state in one table, never
+prompts, and exits non-zero if anything is unusable — the fastest way to find
+out which grant is missing:
+
+```
+$ apple status
+TOOL       PANE                   GRANTED TO     STATE
+notes      Full Disk Access       terminal       authorized
+mail       Automation → Mail      terminal       authorized
+reminders  Reminders              tool           fullAccess
+calendar   Calendars              tool           fullAccess
+contacts   Contacts               tool           authorized
+```
+
+`GRANTED TO` is the column that matters: `tool` means the grant follows the
+binary and works from any terminal; `terminal` means it belongs to whatever
+launched it. `--json` gives the same data with the advice for anything broken.
+
 **Every tool accepts `--json`.** Plain-text output is for humans and its shape
 isn't guaranteed; JSON is.
 
