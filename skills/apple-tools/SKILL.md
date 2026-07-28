@@ -61,6 +61,9 @@ apple mail draft --to a@b.com --subject "Re: Q3" --body-file -   # body on stdin
 apple mail search "invoice" --json                       # whole store, ~0.04s
 apple mail search "budget review" --field content --json # full text of bodies
 apple mail export <message-id>
+apple mail draft --to a@b.com --subject "Q3" --body "..." --json   # → message_id
+apple mail draft --to a@b.com --subject "Q3" --body "..." --replace <message-id>
+apple mail delete-draft <message-id>
 
 # Reminders
 apple reminders show-lists --json
@@ -111,9 +114,26 @@ paste a whole sentence — every word has to appear.
 **Drafting email is where you are most useful.** `apple mail draft` writes to
 Drafts and never sends. Pass long bodies via `--body-file -` on stdin.
 
-There is no `apple mail delete`, so a draft you create is the user's to remove.
-Get the content right and write it once rather than iterating in their Drafts
-folder.
+`draft --json` reports the new draft's `message_id`. Keep it — it is how you
+revise or remove what you just wrote:
+
+```bash
+apple mail draft --to a@b.com --subject "Q3" --body "v1" --json   # → message_id
+apple mail draft --to a@b.com --subject "Q3" --body "v2" --replace <message-id>
+apple mail delete-draft <message-id>
+```
+
+`--replace` writes the new draft first and only then trashes the old one, so a
+failure leaves two drafts rather than none. Check `replaced_removed` in the JSON
+before telling the user it was replaced — if it is `false`, both are still
+there and the old one needs removing in Mail.
+
+Still prefer getting it right in one write. `--replace` is for when the user
+asks for a change, not a substitute for thinking about the wording first — each
+round trip is a visible edit in their Drafts folder.
+
+`delete-draft` only looks in Drafts, so it cannot remove sent or received mail.
+It is a move to trash, not a purge.
 
 `apple mail send` exists but refuses to run without `--confirm`. Default to
 drafting and let the user send. Only use `send` if they asked you to send in

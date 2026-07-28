@@ -121,6 +121,47 @@ final class EmlxTests: XCTestCase {
     XCTAssertEqual(message.text, "the plain version")
   }
 
+  func testFallsBackToHTMLWhenThePlainPartIsPresentButEmpty() {
+    // Mail writes exactly this for every draft it composes, and 2.2% of a real
+    // 40k-message store looks the same. An emptiness check on the *array* of
+    // parts sees one element and prefers it, losing the entire body — the
+    // message then exports blank and no content search can ever match it.
+    let body = """
+      Content-Type: multipart/alternative; boundary="B"
+
+      --B
+      Content-Transfer-Encoding: 7bit
+      Content-Type: text/plain; charset=utf-8
+
+
+      --B
+      Content-Type: text/html; charset=utf-8
+
+      <p>the real body</p>
+      --B--
+      """
+    let message = parseRFC822(Data(body.utf8))
+    XCTAssertEqual(message.text, "the real body")
+  }
+
+  func testPrefersPlainWhenItActuallyHasText() {
+    let body = """
+      Content-Type: multipart/alternative; boundary="B"
+
+      --B
+      Content-Type: text/plain; charset=utf-8
+
+      plain wins
+      --B
+      Content-Type: text/html; charset=utf-8
+
+      <p>html loses</p>
+      --B--
+      """
+    let message = parseRFC822(Data(body.utf8))
+    XCTAssertEqual(message.text, "plain wins")
+  }
+
   func testFallsBackToStrippedHTMLWhenThereIsNoPlainPart() {
     let body = """
       Content-Type: text/html; charset=utf-8

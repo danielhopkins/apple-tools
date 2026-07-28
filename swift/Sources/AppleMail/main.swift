@@ -120,7 +120,10 @@ struct AppleMail: AsyncParsableCommand {
         apple-mail draft --to a@b.com --subject "Hi" --body "text"
       """,
     version: appleToolsVersion,
-    subcommands: [Search.self, Export.self, Accounts.self, Draft.self, Send.self, Status.self]
+    subcommands: [
+      Search.self, Export.self, Accounts.self, Draft.self, DeleteDraft.self, Send.self,
+      Status.self,
+    ]
   )
 }
 
@@ -1157,10 +1160,34 @@ struct Draft: AsyncParsableCommand {
 
   @OptionGroup var compose: ComposeOptions
 
+  @Option(
+    name: .long,
+    help: "Message-ID of a draft to replace: write this one, then trash that one")
+  var replace: String?
+
   @Flag(name: .long, help: "Output as JSON")
   var json = false
 
   func run() async throws {
+    // Mail cannot edit a saved draft in place — `set sender` errors once saved,
+    // and reading recipients back returns the last-added one for every list. So
+    // "replace" is write-then-remove, in that order: if the removal fails the
+    // user has two drafts, which is recoverable, whereas removing first and
+    // failing to write loses the content outright.
+    let target = replace.map { strippingAngleBrackets($0.trimmingCharacters(in: .whitespaces)) }
+    if let target {
+      guard try countDrafts(messageID: target) > 0 else {
+        throw ValidationError(
+          "No draft with Message-ID '\(target)' to replace. Nothing was written. "
+            + "Check with: apple mail search \"\" --mailbox drafts --json")
+      }
+    }
+
+    // Snapshot Drafts so the new message's Message-ID can be identified by
+    // difference; best-effort, since failing to name the draft is not a reason
+    // to refuse to write it.
+    let idsBefore = (try? draftMessageIDs()) ?? []
+
     let argv = try compose.arguments(action: "save")
     let result = try runAppleScript(composeScript, arguments: argv)
 
@@ -1168,12 +1195,33 @@ struct Draft: AsyncParsableCommand {
     let subject = parts.count > 1 ? parts[1] : compose.subject
     let sender = parts.count > 2 ? parts[2] : ""
 
+    // Exactly one new id means we know which draft is ours. Zero or several
+    // (a concurrent save, or Mail not having settled) leaves it unreported
+    // rather than guessed at.
+    let appeared = ((try? draftMessageIDs()) ?? []).subtracting(idsBefore)
+    let messageID = appeared.count == 1 ? appeared.first! : ""
+
+    var replaced: Bool?
+    if let target {
+      replaced = try removeDraft(messageID: target, account: nil)
+      if replaced == false {
+        warn(
+          "warning: the new draft was saved, but the old one (\(target)) is still in Drafts "
+            + "after 3 attempts. You now have both — remove the old one in Mail.app.")
+      }
+    }
+
     if json {
-      let payload: [String: Any] = [
+      var payload: [String: Any] = [
         "status": "saved", "subject": subject, "sender": sender,
         "to": compose.to, "cc": compose.cc, "bcc": compose.bcc,
         "attachments": compose.attach.count,
       ]
+      if !messageID.isEmpty { payload["message_id"] = messageID }
+      if let target {
+        payload["replaced"] = target
+        payload["replaced_removed"] = replaced ?? false
+      }
       let data = try JSONSerialization.data(
         withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
       print(String(data: data, encoding: .utf8) ?? "{}")
@@ -1182,7 +1230,201 @@ struct Draft: AsyncParsableCommand {
       if !sender.isEmpty { print("  from: \(sender)") }
       let recipients = compose.to + compose.cc.map { "cc:" + $0 } + compose.bcc.map { "bcc:" + $0 }
       print("  to:   \(recipients.joined(separator: ", "))")
+      if !messageID.isEmpty { print("  id:   \(messageID)") }
+      if let target, replaced == true { print("Replaced \(target) — the old draft is in trash.") }
       print("It is in your Drafts mailbox — review it in Mail before sending.")
+    }
+  }
+}
+
+// MARK: - Removing a draft
+
+/// Mail's scripting interface offers four ways to remove a message and only
+/// one of them works. Verified against real drafts on macOS 27:
+///
+///     delete <message>                  silently does nothing
+///     move <message> to mailbox "..."   errors
+///     set deleted status to true        "Connection is invalid"
+///     set mailbox of <message> to ...   WORKS
+///
+/// Two traps make the working route look broken. The Drafts enumeration is
+/// stale within a single script run, so a loop that re-scans after each move
+/// keeps finding messages it already moved — ids are collected first and each
+/// is moved exactly once. And a move occasionally reports success without
+/// taking effect, so the caller re-checks and retries rather than trusting the
+/// count this returns.
+///
+/// Only ever enumerates `mailbox "Drafts"`, so it cannot touch sent or
+/// received mail even if handed the Message-ID of one.
+private let deleteDraftScript = """
+  on run argv
+    set target to item 1 of argv
+    set acctFilter to item 2 of argv
+    set moved to 0
+    tell application "Mail"
+      repeat with acct in every account
+        if acctFilter is "" or (name of acct) is acctFilter then
+          try
+            set doomed to {}
+            repeat with m in messages of (mailbox "Drafts" of acct)
+              set mid to ""
+              try
+                set mid to (message id of m) as string
+              end try
+              if mid is target then set end of doomed to (id of m)
+            end repeat
+            repeat with theId in doomed
+              try
+                set m to (first message of (mailbox "Drafts" of acct) whose id is theId)
+                set done to false
+                repeat with tn in {"Deleted Messages", "Trash", "Deleted Items", "Bin"}
+                  if not done then
+                    try
+                      set mailbox of m to mailbox tn of acct
+                      set done to true
+                      set moved to moved + 1
+                    end try
+                  end if
+                end repeat
+              end try
+            end repeat
+          end try
+        end if
+      end repeat
+    end tell
+    return moved as string
+  end run
+  """
+
+/// How many drafts still carry this Message-ID. The only trustworthy check
+/// that a removal took effect.
+private let countDraftScript = """
+  on run argv
+    set target to item 1 of argv
+    set n to 0
+    tell application "Mail"
+      repeat with acct in every account
+        try
+          repeat with m in messages of (mailbox "Drafts" of acct)
+            set mid to ""
+            try
+              set mid to (message id of m) as string
+            end try
+            if mid is target then set n to n + 1
+          end repeat
+        end try
+      end repeat
+    end tell
+    return n as string
+  end run
+  """
+
+func countDrafts(messageID: String) throws -> Int {
+  Int(try runAppleScript(countDraftScript, arguments: [messageID])) ?? 0
+}
+
+/// Every Message-ID currently in Drafts.
+///
+/// Used to learn the Message-ID of a draft that was just written, by diffing
+/// across the save. An outgoing message has no `message id` at all — asking
+/// for it errors with "Can't make «class meid» of «class bcke»" — and Mail
+/// only assigns one once the message lands in Drafts. Matching on the subject
+/// instead would pick the wrong draft whenever two share one.
+///
+/// Deliberately a separate `osascript` run from the save: the Drafts
+/// enumeration is stale *within* a single script run, so a re-scan after
+/// saving in the same script would not see the new message.
+private let draftIDsScript = """
+  on run argv
+    set out to ""
+    tell application "Mail"
+      repeat with acct in every account
+        try
+          repeat with m in messages of (mailbox "Drafts" of acct)
+            try
+              set out to out & ((message id of m) as string) & linefeed
+            end try
+          end repeat
+        end try
+      end repeat
+    end tell
+    return out
+  end run
+  """
+
+func draftMessageIDs() throws -> Set<String> {
+  Set(
+    try runAppleScript(draftIDsScript)
+      .split(separator: "\n").map(String.init)
+      .filter { !$0.isEmpty })
+}
+
+/// Move every Drafts copy of `messageID` to trash, confirming afterwards.
+/// Returns false when the draft is still there after `passes` attempts.
+@discardableResult
+func removeDraft(messageID: String, account: String?, passes: Int = 3) throws -> Bool {
+  for attempt in 0..<passes {
+    _ = try runAppleScript(deleteDraftScript, arguments: [messageID, account ?? ""])
+    if try countDrafts(messageID: messageID) == 0 { return true }
+    // A move that reported success but did not take effect; Mail needs a
+    // moment before the next attempt sees a fresh enumeration.
+    if attempt < passes - 1 { Thread.sleep(forTimeInterval: 1) }
+  }
+  return false
+}
+
+struct DeleteDraft: AsyncParsableCommand {
+  static let configuration = CommandConfiguration(
+    commandName: "delete-draft",
+    abstract: "Move a draft to trash, by Message-ID",
+    discussion: """
+      Only ever touches the Drafts mailbox, so it cannot delete sent or received
+      mail. `draft --json` reports the Message-ID of what it just wrote; `search
+      --mailbox drafts --json` finds one you did not create in this session.
+
+      This is a move to trash, not a purge — the draft lands in Deleted
+      Messages / Deleted Items / Trash depending on the account, and there is no
+      API to empty that.
+
+      Needs Automation → Mail, and Mail.app running.
+      """)
+
+  @Argument(help: "Message-ID of the draft (from `draft --json` or `search`)")
+  var messageId: String
+
+  @Option(name: .long, help: "Only look in this account")
+  var account: String?
+
+  @Flag(name: .long, help: "Output as JSON")
+  var json = false
+
+  func run() async throws {
+    let id = strippingAngleBrackets(messageId.trimmingCharacters(in: .whitespaces))
+
+    let before = try countDrafts(messageID: id)
+    guard before > 0 else {
+      throw ValidationError(
+        "No draft with Message-ID '\(id)'. It may already be gone, or it may not be a draft — "
+          + "this only looks in Drafts. Check with: apple mail search \"\" --mailbox drafts --json")
+    }
+
+    // Trusting the move's own report is exactly the mistake that made this
+    // look unreliable; the membership is re-read instead.
+    guard try removeDraft(messageID: id, account: account) else {
+      throw AppleScriptError(
+        message:
+          "Draft '\(id)' is still in Drafts after 3 attempts. Mail sometimes reports a move it "
+          + "did not perform; try again, or move it to Trash in Mail.app.")
+    }
+
+    if json {
+      let payload: [String: Any] = ["status": "deleted", "message_id": id, "removed": before]
+      let data = try JSONSerialization.data(
+        withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+      print(String(data: data, encoding: .utf8) ?? "{}")
+    } else {
+      print("Draft moved to trash: \(id)")
+      if before > 1 { print("  (\(before) copies)") }
     }
   }
 }

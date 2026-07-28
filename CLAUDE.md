@@ -117,7 +117,9 @@ apple mail export MESSAGE-ID [--account NAME] [--json] [--raw]
 
 apple mail draft --to ADDR [--to ...] [--cc ADDR] [--bcc ADDR]
                  --subject TEXT [--body TEXT | --body-file FILE|-]
-                 [--from ACCOUNT-ADDRESS] [--html] [--attach FILE]... [--json]
+                 [--from ACCOUNT-ADDRESS] [--html] [--attach FILE]...
+                 [--replace MESSAGE-ID] [--json]
+apple mail delete-draft MESSAGE-ID [--account NAME] [--json]
 apple mail send  <same flags> --confirm
 ```
 
@@ -204,6 +206,24 @@ key**, so read it as `account.get("enabled", True)`. It also lists the local
 reads the body from stdin, which is the easiest way to pass long or generated
 text. Attachments are validated before anything is composed.
 
+`draft --json` reports the new draft's `message_id`; that is what `delete-draft`
+and `--replace` take. It is omitted rather than guessed when the save could not
+be identified unambiguously.
+
+**Revising a draft.** There is no in-place edit — Mail will not allow one (the
+sender freezes on save, and reading recipients back is broken). `--replace
+MESSAGE-ID` does the next best thing: it writes the new draft first, *then*
+trashes the old one, so a failure leaves two drafts rather than none. It checks
+the target exists before composing, so a bad id writes nothing at all. If the
+removal fails it says so on stderr and sets `replaced_removed: false` — do not
+report a replacement as clean without checking that.
+
+`delete-draft` only ever enumerates Drafts, so it cannot delete sent or
+received mail even if handed the Message-ID of some. It re-reads the mailbox
+afterwards and fails loudly rather than trusting the move, and it is a move to
+**trash, not a purge** — same as Notes' Recently Deleted, with no API to empty
+it.
+
 `send` refuses to run without `--confirm`, because sending is immediate and
 irreversible. **Prefer `draft` and let the user send it themselves** — only use
 `send` when they have explicitly asked you to send, in that turn.
@@ -211,14 +231,20 @@ irreversible. **Prefer `draft` and let the user send it themselves** — only us
 ⚠️ Mail's compose surface is unusually buggy. These are all verified on
 macOS 27 and pinned by `tests/test_mail_draft.py`:
 
-- **Only one route removes a draft.** `delete` silently does nothing, `move`
-  errors, and `set deleted status` fails with "Connection is invalid".
-  Reassigning `mailbox of <message>` to the account's trash **does** work. The
-  trash mailbox is named differently per account type (`Deleted Messages`,
-  `Trash`, `Deleted Items`), so try each. Two traps: the Drafts enumeration is
-  stale within a single script run, so collect message ids first and move each
-  once rather than re-scanning after every move; and a move occasionally
-  reports success without taking effect, so re-check and retry.
+- **Only one route removes a draft**, and `delete-draft` implements it so you
+  do not have to. `delete` silently does nothing, `move` errors, and `set
+  deleted status` fails with "Connection is invalid". Reassigning `mailbox of
+  <message>` to the account's trash **does** work. The trash mailbox is named
+  differently per account type (`Deleted Messages`, `Trash`, `Deleted Items`),
+  so try each. Two traps: the Drafts enumeration is stale within a single
+  script run, so collect message ids first and move each once rather than
+  re-scanning after every move; and a move occasionally reports success without
+  taking effect, so re-check and retry.
+- **An outgoing message has no `message id`.** Asking for one errors with
+  "Can't make «class meid» of «class bcke»" — Mail assigns it only once the
+  message lands in Drafts. `draft` therefore learns the id by diffing the
+  Drafts Message-IDs across the save, in a *separate* `osascript` run, because
+  the Drafts enumeration is stale within the run that saved.
 - **Reading recipients back is broken.** `to recipients`, `cc recipients` and
   `bcc recipients` on a saved draft all return the last-added recipient. The
   RFC822 `source` is the only trustworthy read. The headers written are correct.

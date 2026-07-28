@@ -148,9 +148,14 @@ func extractText(body: Data, headers: MailHeaders) -> String {
   var html: [String] = []
   collectText(body: body, contentType: contentType, encoding: encoding, plain: &plain, html: &html)
 
-  if !plain.isEmpty {
-    return plain.joined(separator: "\n\n").trimmingCharacters(in: .whitespacesAndNewlines)
-  }
+  // Test the joined *text*, not the array. A message can carry a text/plain
+  // part that is empty — Mail writes exactly that for every draft it composes,
+  // and 2.2% of a real 40k-message store looks the same — which gives
+  // `plain == [""]`: a non-empty array holding nothing. Preferring it on that
+  // basis discards the HTML and reports the message as having no body at all,
+  // which also makes it unfindable by a content search.
+  let joinedPlain = plain.joined(separator: "\n\n").trimmingCharacters(in: .whitespacesAndNewlines)
+  if !joinedPlain.isEmpty { return joinedPlain }
   return html.map(strippingHTML).joined(separator: "\n\n")
     .trimmingCharacters(in: .whitespacesAndNewlines)
 }
@@ -184,7 +189,11 @@ func collectText(
     }
     // In multipart/alternative the parts are the same content twice; taking
     // both would duplicate every message body that ships plain text and HTML.
-    if type == "multipart/alternative", !alternativePlain.isEmpty {
+    // The plain half only wins if it actually says something — an empty
+    // text/plain alongside real HTML is common, and dropping the HTML for it
+    // loses the whole body.
+    let plainHasText = alternativePlain.contains { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    if type == "multipart/alternative", plainHasText {
       plain.append(contentsOf: alternativePlain)
     } else {
       plain.append(contentsOf: alternativePlain)
