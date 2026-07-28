@@ -88,21 +88,45 @@ class MailWedged(AssertionError):
 
 # Every osascript call gets a deadline. Without one, a single Apple Event to a
 # wedged Mail blocks forever: a suite that normally takes 26s ran for eleven
-# minutes before it was killed, having produced no output at all, because each
-# call was waiting on an app that was never going to answer.
-OSASCRIPT_TIMEOUT = 45
+# minutes before it was killed, having produced no output at all.
+OSASCRIPT_TIMEOUT = 20
+
+# Mail rarely hangs outright — it *degrades*, and a generous timeout sails
+# straight past that. With a 45s deadline a suite once crawled for ten minutes
+# with every call slow but none slow enough to trip. A healthy call here is
+# ~0.2s, so seconds mean trouble, and trouble that repeats means Mail is on its
+# way down and the run should stop while it can still say so.
+SLOW_CALL_SECONDS = 5
+SLOW_CALLS_BEFORE_GIVING_UP = 3
+_consecutive_slow = 0
 
 
 def osascript(source, *args, timeout=OSASCRIPT_TIMEOUT):
+    global _consecutive_slow
+    started = time.monotonic()
     try:
         proc = subprocess.run(
             ["/usr/bin/osascript", "-e", source, *args],
             capture_output=True, text=True, timeout=timeout,
         )
     except subprocess.TimeoutExpired:
+        _consecutive_slow = 0
         raise MailWedged(
             f"Mail did not answer an Apple Event within {timeout}s.\n{WEDGED_ADVICE}"
         ) from None
+
+    elapsed = time.monotonic() - started
+    if elapsed >= SLOW_CALL_SECONDS:
+        _consecutive_slow += 1
+        if _consecutive_slow >= SLOW_CALLS_BEFORE_GIVING_UP:
+            _consecutive_slow = 0
+            raise MailWedged(
+                f"{SLOW_CALLS_BEFORE_GIVING_UP} Apple Events in a row took over "
+                f"{SLOW_CALL_SECONDS}s (last: {elapsed:.0f}s). Mail is going under; "
+                f"stopping before it locks up.\n{WEDGED_ADVICE}")
+    else:
+        _consecutive_slow = 0
+
     if proc.returncode != 0:
         # -1712 is the Apple Event timeout; Mail raises it once it is far
         # enough behind that it cannot service the request at all.

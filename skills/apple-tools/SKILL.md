@@ -61,6 +61,8 @@ apple mail draft --to a@b.com --subject "Re: Q3" --body-file -   # body on stdin
 apple mail search "invoice" --json                       # whole store, ~0.04s
 apple mail search "budget review" --field content --json # full text of bodies
 apple mail export <message-id>
+apple mail attachments <message-id>                      # list what it carries
+apple mail attachments <message-id> --save ~/Downloads   # get the files
 apple mail draft --to a@b.com --subject "Q3" --body "..." --json   # → message_id
 apple mail draft --to a@b.com --subject "Q3" --body "..." --replace <message-id>
 apple mail delete-draft <message-id>
@@ -167,6 +169,17 @@ two-minute wait means the search *failed*, not that the inbox is empty.
 
 **Note search is title-only.** To search note *content*, export candidates and
 grep them.
+
+**Attachment contents are never searched, and you cannot read one directly.**
+`--field content` covers message bodies only; there is no PDF text extraction.
+If the user asks what is *in* an attachment, save it with `apple mail
+attachments <id> --save <dir>` and read the file yourself — do not report on it
+from the filename alone.
+
+`--save` never overwrites (a clash gets `-2` before the extension) and writes
+only inside the directory you name, so it is safe to point at a real folder.
+Prefer a scratch directory over `~/Downloads` unless the user asked for a
+specific place.
 
 **Contact multi-value flags replace, they don't append.** `contacts edit --email`
 replaces every email on that contact. Read it first with `get`, then re-pass the

@@ -121,8 +121,8 @@ struct AppleMail: AsyncParsableCommand {
       """,
     version: appleToolsVersion,
     subcommands: [
-      Search.self, Export.self, Accounts.self, Draft.self, DeleteDraft.self, Send.self,
-      Status.self,
+      Search.self, Export.self, Attachments.self, Accounts.self, Draft.self, DeleteDraft.self,
+      Send.self, Status.self,
     ]
   )
 }
@@ -1242,6 +1242,133 @@ struct Draft: AsyncParsableCommand {
       if !messageID.isEmpty { print("  id:   \(messageID)") }
       if let target, removal != .failed { print("Replaced \(target) — the old draft is in trash.") }
       print("It is in your Drafts mailbox — review it in Mail before sending.")
+    }
+  }
+}
+
+// MARK: - Attachments
+
+struct Attachments: AsyncParsableCommand {
+  static let configuration = CommandConfiguration(
+    abstract: "List or save a message's attachments",
+    discussion: """
+      Lists what a message carries; --save writes the files out. Reads the
+      message off disk, so it needs Full Disk Access and never involves
+      Mail.app.
+
+      An attachment is a part with a filename — the same rule Mail's own index
+      uses, so this agrees with `export --json`. Nameless inline parts
+      (tracking pixels) are not attachments; named inline images are, and
+      --skip-inline drops them if you only want the paperclip ones.
+
+      Examples:
+        apple-mail attachments <id>                       # list
+        apple-mail attachments <id> --save ~/Downloads
+        apple-mail attachments <id> --save . --skip-inline
+      """)
+
+  @Argument(help: "Message ID (from search results)")
+  var messageId: String
+
+  @Option(name: .long, help: "Account name")
+  var account: String?
+
+  @Option(name: .long, help: "Directory to write the files into (created if missing)")
+  var save: String?
+
+  @Flag(name: .long, help: "Skip inline images referenced by the HTML body")
+  var skipInline: Bool = false
+
+  @Flag(name: .long, help: "Output as JSON")
+  var json: Bool = false
+
+  func run() async throws {
+    let store = try MailStore()
+    let (summary, all) = try store.attachments(messageID: messageId, account: account)
+    let files = skipInline ? all.filter { !$0.isInline } : all
+
+    guard let save else {
+      report(files, summary: summary, written: nil)
+      return
+    }
+
+    let directory = URL(fileURLWithPath: (save as NSString).expandingTildeInPath)
+      .standardizedFileURL
+    try FileManager.default.createDirectory(
+      at: directory, withIntermediateDirectories: true)
+
+    var written: [String] = []
+    for file in files {
+      var destination = directory.appendingPathComponent(file.name)
+      // Never overwrite. The name came from whoever sent the mail, so a
+      // collision with something already in the directory is not the user's
+      // doing and must not cost them the existing file.
+      var attempt = 2
+      while FileManager.default.fileExists(atPath: destination.path) {
+        let ext = (file.name as NSString).pathExtension
+        let stem = (file.name as NSString).deletingPathExtension
+        let candidate = ext.isEmpty ? "\(stem)-\(attempt)" : "\(stem)-\(attempt).\(ext)"
+        destination = directory.appendingPathComponent(candidate)
+        attempt += 1
+      }
+
+      // Belt and braces on top of safeFilename: refuse anything that did not
+      // land directly inside the target directory. Symlinks are resolved on
+      // both sides — /tmp is a link to /private/tmp, so comparing the paths as
+      // given rejects a perfectly good destination.
+      let parent = destination.deletingLastPathComponent()
+        .resolvingSymlinksInPath().standardizedFileURL.path
+      let root = directory.resolvingSymlinksInPath().standardizedFileURL.path
+      guard parent == root else {
+        throw ValidationError("refusing to write '\(file.name)' outside \(root)")
+      }
+      try file.data.write(to: destination)
+      written.append(destination.path)
+    }
+    report(files, summary: summary, written: written)
+  }
+
+  private func report(_ files: [MailAttachment], summary: MessageSummary, written: [String]?) {
+    if json {
+      var payload: [String: Any] = [
+        "id": summary.id,
+        "subject": summary.subject,
+        "count": files.count,
+        "attachments": files.enumerated().map { offset, file -> [String: Any] in
+          var row: [String: Any] = [
+            "index": offset,
+            "name": file.name,
+            "content_type": file.contentType,
+            "bytes": file.byteCount,
+            "inline": file.isInline,
+          ]
+          if file.originalName != file.name { row["original_name"] = file.originalName }
+          if let written, offset < written.count { row["path"] = written[offset] }
+          return row
+        },
+      ]
+      if written != nil { payload["saved"] = written?.count ?? 0 }
+      let data = try! JSONSerialization.data(
+        withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+      print(String(data: data, encoding: .utf8)!)
+      return
+    }
+
+    if files.isEmpty {
+      print("No attachments.")
+      return
+    }
+    for (offset, file) in files.enumerated() {
+      let size = ByteCountFormatter.string(fromByteCount: Int64(file.byteCount), countStyle: .file)
+      var line = "\(Style.dim("\(offset + 1)."))  \(Style.title(file.name))"
+      line += "  " + Style.dim("\(file.contentType), \(size)")
+      if file.isInline { line += " " + Style.dim("(inline)") }
+      print(line)
+      if let written, offset < written.count { print("    " + Style.identifier(written[offset])) }
+    }
+    if let written {
+      print()
+      print(Style.dim("Saved \(written.count) file\(written.count == 1 ? "" : "s")."))
     }
   }
 }

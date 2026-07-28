@@ -114,6 +114,7 @@ apple mail search QUERY [--account NAME] [--mailbox NAME] [--field subject|sende
                         [--flagged] [--unread] [--has-attachment] [--attachment-names]
                         [--all] [--json]
 apple mail export MESSAGE-ID [--account NAME] [--json] [--raw]
+apple mail attachments MESSAGE-ID [--save DIR] [--skip-inline] [--account NAME] [--json]
 
 apple mail draft --to ADDR [--to ...] [--cc ADDR] [--bcc ADDR]
                  --subject TEXT [--body TEXT | --body-file FILE|-]
@@ -179,11 +180,35 @@ invoices, not every message that happens to carry an `invoice.pdf`. Pass
 costs nothing. Attachment **contents are never searched**, with or without the
 flag: a `text/*` part marked `Content-Disposition: attachment` is skipped, and
 non-text parts (PDF, images) are never decoded. There is no PDF text
-extraction.
+extraction. To read an attachment, save it with `apple mail attachments` and
+open it yourself.
 
 `export --raw` writes the RFC 822 source; `export --json` gives structured
 headers, recipients, attachment names and body. Both need the file-system
 engine.
+
+**Getting the files out.** `export` reports attachment *names*; `attachments`
+gets the bytes. Listing shows name, content type and size; `--save DIR` writes
+them, creating the directory and printing each path. `--skip-inline` drops
+images the HTML body references, leaving the paperclip ones.
+
+⚠️ **Attachment bytes are not in the `.emlx`.** Mail strips them out, leaving
+the MIME part with an empty body and an `X-Apple-Content-Length` header, and
+writes the file *already decoded* to
+`Data/<digits>/Attachments/<rowid>/<mime-part>/<filename>`. Parsing the message
+alone yields zero-byte attachments — the command reads the directory and falls
+back to embedded bytes only for messages that really carry them (anything Mail
+composed locally).
+
+**What counts as an attachment is Mail's rule: a part with a filename.**
+Verified against its index — a message with two nameless tracking pixels
+reports zero attachments, one with seven named inline images reports seven. So
+`attachments` and `export --json` always agree.
+
+`--save` never overwrites: a name that already exists gets `-2` before the
+extension. Filenames come from the sender, so they are sanitised to a bare
+basename before being joined onto `DIR`, and a write that would land anywhere
+else is refused.
 
 See [`docs/apple-mail-store.md`](docs/apple-mail-store.md) for the schema, the
 `.emlx` layout, and the traps in reading them.

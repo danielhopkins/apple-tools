@@ -161,6 +161,49 @@ V10/<ACCOUNT-UUID>/<Comp1>.mbox/<Comp2>.mbox/<STORE-UUID>/Data/<digits>/Messages
   one case where the AppleScript engine can still do something the file-system
   engine cannot, and why `--engine auto` keeps the fallback.
 
+## Where attachments actually live
+
+⚠️ **Not in the `.emlx`.** Mail strips attachment payloads out of the message
+file, leaving the MIME part with its headers, an empty body, and an
+`X-Apple-Content-Length` giving the *encoded* size:
+
+```
+Content-Transfer-Encoding: base64
+Content-Disposition: ATTACHMENT;
+	filename=Invoice_07201731703_from_Boulder_Lawns_LLC.pdf
+Content-Type: application/pdf;
+	name=Invoice_07201731703_from_Boulder_Lawns_LLC.pdf
+X-Apple-Content-Length: 40891
+
+--boundary--
+```
+
+A MIME parser reading that gets a zero-byte attachment and no error. The bytes
+are here instead, **already decoded** — a real PDF, not base64:
+
+```
+<mbox>/<store-uuid>/Data/<digits>/Attachments/<message-rowid>/<mime-part>/<filename>
+```
+
+`<digits>` is the same rowid split as for `Messages/`. `<mime-part>` is the
+part path, so `2` and `2.2` are siblings — sort them numerically or `2.10`
+lands before `2.9`. The 40891 above is the base64 length; the file on disk is
+30269 bytes.
+
+Messages Mail composed locally *do* carry their bytes inline, so a reader needs
+both paths: the directory when it exists, the MIME body otherwise.
+
+**What counts as an attachment: a part with a filename.** Checked against
+Mail's own `attachments` table on a real store — a message with two nameless
+`Content-ID` tracking pixels reports zero, one with seven *named* inline images
+reports seven. Disposition does not decide it (546 of 1085 sampled parts were
+`inline`), and neither does Content-ID.
+
+Filenames are hostile input — they come from the sender and get joined onto a
+directory the user names. Sanitise to a bare basename. Note that "contains
+`..`" is *not* a traversal test: `3360 Mitchell Ln..pdf` is a real filename in
+this store.
+
 ## The .emlx format
 
 ```

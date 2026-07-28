@@ -329,6 +329,60 @@ public final class MailStore {
       source: parsed.source)
   }
 
+  // MARK: Attachments
+
+  /// The message's attachments, with the summary for context.
+  ///
+  /// Bytes come from Mail's own attachment directory when it has one, because
+  /// that is where they actually are: Mail strips payloads out of the `.emlx`
+  /// and stores them decoded on disk. Parsing the message alone yields
+  /// zero-byte files. The MIME structure is still parsed, for content types
+  /// and to tell an inline image from a paperclip attachment, and it supplies
+  /// the bytes for the messages that *do* carry them inline — anything Mail
+  /// composed locally, for one.
+  ///
+  /// Separate from `export` because reading attachment bytes is the expensive
+  /// part and almost no caller of `export` wants it.
+  public func attachments(messageID: String, account: String?) throws
+    -> (summary: MessageSummary, files: [MailAttachment])
+  {
+    let message = try export(messageID: messageID, account: account)
+    let embedded = MailLibrary.attachments(inRFC822: message.source)
+
+    guard let box = byURL[message.summary.mailboxURL] else { return (message.summary, embedded) }
+    let onDisk = index.attachmentFiles(ofMessage: message.summary.rowid, in: box)
+    guard !onDisk.isEmpty else { return (message.summary, embedded) }
+
+    // Match on filename: the directory is named by MIME part path, which the
+    // parser does not track, but Mail names the file exactly as the part did.
+    var metadata: [String: MailAttachment] = [:]
+    for item in embedded { metadata[item.originalName.lowercased()] = item }
+
+    var files: [MailAttachment] = []
+    for (_, url) in onDisk {
+      guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { continue }
+      let name = url.lastPathComponent
+      let match = metadata[name.lowercased()]
+      files.append(
+        MailAttachment(
+          name: safeFilename(name, fallback: "attachment-\(files.count + 1)"),
+          originalName: name,
+          contentType: match?.contentType ?? "application/octet-stream",
+          data: data,
+          isInline: match?.isInline ?? false))
+    }
+
+    // A part Mail did not write out but that carries its own bytes still
+    // counts; without this an inline image embedded in a locally composed
+    // message would vanish from the listing.
+    let written = Set(files.map { $0.originalName.lowercased() })
+    files.append(
+      contentsOf: embedded.filter {
+        !written.contains($0.originalName.lowercased()) && !$0.data.isEmpty
+      })
+    return (message.summary, files)
+  }
+
   // MARK: Accounts
 
   public struct AccountSummary: Sendable {

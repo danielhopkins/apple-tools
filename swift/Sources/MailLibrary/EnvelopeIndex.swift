@@ -483,10 +483,11 @@ public final class EnvelopeIndex {
 
   // MARK: .emlx lookup
 
-  /// `V10/<account>/<Mailbox>.mbox/<store-uuid>/Data/<digits>/Messages/<rowid>.emlx`.
-  /// The store directory is a UUID we have no record of, so it is globbed. A
-  /// message that has not been downloaded has no file at all.
-  public func emlxPath(ofMessage rowid: Int64, in mailbox: MailboxRef) -> URL? {
+  /// The `Data/<digits>/` directories a message's files could live under.
+  ///
+  /// `V10/<account>/<Mailbox>.mbox/<store-uuid>/Data/<digits>/`. The store
+  /// directory is a UUID we have no record of, so it is globbed.
+  private func dataDirectories(ofMessage rowid: Int64, in mailbox: MailboxRef) -> [URL] {
     var directory = versionDirectory.appendingPathComponent(mailbox.accountUUID)
     for component in mailbox.components {
       directory = directory.appendingPathComponent(component + ".mbox")
@@ -494,13 +495,21 @@ public final class EnvelopeIndex {
     guard
       let stores = try? FileManager.default.contentsOfDirectory(
         at: directory, includingPropertiesForKeys: nil)
-    else { return nil }
+    else { return [] }
 
     let subdirectories = emlxSubdirectories(forRowID: rowid)
-    for store in stores where store.hasDirectoryPath {
-      var messages = store.appendingPathComponent("Data")
-      for part in subdirectories { messages = messages.appendingPathComponent(part) }
-      messages = messages.appendingPathComponent("Messages")
+    return stores.filter(\.hasDirectoryPath).map { store in
+      var data = store.appendingPathComponent("Data")
+      for part in subdirectories { data = data.appendingPathComponent(part) }
+      return data
+    }
+  }
+
+  /// `…/Data/<digits>/Messages/<rowid>.emlx`. A message that has not been
+  /// downloaded has no file at all.
+  public func emlxPath(ofMessage rowid: Int64, in mailbox: MailboxRef) -> URL? {
+    for data in dataDirectories(ofMessage: rowid, in: mailbox) {
+      let messages = data.appendingPathComponent("Messages")
       // `.partial.emlx` is a message whose body was only partly fetched; it
       // still parses, and it is better than reporting the message missing.
       for name in ["\(rowid).emlx", "\(rowid).partial.emlx"] {
@@ -509,6 +518,43 @@ public final class EnvelopeIndex {
       }
     }
     return nil
+  }
+
+  /// `…/Data/<digits>/Attachments/<rowid>/<mime-part>/<filename>`.
+  ///
+  /// Mail does not keep attachment bytes in the `.emlx`. It strips them out,
+  /// leaving the MIME skeleton with an empty body and an
+  /// `X-Apple-Content-Length` header, and writes the file here **already
+  /// decoded** — a real PDF, not base64. Reading the message alone therefore
+  /// yields zero-byte attachments.
+  ///
+  /// Directories are named by MIME part path, so `2` and `2.2` are siblings.
+  public func attachmentFiles(ofMessage rowid: Int64, in mailbox: MailboxRef) -> [(
+    part: String, url: URL
+  )] {
+    let manager = FileManager.default
+    for data in dataDirectories(ofMessage: rowid, in: mailbox) {
+      let root = data.appendingPathComponent("Attachments").appendingPathComponent("\(rowid)")
+      guard let parts = try? manager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+      else { continue }
+      var found: [(part: String, url: URL)] = []
+      for partDirectory in parts.filter(\.hasDirectoryPath) {
+        guard
+          let files = try? manager.contentsOfDirectory(
+            at: partDirectory, includingPropertiesForKeys: nil)
+        else { continue }
+        for file in files where !file.hasDirectoryPath {
+          found.append((part: partDirectory.lastPathComponent, url: file))
+        }
+      }
+      if !found.isEmpty {
+        // "2.10" must sort after "2.9", so compare numerically per component.
+        return found.sorted {
+          $0.part.compare($1.part, options: .numeric) == .orderedAscending
+        }
+      }
+    }
+    return []
   }
 }
 
