@@ -1,8 +1,8 @@
 class AppleTools < Formula
-  desc "CLIs for local Apple app data: Notes, Mail, Reminders, Calendar, Contacts"
+  desc "CLIs for local Apple app data: Notes, Mail, Messages, Reminders, Calendar, Contacts"
   homepage "https://github.com/danielhopkins/apple-tools"
-  url "https://github.com/danielhopkins/apple-tools/releases/download/v26.728.4/apple-tools-26.728.4.tar.gz"
-  sha256 "b4686a1a29a734a2c699666dc3023fa83f2bc6191c2f2595faf20f50b92070e3"
+  url "https://github.com/danielhopkins/apple-tools/releases/download/v26.728.5/apple-tools-26.728.5.tar.gz"
+  sha256 "7ba2dec91dd21c1b81fc93c943ee8c59452be7ff8dfa33b1a83f487f340725dd"
   license "MIT"
 
   depends_on :macos
@@ -14,7 +14,8 @@ class AppleTools < Formula
     libexec.install "apple-notes", "notestore.py", "notestore.proto"
     bin.install_symlink libexec/"apple-notes"
 
-    bin.install "apple", "apple-contacts", "apple-mail", "apple-calendar", "reminders"
+    bin.install "apple", "apple-contacts", "apple-mail", "apple-messages",
+                "apple-calendar", "reminders"
 
     doc.install "README.md", "CLAUDE.md", "docs"
 
@@ -55,14 +56,17 @@ class AppleTools < Formula
       in System Settings under their own names. Upgrading this formula
       occasionally asks for a grant again; that is expected, not a fault.
 
-      apple-notes and apple-mail read Apple's SQLite stores directly, which
-      requires Full Disk Access for your terminal app:
+      apple-notes, apple-mail and apple-messages read Apple's SQLite stores
+      directly, which requires Full Disk Access for your terminal app:
       System Settings -> Privacy & Security -> Full Disk Access
 
       For apple-mail that covers search, export and accounts — they read Mail's
       own index and message files, so they are fast and work with Mail.app
       closed. Only draft and send need the Automation grant above. Run
       `apple mail status` to see both.
+
+      apple-messages is read-only and needs nothing beyond that Full Disk
+      Access; it reads ~/Library/Messages/chat.db and never drives Messages.app.
 
       apple-contacts also reads that store for contact notes, which the Contacts
       framework cannot expose without an Apple-granted entitlement.
@@ -76,6 +80,7 @@ class AppleTools < Formula
     assert_match version.to_s, shell_output("#{bin}/reminders --version")
     assert_match version.to_s, shell_output("#{bin}/apple-mail --version")
     assert_match version.to_s, shell_output("#{bin}/apple-calendar --version")
+    assert_match version.to_s, shell_output("#{bin}/apple-messages --version")
 
     # The dispatcher must find each tool as a sibling in bin.
     assert_match "apple-notes", shell_output("#{bin}/apple --which")
