@@ -128,17 +128,19 @@ out which grant is missing:
 
 ```
 $ apple status
-TOOL       PANE                   GRANTED TO     STATE
-notes      Full Disk Access       terminal       authorized
-mail       Automation → Mail      terminal       authorized
-reminders  Reminders              tool           fullAccess
-calendar   Calendars              tool           fullAccess
-contacts   Contacts               tool           authorized
+TOOL       PERMISSION             OK
+notes      Full Disk Access       ✓
+mail       Automation → Mail      ✓
+reminders  Reminders              ✓
+calendar   Calendars              ✓
+contacts   Contacts               ✓
+
+All tools have the access they need.
 ```
 
-`GRANTED TO` is the column that matters: `tool` means the grant follows the
-binary and works from any terminal; `terminal` means it belongs to whatever
-launched it. `--json` gives the same data with the advice for anything broken.
+Anything marked ✗ gets a line underneath naming the exact state and what to do
+about it — `denied`, `writeOnly` ("Add Only", which looks granted but cannot
+read), `notDetermined`, and so on. `--json` reports the same detail per tool.
 
 **Every tool accepts `--json`.** Plain-text output is for humans and its shape
 isn't guaranteed; JSON is.
