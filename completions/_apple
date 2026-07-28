@@ -18,6 +18,7 @@ _apple() {
 
     local -a top_level
     top_level=(
+        'status:Permission state of every tool, without prompting'
         '--help:Show usage'
         '--version:Print the apple-tools version'
         '--which:Print the resolved path of each tool'

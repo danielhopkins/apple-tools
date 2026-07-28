@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-APPLE_TOOLS_VERSION="26.727.13"
+APPLE_TOOLS_VERSION="26.727.14"
 
 # Resolve the repo root even when invoked through a symlink in ~/bin.
 SOURCE="${BASH_SOURCE[0]}"
@@ -52,6 +52,7 @@ ${H}TOOLS:${R}
 Every tool supports --json. Run \`apple <tool> --help\` for its own options.
 
 ${H}OTHER:${R}
+    ${G}apple status${R}        Permission state of every tool, without prompting
     ${G}apple --help${R}        Show this message
     ${G}apple --version${R}     Print the apple-tools version
     ${G}apple --which${R}       Print the resolved path of each tool
@@ -117,6 +118,100 @@ resolve() {
     return 1
 }
 
+# Collect every tool's `status --json` and render one report.
+#
+# Each tool answers for itself rather than the dispatcher guessing, so this
+# stays correct as the underlying permission models drift apart. Records are
+# separated by \x1e because the JSON is pretty-printed and contains newlines.
+status_report() {
+    local want_json=0
+    [ "${1:-}" = "--json" ] && want_json=1
+
+    local payload="" tool bin js
+    for tool in notes mail reminders calendar contacts; do
+        if ! bin="$(resolve "$tool" 2>/dev/null)"; then
+            payload+="$tool"$'\t'$'\x1f'"not installed"$'\x1e'
+            continue
+        fi
+        if ! js="$("$bin" status --json 2>/dev/null)"; then
+            payload+="$tool"$'\t'$'\x1f'"status unavailable"$'\x1e'
+            continue
+        fi
+        payload+="$tool"$'\t'"$js"$'\x1e'
+    done
+
+    printf '%s' "$payload" | python3 -c '
+import json, os, sys
+
+want_json = sys.argv[1] == "1"
+
+# Which System Settings pane, and whether the grant follows the tool or the
+# terminal that launched it. That distinction is the whole reason this report
+# is useful: three of these are per-tool, two are per-terminal.
+META = {
+    "notes":     ("Full Disk Access",    "terminal"),
+    "mail":      ("Automation → Mail", "terminal"),
+    "reminders": ("Reminders",           "tool"),
+    "calendar":  ("Calendars",           "tool"),
+    "contacts":  ("Contacts",            "tool"),
+}
+
+records = []
+for chunk in sys.stdin.read().split("\x1e"):
+    if not chunk.strip():
+        continue
+    name, _, raw = chunk.partition("\t")
+    if raw.startswith("\x1f"):
+        records.append((name, {"status": raw[1:], "usable": False}))
+        continue
+    try:
+        records.append((name, json.loads(raw)))
+    except ValueError:
+        records.append((name, {"status": "unparseable", "usable": False}))
+
+unusable = [name for name, info in records if info.get("usable") is not True]
+
+if want_json:
+    print(json.dumps(
+        {name: {**info, "pane": META.get(name, ("", ""))[0],
+                "granted_to": META.get(name, ("", ""))[1]}
+         for name, info in records},
+        indent=2, sort_keys=True))
+    # Same contract as the table form: non-zero when something needs attention.
+    sys.exit(1 if unusable else 0)
+
+colour = (sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+          and os.environ.get("CLICOLOR", "1") != "0"
+          and os.environ.get("TERM") != "dumb") or \
+         os.environ.get("CLICOLOR_FORCE", "0") != "0"
+def paint(text, code):
+    return "\033[%sm%s\033[0m" % (code, text) if colour else text
+
+print(paint("%-10s %-22s %-14s %s" % ("TOOL", "PANE", "GRANTED TO", "STATE"), "1;34"))
+problems = []
+for name, info in records:
+    pane, scope = META.get(name, ("", ""))
+    state = info.get("status", "unknown")
+    ok = info.get("usable") is True
+    print("%-10s %-22s %-14s %s" % (
+        paint(name, "1;35"), pane, scope,
+        paint(state, "32" if ok else "31")))
+    if not ok:
+        problems.append((name, info.get("advice")))
+
+if problems:
+    print()
+    for name, advice in problems:
+        print("%s: %s" % (paint(name, "1;35"), advice or "not usable"))
+else:
+    print()
+    print(paint("All tools have the access they need.", "32"))
+
+# Non-zero when anything is unusable, so this can gate a script.
+sys.exit(1 if problems else 0)
+' "$want_json"
+}
+
 main() {
     if [ $# -eq 0 ]; then
         usage
@@ -136,6 +231,14 @@ main() {
             for tool in notes mail reminders calendar contacts; do
                 printf '%-10s %s\n' "$tool" "$(resolve "$tool" 2>&1 || true)"
             done
+            exit 0
+            ;;
+        status)
+            shift
+            # `|| exit` keeps this in a condition context, so `set -e` doesn't
+            # abort before the status can be propagated. 1 means a tool lacks
+            # access; 0 means everything is usable.
+            status_report "${1:-}" || exit $?
             exit 0
             ;;
     esac
