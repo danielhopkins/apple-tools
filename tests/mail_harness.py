@@ -82,13 +82,42 @@ def mail(*args, check=True, stdin=None):
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def osascript(source, *args):
-    proc = subprocess.run(
-        ["/usr/bin/osascript", "-e", source, *args], capture_output=True, text=True
-    )
+class MailWedged(AssertionError):
+    """Mail stopped servicing Apple Events and needs restarting."""
+
+
+# Every osascript call gets a deadline. Without one, a single Apple Event to a
+# wedged Mail blocks forever: a suite that normally takes 26s ran for eleven
+# minutes before it was killed, having produced no output at all, because each
+# call was waiting on an app that was never going to answer.
+OSASCRIPT_TIMEOUT = 45
+
+
+def osascript(source, *args, timeout=OSASCRIPT_TIMEOUT):
+    try:
+        proc = subprocess.run(
+            ["/usr/bin/osascript", "-e", source, *args],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise MailWedged(
+            f"Mail did not answer an Apple Event within {timeout}s.\n{WEDGED_ADVICE}"
+        ) from None
     if proc.returncode != 0:
+        # -1712 is the Apple Event timeout; Mail raises it once it is far
+        # enough behind that it cannot service the request at all.
+        if "-1712" in proc.stderr or "timed out" in proc.stderr.lower():
+            raise MailWedged(f"Mail returned an Apple Event timeout.\n{WEDGED_ADVICE}")
         raise AssertionError(f"osascript failed: {proc.stderr.strip()}")
     return proc.stdout.strip()
+
+
+WEDGED_ADVICE = (
+    "Mail.app's scripting interface is wedged — it stops servicing Apple Events\n"
+    "under sustained volume and does not recover on its own. Quit and reopen\n"
+    "Mail.app, then re-run. If it will not quit:\n"
+    "    kill -9 $(pgrep -f 'Mail.app/Contents/MacOS/Mail') && open -a Mail"
+)
 
 
 def mail_running():
@@ -98,6 +127,30 @@ def mail_running():
         ["/usr/bin/pgrep", "-f", "Mail.app/Contents/MacOS/Mail"],
         capture_output=True,
     ).returncode == 0
+
+
+# A wedged Mail still answers trivial requests: `tell application "Mail" to
+# return name` came back instantly from an app macOS was reporting as "not
+# responding". The probe therefore has to touch a mailbox, which is the thing
+# a wedged Mail cannot do.
+HEALTH_PROBE = """
+tell application "Mail" to return (count of messages of mailbox "Drafts" of account 1) as string
+"""
+
+
+def mail_responsive(timeout=20):
+    """Whether Mail can still do real work, not just answer static properties."""
+    if not mail_running():
+        return False
+    try:
+        proc = subprocess.run(
+            ["/usr/bin/osascript", "-e", HEALTH_PROBE],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False
+    # A wedged Mail returns success with empty output as readily as it errors.
+    return proc.returncode == 0 and proc.stdout.strip() != ""
 
 
 FIND_SOURCE = """
@@ -263,11 +316,25 @@ class LiveMailTest(unittest.TestCase):
             )
         if not mail_running():
             raise unittest.SkipTest("Mail.app is not running")
+        # Check before spending anything. A wedged Mail cannot be tested
+        # against, and every call made to one blocks until its timeout — so
+        # starting anyway turns a fast failure into a very slow one.
+        if not mail_responsive():
+            raise unittest.SkipTest(
+                f"Mail.app is not answering Apple Events.\n{WEDGED_ADVICE}")
         sweep()
 
     @classmethod
     def tearDownClass(cls):
-        sweep()
+        try:
+            sweep()
+        except MailWedged:
+            pass
+        # A green suite that leaves Mail unusable is not a pass. Reported
+        # rather than raised: unittest swallows tearDownClass errors into a
+        # confusing traceback, and this needs to be the last thing read.
+        if not mail_responsive():
+            print(f"\n\n*** THIS SUITE WEDGED MAIL.APP ***\n{WEDGED_ADVICE}\n", file=sys.stderr)
 
     # Deliberately NO per-test tearDown sweep. Each sweep is several Apple
     # Events, and Mail stops answering entirely under sustained load — a
