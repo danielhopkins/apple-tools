@@ -29,17 +29,16 @@ Notes on each:
   to be clever with `--to`.
 - **Reminders** — `--include-overdue` is essential. Overdue items are the whole
   point of a brief and are omitted without it.
-- **Mail** — the slow one, and the one that lies. Scope it: `--mailbox inbox`
-  plus a tight `--since`. **Never** combine an empty query with `--field all`;
-  that searches every message body across every mailbox and will not finish.
-  Add `--flagged` if the user only cares about flagged mail.
+- **Mail** — reads Mail's own store, so it is fast and works with Mail.app
+  closed. `--mailbox inbox` and `--since 2` are here because a brief is about
+  what is *new and unhandled*, not because the query needs bounding. Add
+  `--flagged` if the user only cares about flagged mail.
 
-  ⚠️ **A mail search that takes ~120s and returns `[]` timed out — it did not
-  find an empty inbox.** AppleScript's event timeout is two minutes and the
-  result is indistinguishable from no matches. If a search takes that long,
-  report mail as unavailable and give the rest of the brief. Do not tell the
-  user their inbox is clear on the strength of an empty result that took two
-  minutes to arrive.
+  ⚠️ **An empty result is only trustworthy if stderr is quiet.** Without Full
+  Disk Access this falls back to AppleScript, which hits a ~120s timeout and
+  returns `[]` with exit status 0. If you see `note: falling back to
+  AppleScript` and an empty result after a long wait, report mail as unavailable
+  and give the rest of the brief — do not tell the user their inbox is clear.
 
 If the user names a different day ("what's tomorrow look like"), use
 `--from`/`--to` on calendar and `--due-date` on reminders instead.

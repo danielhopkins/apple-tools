@@ -55,10 +55,11 @@ apple calendar add --help # every flag, with defaults
 apple notes search "budget" --json
 apple notes export 261                    # body as Markdown
 
-# Mail — bound every search; see the timeout trap below
+# Mail — reads Mail's own store; fast, and works with Mail.app closed
 apple mail accounts --json
 apple mail draft --to a@b.com --subject "Re: Q3" --body-file -   # body on stdin
-apple mail search "invoice" --mailbox inbox --since 30 --limit 20 --json
+apple mail search "invoice" --json                       # whole store, ~0.04s
+apple mail search "budget review" --field content --json # full text of bodies
 apple mail export <message-id>
 
 # Reminders
@@ -97,9 +98,15 @@ destroys every attachment on it, unrecoverably. These tools do not expose note
 writing at all, which is deliberate — do not reach for AppleScript to work
 around it.
 
-**Mail search defaults to subject only.** Use `--field all` when the user is
-describing content rather than a subject line. Trash and junk are excluded
-unless you pass `--all`.
+**Mail search defaults to subject only.** Use `--field content` when the user is
+describing what an email *said*, or `--field all` for subject, sender and body
+together. Both are cheap enough to reach for — see below. Trash and junk are
+excluded unless you pass `--all`.
+
+**A mail query is an AND of terms.** `budget review` finds messages containing
+both words anywhere, in any order. Double-quote to require adjacency:
+`"budget review"`. So prefer two or three distinctive words over one, and do not
+paste a whole sentence — every word has to appear.
 
 **Drafting email is where you are most useful.** `apple mail draft` writes to
 Drafts and never sends. Pass long bodies via `--body-file -` on stdin.
@@ -117,13 +124,26 @@ a `<blockquote type="cite">` by Mail itself (styling neutralised, renders
 normally), and the `text/plain` alternative is empty so plain-text-only readers
 see nothing until Mail regenerates the MIME on send.
 
-**Mail search can time out and look like an empty result.** AppleScript's event
-timeout is ~120 seconds, and when it trips, the search returns `[]` with exit
-status 0 — indistinguishable from "no matches". So: if a mail search takes about
-two minutes and comes back empty, treat it as *failed*, not as an empty inbox.
-Keep searches cheap — `--mailbox inbox`, a tight `--since`, a small `--limit`,
-and never an empty query with `--field all` (that greps every body in every
-mailbox and will not finish).
+**Mail search is fast now — search widely.** It reads Mail's own index and
+message files rather than driving Mail.app, so a whole-store subject search is
+~0.04s, it covers every mailbox rather than a handful, and it works with Mail
+closed. The old advice to bound every search with `--mailbox inbox` and a tight
+`--since` no longer applies; narrow because the *user's question* is narrow, not
+out of fear.
+
+`--field content` is the one mode that opens files. It stops as soon as
+`--limit` is filled, so it usually reads a small slice of the store — but a
+term with fewer matches than `--limit` has to read all of it (~9s on a 40k
+store). It prints `note: scanned N message bodies of M candidates` on stderr, so
+you can always see how deep it went. If that is too slow, add `--since` or
+`--mailbox`: those filter in SQL *before* any file is opened.
+
+**If a search comes back empty, check stderr before reporting "nothing found".**
+The file-system engine either answers or errors — it has no silent-empty mode.
+But `--engine applescript` (the fallback, used when Full Disk Access is missing)
+still hits a ~120s Apple Event timeout that returns `[]` with exit status 0. A
+`note: falling back to AppleScript` line on stderr plus an empty result and a
+two-minute wait means the search *failed*, not that the inbox is empty.
 
 **Note search is title-only.** To search note *content*, export candidates and
 grep them.

@@ -54,9 +54,15 @@ apple mail search "alice@example.com" --field sender --since 60 --limit 10 --jso
 apple mail search "<topic from the event title>" --since 90 --limit 10 --json
 ```
 
-`--field sender` and the default `--field subject` are the cheap ones. Reach for
-`--field all` only when subject search found nothing and the topic is likely to
-appear only in message bodies — it greps every body and is dramatically slower.
+`--field sender` and the default `--field subject` are free — they are indexed,
+so they cost milliseconds no matter how wide you cast. If subject search finds
+nothing, follow up with `--field content`, which searches message bodies; it
+opens files, so it is the slower one, but with `--since 90` already applied it
+is a fraction of a second. That is often where the real context is — the topic
+gets discussed in a thread whose subject line never mentions it.
+
+Remember a query is an AND of terms: `budget review` needs both words present.
+Prefer two distinctive words over a whole phrase from the event title.
 
 And any notes on the subject:
 
@@ -68,10 +74,12 @@ apple notes export <id>        # only for the ones that actually look relevant
 Note search is **title-only**, so try a couple of phrasings of the topic. Do not
 export every result — read titles first, export the two or three that matter.
 
-⚠️ A mail search that takes ~120s and returns `[]` hit AppleScript's event
-timeout; it did not establish that there is no correspondence. Say so rather
-than reporting "no recent email with them". Narrow `--since` and retry once, and
-if it times out again continue the prep without it.
+⚠️ An empty mail result establishes there is no correspondence *only if stderr
+is quiet*. Without Full Disk Access this falls back to AppleScript, which hits a
+~120s event timeout and returns `[]` with exit status 0. If you see `note:
+falling back to AppleScript` and an empty result after a long wait, say the
+search failed rather than reporting "no recent email with them", and continue
+the prep without it.
 
 ## 4. Present
 

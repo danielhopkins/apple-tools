@@ -15,20 +15,16 @@ Requires the `apple` CLI; see the `apple-tools` skill for the tool surface.
 
 ## 1. Read
 
-Mail.app must be running. Bound every search; large mailboxes are slow.
+Mail reads its own on-disk store, so this is fast and works with Mail.app
+closed.
 
 ```bash
 apple mail search "" --mailbox inbox --unread --since 7 --limit 30 --json
 ```
 
-⚠️ **Never combine an empty query with `--field all`.** That greps every message
-body in every mailbox and will not finish. Keep triage scoped to `--mailbox
-inbox` with a tight `--since`.
-
-⚠️ **A search that takes ~120s and returns `[]` timed out.** That is
-AppleScript's event timeout, and the empty result is indistinguishable from "no
-matches". Never report a clear inbox on the strength of one — say the search
-timed out and suggest a narrower `--since`.
+The scoping here is about *what triage means* — unread, in the inbox, recent —
+not about keeping the query cheap. Widening it is safe if the user asks for
+something broader.
 
 Variations worth using:
 
@@ -38,12 +34,18 @@ Variations worth using:
 - `--account "<name>"` to scope to one account — get exact names from
   `apple mail accounts --json`, since they can contain emoji and spaces.
 
-Reading a body is a second AppleScript round trip and is slow, so do it only
-where it changes the answer:
+Reading a body is a local file read, so it is cheap — read the ones where the
+subject line does not settle whether there is an action:
 
 ```bash
 apple mail export <message-id>
 ```
+
+⚠️ **If a search returns empty, check stderr first.** The normal engine either
+answers or errors. But when Full Disk Access is missing it falls back to
+AppleScript, which hits a ~120s timeout and returns `[]` with exit status 0. A
+`note: falling back to AppleScript` line plus an empty result after a long wait
+means the search *failed* — never report a clear inbox on the strength of it.
 
 Subject lines lie. Don't classify something as actionable, or dismiss it, on a
 subject alone when the body is available and the call is close.
