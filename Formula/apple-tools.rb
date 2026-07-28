@@ -1,8 +1,8 @@
 class AppleTools < Formula
   desc "CLIs for local Apple app data: Notes, Mail, Reminders, Calendar, Contacts"
   homepage "https://github.com/danielhopkins/apple-tools"
-  url "https://github.com/danielhopkins/apple-tools/releases/download/v26.727.15/apple-tools-26.727.15.tar.gz"
-  sha256 "164e80cd53ea5707f543e2de27ca83360c30090a409127a9577a24fbd3954073"
+  url "https://github.com/danielhopkins/apple-tools/releases/download/v26.728.0/apple-tools-26.728.0.tar.gz"
+  sha256 "2a1f9f815742e33048d30c7572ed05d21dde27ea5219cdadf735a4c2c825a064"
   license "MIT"
 
   depends_on :macos
@@ -46,18 +46,23 @@ class AppleTools < Formula
 
         reminders show-lists       # Reminders access
         apple-calendar calendars   # Calendar access
-        apple-mail accounts        # Automation access for Mail
-
         apple-contacts list        # Contacts access
+
+        apple-mail draft --help    # Automation access for Mail, for draft/send
 
       reminders, apple-calendar and apple-contacts hold their own grants rather
       than borrowing the terminal's, so they work from any terminal and appear
       in System Settings under their own names. Upgrading this formula
       occasionally asks for a grant again; that is expected, not a fault.
 
-      apple-notes reads Apple's SQLite store directly, which requires Full Disk
-      Access for your terminal app:
+      apple-notes and apple-mail read Apple's SQLite stores directly, which
+      requires Full Disk Access for your terminal app:
       System Settings -> Privacy & Security -> Full Disk Access
+
+      For apple-mail that covers search, export and accounts — they read Mail's
+      own index and message files, so they are fast and work with Mail.app
+      closed. Only draft and send need the Automation grant above. Run
+      `apple mail status` to see both.
 
       apple-contacts also reads that store for contact notes, which the Contacts
       framework cannot expose without an Apple-granted entitlement.
