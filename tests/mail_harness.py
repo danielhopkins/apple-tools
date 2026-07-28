@@ -40,6 +40,7 @@ class, not once per test.
 import unicodedata
 
 import email
+import json
 import os
 import subprocess
 import sys
@@ -172,13 +173,55 @@ end run
 """.replace("TRASH_LIST", ", ".join(f'"{name}"' for name in TRASH_NAMES))
 
 
+# Reads go through the file-system engine, writes through AppleScript.
+#
+# Mail's scripting interface has a hard ceiling on Apple Event volume: past it
+# the app stops answering and has to be force-quit. Enumerating Drafts is among
+# the most expensive things to ask for, and the read helpers below are called
+# by nearly every test, so on AppleScript they dominated the suite's event
+# budget — enough that adding six tests wedged Mail three times.
+#
+# The index carries the same information for a fraction of the cost (0.03s vs
+# 0.19s) and is *fresher*: a new draft appears immediately, while a moved one
+# lingers in the scripting enumeration for ~135s waiting on the IMAP expunge.
+# Both helpers fall back to AppleScript when the index cannot be read, so a
+# machine without Full Disk Access still runs the suite — slowly.
+
+
+def _index_drafts():
+    """Draft summaries from Mail's own index. None if it cannot be read."""
+    code, out, _ = mail(
+        "search", "", "--mailbox", "drafts", "--limit", "999", "--json",
+        "--engine", "filesystem", check=False)
+    if code != 0:
+        return None
+    try:
+        return json.loads(out or "[]")
+    except ValueError:
+        return None
+
+
 def find_draft_source(marker):
-    """RFC822 source of the first draft whose subject contains `marker`."""
-    return osascript(FIND_SOURCE, marker)
+    """RFC822 source of the newest draft whose subject contains `marker`."""
+    drafts = _index_drafts()
+    if drafts is None:
+        return osascript(FIND_SOURCE, marker)
+    for draft in drafts:
+        if marker in draft["subject"]:
+            code, out, _ = mail(
+                "export", draft["id"], "--raw", "--engine", "filesystem", check=False)
+            if code == 0:
+                return out
+            # In the index but not yet on disk; Mail can still produce it.
+            return osascript(FIND_SOURCE, marker)
+    return ""
 
 
 def count_drafts(marker=TEST_PREFIX):
-    return int(osascript(COUNT_DRAFTS, marker))
+    drafts = _index_drafts()
+    if drafts is None:
+        return int(osascript(COUNT_DRAFTS, marker))
+    return sum(1 for draft in drafts if marker in draft["subject"])
 
 
 def sweep(marker=TEST_PREFIX, passes=2):

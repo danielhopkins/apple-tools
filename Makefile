@@ -177,6 +177,20 @@ set-version:
 
 ## Build a release tarball for the Homebrew tap, and print its sha256
 dist: set-version completions
+	@# Every tool must carry the version in ./VERSION. `set-version` stamps
+	@# four files and can be cut short — piping it into `head` SIGPIPEs it
+	@# partway, which shipped v26.728.2 with bin/apple still on 26.728.1.
+	@# dist re-runs it, so the tarball was right and only the tagged source
+	@# was wrong: silent, and invisible until someone builds from the tag.
+	@for f in bin/apple notes/apple-notes swift/Sources/AppleToolsVersion/Version.swift; do \
+		grep -q "$(VERSION)" "$$f" \
+			|| { echo "error: $$f does not carry $(VERSION); run 'make set-version'"; exit 1; }; \
+	done
+	@# Skills ship in this tarball, so an edit made after the last dist is a
+	@# release that documents the wrong behaviour — which is exactly what
+	@# v26.728.0 did.
+	@git diff --quiet -- skills/ \
+		|| { echo "error: skills/ has uncommitted changes; commit them before releasing"; exit 1; }
 	cd $(SWIFT_DIR) && swift build $(SWIFT_UNIV)
 	rm -rf $(DIST) $(TARBALL)
 	mkdir -p $(DIST)/docs

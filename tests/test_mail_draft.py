@@ -5,10 +5,12 @@ properties lie about recipients (see mail_harness). Drafts are prefixed and
 swept; nothing here sends anything.
 """
 
+import json
 import os
 import tempfile
+import time
 
-from mail_harness import LiveMailTest, count_drafts, mail, same_text
+from mail_harness import TRASH_NAMES, LiveMailTest, count_drafts, mail, same_text
 
 
 class TestGuards(LiveMailTest):
@@ -256,3 +258,127 @@ class TestKnownMailQuirks(LiveMailTest):
         self.assertIn("text/html", bodies)
         self.assertIn("visible only in html", bodies["text/html"])
         self.assertEqual(bodies.get("text/plain", "").strip(), "")
+
+
+class TestDraftRemoval(LiveMailTest):
+    """`delete-draft` and `draft --replace`.
+
+    Mail offers four ways to remove a message and only one of them works, so
+    these pin that the working one stays wired up. The guards matter more than
+    the happy path: this is the only destructive thing apple-mail does to mail.
+    """
+
+    def assertReachedTrash(self, marker):
+        """Assert the draft is now in a trash mailbox.
+
+        Deliberately not "assert it left Drafts". An IMAP move is
+        copy-then-expunge: the index shows the message in trash *and* Drafts at
+        once, and the Drafts copy survives until the server expunges it —
+        measured at ~135s, consistently. Waiting for that would test the mail
+        server, and polling for it wedges Mail's scripting interface outright.
+
+        Read through the file-system engine, which reports Mail's own index and
+        does not suffer the scripting enumeration's lag.
+        """
+        _, out, _ = mail(
+            "search", "", "--all", "--limit", "999", "--json", "--engine", "filesystem")
+        boxes = {m["mailbox"] for m in json.loads(out or "[]") if marker in m["subject"]}
+        self.assertTrue(
+            boxes & set(TRASH_NAMES),
+            f"expected a copy of {marker!r} in trash, found it in {sorted(boxes) or 'nowhere'}")
+
+    def draft_with_id(self, suffix, body="version one"):
+        """Create a draft and return (marker, message_id)."""
+        marker = self.marker(suffix)
+        _, out, _ = mail(
+            "draft", "--to", "nobody@example.invalid", "--subject", marker,
+            "--body", body, "--json")
+        message_id = json.loads(out).get("message_id", "")
+        self.assertTrue(message_id, "draft --json must report the new draft's message_id")
+        return marker, message_id
+
+    def test_draft_reports_its_message_id(self):
+        """Everything else here depends on being able to name the draft.
+
+        An outgoing message has no `message id` at all — asking errors with
+        "Can't make «class meid» of «class bcke»" — and Mail assigns one only
+        once the message reaches Drafts. So it is found by diffing the Drafts
+        ids across the save. If that breaks, both removal paths lose their
+        handle and the failure is silent.
+        """
+        marker, message_id = self.draft_with_id("reports-id")
+        self.assertIn("@", message_id)
+        self.assertEqual(count_drafts(marker), 1)
+
+    def test_delete_draft_removes_it(self):
+        marker, message_id = self.draft_with_id("delete-me")
+        self.assertEqual(count_drafts(marker), 1)
+        mail("delete-draft", message_id)
+        self.assertReachedTrash(marker)
+
+    def test_delete_draft_refuses_an_unknown_id(self):
+        code, _, err = mail("delete-draft", "no-such-id@nowhere.invalid", check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("no draft", err.lower())
+
+    def test_delete_draft_refuses_a_real_non_draft(self):
+        """The guard that keeps this away from the user's actual mail.
+
+        Pointed at a real received message, not a made-up id: a fake id proves
+        only that lookup fails, whereas the property worth pinning is that a
+        message which genuinely exists is still out of reach because it is not
+        in Drafts.
+
+        Safe to run because the AppleScript only ever enumerates
+        `mailbox "Drafts"`, and the assertion afterwards fails loudly if that
+        ever stops being true. Worst case the message is in Trash, which is
+        recoverable — and knowing is worth more than not looking.
+        """
+        _, out, _ = mail(
+            "search", "", "--mailbox", "inbox", "--limit", "1", "--json",
+            "--engine", "filesystem")
+        inbox = json.loads(out or "[]")
+        if not inbox:
+            self.skipTest("no inbox message to test against")
+        victim = inbox[0]
+
+        code, _, err = mail("delete-draft", victim["id"], check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("no draft", err.lower())
+
+        _, after, _ = mail(
+            "search", "", "--mailbox", "inbox", "--limit", "999", "--json",
+            "--engine", "filesystem")
+        self.assertIn(
+            victim["id"], [m["id"] for m in json.loads(after or "[]")],
+            "delete-draft reached a message outside Drafts — it is now in Trash")
+
+    def test_replace_writes_the_new_draft_and_removes_the_old(self):
+        old_marker, old_id = self.draft_with_id("replace-old")
+        new_marker = self.marker("replace-new")
+        _, out, _ = mail(
+            "draft", "--to", "nobody@example.invalid", "--subject", new_marker,
+            "--body", "version two", "--replace", old_id, "--json")
+
+        payload = json.loads(out)
+        self.assertEqual(payload.get("replaced"), old_id)
+        self.assertTrue(
+            payload.get("replaced_removed"),
+            "replaced_removed is what callers check before reporting a clean replacement")
+        self.assertReachedTrash(old_marker)
+        self.assertEqual(count_drafts(new_marker), 1)
+
+    def test_replace_with_an_unknown_target_writes_nothing(self):
+        """Order of operations, which is the whole safety argument.
+
+        The target is verified before anything is composed, so a bad id leaves
+        no orphan draft. And the write happens before the removal, so the
+        failure mode is two drafts rather than none — never lost content.
+        """
+        marker = self.marker("orphan-check")
+        code, _, err = mail(
+            "draft", "--to", "nobody@example.invalid", "--subject", marker,
+            "--body", "x", "--replace", "no-such-id@nowhere.invalid", check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("nothing was written", err.lower())
+        self.assertEqual(count_drafts(marker), 0)

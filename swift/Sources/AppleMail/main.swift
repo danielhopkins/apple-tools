@@ -1183,10 +1183,12 @@ struct Draft: AsyncParsableCommand {
       }
     }
 
-    // Snapshot Drafts so the new message's Message-ID can be identified by
-    // difference; best-effort, since failing to name the draft is not a reason
-    // to refuse to write it.
-    let idsBefore = (try? draftMessageIDs()) ?? []
+    // Learning the Message-ID costs two full enumerations of Drafts, and Mail
+    // degrades badly under Apple Event volume — its scripting interface stops
+    // answering entirely if pushed. So only pay for it when the caller can
+    // actually use the answer.
+    let wantsMessageID = json || replace != nil
+    let idsBefore = wantsMessageID ? ((try? draftMessageIDs()) ?? []) : []
 
     let argv = try compose.arguments(action: "save")
     let result = try runAppleScript(composeScript, arguments: argv)
@@ -1198,16 +1200,19 @@ struct Draft: AsyncParsableCommand {
     // Exactly one new id means we know which draft is ours. Zero or several
     // (a concurrent save, or Mail not having settled) leaves it unreported
     // rather than guessed at.
-    let appeared = ((try? draftMessageIDs()) ?? []).subtracting(idsBefore)
-    let messageID = appeared.count == 1 ? appeared.first! : ""
+    var messageID = ""
+    if wantsMessageID {
+      let appeared = ((try? draftMessageIDs()) ?? []).subtracting(idsBefore)
+      if appeared.count == 1 { messageID = appeared.first! }
+    }
 
-    var replaced: Bool?
+    var removal: DraftRemoval?
     if let target {
-      replaced = try removeDraft(messageID: target, account: nil)
-      if replaced == false {
+      removal = try removeDraft(messageID: target, account: nil)
+      if removal == .failed {
         warn(
-          "warning: the new draft was saved, but the old one (\(target)) is still in Drafts "
-            + "after 3 attempts. You now have both — remove the old one in Mail.app.")
+          "warning: the new draft was saved, but Mail would not move the old one (\(target)) "
+            + "out of Drafts. You now have both — remove the old one in Mail.app.")
       }
     }
 
@@ -1220,7 +1225,11 @@ struct Draft: AsyncParsableCommand {
       if !messageID.isEmpty { payload["message_id"] = messageID }
       if let target {
         payload["replaced"] = target
-        payload["replaced_removed"] = replaced ?? false
+        // "removed" means Mail performed the move — the old draft is on its
+        // way to trash. "confirmed" means Drafts no longer lists it, which can
+        // lag by seconds on IMAP and is not something to block on.
+        payload["replaced_removed"] = removal != .failed
+        payload["replaced_confirmed"] = removal == .confirmed
       }
       let data = try JSONSerialization.data(
         withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
@@ -1231,7 +1240,7 @@ struct Draft: AsyncParsableCommand {
       let recipients = compose.to + compose.cc.map { "cc:" + $0 } + compose.bcc.map { "bcc:" + $0 }
       print("  to:   \(recipients.joined(separator: ", "))")
       if !messageID.isEmpty { print("  id:   \(messageID)") }
-      if let target, replaced == true { print("Replaced \(target) — the old draft is in trash.") }
+      if let target, removal != .failed { print("Replaced \(target) — the old draft is in trash.") }
       print("It is in your Drafts mailbox — review it in Mail before sending.")
     }
   }
@@ -1319,8 +1328,36 @@ private let countDraftScript = """
   end run
   """
 
+/// Drafts, read from Mail's index rather than by asking Mail.
+///
+/// Every Apple Event spent here is charged against a budget Mail enforces by
+/// becoming unresponsive — its scripting interface stops answering under
+/// sustained volume, and enumerating Drafts is among the most expensive things
+/// to ask it for. The index carries the same information, is measurably
+/// fresher than the scripting enumeration (a new draft appears immediately,
+/// while a moved one lingers there for ~135s), and costs a local SQLite read.
+///
+/// Returns nil when the index cannot be read — no Full Disk Access — so the
+/// caller falls back to AppleScript rather than reporting an empty mailbox.
+private func draftsFromIndex() -> [[String: Any]]? {
+  guard let index = try? EnvelopeIndex.open(), let boxes = try? index.mailboxes() else {
+    return nil
+  }
+  let wanted = MailboxNames.matching("drafts")
+  let draftBoxes = boxes.filter { wanted.contains($0.name.lowercased()) }
+  guard !draftBoxes.isEmpty else { return [] }
+
+  var filter = EnvelopeIndex.Filter()
+  filter.mailboxRowIDs = draftBoxes.map(\.rowid)
+  return (try? index.messages(filter: filter, limit: nil)) ?? []
+}
+
 func countDrafts(messageID: String) throws -> Int {
-  Int(try runAppleScript(countDraftScript, arguments: [messageID])) ?? 0
+  let target = strippingAngleBrackets(messageID)
+  if let rows = draftsFromIndex() {
+    return rows.filter { strippingAngleBrackets($0["message_id"] as? String ?? "") == target }.count
+  }
+  return Int(try runAppleScript(countDraftScript, arguments: [messageID])) ?? 0
 }
 
 /// Every Message-ID currently in Drafts.
@@ -1353,24 +1390,65 @@ private let draftIDsScript = """
   """
 
 func draftMessageIDs() throws -> Set<String> {
-  Set(
+  if let rows = draftsFromIndex() {
+    return Set(
+      rows.compactMap { $0["message_id"] as? String }
+        .map(strippingAngleBrackets)
+        .filter { !$0.isEmpty })
+  }
+  return Set(
     try runAppleScript(draftIDsScript)
       .split(separator: "\n").map(String.init)
+      .map(strippingAngleBrackets)
       .filter { !$0.isEmpty })
 }
 
-/// Move every Drafts copy of `messageID` to trash, confirming afterwards.
-/// Returns false when the draft is still there after `passes` attempts.
-@discardableResult
-func removeDraft(messageID: String, account: String?, passes: Int = 3) throws -> Bool {
-  for attempt in 0..<passes {
-    _ = try runAppleScript(deleteDraftScript, arguments: [messageID, account ?? ""])
-    if try countDrafts(messageID: messageID) == 0 { return true }
-    // A move that reported success but did not take effect; Mail needs a
-    // moment before the next attempt sees a fresh enumeration.
-    if attempt < passes - 1 { Thread.sleep(forTimeInterval: 1) }
+enum DraftRemoval {
+  /// A copy is in a trash mailbox — the removal demonstrably happened.
+  case confirmed
+  /// Mail reported the move but it could not be independently verified.
+  case issued
+  /// Mail did not move anything and the draft is still in Drafts.
+  case failed
+}
+
+/// Whether any copy of this message is now in a trash mailbox, according to
+/// Mail's own index. Best-effort: needs Full Disk Access, which `delete-draft`
+/// otherwise does not, so an unreadable index is not an error.
+private func hasTrashCopy(messageID: String) -> Bool {
+  guard let index = try? EnvelopeIndex.open(),
+    let boxes = try? index.mailboxes()
+  else { return false }
+  let byURL = Dictionary(boxes.map { ($0.url, $0) }, uniquingKeysWith: { first, _ in first })
+  for candidate in messageIDCandidates(messageID) {
+    guard let rows = try? index.messages(withMessageID: candidate) else { continue }
+    for row in rows {
+      if let url = row["mailbox_url"] as? String, let box = byURL[url], box.isTrash { return true }
+    }
   }
   return false
+}
+
+/// Move every Drafts copy of `messageID` to trash.
+///
+/// Verification deliberately does *not* wait for the message to leave Drafts.
+/// An IMAP move is copy-then-expunge, so the index shows the message in trash
+/// *and* Drafts at once, and the Drafts copy survives until the server
+/// expunges — measured at ~135 seconds, consistently. Polling the Drafts
+/// enumeration for that is both useless and actively harmful: every check
+/// enumerates all Drafts, and Mail's scripting interface stops answering
+/// entirely under sustained Apple Event volume.
+///
+/// So success is judged on the trash copy appearing, which the index reports
+/// immediately, and the move count is the fallback when the index cannot be
+/// read.
+func removeDraft(messageID: String, account: String?) throws -> DraftRemoval {
+  let moved = Int(try runAppleScript(deleteDraftScript, arguments: [messageID, account ?? ""])) ?? 0
+  if hasTrashCopy(messageID: messageID) { return .confirmed }
+  if moved > 0 { return .issued }
+  // Nothing moved and nothing in trash — but if it is no longer in Drafts
+  // either, someone else removed it and there is nothing to report as broken.
+  return (try countDrafts(messageID: messageID)) > 0 ? .failed : .confirmed
 }
 
 struct DeleteDraft: AsyncParsableCommand {
@@ -1410,15 +1488,19 @@ struct DeleteDraft: AsyncParsableCommand {
 
     // Trusting the move's own report is exactly the mistake that made this
     // look unreliable; the membership is re-read instead.
-    guard try removeDraft(messageID: id, account: account) else {
+    let outcome = try removeDraft(messageID: id, account: account)
+    guard outcome != .failed else {
       throw AppleScriptError(
         message:
-          "Draft '\(id)' is still in Drafts after 3 attempts. Mail sometimes reports a move it "
-          + "did not perform; try again, or move it to Trash in Mail.app.")
+          "Mail would not move draft '\(id)' out of Drafts. Try again, or move it to Trash "
+          + "in Mail.app.")
     }
 
     if json {
-      let payload: [String: Any] = ["status": "deleted", "message_id": id, "removed": before]
+      let payload: [String: Any] = [
+        "status": "deleted", "message_id": id, "removed": before,
+        "confirmed": outcome == .confirmed,
+      ]
       let data = try JSONSerialization.data(
         withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
       print(String(data: data, encoding: .utf8) ?? "{}")
@@ -1426,6 +1508,13 @@ struct DeleteDraft: AsyncParsableCommand {
       print("Draft moved to trash: \(id)")
       if before > 1 { print("  (\(before) copies)") }
     }
+    // The Drafts copy of an IMAP message survives the move until the server
+    // expunges it — around two minutes. Saying so is the difference between a
+    // caller re-listing Drafts and trusting the result, or concluding the
+    // delete silently failed.
+    warn(
+      "note: a copy is in trash now, but the Drafts copy remains until the server "
+        + "expunges it (~2 min on IMAP). Re-listing drafts before then still shows it.")
   }
 }
 
