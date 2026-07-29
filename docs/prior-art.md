@@ -190,13 +190,13 @@ partial one. Verified by reading `src/memo_helpers/edit_memo.py` and
 - **The full round trip works.** Harvest → `set body` (attachments drop to 0) →
   decode each data URI to a file → re-attach. Two distinct images came back with
   matching SHA-256s, in the original order, with the body edit applied.
-- **The countermeasure works for images — and destroys a PDF.**
+- **The countermeasure works for images, and is a no-op for PDFs.**
   `if (count of attachments of n) > EXPECTED then delete last attachment of n`
-  lands an image on 1 then 2 across two adds. The identical script leaves a PDF
-  note with **zero** attachments and **two orphaned `￼`**, reproduced 4/4 and
-  unaffected by a settle delay. `memo` ships it unguarded by type, so this is a
-  live bug in their editor for any note carrying a PDF. Everything here is
-  per-type; a PNG result proves nothing about a PDF.
+  lands an image on 1 then 2 across two adds. For a PDF the count it tests is
+  always 0 — AppleScript cannot see PDF attachments at all — so the guard never
+  fires. Guarded and unguarded PDF adds are identical: two placeholders in the
+  text, one byte-exact file on disk. The duplicate is unfixable through
+  AppleScript, since you cannot delete a reference you cannot enumerate.
 
 Verified costs, worth surfacing to a user rather than claiming a clean edit:
 non-image attachments are destroyed silently with nothing to restore from;
@@ -206,19 +206,16 @@ files; and every restored image lands at the **end** of the note, because
 f-string-interpolates the note body, so a body containing a `"` breaks the
 script — take the technique, not the code.
 
-**🛑 And the obvious improvement is a trap.** Neither memo nor macnotesapp tried
-writing the data URI back *inline* — `set body` with an `<img src="data:…"/>`
-between two paragraphs. It half-works, which is what makes it dangerous: it
-creates a genuine attachment **at the correct position** (SQLite shows
-`ABOVE\n￼\nBELOW`), something `make new attachment` can never do, and it works
-for **any** MIME type — `application/pdf` and `text/plain` too, via `<img src>`
-or `<object data>`. So it is the only way to place an attachment mid-note. But
-the attachment is **nameless**, and `body` never renders it back — polled for
-20s, and a control confirms `make new attachment` shows up instantly, so it is
-not a lag. The next harvest finds nothing and the following edit destroys the
-file silently. Pinned by
-`test_inline_data_uri_write_creates_unharvestable_attachment` and
-`test_inline_data_uri_is_not_image_only`.
+**🛑 And the obvious improvement stores nothing.** Neither memo nor macnotesapp
+tried writing the data URI back *inline* — `set body` with an
+`<img src="data:…"/>` between two paragraphs. It creates an attachment row and
+puts the placeholder at the **correct position** (`ABOVE\n￼\nBELOW`), the one
+thing `make new attachment` cannot do, so it reads as strictly better. The row
+is empty: `ZFILENAME = NULL, ZFILESIZE = 0, ZTYPEUTI = 'public.data'`, and no
+file is ever written (polled 30s). The payload is discarded — for images, PDFs
+and text alike. So **there is no way to place an attachment mid-note**;
+everything appends to the end. Pinned by
+`test_inline_data_uri_write_discards_the_payload`.
 
 ### macnotesapp — the mature one
 

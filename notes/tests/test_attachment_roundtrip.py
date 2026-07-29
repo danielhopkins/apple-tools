@@ -8,22 +8,30 @@ attachment into the body as a base64 `data:` URI, which means it can be
 harvested before a write and restored after one.
 
 The technique comes from antoniorodr/memo (see docs/prior-art.md). These tests
-establish which half of it is real on this macOS version, and pin the two
-seductive variants that silently lose data:
+establish which half of it is real on this macOS version, and pin the traps
+around it.
 
-- writing a data URI back *inline*, which produces an attachment `body` can
-  never return; and
-- the double-insert guard, which is safe for images and **destroys a PDF**.
+⚠️ **Two measurement rules, both learned by getting them wrong here.**
 
-⚠️ Everything here is per-attachment-type. PDFs behave differently from images
-at every step, so a test that passes for a PNG proves nothing about a PDF —
-that mistake is exactly how the guard got documented as working.
+1. **Verify through the store, not through AppleScript.** `count of attachments`
+   returns 0 for a note that demonstrably holds a PDF — the file is on disk,
+   byte-exact, and AppleScript cannot see it. A count of 0 therefore proves
+   nothing about whether an attachment exists, and reading it as evidence of
+   deletion is how a wrong claim got into the docs.
+2. **Let the decoded text settle.** The placeholder count passes through a
+   transient (1) before reaching its settled value (2). `h.poll` returns the
+   first non-empty decode, which is mid-write — use `settled_placeholders()`.
+
+Everything here is per-attachment-type: a result for a PNG proves nothing about
+a PDF.
 """
 
 import os
 import re
+import time
 import base64
 import hashlib
+import sqlite3
 import struct
 import zlib
 import tempfile
@@ -54,6 +62,89 @@ def data_uris(body: str) -> list[tuple[str, str]]:
 
 def digest(b64: str) -> str:
     return hashlib.sha256(base64.b64decode(b64)).hexdigest()
+
+
+def digest_file(path: str) -> str:
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+CONTAINER = os.path.expanduser("~/Library/Group Containers/group.com.apple.notes")
+
+
+def container_files() -> set:
+    """Every file under the Notes group container, for before/after diffing."""
+    out = set()
+    for root, _dirs, files in os.walk(CONTAINER):
+        for fn in files:
+            out.add(os.path.join(root, fn))
+    return out
+
+
+def _new_under_accounts(before: set) -> list:
+    return [p for p in container_files() - before if "/Accounts/" in p]
+
+
+def new_account_files(before: set) -> int:
+    return len(_new_under_accounts(before))
+
+
+def files_matching(before: set, want_sha: str) -> int:
+    """How many newly-created files under Accounts/ have this exact content.
+
+    This is the only trustworthy check that an attachment really landed —
+    `count of attachments` lies for PDFs.
+    """
+    n = 0
+    for p in _new_under_accounts(before):
+        try:
+            if digest_file(p) == want_sha:
+                n += 1
+        except OSError:
+            pass
+    return n
+
+
+def attachment_rows(pk: int) -> list:
+    """(ZFILENAME, ZFILESIZE, ZTYPEUTI) for each child row of the note."""
+    conn = sqlite3.connect(f"file:{h.DB_PATH}?mode=ro", uri=True, timeout=5)
+    try:
+        return conn.execute(
+            "SELECT ZFILENAME, ZFILESIZE, ZTYPEUTI "
+            "FROM ZICCLOUDSYNCINGOBJECT WHERE ZNOTE = ?", (pk,)
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def attach_plain(note_id: str, path: str) -> None:
+    """`make new attachment` without reading the id back (a PDF errors -1728)."""
+    h.osascript(
+        'tell application "Notes"\n'
+        f"set n to note id {h._as_str(note_id)}\n"
+        f"make new attachment at end of n with data (POSIX file {h._as_str(path)})\n"
+        "end tell"
+    )
+
+
+def settled_placeholders(pk: int, stable_for: float = 2.0, timeout: float = 15.0) -> int:
+    """Placeholder count once it stops changing.
+
+    The decoded text passes through a transient (1 placeholder) on its way to
+    the settled value (2). Reading the first non-empty decode — which is what
+    h.poll gives you — catches that transient and reports the wrong number.
+    """
+    deadline = time.time() + timeout
+    last, since = None, time.time()
+    while time.time() < deadline:
+        text = h.sqlite_note_text(pk)
+        now = h.object_replacement_count(text) if text else None
+        if now != last:
+            last, since = now, time.time()
+        elif last is not None and time.time() - since >= stable_for:
+            return last
+        time.sleep(0.3)
+    return last or 0
 
 
 class AttachmentRoundTripTests(unittest.TestCase):
@@ -209,34 +300,75 @@ class AttachmentRoundTripTests(unittest.TestCase):
             # but the body really does show the image twice
             self.assertEqual(len(data_uris(h.get_body(note_id))), 2)
 
-    def test_guard_destroys_a_pdf(self):
-        """🛑 The double-insert guard is IMAGE-ONLY. On a PDF it deletes everything.
+    def test_applescript_count_is_blind_to_pdf_attachments(self):
+        """🛑 `count of attachments` reports 0 for a note that HAS a PDF.
 
-        Same script that lands a PNG on exactly 1 attachment leaves a PDF note
-        with **zero** attachments and **two orphaned U+FFFC placeholders** in the
-        note text — the file is gone and the note is left visibly broken.
-        Reproduced 4/4, and adding a settle delay before the count does not help,
-        so it is deterministic rather than a race.
+        The file is attached and byte-exact on disk; AppleScript simply cannot
+        see it. Enumerating `attachments of n` yields nothing either.
 
-        This is why `notes attach` must branch on attachment type rather than
-        applying the guard universally.
+        This is the trap that matters most for a write path: any code that
+        reasons about attachments through AppleScript's count is wrong for PDFs.
+        It is also what made a count of 0 look like evidence of deletion when
+        nothing had been deleted. **Verify through the store, not the count.**
         """
-        with h.temp_note(body_html="<div>X</div>", label="pdfguard") as note_id:
-            self._add_guarded(note_id, self._pdf(), expected=1)
+        pdf = self._pdf()
+        want = digest_file(pdf)
+        with h.temp_note(body_html="<div>X</div>", label="pdfblind") as note_id:
+            before = container_files()
+            attach_plain(note_id, pdf)
 
             self.assertEqual(
                 h.count_attachments(note_id), 0,
-                "expected the known PDF-destroying behaviour; if this is now 1, "
-                "Apple fixed it — re-test and update docs/apple-notes-api.md",
+                "AppleScript is expected to be blind to PDF attachments; if this "
+                "is now 1, Apple fixed it — re-test and update docs/apple-notes-api.md",
             )
+            # ...yet exactly one byte-exact copy really was stored
+            self.assertEqual(
+                files_matching(before, want), 1,
+                "the PDF should be on disk exactly once, byte-exact",
+            )
+
+    def test_pdf_double_inserts_and_the_guard_cannot_fix_it(self):
+        """A PDF is referenced twice in the text, and the guard is a no-op.
+
+        Because `count of attachments` is 0 (see above), `if count > EXPECTED`
+        never fires — so the guard neither helps nor harms a PDF. Guarded and
+        unguarded adds are indistinguishable: two placeholders, one stored file.
+        The user sees the PDF twice and there is no AppleScript route to fix it.
+        """
+        pdf = self._pdf()
+        want = digest_file(pdf)
+        for label, add in (("unguarded", attach_plain),
+                           ("guarded", lambda n, p: self._add_guarded(n, p, 1))):
+            with self.subTest(variant=label):
+                with h.temp_note(body_html="<div>X</div>", label=f"pdf{label}") as note_id:
+                    before = container_files()
+                    add(note_id, pdf)
+                    pk = h.pk_from_note_id(note_id)
+                    self.assertEqual(
+                        settled_placeholders(pk), 2,
+                        "a PDF is referenced twice in the note text",
+                    )
+                    self.assertEqual(files_matching(before, want), 1,
+                                     "but only one copy is stored")
+
+    def test_placeholder_count_has_a_transient(self):
+        """The decoded placeholder count is 1 before it settles to 2.
+
+        Pinned because reading it too early is exactly how a wrong conclusion
+        got into the docs. `h.poll` returns the FIRST non-empty decode, which
+        for an attachment write is a mid-write state — assertions must settle.
+        """
+        with h.temp_note(body_html="<div>X</div>", label="transient") as note_id:
             pk = h.pk_from_note_id(note_id)
-            text = h.poll(
-                lambda: (t := h.sqlite_note_text(pk)) and h.object_replacement_count(t) >= 1 and t
-            )
-            self.assertTrue(text)
-            self.assertGreaterEqual(
-                h.object_replacement_count(text), 1,
-                "the note text keeps placeholders for the attachment that no longer exists",
+            attach_plain(note_id, self._pdf())
+            first = h.poll(lambda: h.sqlite_note_text(pk))
+            early = h.object_replacement_count(first) if first else 0
+            settled = settled_placeholders(pk)
+            self.assertEqual(settled, 2)
+            self.assertLessEqual(
+                early, settled,
+                "the early read should be a prefix state, never larger than settled",
             )
 
     def test_pdf_attach_cannot_read_back_its_id(self):
@@ -254,24 +386,32 @@ class AttachmentRoundTripTests(unittest.TestCase):
             # the attachment id we could not read is nonetheless in the error
             self.assertRegex(msg, r"ICAttachment/p\d+")
 
-    def test_inline_data_uri_is_not_image_only(self):
-        """The inline-write path accepts any MIME type, not just images.
+    def test_inline_data_uri_write_discards_the_payload(self):
+        """🛑 The inline write stores NOTHING. It is pure data loss, any type.
 
-        A PDF or a text file written as `<img src="data:…">` also lands as a real
-        attachment at the chosen position. Same trap applies to all of them, so
-        the warning cannot be scoped to images.
+        `set body` with `<img src="data:…;base64,…"/>` creates an attachment row
+        and a correctly-positioned placeholder, so it looks like it worked — and
+        it is the only thing that can place an attachment mid-note, which makes
+        it tempting. But the row is empty:
+
+            ZFILENAME = NULL, ZFILESIZE = 0, ZTYPEUTI = 'public.data'
+
+        and **no file is ever written** (polled 30s). The bytes are discarded.
+        True for images and PDFs alike, so there is no safe variant of this.
         """
         with open(self._pdf(), "rb") as f:
             pdf_b64 = base64.b64encode(f.read()).decode()
-        txt_b64 = base64.b64encode(b"hello inline text\n").decode()
+        with open(self._png(), "rb") as f:
+            png_b64 = base64.b64encode(f.read()).decode()
 
         for label, mime, payload in (
             ("pdf", "application/pdf", pdf_b64),
-            ("txt", "text/plain", txt_b64),
+            ("png", "image/png", png_b64),
         ):
             with self.subTest(kind=label):
                 with h.temp_note(body_html="<div>x</div>", label=f"inl{label}") as note_id:
                     title_div = h.get_body(note_id).split("</div>")[0] + "</div>"
+                    before = container_files()
                     h.set_body(
                         note_id,
                         title_div
@@ -279,12 +419,24 @@ class AttachmentRoundTripTests(unittest.TestCase):
                         + f'<div><img src="data:{mime};base64,{payload}"/></div>'
                         + "<div>BELOW</div>",
                     )
+                    # it looks like it worked: one attachment, placed correctly
                     self.assertEqual(h.count_attachments(note_id), 1)
                     pk = h.pk_from_note_id(note_id)
-                    text = h.poll(lambda: h.sqlite_note_text(pk))
-                    self.assertRegex(text, r"ABOVE\s*￼\s*BELOW")
-                    # ...and it is just as unharvestable as the image case
-                    self.assertEqual(data_uris(h.get_body(note_id)), [])
+                    self.assertRegex(h.poll(lambda: h.sqlite_note_text(pk)),
+                                     r"ABOVE\s*￼\s*BELOW")
+
+                    # ...but the payload was thrown away
+                    self.assertEqual(
+                        new_account_files(before), 0,
+                        "the inline write must not be storing a file; if it now "
+                        "does, re-test — mid-note placement would become viable",
+                    )
+                    rows = attachment_rows(pk)
+                    self.assertTrue(rows)
+                    for filename, size, uti in rows:
+                        self.assertIsNone(filename)
+                        self.assertEqual(size, 0)
+                        self.assertEqual(uti, "public.data")
 
     def test_image_roundtrip_preserves_bytes_and_order(self):
         """The full recipe: harvest data URIs, rewrite the body, re-attach.

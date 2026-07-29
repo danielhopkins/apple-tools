@@ -137,17 +137,43 @@ For an **image** this lands the count on `EXPECTED` with exactly one `￼` per
 attachment. Locked by
 `tests/test_attachment_roundtrip.py::test_guarded_add_defeats_double_insert_for_images`.
 
-🛑 **Do not apply it to a PDF — it destroys the attachment.** The identical
-script leaves a PDF note with **zero** attachments and **two orphaned `￼`
-placeholders**: the file is gone and the note is visibly broken. Reproduced 4/4,
-and a settle delay before the count does not help, so it is deterministic rather
-than a race. Locked by
-`tests/test_attachment_roundtrip.py::test_guard_destroys_a_pdf`.
+**For a PDF the guard is a no-op**, because the count it tests is always 0 (see
+below). Guarded and unguarded adds are indistinguishable: **two placeholders in
+the text, one file on disk**. The PDF is intact and the user sees it twice, and
+there is no AppleScript route to fix that — you cannot delete a reference you
+cannot enumerate. Locked by
+`tests/test_attachment_roundtrip.py::test_pdf_double_inserts_and_the_guard_cannot_fix_it`.
 
 For a **text file** the count lands on 1 but the placeholder count is unstable
-(1 or 2 across runs), so the note text can keep an orphan even when the count
-looks right. Any `notes attach` must branch on attachment type; there is no
+across runs. Any `notes attach` must branch on attachment type; there is no
 universal guard.
+
+### 🛑 `count of attachments` is blind to PDFs
+
+A note with a PDF reports `count of attachments` = **0**, and `attachments of n`
+enumerates nothing — while the file sits on disk under
+`Accounts/<uuid>/Media/…`, byte-exact. AppleScript simply cannot see PDF
+attachments.
+
+Consequences, all load-bearing for a write path:
+
+- **A count of 0 does not mean "no attachments."** It never proves an attachment
+  was deleted, which is exactly the false conclusion this repo drew once.
+- **Verify writes through the store**, not through AppleScript: count `￼` in the
+  decoded note text and check for the file under `Accounts/`. The CLI already
+  has that read path; use it.
+- Any per-type reconciliation keyed on `count of attachments` silently does
+  nothing for PDFs.
+
+Locked by `tests/test_attachment_roundtrip.py::test_applescript_count_is_blind_to_pdf_attachments`.
+
+### ⚠️ The decoded placeholder count has a transient
+
+After an attachment write the decoded note text briefly shows **one** `￼` before
+settling on **two**. Any assertion that reads the first non-empty decode (which
+is what the test harness's `poll` returns) gets the mid-write value. Use
+`settled_placeholders()`, which waits for the count to stop changing. Locked by
+`tests/test_attachment_roundtrip.py::test_placeholder_count_has_a_transient`.
 
 Locked by `tests/test_attachments.py::test_make_attachment_double_inserts` and
 `tests/test_attachment_roundtrip.py::test_double_insert_is_one_attachment_referenced_twice`.
@@ -193,22 +219,28 @@ original filenames do not survive (the attachments are rebuilt, so they take the
 name of the temp file); and every restored image lands at the **end** of the
 note, because `make new attachment` cannot place one mid-text.
 
-🛑 **Do not "improve" this by writing the data URI inline.** `set body` with an
-`<img src="data:image/png;base64,…"/>` *does* create a real attachment, and it
-lands at the correct position in the text rather than at the end — so it looks
-strictly better. It is a data-loss trap: the resulting attachment is **nameless**
-and `body` never renders it back as an `<img>` (checked over 20s — it is not a
-propagation lag). The next harvest finds nothing, so the following edit destroys
-the image without warning. Locked by
-`tests/test_attachment_roundtrip.py::test_inline_data_uri_write_creates_unharvestable_attachment`.
+🛑 **Do not "improve" this by writing the data URI inline. It stores nothing.**
 
-**The inline path is not image-specific.** `data:application/pdf` and
-`data:text/plain` also land as real attachments at the chosen position, via
-either `<img src>` or `<object data>` — so this is the *only* way to place any
-attachment mid-note, and it carries the trap for every type. (`<embed>` is
-ignored entirely; `<a href="data:…">` stores the base64 in the body as a link
-and creates no attachment.) Locked by
-`tests/test_attachment_roundtrip.py::test_inline_data_uri_is_not_image_only`.
+`set body` with an `<img src="data:image/png;base64,…"/>` creates an attachment
+row and puts the placeholder at the **correct position** in the text rather than
+at the end — the only thing that can place an attachment mid-note, so it looks
+strictly better than `make new attachment`. It is pure data loss. The row is
+empty:
+
+```
+ZFILENAME = NULL   ZFILESIZE = 0   ZTYPEUTI = 'public.data'
+```
+
+and **no file is ever written** — polled 30s, and nothing appears under
+`Accounts/`. The bytes are discarded. True for `image/png`, `application/pdf`
+and `text/plain` alike, via `<img src>` or `<object data>`, so there is no safe
+variant. (`<embed>` is ignored entirely; `<a href="data:…">` keeps the base64 in
+the body as a link and creates no attachment at all — the one form that does
+preserve the payload, though only as link text.)
+
+**There is therefore no way to place an attachment mid-note.** Everything lands
+at the end. Locked by
+`tests/test_attachment_roundtrip.py::test_inline_data_uri_write_discards_the_payload`.
 
 Locked by `tests/test_attachments.py::test_editing_body_destroys_attachments`. If
 it starts preserving attachments, Apple fixed it — update this section.

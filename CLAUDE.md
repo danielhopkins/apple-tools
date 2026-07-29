@@ -107,11 +107,19 @@ search content, export candidates and grep them.
 - `make new attachment` **double-inserts** on macOS 27 — one attachment record,
   referenced twice, so the user sees the file twice. Deleting the surplus
   immediately (`if (count of attachments of n) > EXPECTED then delete last
-  attachment of n`) fixes it **for images**. 🛑 The same script **destroys a
-  PDF**, leaving zero attachments and two orphaned placeholders. Branch on type.
+  attachment of n`) fixes it **for images**. For a PDF it is a no-op and the
+  duplicate is unfixable.
+- 🛑 **`count of attachments` is blind to PDFs** — it returns 0 for a note that
+  holds one, and `attachments of n` enumerates nothing, while the file sits on
+  disk byte-exact. Never treat a count of 0 as "no attachments". **Verify writes
+  through the SQLite store** (count `￼` in the decoded text, check for the file
+  under `Accounts/`), not through AppleScript.
 - **Attaching a PDF errors on reading the id back** (`-1728, Can't get attachment
   id`). The attachment is created; only the id read fails, and the id is in the
   error text.
+- 🛑 **Writing a `data:` URI into `body` stores nothing** — it creates an empty
+  `public.data` attachment (0 bytes, no file) at the right position. There is no
+  way to place an attachment mid-note; everything lands at the end.
 
 Stdlib only — `notestore.py` decodes the gzipped-protobuf note body directly,
 so no virtualenv is involved.
