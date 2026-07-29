@@ -130,6 +130,22 @@ things an AppleScript body write annihilates:
 attachment-safe, checklist-safe, Markdown-aware, and fast. Nothing in the
 AppleScript surface can do any of that.
 
+### The permission grant is per-shortcut, not per-note
+
+The dialog lists the notes it is about to touch, which reads like a scope
+picker. It is not — the list is a **preview of that run's data**. Tested: a note
+created *after* "Always Allow" was granted was appended to silently (0.393s, no
+prompt). Same for Create, which made several different notes after one grant.
+
+So "Always Allow" means *this shortcut may write to Notes, unattended, forever*.
+
+**That makes "Allow Once" a genuine human-in-the-loop gate**, and a useful one:
+decline the standing grant and every single write shows the user exactly what
+text is going into which note, with Don't Allow / Allow Once. For an agent-driven
+write path that is a built-in confirmation surface we would otherwise have to
+build — and it is enforced by the OS rather than by our own code. Worth exposing
+as a deliberate choice rather than telling users to click Always Allow.
+
 ### ⚠️ Name matching is ambiguous
 
 `is.workflow.actions.filter.notes` matches on `Name`, and two notes can share
