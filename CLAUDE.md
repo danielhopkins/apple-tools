@@ -105,9 +105,13 @@ search content, export candidates and grep them.
 - The SQLite reader **can see Recently Deleted notes**. Filter them out if the
   user asked for live notes.
 - `make new attachment` **double-inserts** on macOS 27 — one attachment record,
-  referenced twice, so the user sees the file twice. Fix by deleting the surplus
-  immediately: `if (count of attachments of n) > EXPECTED then delete last
-  attachment of n`.
+  referenced twice, so the user sees the file twice. Deleting the surplus
+  immediately (`if (count of attachments of n) > EXPECTED then delete last
+  attachment of n`) fixes it **for images**. 🛑 The same script **destroys a
+  PDF**, leaving zero attachments and two orphaned placeholders. Branch on type.
+- **Attaching a PDF errors on reading the id back** (`-1728, Can't get attachment
+  id`). The attachment is created; only the id read fails, and the id is in the
+  error text.
 
 Stdlib only — `notestore.py` decodes the gzipped-protobuf note body directly,
 so no virtualenv is involved.

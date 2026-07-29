@@ -172,8 +172,8 @@ partial one. Verified by reading `src/memo_helpers/edit_memo.py` and
    attachment and re-add the survivors** by base64-decoding each data URI to a
    temp file and running `make new attachment`.
 
-**We ran it. Both halves hold** — see `notes/tests/test_image_roundtrip.py`,
-7 tests, all passing on macOS 27:
+**We ran it. Both halves hold** — see `notes/tests/test_attachment_roundtrip.py`,
+10 tests, all passing on macOS 27:
 
 - **The premise is true, and our docs were wrong.** CLAUDE.md said a note's
   `body` "doesn't include attachments at all". That is true for a **text file**
@@ -190,9 +190,13 @@ partial one. Verified by reading `src/memo_helpers/edit_memo.py` and
 - **The full round trip works.** Harvest → `set body` (attachments drop to 0) →
   decode each data URI to a file → re-attach. Two distinct images came back with
   matching SHA-256s, in the original order, with the body edit applied.
-- **The countermeasure works.** `if (count of attachments of n) > EXPECTED then
-  delete last attachment of n` lands the count on 1 and 2 across two adds, with
-  exactly two `￼` in the decoded SQLite text.
+- **The countermeasure works for images — and destroys a PDF.**
+  `if (count of attachments of n) > EXPECTED then delete last attachment of n`
+  lands an image on 1 then 2 across two adds. The identical script leaves a PDF
+  note with **zero** attachments and **two orphaned `￼`**, reproduced 4/4 and
+  unaffected by a settle delay. `memo` ships it unguarded by type, so this is a
+  live bug in their editor for any note carrying a PDF. Everything here is
+  per-type; a PNG result proves nothing about a PDF.
 
 Verified costs, worth surfacing to a user rather than claiming a clean edit:
 non-image attachments are destroyed silently with nothing to restore from;
@@ -206,12 +210,15 @@ script — take the technique, not the code.
 writing the data URI back *inline* — `set body` with an `<img src="data:…"/>`
 between two paragraphs. It half-works, which is what makes it dangerous: it
 creates a genuine attachment **at the correct position** (SQLite shows
-`ABOVE\n￼\nBELOW`), something `make new attachment` can never do. But the
-attachment is **nameless**, and `body` never renders it back as an `<img>` —
-polled for 20s, and a control confirms `make new attachment` shows up instantly,
-so it is not a lag. The next harvest finds nothing and the following edit
-destroys the image silently. Pinned by
-`test_inline_data_uri_write_creates_unharvestable_attachment`.
+`ABOVE\n￼\nBELOW`), something `make new attachment` can never do, and it works
+for **any** MIME type — `application/pdf` and `text/plain` too, via `<img src>`
+or `<object data>`. So it is the only way to place an attachment mid-note. But
+the attachment is **nameless**, and `body` never renders it back — polled for
+20s, and a control confirms `make new attachment` shows up instantly, so it is
+not a lag. The next harvest finds nothing and the following edit destroys the
+file silently. Pinned by
+`test_inline_data_uri_write_creates_unharvestable_attachment` and
+`test_inline_data_uri_is_not_image_only`.
 
 ### macnotesapp — the mature one
 
@@ -297,8 +304,8 @@ is why the suite is gated behind `notes/run-tests`. A checked-in fixture corpus
 would make the *rendering* half fast, offline, and safe to run in CI — and the
 per-version DBs are the only way to catch a schema change before a user does.
 
-**Done — `notes/tests/test_image_roundtrip.py`, 7 tests, written from this
-survey and all passing:** images appear in `body` as data URIs and text files do
+**Done — `notes/tests/test_attachment_roundtrip.py`, 10 tests, written
+from this survey and all passing:** images appear in `body` as data URIs and text files do
 not; the double-insert is one record referenced twice; the guarded add defeats
 it; the full harvest-edit-re-attach round trip is byte-exact and order-
 preserving; filenames are lost; and the inline-data-URI write is a silent
@@ -315,8 +322,6 @@ data-loss trap.
    We assert the first line becomes the title but not the empty case.
 4. **Body containing a double quote or backslash.** Every AppleScript wrapper
    surveyed, ours included, interpolates the body into a script string.
-5. **A PDF specifically.** We confirmed a *text* file is invisible in `body`;
-   PDFs are the attachment kind users actually care about losing.
 
 **Untested lead: Shortcuts.** The Shortcuts app ships an **"Append to Note"**
 action, runnable headlessly as `shortcuts run "…"` with stdin. It goes through

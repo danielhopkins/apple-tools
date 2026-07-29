@@ -1,5 +1,5 @@
 """
-Image round-trip tests — whether an attachment-preserving edit is possible.
+Attachment round-trip tests — whether an attachment-preserving edit is possible.
 
 CLAUDE.md long said a note's `body` "doesn't include attachments at all", so any
 body write destroys them and there is no attachment-preserving edit path. That
@@ -8,8 +8,16 @@ attachment into the body as a base64 `data:` URI, which means it can be
 harvested before a write and restored after one.
 
 The technique comes from antoniorodr/memo (see docs/prior-art.md). These tests
-establish which half of it is real on this macOS version, and pin the one
-seductive variant that silently loses data.
+establish which half of it is real on this macOS version, and pin the two
+seductive variants that silently lose data:
+
+- writing a data URI back *inline*, which produces an attachment `body` can
+  never return; and
+- the double-insert guard, which is safe for images and **destroys a PDF**.
+
+⚠️ Everything here is per-attachment-type. PDFs behave differently from images
+at every step, so a test that passes for a PNG proves nothing about a PDF —
+that mistake is exactly how the guard got documented as working.
 """
 
 import os
@@ -48,7 +56,7 @@ def digest(b64: str) -> str:
     return hashlib.sha256(base64.b64decode(b64)).hexdigest()
 
 
-class ImageRoundTripTests(unittest.TestCase):
+class AttachmentRoundTripTests(unittest.TestCase):
     def _png(self, rgb=(220, 40, 40), size=8) -> str:
         """Write a tiny solid-colour PNG. Distinct colours give distinct bytes."""
         raw = b"".join(b"\x00" + bytes(rgb) * size for _ in range(size))
@@ -73,6 +81,34 @@ class ImageRoundTripTests(unittest.TestCase):
         fd, path = tempfile.mkstemp(prefix="claude_txt_", suffix=".txt")
         with os.fdopen(fd, "wb") as f:
             f.write(b"a text attachment\n")
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        return path
+
+    def _pdf(self) -> str:
+        """A minimal but genuinely valid one-page PDF."""
+        objs = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
+            b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+            b"<< /Length 62 >>\nstream\nBT /F1 18 Tf 20 100 Td (test pdf) Tj ET\nendstream",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        ]
+        out = bytearray(b"%PDF-1.4\n")
+        offsets = []
+        for i, body in enumerate(objs, start=1):
+            offsets.append(len(out))
+            out += b"%d 0 obj\n" % i + body + b"\nendobj\n"
+        xref = len(out)
+        out += b"xref\n0 %d\n" % (len(objs) + 1) + b"0000000000 65535 f \n"
+        for off in offsets:
+            out += b"%010d 00000 n \n" % off
+        out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (
+            len(objs) + 1, xref
+        )
+        fd, path = tempfile.mkstemp(prefix="claude_pdf_", suffix=".pdf")
+        with os.fdopen(fd, "wb") as f:
+            f.write(bytes(out))
         self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
         return path
 
@@ -122,11 +158,13 @@ class ImageRoundTripTests(unittest.TestCase):
             # ...even though the note really does carry the attachment
             self.assertGreaterEqual(h.count_attachments(note_id), 1)
 
-    def test_guarded_add_defeats_double_insert(self):
+    def test_guarded_add_defeats_double_insert_for_images(self):
         """Deleting the surplus attachment right after the add fixes the count.
 
-        test_make_attachment_double_inserts pins the bug; this pins the remedy,
-        so a future `notes attach` can rely on it.
+        test_make_attachment_double_inserts pins the bug; this pins the remedy.
+
+        ⚠️ **Images only.** See test_guard_destroys_a_pdf — the identical script
+        deletes a PDF outright. Do not generalise this test.
         """
         with h.temp_note(label="guarded") as note_id:
             self._add_guarded(note_id, self._png(rgb=(220, 40, 40)), expected=1)
@@ -170,6 +208,83 @@ class ImageRoundTripTests(unittest.TestCase):
             self.assertEqual(len(set(ids)), 1, "the two entries should share one id")
             # but the body really does show the image twice
             self.assertEqual(len(data_uris(h.get_body(note_id))), 2)
+
+    def test_guard_destroys_a_pdf(self):
+        """🛑 The double-insert guard is IMAGE-ONLY. On a PDF it deletes everything.
+
+        Same script that lands a PNG on exactly 1 attachment leaves a PDF note
+        with **zero** attachments and **two orphaned U+FFFC placeholders** in the
+        note text — the file is gone and the note is left visibly broken.
+        Reproduced 4/4, and adding a settle delay before the count does not help,
+        so it is deterministic rather than a race.
+
+        This is why `notes attach` must branch on attachment type rather than
+        applying the guard universally.
+        """
+        with h.temp_note(body_html="<div>X</div>", label="pdfguard") as note_id:
+            self._add_guarded(note_id, self._pdf(), expected=1)
+
+            self.assertEqual(
+                h.count_attachments(note_id), 0,
+                "expected the known PDF-destroying behaviour; if this is now 1, "
+                "Apple fixed it — re-test and update docs/apple-notes-api.md",
+            )
+            pk = h.pk_from_note_id(note_id)
+            text = h.poll(
+                lambda: (t := h.sqlite_note_text(pk)) and h.object_replacement_count(t) >= 1 and t
+            )
+            self.assertTrue(text)
+            self.assertGreaterEqual(
+                h.object_replacement_count(text), 1,
+                "the note text keeps placeholders for the attachment that no longer exists",
+            )
+
+    def test_pdf_attach_cannot_read_back_its_id(self):
+        """Attaching a PDF creates it but errors (-1728) when asked for the id.
+
+        `make new attachment` succeeds; `id of` the result fails with
+        "Can't get attachment id x-coredata://…". The id is recoverable from the
+        error text, which is what macnotesapp's parse_id_from_error does.
+        """
+        with h.temp_note(body_html="<div>X</div>", label="pdfid") as note_id:
+            with self.assertRaises(h.AppleScriptError) as ctx:
+                h.add_attachment(note_id, self._pdf())
+            msg = str(ctx.exception)
+            self.assertIn("-1728", msg)
+            # the attachment id we could not read is nonetheless in the error
+            self.assertRegex(msg, r"ICAttachment/p\d+")
+
+    def test_inline_data_uri_is_not_image_only(self):
+        """The inline-write path accepts any MIME type, not just images.
+
+        A PDF or a text file written as `<img src="data:…">` also lands as a real
+        attachment at the chosen position. Same trap applies to all of them, so
+        the warning cannot be scoped to images.
+        """
+        with open(self._pdf(), "rb") as f:
+            pdf_b64 = base64.b64encode(f.read()).decode()
+        txt_b64 = base64.b64encode(b"hello inline text\n").decode()
+
+        for label, mime, payload in (
+            ("pdf", "application/pdf", pdf_b64),
+            ("txt", "text/plain", txt_b64),
+        ):
+            with self.subTest(kind=label):
+                with h.temp_note(body_html="<div>x</div>", label=f"inl{label}") as note_id:
+                    title_div = h.get_body(note_id).split("</div>")[0] + "</div>"
+                    h.set_body(
+                        note_id,
+                        title_div
+                        + "<div>ABOVE</div>"
+                        + f'<div><img src="data:{mime};base64,{payload}"/></div>'
+                        + "<div>BELOW</div>",
+                    )
+                    self.assertEqual(h.count_attachments(note_id), 1)
+                    pk = h.pk_from_note_id(note_id)
+                    text = h.poll(lambda: h.sqlite_note_text(pk))
+                    self.assertRegex(text, r"ABOVE\s*￼\s*BELOW")
+                    # ...and it is just as unharvestable as the image case
+                    self.assertEqual(data_uris(h.get_body(note_id)), [])
 
     def test_image_roundtrip_preserves_bytes_and_order(self):
         """The full recipe: harvest data URIs, rewrite the body, re-attach.

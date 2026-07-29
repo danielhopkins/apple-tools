@@ -126,20 +126,46 @@ the decoded text two `￼`. So the user really does see the file twice — but
 "dedupe the attachments listing by id", which is what macnotesapp does, reports
 1 and hides the visible defect rather than fixing it.
 
-**Workaround, verified:** add, then immediately delete the surplus reference.
+**Workaround for images only** — add, then immediately delete the surplus:
 
 ```applescript
 make new attachment at end of n with data (POSIX file "…")
 if (count of attachments of n) > EXPECTED then delete last attachment of n
 ```
 
-This lands the count on `EXPECTED` and leaves exactly one `￼` per attachment in
-the decoded text. Locked by
-`tests/test_image_roundtrip.py::test_guarded_add_defeats_double_insert`.
+For an **image** this lands the count on `EXPECTED` with exactly one `￼` per
+attachment. Locked by
+`tests/test_attachment_roundtrip.py::test_guarded_add_defeats_double_insert_for_images`.
+
+🛑 **Do not apply it to a PDF — it destroys the attachment.** The identical
+script leaves a PDF note with **zero** attachments and **two orphaned `￼`
+placeholders**: the file is gone and the note is visibly broken. Reproduced 4/4,
+and a settle delay before the count does not help, so it is deterministic rather
+than a race. Locked by
+`tests/test_attachment_roundtrip.py::test_guard_destroys_a_pdf`.
+
+For a **text file** the count lands on 1 but the placeholder count is unstable
+(1 or 2 across runs), so the note text can keep an orphan even when the count
+looks right. Any `notes attach` must branch on attachment type; there is no
+universal guard.
 
 Locked by `tests/test_attachments.py::test_make_attachment_double_inserts` and
-`tests/test_image_roundtrip.py::test_double_insert_is_one_attachment_referenced_twice`.
+`tests/test_attachment_roundtrip.py::test_double_insert_is_one_attachment_referenced_twice`.
 If either starts seeing **1**, Apple fixed the bug — update this section.
+
+### ⚠️ Attaching a PDF errors when you read back its id
+
+`make new attachment` with a PDF creates the attachment but fails on `id of` the
+result:
+
+```
+Notes got an error: Can't get attachment id "x-coredata://…/ICAttachment/p3594". (-1728)
+```
+
+The attachment exists; only the id read fails, and the id itself is in the error
+text. macnotesapp handles this with a `parse_id_from_error` helper, which is the
+right shape: catch the error, recover the id from the message. Locked by
+`tests/test_attachment_roundtrip.py::test_pdf_attach_cannot_read_back_its_id`.
 
 ### 🛑 Data-loss bug: editing `body` destroys all attachments
 
@@ -158,7 +184,7 @@ whether the loss is recoverable:**
 So there *is* a partial attachment-preserving edit path, for images only.
 Harvest every data URI from `body` before the write, then decode each back to a
 file and re-attach it afterwards. Verified byte-exact and order-preserving by
-`tests/test_image_roundtrip.py::test_image_roundtrip_preserves_bytes_and_order`.
+`tests/test_attachment_roundtrip.py::test_image_roundtrip_preserves_bytes_and_order`.
 The technique is from [antoniorodr/memo](https://github.com/antoniorodr/memo);
 see [`prior-art.md`](prior-art.md).
 
@@ -174,7 +200,15 @@ strictly better. It is a data-loss trap: the resulting attachment is **nameless*
 and `body` never renders it back as an `<img>` (checked over 20s — it is not a
 propagation lag). The next harvest finds nothing, so the following edit destroys
 the image without warning. Locked by
-`tests/test_image_roundtrip.py::test_inline_data_uri_write_creates_unharvestable_attachment`.
+`tests/test_attachment_roundtrip.py::test_inline_data_uri_write_creates_unharvestable_attachment`.
+
+**The inline path is not image-specific.** `data:application/pdf` and
+`data:text/plain` also land as real attachments at the chosen position, via
+either `<img src>` or `<object data>` — so this is the *only* way to place any
+attachment mid-note, and it carries the trap for every type. (`<embed>` is
+ignored entirely; `<a href="data:…">` stores the base64 in the body as a link
+and creates no attachment.) Locked by
+`tests/test_attachment_roundtrip.py::test_inline_data_uri_is_not_image_only`.
 
 Locked by `tests/test_attachments.py::test_editing_body_destroys_attachments`. If
 it starts preserving attachments, Apple fixed it — update this section.
