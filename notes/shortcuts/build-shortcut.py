@@ -100,7 +100,53 @@ def build_create_markdown():
 APPEND_TARGET = "__claude_notes_test__append_target"
 
 
+def extension_input_attachment():
+    """The shortcut's own input, as a non-text (attachment) reference."""
+    return {"Value": {"Type": "ExtensionInput"},
+            "WFSerializationType": "WFTextTokenAttachment"}
+
+
+def literal_text(s):
+    return {"Value": {"string": s}, "WFSerializationType": "WFTextTokenString"}
+
+
+def variable_text(uuid_str, name):
+    """A text field whose whole content is one earlier action's output."""
+    return {
+        "Value": {"string": "￼",
+                  "attachmentsByRange": {
+                      "{0, 1}": {"OutputUUID": uuid_str, "Type": "ActionOutput",
+                                 "OutputName": name}}},
+        "WFSerializationType": "WFTextTokenString",
+    }
+
+
+def get_dictionary(uuid_str):
+    return {
+        "WFWorkflowActionIdentifier": "is.workflow.actions.detect.dictionary",
+        "WFWorkflowActionParameters": {
+            "UUID": uuid_str,
+            "WFInput": extension_input_attachment(),
+        },
+    }
+
+
+def value_for_key(uuid_str, dict_uuid, key):
+    return {
+        "WFWorkflowActionIdentifier": "is.workflow.actions.getvalueforkey",
+        "WFWorkflowActionParameters": {
+            "UUID": uuid_str,
+            "WFInput": {"Value": {"OutputUUID": dict_uuid, "Type": "ActionOutput",
+                                  "OutputName": "Dictionary"},
+                        "WFSerializationType": "WFTextTokenAttachment"},
+            "WFDictionaryKey": literal_text(key),
+            "CustomOutputName": key,
+        },
+    }
+
+
 def find_note_by_name(name, uuid_str):
+    """`name` may be a literal str or a serialized variable dict."""
     """`is.workflow.actions.filter.notes` matching Name exactly.
 
     Structure copied from a working shortcut; Operator 99 is "is" and the
@@ -172,10 +218,41 @@ def build_append_markdown():
     ])
 
 
+def build_generic_append():
+    """Append Markdown to ANY note, named at call time.
+
+    Input is JSON: {"note": "<exact title>", "text": "<markdown>"}
+
+        shortcuts run "<name>" --input-path payload.json
+
+    Five actions: read the dictionary, pull "note", find that note, pull "text",
+    append it. The note name reaches the filter as a variable — the one piece
+    with no working example to copy, since nothing in the sampled library puts a
+    variable inside a filter template.
+    """
+    dict_uuid = str(uuid.uuid4()).upper()
+    name_uuid = str(uuid.uuid4()).upper()
+    find_uuid = str(uuid.uuid4()).upper()
+    text_uuid = str(uuid.uuid4()).upper()
+    return workflow([
+        get_dictionary(dict_uuid),
+        value_for_key(name_uuid, dict_uuid, "note"),
+        find_note_by_name(variable_text(name_uuid, "note"), find_uuid),
+        value_for_key(text_uuid, dict_uuid, "text"),
+        action("is.workflow.actions.appendnote", "AppendToNoteLinkAction", {
+            "WFNote": action_output(find_uuid),
+            "WFInput": variable_text(text_uuid, "text"),
+            "interpretAsMarkdown": True,
+        }),
+    ])
+
+
 def main():
     out = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "NotesCreateMarkdown.shortcut")
     which = sys.argv[2] if len(sys.argv) > 2 else "create"
-    wf = build_append_markdown() if which == "append" else build_create_markdown()
+    wf = {"create": build_create_markdown,
+          "append": build_append_markdown,
+          "generic-append": build_generic_append}[which]()
     out.write_bytes(plistlib.dumps(wf, fmt=plistlib.FMT_BINARY))
     print(f"wrote {out} ({out.stat().st_size} bytes)")
 
