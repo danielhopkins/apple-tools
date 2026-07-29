@@ -113,12 +113,45 @@ one general-purpose shortcut over several narrow ones.
   the CLI's reader still lists them. Same behaviour as markdown-imported notes.
   Whether it ever settles is unverified.
 
-## Next: the append
+## The append: ✅ it preserves what `set body` destroys
 
-`AppendToNoteIntent` is the real prize — a genuine append that should sidestep
-both the attachment destruction and the checklist flattening of `set body`. It
-needs the target note resolved to an entity at runtime, which means a
-`is.workflow.actions.filter.notes` lookup ahead of it. Both halves now have
-working examples to copy from in `Shortcuts.sqlite`: that filter action, and
-`DeleteNotesLinkAction` showing how a filter's output is passed into an intent
-as a `WFTextTokenAttachment` carrying the upstream `OutputUUID`.
+Measured on a note carrying **both** an attachment and a checklist — the two
+things an AppleScript body write annihilates:
+
+| | before | after append |
+|---|---|---|
+| attachment (`public.png`) | 1 | **1 — survived** |
+| checklist items | 2 | 4 (2 kept + appended) |
+| checked state | `[done 0, done 1]` | `[done 0, done 1, …]` — **kept** |
+| appended text | — | present |
+| appended `- [ ] task three` | — | a **real** checklist item |
+
+**Second run: 0.331s, exit 0, silent.** So this is a genuine append: additive,
+attachment-safe, checklist-safe, Markdown-aware, and fast. Nothing in the
+AppleScript surface can do any of that.
+
+### ⚠️ Name matching is ambiguous
+
+`is.workflow.actions.filter.notes` matches on `Name`, and two notes can share
+one. The permission dialog gave it away — *"append 1 text item and 2 note to a
+note"* — because a leftover from an earlier run had the same title. A real
+implementation must resolve the target unambiguously (by identifier, or by
+erroring on multiple matches the way `apple messages` does) rather than
+appending to every match.
+
+### 🛑 The parameter names are not the intent's parameter names
+
+The metadata for `Notes.AppendToNoteIntent` lists `entity`, `text`,
+`interpretAsMarkdown`. **Two of those three are wrong in the serialized form:**
+
+| Metadata says | Plist actually needs |
+|---|---|
+| action `com.apple.Notes.AppendToNoteLinkAction` | `is.workflow.actions.appendnote` |
+| `entity` | `WFNote` |
+| `text` | `WFInput` |
+
+Worse, Shortcuts **silently normalises the wrong action identifier to the right
+one on import** while keeping the wrong parameter names — so the action renders
+correctly in the editor and only fails at run time, by popping a note picker.
+Always copy the serialization from a working shortcut in `Shortcuts.sqlite`;
+never derive it from the intent metadata.

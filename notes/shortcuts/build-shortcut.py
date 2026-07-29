@@ -97,9 +97,86 @@ def build_create_markdown():
     ])
 
 
+APPEND_TARGET = "__claude_notes_test__append_target"
+
+
+def find_note_by_name(name, uuid_str):
+    """`is.workflow.actions.filter.notes` matching Name exactly.
+
+    Structure copied from a working shortcut; Operator 99 is "is" and the
+    calendar-unit cruft in Values is required even for a string match.
+    """
+    return {
+        "WFWorkflowActionIdentifier": "is.workflow.actions.filter.notes",
+        "WFWorkflowActionParameters": {
+            "UUID": uuid_str,
+            "WFContentItemFilter": {
+                "Value": {
+                    "WFActionParameterFilterPrefix": 1,
+                    "WFActionParameterFilterTemplates": [{
+                        "Operator": 99,
+                        "Property": "Name",
+                        "Removable": True,
+                        "Values": {
+                            "String": name,
+                            "Unit": {"Value": 4,
+                                     "WFSerializationType":
+                                         "WFCalendarUnitSubstitutableState"},
+                        },
+                    }],
+                    "WFContentPredicateBoundedDate": False,
+                },
+                "WFSerializationType": "WFContentPredicateTableTemplate",
+            },
+            "AppIntentDescriptor": {
+                "TeamIdentifier": "0000000000",
+                "BundleIdentifier": "com.apple.Notes",
+                "AppIntentIdentifier": "NoteEntity",
+                "ActionRequiresAppInstallation": True,
+                "Name": "Notes",
+            },
+        },
+    }
+
+
+def action_output(uuid_str, name="Note"):
+    """Reference an earlier action's output as a parameter value."""
+    return {
+        "Value": {"OutputUUID": uuid_str, "Type": "ActionOutput", "OutputName": name},
+        "WFSerializationType": "WFTextTokenAttachment",
+    }
+
+
+def build_append_markdown():
+    """Append Markdown to a fixed note — the smallest test of AppendToNoteIntent.
+
+    Deliberately not generic yet: resolving an arbitrary note name would need a
+    dictionary-input pipeline in front, and the question worth answering first
+    is whether a real append preserves attachments and checklists at all.
+    """
+    find_uuid = str(uuid.uuid4()).upper()
+    return workflow([
+        find_note_by_name(APPEND_TARGET, find_uuid),
+        # ⚠️ Append is `is.workflow.actions.appendnote` with WFNote/WFInput —
+        # NOT com.apple.Notes.AppendToNoteLinkAction with entity/text, which is
+        # what the intent metadata's parameter names suggest. Shortcuts silently
+        # normalises the wrong action identifier to the right one on import but
+        # keeps the wrong parameter names, so the action looks correct in the
+        # editor and prompts for a note at run time instead of binding.
+        # Verified against three working shortcuts in Shortcuts.sqlite.
+        action("is.workflow.actions.appendnote", "AppendToNoteLinkAction", {
+            "WFNote": action_output(find_uuid),
+            "WFInput": shortcut_input(),
+            "interpretAsMarkdown": True,
+        }),
+    ])
+
+
 def main():
     out = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "NotesCreateMarkdown.shortcut")
-    out.write_bytes(plistlib.dumps(build_create_markdown(), fmt=plistlib.FMT_BINARY))
+    which = sys.argv[2] if len(sys.argv) > 2 else "create"
+    wf = build_append_markdown() if which == "append" else build_create_markdown()
+    out.write_bytes(plistlib.dumps(wf, fmt=plistlib.FMT_BINARY))
     print(f"wrote {out} ({out.stat().st_size} bytes)")
 
 
