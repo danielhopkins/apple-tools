@@ -86,6 +86,15 @@ apple notes get-url ID [--json]                  # applenotes:// deep link
 **Search is title-only.** There is no full-text search over note bodies; to
 search content, export candidates and grep them.
 
+⚠️ **The gotchas below are about the AppleScript write path, which is the wrong
+tool for most writes.** It cannot create a checklist at all, and its only body
+write is a full replace that destroys attachments and flattens checklists.
+**Shortcuts can do all of it** — a genuine append that preserves attachments and
+checklist state, and Markdown interpreted into native structure, in ~0.3s. It
+costs a one-time install and permission grant per shortcut. See
+[`docs/apple-notes-shortcuts.md`](docs/apple-notes-shortcuts.md); build scripts
+in `notes/shortcuts/`.
+
 **Gotchas** (each locked by a live test in `notes/tests/`, full detail in
 [`docs/apple-notes-api.md`](docs/apple-notes-api.md)):
 
@@ -634,6 +643,9 @@ swift/                    one Swift package, five binaries
 notes/                    Python; apple-notes, notestore.py, notestore.proto,
                           tests/ (live Notes.app suite)
 docs/apple-notes-api.md   NoteStore schema, AppleScript API, verified bugs
+docs/apple-notes-shortcuts.md  driving Notes' AppIntents from the CLI —
+                          the only route to checklist writes and a real append
+notes/shortcuts/          .shortcut build scripts + signed files to install
 docs/apple-mail-store.md  Envelope Index schema, .emlx layout, verified traps
 docs/apple-messages-store.md  chat.db schema, the typedstream body, verified traps
 docs/prior-art.md         other projects solving this; check before building
