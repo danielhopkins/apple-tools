@@ -651,6 +651,8 @@ docs/apple-messages-store.md  chat.db schema, the typedstream body, verified tra
 docs/prior-art.md         other projects solving this; check before building
 docs/todo-deep-links.md   planned: a `url` on every entity, so anything we
                           name can be opened and cross-linked
+docs/todo-offline-tests.md  planned: move the Notes suite off live Notes.app
+                          (5.5 min today, and it cannot run in CI)
 Formula/apple-tools.rb    Homebrew formula
 VERSION                   CalVer YY.MMDD.Patch, stamped in by scripts/set-version
 ```
