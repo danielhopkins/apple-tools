@@ -136,19 +136,45 @@ def cmd_status(args):
             print(advice)
 
 
-def search_notes(term=None, limit=50):
-    """Search notes by title or list recent notes."""
+# A password-protected ("locked") note keeps its row in ZICCLOUDSYNCINGOBJECT but
+# its body is encrypted and not exposed to us at all — ZICNOTEDATA.ZDATA is NULL.
+# There is no read path: the key is derived from the user's note password (or the
+# device passcode on iOS 16+), which we neither have nor should ask for. So these
+# are skipped by default rather than surfaced as notes that mysteriously fail.
+#
+# Verified against the live store; see docs/apple-notes-api.md §4.
+NOT_LOCKED = "COALESCE(n.ZISPASSWORDPROTECTED, 0) = 0"
+
+
+def search_notes(term=None, limit=50, include_locked=False):
+    """Search notes by title or list recent notes.
+
+    Locked notes are excluded unless include_locked, in which case they come
+    back with locked=True and no readable body.
+    """
     db_path = get_db_path()
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
+    # With --include-locked the title filter is relaxed too: a locked note may
+    # carry no title at all, and omitting it after the user explicitly asked to
+    # see locked notes would be the same silent gap the flag exists to close.
+    if include_locked:
+        lock_clause = ""
+        title_clause = "(n.ZTITLE1 IS NOT NULL OR COALESCE(n.ZISPASSWORDPROTECTED, 0) = 1)"
+    else:
+        lock_clause = f"AND {NOT_LOCKED}"
+        title_clause = "n.ZTITLE1 IS NOT NULL"
+
     if term:
         cursor.execute(
-            """
-            SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, n.ZMODIFICATIONDATE1
+            f"""
+            SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, n.ZMODIFICATIONDATE1,
+                   COALESCE(n.ZISPASSWORDPROTECTED, 0)
             FROM ZICCLOUDSYNCINGOBJECT n
-            WHERE n.ZTITLE1 IS NOT NULL
+            WHERE {title_clause}
             AND n.ZMARKEDFORDELETION = 0
+            {lock_clause}
             AND n.ZTITLE1 LIKE ?
             ORDER BY n.ZMODIFICATIONDATE1 DESC
             LIMIT ?
@@ -157,11 +183,13 @@ def search_notes(term=None, limit=50):
         )
     else:
         cursor.execute(
-            """
-            SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, n.ZMODIFICATIONDATE1
+            f"""
+            SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, n.ZMODIFICATIONDATE1,
+                   COALESCE(n.ZISPASSWORDPROTECTED, 0)
             FROM ZICCLOUDSYNCINGOBJECT n
-            WHERE n.ZTITLE1 IS NOT NULL
+            WHERE {title_clause}
             AND n.ZMARKEDFORDELETION = 0
+            {lock_clause}
             ORDER BY n.ZMODIFICATIONDATE1 DESC
             LIMIT ?
         """,
@@ -170,12 +198,49 @@ def search_notes(term=None, limit=50):
 
     results = []
     for row in cursor.fetchall():
-        results.append(
-            {"pk": row[0], "title": row[1], "identifier": row[2], "modified": row[3]}
-        )
+        entry = {
+            "pk": row[0],
+            "title": row[1],
+            "identifier": row[2],
+            "modified": row[3],
+        }
+        if row[4]:
+            entry["locked"] = True
+            if entry["title"] is None:
+                entry["title"] = "<locked note>"
+        results.append(entry)
 
     conn.close()
     return results
+
+
+def count_locked_notes():
+    """How many live notes are locked — used to tell the user what was skipped."""
+    conn = sqlite3.connect(get_db_path())
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) FROM ZICCLOUDSYNCINGOBJECT n "
+            "WHERE COALESCE(n.ZISPASSWORDPROTECTED, 0) = 1 "
+            "AND n.ZMARKEDFORDELETION = 0"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def warn_locked_skipped(include_locked):
+    """Say on stderr that locked notes were omitted, so the gap is never silent."""
+    if include_locked:
+        return
+    try:
+        n = count_locked_notes()
+    except sqlite3.Error:
+        return
+    if n:
+        print(
+            f"note: skipped {n} password-protected note{'s' if n != 1 else ''} "
+            "(contents are encrypted; pass --include-locked to list them)",
+            file=sys.stderr,
+        )
 
 
 def list_folders():
@@ -191,6 +256,7 @@ def list_folders():
         LEFT JOIN ZICCLOUDSYNCINGOBJECT n ON n.ZFOLDER = f.Z_PK
             AND n.ZMARKEDFORDELETION = 0
             AND n.ZTITLE1 IS NOT NULL
+            AND COALESCE(n.ZISPASSWORDPROTECTED, 0) = 0
         WHERE f.ZTITLE2 IS NOT NULL
         AND f.ZMARKEDFORDELETION = 0
         GROUP BY f.Z_PK, f.ZTITLE2
@@ -220,6 +286,7 @@ def search_by_folder(folder_name, limit=100):
         WHERE f.ZTITLE2 LIKE ?
         AND n.ZMARKEDFORDELETION = 0
         AND n.ZTITLE1 IS NOT NULL
+        AND COALESCE(n.ZISPASSWORDPROTECTED, 0) = 0
         ORDER BY n.ZMODIFICATIONDATE1 DESC
         LIMIT ?
     """,
@@ -252,7 +319,8 @@ def find_note(identifier):
     if identifier.isdigit():
         cursor.execute(
             """
-            SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, nd.ZDATA
+            SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, nd.ZDATA,
+                   COALESCE(n.ZISPASSWORDPROTECTED, 0)
             FROM ZICCLOUDSYNCINGOBJECT n
             JOIN ZICNOTEDATA nd ON nd.ZNOTE = n.Z_PK
             WHERE n.Z_PK = ?
@@ -266,7 +334,8 @@ def find_note(identifier):
             note_id = match.group(1)
             cursor.execute(
                 """
-                SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, nd.ZDATA
+                SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, nd.ZDATA,
+                       COALESCE(n.ZISPASSWORDPROTECTED, 0)
                 FROM ZICCLOUDSYNCINGOBJECT n
                 JOIN ZICNOTEDATA nd ON nd.ZNOTE = n.Z_PK
                 WHERE n.ZIDENTIFIER = ?
@@ -280,7 +349,8 @@ def find_note(identifier):
         # Search by title (exact match first, then partial)
         cursor.execute(
             """
-            SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, nd.ZDATA
+            SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, nd.ZDATA,
+                   COALESCE(n.ZISPASSWORDPROTECTED, 0)
             FROM ZICCLOUDSYNCINGOBJECT n
             JOIN ZICNOTEDATA nd ON nd.ZNOTE = n.Z_PK
             WHERE n.ZTITLE1 = ?
@@ -293,7 +363,8 @@ def find_note(identifier):
             # Try partial match
             cursor.execute(
                 """
-                SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, nd.ZDATA
+                SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, nd.ZDATA,
+                       COALESCE(n.ZISPASSWORDPROTECTED, 0)
                 FROM ZICCLOUDSYNCINGOBJECT n
                 JOIN ZICNOTEDATA nd ON nd.ZNOTE = n.Z_PK
                 WHERE n.ZTITLE1 LIKE ?
@@ -598,22 +669,32 @@ def format_as_markdown(title, text, links=None):
 def cmd_search(args):
     """Handle search command"""
     term = " ".join(args.term) if args.term else None
-    results = search_notes(term, limit=args.limit)
+    include_locked = getattr(args, "include_locked", False)
+    results = search_notes(term, limit=args.limit, include_locked=include_locked)
 
     if getattr(args, "json", False):
-        print(json.dumps(
-            [{"id": n["pk"], "title": n["title"]} for n in results],
-            indent=2, ensure_ascii=False))
+        payload = []
+        for n in results:
+            entry = {"id": n["pk"], "title": n["title"]}
+            if n.get("locked"):
+                entry["locked"] = True
+            payload.append(entry)
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        warn_locked_skipped(include_locked)
         return
 
     if not results:
         print("No notes found.")
+        warn_locked_skipped(include_locked)
         return
 
     print(Style.dim(f"{'ID':>5}  Title"))
     print(Style.dim("-" * 60))
     for note in results:
-        print(f"{Style.identifier('%5d' % note['pk'])}  {Style.title(note['title'])}")
+        suffix = Style.dim("  [locked]") if note.get("locked") else ""
+        print(f"{Style.identifier('%5d' % note['pk'])}  "
+              f"{Style.title(note['title'])}{suffix}")
+    warn_locked_skipped(include_locked)
 
 
 def cmd_folders(args):
@@ -666,7 +747,19 @@ def cmd_export(args):
         print(f"Note not found: {args.identifier}", file=sys.stderr)
         sys.exit(1)
 
-    pk, title, identifier, compressed_data = result
+    pk, title, identifier, compressed_data, locked = result
+
+    # A locked note has no readable body — say so, rather than blaming the
+    # parser for content that was never there.
+    if locked:
+        print(
+            f"Note {pk} is password-protected; its contents are encrypted and "
+            "cannot be exported.\nUnlock it in Notes.app and copy the text out "
+            "manually — there is no API to decrypt it.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     print(f"Found note: {title} (ID: {pk})", file=sys.stderr)
 
     # Parse the note content using protobuf
@@ -704,16 +797,24 @@ def cmd_get_url(args):
         print(f"Note not found: {args.identifier}", file=sys.stderr)
         sys.exit(1)
 
-    pk, title, identifier, _ = result
+    pk, title, identifier, _, locked = result
 
     if not identifier:
         print(f"Note has no identifier: {title}", file=sys.stderr)
         sys.exit(1)
 
+    # A deep link to a locked note still works — Notes.app prompts for the
+    # password — so this is reported, not refused.
     url = f"applenotes://note/{identifier}"
     if getattr(args, "json", False):
-        print(json.dumps({"id": pk, "title": title, "url": url}, indent=2, ensure_ascii=False))
+        payload = {"id": pk, "title": title, "url": url}
+        if locked:
+            payload["locked"] = True
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
+        if locked:
+            print("note: this note is password-protected; opening it will "
+                  "prompt for the password", file=sys.stderr)
         print(url)
 
 
@@ -752,6 +853,11 @@ Examples:
         "--limit", "-n", type=int, default=50, help="Max results (default: 50)"
     )
     search_parser.add_argument("--json", action="store_true", help="Output as JSON")
+    search_parser.add_argument(
+        "--include-locked",
+        action="store_true",
+        help="List password-protected notes too (their contents stay unreadable)",
+    )
 
     # folders command
     folders_parser = subparsers.add_parser(

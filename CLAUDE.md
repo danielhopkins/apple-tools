@@ -75,7 +75,7 @@ Reads `NoteStore.sqlite` directly, ungzips the protobuf body, and renders
 Markdown (preserves `==highlights==`, bold, headings, lists, checklists).
 
 ```
-apple notes search [TERM] [--limit N] [--json]   # title search; lists recent if TERM omitted
+apple notes search [TERM] [--limit N] [--json] [--include-locked]  # title search
 apple notes folders [NAME] [--limit N] [--json]  # all folders, or notes in one folder
 apple notes export ID [-o out.md]                # note body as Markdown
 apple notes get-url ID [--json]                  # applenotes:// deep link
@@ -108,6 +108,11 @@ search content, export candidates and grep them.
   auto-purges in ~30 days. There is no API to empty that folder.
 - The SQLite reader **can see Recently Deleted notes**. Filter them out if the
   user asked for live notes.
+- **Locked notes are skipped by default.** A password-protected note has no
+  readable body (`ZDATA` is NULL) and no decrypt path. `search`/`folders` omit
+  them and say so on stderr; `--include-locked` lists them as `locked: true`.
+  `export` refuses with **exit 2** (distinct from 1, "not found"); `get-url`
+  still works, since Notes.app prompts for the password itself.
 - `make new attachment` **double-inserts** on macOS 27 — one attachment record,
   referenced twice, so the user sees the file twice. Deleting the surplus
   immediately (`if (count of attachments of n) > EXPECTED then delete last

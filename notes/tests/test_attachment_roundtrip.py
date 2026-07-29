@@ -399,14 +399,15 @@ class AttachmentRoundTripTests(unittest.TestCase):
         and **no file is ever written** (polled 30s). The bytes are discarded.
         True for images and PDFs alike, so there is no safe variant of this.
         """
-        with open(self._pdf(), "rb") as f:
+        pdf, png = self._pdf(), self._png()
+        with open(pdf, "rb") as f:
             pdf_b64 = base64.b64encode(f.read()).decode()
-        with open(self._png(), "rb") as f:
+        with open(png, "rb") as f:
             png_b64 = base64.b64encode(f.read()).decode()
 
-        for label, mime, payload in (
-            ("pdf", "application/pdf", pdf_b64),
-            ("png", "image/png", png_b64),
+        for label, mime, payload, want_sha in (
+            ("pdf", "application/pdf", pdf_b64, digest_file(pdf)),
+            ("png", "image/png", png_b64, digest_file(png)),
         ):
             with self.subTest(kind=label):
                 with h.temp_note(body_html="<div>x</div>", label=f"inl{label}") as note_id:
@@ -425,10 +426,15 @@ class AttachmentRoundTripTests(unittest.TestCase):
                     self.assertRegex(h.poll(lambda: h.sqlite_note_text(pk)),
                                      r"ABOVE\s*￼\s*BELOW")
 
-                    # ...but the payload was thrown away
+                    # ...but the payload was thrown away.
+                    #
+                    # Checks for a file with *these bytes* rather than for any
+                    # new file at all: Notes writes to the container in the
+                    # background, so an unrelated file appearing between the two
+                    # snapshots says nothing about this write.
                     self.assertEqual(
-                        new_account_files(before), 0,
-                        "the inline write must not be storing a file; if it now "
+                        files_matching(before, want_sha), 0,
+                        "the inline write must not store the payload; if it now "
                         "does, re-test — mid-note placement would become viable",
                     )
                     rows = attachment_rows(pk)

@@ -293,7 +293,7 @@ def export_markdown(pk: int) -> str | None:
     res = cli.find_note(str(pk))
     if not res:
         return None
-    _pk, title, _ident, zdata = res
+    _pk, title, _ident, zdata, _locked = res
     text, runs = cli.parse_note_content(zdata)
     labels = cli.get_attachment_labels(
         [r["attachment"]["identifier"] for r in runs if r.get("attachment")]

@@ -62,7 +62,12 @@ class EditingTests(unittest.TestCase):
         note_id = h.create_note(f"<div><h1>{h.unique_title('softdel')}</h1></div>")
         pk = h.pk_from_note_id(note_id)
         h.delete_note(note_id)
-        moved = h.poll(lambda: h.sqlite_folder_name(pk) == "Recently Deleted")
+        # 30s rather than the 10s default: the move to Recently Deleted lands in
+        # SQLite well behind the AppleScript call, and the lag grows with how
+        # busy Notes.app is — this flaked under the full suite while passing in
+        # isolation. The assertion is unchanged; only the patience is.
+        moved = h.poll(
+            lambda: h.sqlite_folder_name(pk) == "Recently Deleted", timeout=30.0)
         self.assertTrue(moved, "note never moved to Recently Deleted in the SQLite view")
 
 

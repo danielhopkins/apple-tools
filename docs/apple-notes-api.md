@@ -45,6 +45,45 @@ out the Recently Deleted folder, e.g. `AND f.ZTITLE2 != 'Recently Deleted'`
 
 Locked by `tests/test_reading.py::test_recently_deleted_is_visible_to_reader`.
 
+### Locked (password-protected) notes
+
+A locked note keeps its `ZICCLOUDSYNCINGOBJECT` row, flagged
+`ZISPASSWORDPROTECTED = 1`, but **its body is not present at all**:
+`ZICNOTEDATA.ZDATA` is `NULL`. There is nothing to decode and no read path — the
+key derives from the user's note password, or the device passcode on iOS 16+,
+which the CLI neither holds nor should ask for. The related columns
+(`ZCRYPTOSALT`, `ZCRYPTOWRAPPEDKEY`, `ZCRYPTOITERATIONCOUNT`,
+`ZPASSWORDHINT`, `ZLOCKEDNOTESMODE`) are all on the same table.
+
+⚠️ **A locked row may also have `ZTITLE1 = NULL` and `ZMODIFICATIONDATE1 =
+NULL`.** Both were true of the only locked note on this machine, which matters
+twice: a `WHERE ZTITLE1 IS NOT NULL` filter hides it *incidentally* rather than
+deliberately, and `ORDER BY ZMODIFICATIONDATE1 DESC` sorts it dead last, so a
+listing with a small `--limit` will not reach it.
+
+The CLI detects the flag and **skips locked notes by default** across `search`,
+`folders` and folder listings, announcing the omission on stderr so the gap is
+never silent:
+
+```
+note: skipped 1 password-protected note (contents are encrypted; pass
+      --include-locked to list them)
+```
+
+- `--include-locked` lists them with `locked: true`, and relaxes the title
+  filter so a title-less locked note still appears (shown as `<locked note>`).
+- `export` **refuses with exit code 2** and names the reason. It previously
+  printed "Failed to parse note content", blaming the parser for content that
+  was never there. Exit 2 is distinct from exit 1 ("not found") so a caller can
+  tell the two apart.
+- `get-url` still works and sets `locked: true` — a deep link is harmless, since
+  Notes.app prompts for the password itself.
+
+Locked by `tests/test_locked_notes.py` (9 tests). Those tests copy the store to
+a temp directory and flip the flag on a throwaway row, so they run whether or
+not the machine owns a locked note — and they are the **only notes tests that
+need neither Notes.app nor iCloud**, running in ~3s.
+
 ### Unknown protobuf fields
 
 Our trimmed `.proto` omits many fields that real notes carry; parsing leaves them
