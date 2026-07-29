@@ -102,6 +102,17 @@ search content, export candidates and grep them.
     recovered but flattens to `public.png` — the strokes are gone.
   - **PDFs, text files and scans** are invisible in `body` and **unrecoverable**.
   🛑 Do not put a `data:` URI back in the body — see below.
+- 🛑 **A body write flattens every checklist into a plain bulleted list**, losing
+  which items were ticked. A real checklist comes back from `body` as a bare
+  `<ul><li>` with no checkbox information at all, so it cannot be written back —
+  unrecoverable, invisible (it still looks like a list), and it applies to the
+  innocuous append pattern too. 7% of notes here (48 of 672) have one.
+- ⚠️ **Writes need a second grant.** Reads use SQLite (Full Disk Access); every
+  write goes through AppleScript, which needs **Automation → Notes** for the
+  calling terminal and **launches Notes.app** if it is closed. `apple status`
+  currently reports only the read grant.
+- ⚠️ **A shared note pushes to other people**, not just your other devices, and
+  there is no undo. Check `ZSERVERSHAREDATA` before writing.
 - `set body` is a **full replace**, never a merge.
 - The **first line becomes the title**, silently, on every body write.
 - `delete` is a **soft delete** — the note moves to Recently Deleted and

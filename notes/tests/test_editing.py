@@ -71,5 +71,35 @@ class EditingTests(unittest.TestCase):
         self.assertTrue(moved, "note never moved to Recently Deleted in the SQLite view")
 
 
+    def test_written_list_is_a_plain_bullet_not_a_checklist(self):
+        """🛑 DATA LOSS: a body round trip flattens checklists into plain lists.
+
+        A real Notes checklist comes back from `body` as a bare `<ul><li>` with
+        **no** checkbox signal — no class, no data attribute, no checked state,
+        no marker character. Verified by inspecting real checklist notes.
+
+        This test pins the other half: HTML we write back as `<ul><li>` renders
+        as a plain bullet (`- alpha`), never a checklist (`- [ ] alpha`). Put
+        together, any body write turns every checklist on the note into a plain
+        bulleted list and discards which items were ticked — invisibly, since
+        the note still looks like a list.
+
+        It applies to the innocuous-looking append pattern too, and there is no
+        recovery: the state was never in the body to begin with. 7% of the notes
+        on this machine (48 of 672) contain a checklist.
+        """
+        with h.temp_note(body_html="<div>X</div><ul><li>alpha</li><li>beta</li></ul>",
+                         label="checklist") as note_id:
+            pk = h.pk_from_note_id(note_id)
+            md = h.poll(lambda: h.export_markdown(pk))
+            self.assertTrue(md)
+            self.assertIn("- alpha", md)
+            self.assertNotRegex(
+                md, r"- \[[ x]\] alpha",
+                "if a written <ul><li> now produces a real checklist, Apple "
+                "changed this — re-test and update docs/apple-notes-api.md",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -232,6 +232,31 @@ text. macnotesapp handles this with a `parse_id_from_error` helper, which is the
 right shape: catch the error, recover the id from the message. Locked by
 `tests/test_attachment_roundtrip.py::test_pdf_attach_cannot_read_back_its_id`.
 
+### 🛑 Data-loss bug: a body write flattens checklists
+
+A Notes checklist is a paragraph style, not an embedded object, and **`body`
+carries none of it**. A real checklist reads back as:
+
+```html
+<ul><li>·</li><li>·</li></ul>
+```
+
+with no class, no `data-` attribute, no `<input type="checkbox">`, no checked
+state, no marker character — verified by inspecting real checklist notes on this
+machine. Writing that HTML back produces a **plain bulleted list**: the CLI
+renders a written `<ul><li>` as `- alpha`, never `- [ ] alpha`.
+
+So any body write converts every checklist on the note into a plain list and
+discards which items were ticked. It is unrecoverable (the state was never in
+the body), invisible (the note still looks like a list), and it applies to the
+append pattern as much as to a full rewrite. **48 of 672 live notes here (7%)
+contain a checklist.**
+
+Locked by `tests/test_editing.py::test_written_list_is_a_plain_bullet_not_a_checklist`.
+
+Bold, italic, highlights, links and ordinary bullet lists *do* survive a round
+trip — checklists are the exception.
+
 ### 🛑 Data-loss bug: editing `body` destroys all attachments
 
 *Any* write to `body` deletes **every attachment on the note**. This is not
