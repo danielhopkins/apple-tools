@@ -34,6 +34,7 @@ import hashlib
 import sqlite3
 import struct
 import zlib
+import uuid
 import tempfile
 import unittest
 
@@ -149,16 +150,30 @@ def settled_placeholders(pk: int, stable_for: float = 2.0, timeout: float = 15.0
 
 class AttachmentRoundTripTests(unittest.TestCase):
     def _png(self, rgb=(220, 40, 40), size=8) -> str:
-        """Write a tiny solid-colour PNG. Distinct colours give distinct bytes."""
+        """Write a tiny solid-colour PNG, unique on every call.
+
+        ⚠️ The uniqueness is load-bearing, not cosmetic. Several tests here ask
+        "did a file with *these bytes* appear under Accounts/?" — and Notes
+        flushes attachments to disk asynchronously, so another test's file can
+        land inside this test's before/after window. When two tests generated
+        byte-identical PNGs, that made
+        test_inline_data_uri_write_discards_the_payload fail intermittently
+        (~2 runs in 6) by finding someone else's copy.
+
+        A per-call uuid in a tEXt chunk keeps the colour meaningful while making
+        collisions impossible.
+        """
         raw = b"".join(b"\x00" + bytes(rgb) * size for _ in range(size))
 
         def chunk(tag, data):
             c = tag + data
             return struct.pack(">I", len(data)) + c + struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
 
+        nonce = uuid.uuid4().hex.encode()
         png = (
             b"\x89PNG\r\n\x1a\n"
             + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+            + chunk(b"tEXt", b"claude-test-nonce\x00" + nonce)
             + chunk(b"IDAT", zlib.compress(raw))
             + chunk(b"IEND", b"")
         )
@@ -169,9 +184,10 @@ class AttachmentRoundTripTests(unittest.TestCase):
         return path
 
     def _text_file(self) -> str:
+        """Unique per call, for the same collision reason as the PNG nonce."""
         fd, path = tempfile.mkstemp(prefix="claude_txt_", suffix=".txt")
         with os.fdopen(fd, "wb") as f:
-            f.write(b"a text attachment\n")
+            f.write(b"a text attachment %s\n" % uuid.uuid4().hex.encode())
         self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
         return path
 
@@ -182,7 +198,9 @@ class AttachmentRoundTripTests(unittest.TestCase):
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
             b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
             b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
-            b"<< /Length 62 >>\nstream\nBT /F1 18 Tf 20 100 Td (test pdf) Tj ET\nendstream",
+            # unique per call, for the same reason as the PNG nonce
+            b"<< /Length 62 >>\nstream\nBT /F1 18 Tf 20 100 Td ("
+            + uuid.uuid4().hex[:8].encode() + b") Tj ET\nendstream",
             b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
         ]
         out = bytearray(b"%PDF-1.4\n")
