@@ -306,11 +306,23 @@ def object_replacement_count(text: str) -> int:
     return text.count("￼")
 
 
-def poll(fn, *, timeout: float = 10.0, interval: float = 0.3):
+def poll(fn, *, timeout: float = 25.0, interval: float = 0.3):
     """Poll fn() until it returns a truthy value or timeout; returns last value.
 
     Local AppleScript edits propagate to NoteStore.sqlite with a short lag, so
     SQLite assertions must wait rather than read immediately.
+
+    The default was 10s and produced roughly one spurious failure per four
+    full-suite runs once the suite grew past ~7 minutes: the lag scales with how
+    busy Notes.app is, and a long suite keeps it busy. Raising it costs nothing
+    on success — poll returns as soon as the value is truthy — and only slows
+    genuine failures down.
+
+    ⚠️ This waits for *truthy*, so it returns the first non-empty value, which
+    for a value still settling is a mid-write state. When the quantity itself
+    changes over time (an attachment write briefly shows one placeholder before
+    settling on two), poll for stability instead — see `settled_placeholders` in
+    test_attachment_roundtrip.py.
     """
     deadline = time.time() + timeout
     val = fn()
