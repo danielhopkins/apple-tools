@@ -321,6 +321,47 @@ it.
   code search across the repo returns nothing for "checklist". The summary was
   wrong; the source is the authority.
 
+**macOS 27 changes the picture: Markdown import produces real checklists.**
+Notes 27.0 ships "Markdown Export & Import" (strings in the app binary:
+`importMarkdown:`, `initWithPlainMarkdown:error:`, `Interpret as Markdown`,
+`ICMarkdownFlavor`). Importing a `.md` file was tested end to end and the
+structures are **genuinely native**, not text that looks like them:
+
+| Markdown written | Result in the store |
+|---|---|
+| `- [ ] unchecked task` | `style_type: 103`, `checklist: {done: 0}` |
+| `- [x] checked task` | `style_type: 103`, `checklist: {done: 1}` |
+| `- plain bullet` | `style_type: 101` (bulleted list) |
+| a pipe table | a real `com.apple.notes.table` object |
+
+So the checklist write **is** solvable on macOS 27, including checked state —
+the thing macnotesapp #29 has wanted since 2022.
+
+🛑 **But it is not headless.** `open -a Notes file.md` pops a GUI confirmation
+the user must click; the import does not proceed without it. It also lands the
+note in an **"Imported Notes"** folder with no way to choose the destination,
+and it always creates a *new* note — there is no import-into-existing, so it is
+a `create` path, never an `edit` one.
+
+⚠️ A note imported this way then deleted via AppleScript disappeared from
+Notes.app but **kept `ZFOLDER` = "Imported Notes" and `ZMARKEDFORDELETION = 0`
+in SQLite**, so our reader still lists it. Imported notes may not follow the
+normal soft-delete path; treat their delete state as unverified.
+
+**The Shortcuts surface is far richer than AppleScript** — 51 actions, from
+`/System/Applications/Notes.app/Contents/Resources/Metadata.appintents`:
+
+- `Append Checklist Item` (`CreateChecklistItemIntent`) and
+  `Set Checklist Items Checked` — the checklist write and its checked state.
+- `Create Note` and `Append to Note` both take an **`interpretAsMarkdown`**
+  parameter. `Append to Note` is described as *"Adds text to the end of a
+  note"* — a genuine append rather than a body replace, which is exactly what
+  our attachment- and checklist-destroying `set body` is not.
+- `Add File to Note`, `Delete Attachments` — attachment removal, which
+  AppleScript cannot do safely at all.
+- `Add Table to Note`, `Set Paragraph Style`, `Add or Remove Note Lock`, tags,
+  mentions, note links.
+
 **Shortcuts is the one route that works.** The Shortcuts app has an **"Append
 checklist item"** action that adds genuinely interactive checklist items to a
 new or existing note — doing through Notes' own intents what the scripting
