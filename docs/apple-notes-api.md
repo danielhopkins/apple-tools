@@ -87,7 +87,7 @@ attachment property after creation. The API is **add-only**.
 | **Plain text gets wrapped** | Setting a non-HTML body wraps it in `<div>…</div>`. | `test_editing::test_plaintext_body_is_wrapped_in_div` |
 | **`<h1>` loses its semantics** | A heading round-trips as `<font face=".AppleSystemUIFontBold">` / `<span style="font-size:24px">`, not `<h1>`. | `test_editing::test_h1_heading_roundtrip_loses_semantic_tag` |
 | **`delete` is a soft delete** | Moves the note to Recently Deleted; it is **not** gone. There is no AppleScript API to empty that folder; it auto-purges in ~30 days. After soft delete, `container of note` raises **-1728**, so check the folder via SQLite. | `test_editing::test_delete_moves_to_recently_deleted` |
-| 🛑 **editing `body` destroys attachments** | `body` omits attachments entirely, so the first write to it deletes them all. See §3. | `test_attachments::test_editing_body_destroys_attachments` |
+| 🛑 **editing `body` destroys attachments** | The first write to `body` deletes them all. Images are recoverable (they appear in `body` as base64 data URIs) — nothing else is. See §3. | `test_attachments::test_editing_body_destroys_attachments` |
 
 ---
 
@@ -120,26 +120,61 @@ This reproduces with both `at end of <note>` and the plain
 `tell <note> to make new attachment` form, so it is not a placement-syntax
 artifact. This is very likely the source of past attachment problems.
 
-**Workarounds:** add once then delete the surplus attachment; or drive
-attachments through Shortcuts instead of AppleScript; or verify
-`count of attachments` afterward and reconcile.
+**It is one attachment record referenced twice, not two records.** Both entries
+report the *same* `ICAttachment` id, while the body carries two `<img>` tags and
+the decoded text two `￼`. So the user really does see the file twice — but
+"dedupe the attachments listing by id", which is what macnotesapp does, reports
+1 and hides the visible defect rather than fixing it.
 
-Locked by `tests/test_attachments.py::test_make_attachment_double_inserts`. If
-that test starts seeing **1**, Apple fixed the bug — update this section.
+**Workaround, verified:** add, then immediately delete the surplus reference.
+
+```applescript
+make new attachment at end of n with data (POSIX file "…")
+if (count of attachments of n) > EXPECTED then delete last attachment of n
+```
+
+This lands the count on `EXPECTED` and leaves exactly one `￼` per attachment in
+the decoded text. Locked by
+`tests/test_image_roundtrip.py::test_guarded_add_defeats_double_insert`.
+
+Locked by `tests/test_attachments.py::test_make_attachment_double_inserts` and
+`tests/test_image_roundtrip.py::test_double_insert_is_one_attachment_referenced_twice`.
+If either starts seeing **1**, Apple fixed the bug — update this section.
 
 ### 🛑 Data-loss bug: editing `body` destroys all attachments
 
-Reading a note's `body` returns **only its text/HTML — attachments are not
-represented in it at all** (no `<object>`, no `￼` placeholder). Therefore *any*
-write to `body` replaces the note with attachment-free content, so **the first
-body edit deletes every attachment on the note.** This is not gradual; one write
-wipes them all. Confirmed on macOS 26 and 27. `set body` full-replace and the
-read-modify-write "append" pattern both trigger it.
+*Any* write to `body` deletes **every attachment on the note**. This is not
+gradual; one write wipes them all. Confirmed on macOS 26 and 27. `set body`
+full-replace and the read-modify-write "append" pattern both trigger it.
 
-**There is no attachment-preserving edit path through `body`.** Treat a note with
-attachments as effectively read-only via AppleScript body editing. If you must
-edit such a note, plan to re-add the attachments afterward (and remember the
-double-insertion bug when you do), or edit it by hand in the UI.
+**But `body` is not uniformly blind to attachments, and the difference decides
+whether the loss is recoverable:**
+
+| Attachment kind | In `body`? | Recoverable? |
+|---|---|---|
+| **image** (png, jpeg…) | yes — `<img src="data:image/png;base64,…"/>` | **yes**, harvest and re-add |
+| everything else (txt, pdf…) | no — renders as a bare `<div><br></div>` | **no**, nothing to restore from |
+
+So there *is* a partial attachment-preserving edit path, for images only.
+Harvest every data URI from `body` before the write, then decode each back to a
+file and re-attach it afterwards. Verified byte-exact and order-preserving by
+`tests/test_image_roundtrip.py::test_image_roundtrip_preserves_bytes_and_order`.
+The technique is from [antoniorodr/memo](https://github.com/antoniorodr/memo);
+see [`prior-art.md`](prior-art.md).
+
+Its costs, all verified: non-image attachments are still destroyed silently;
+original filenames do not survive (the attachments are rebuilt, so they take the
+name of the temp file); and every restored image lands at the **end** of the
+note, because `make new attachment` cannot place one mid-text.
+
+🛑 **Do not "improve" this by writing the data URI inline.** `set body` with an
+`<img src="data:image/png;base64,…"/>` *does* create a real attachment, and it
+lands at the correct position in the text rather than at the end — so it looks
+strictly better. It is a data-loss trap: the resulting attachment is **nameless**
+and `body` never renders it back as an `<img>` (checked over 20s — it is not a
+propagation lag). The next harvest finds nothing, so the following edit destroys
+the image without warning. Locked by
+`tests/test_image_roundtrip.py::test_inline_data_uri_write_creates_unharvestable_attachment`.
 
 Locked by `tests/test_attachments.py::test_editing_body_destroys_attachments`. If
 it starts preserving attachments, Apple fixed it — update this section.

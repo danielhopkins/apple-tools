@@ -89,16 +89,25 @@ search content, export candidates and grep them.
 **Gotchas** (each locked by a live test in `notes/tests/`, full detail in
 [`docs/apple-notes-api.md`](docs/apple-notes-api.md)):
 
-- 🛑 **Editing `body` destroys all attachments.** A note's `body` doesn't include
-  attachments at all, so the first write wipes every one of them. There is no
-  attachment-preserving edit path. Treat notes with attachments as read-only.
+- 🛑 **Editing `body` destroys all attachments.** The first write wipes every one
+  of them. Treat notes with attachments as read-only unless you run the recovery
+  below. **Images are the one recoverable kind**: they appear in `body` as
+  `<img src="data:image/png;base64,…"/>`, so harvesting those before the write
+  and re-attaching them after is byte-exact. Everything else (txt, pdf) is
+  invisible in `body` and unrecoverable. Costs: filenames are lost and restored
+  images move to the end of the note. 🛑 Do not write the data URI back inline —
+  it creates a nameless attachment `body` can never return, so the *next* edit
+  destroys it silently.
 - `set body` is a **full replace**, never a merge.
 - The **first line becomes the title**, silently, on every body write.
 - `delete` is a **soft delete** — the note moves to Recently Deleted and
   auto-purges in ~30 days. There is no API to empty that folder.
 - The SQLite reader **can see Recently Deleted notes**. Filter them out if the
   user asked for live notes.
-- `make new attachment` **double-inserts** on macOS 27.
+- `make new attachment` **double-inserts** on macOS 27 — one attachment record,
+  referenced twice, so the user sees the file twice. Fix by deleting the surplus
+  immediately: `if (count of attachments of n) > EXPECTED then delete last
+  attachment of n`.
 
 Stdlib only — `notestore.py` decodes the gzipped-protobuf note body directly,
 so no virtualenv is involved.
