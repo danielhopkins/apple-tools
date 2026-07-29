@@ -212,14 +212,28 @@ def _silent_delete(note_id: str) -> None:
 
 
 def sweep_test_notes() -> int:
-    """Delete every note whose name starts with TEST_PREFIX. Returns count deleted."""
+    """Delete every note whose name starts with TEST_PREFIX. Returns count deleted.
+
+    Each delete is wrapped in its own `try`, because the enumeration and the
+    deletions are not atomic: a note can vanish between the two — already
+    soft-deleted, or removed by a run that was interrupted — and an unguarded
+    loop then aborts the whole sweep with
+
+        Notes got an error: Can't get note id "x-coredata://…". (-1728)
+
+    leaving every remaining test note behind. Cleanup must be best-effort, since
+    the thing it is cleaning up after is usually a run that already went wrong.
+    """
     return int(
         osascript(
             'tell application "Notes"\n'
             f"set victims to (notes whose name starts with {_as_str(TEST_PREFIX)})\n"
-            "set n to count of victims\n"
+            "set n to 0\n"
             "repeat with v in victims\n"
-            "  delete v\n"
+            "  try\n"
+            "    delete v\n"
+            "    set n to n + 1\n"
+            "  end try\n"
             "end repeat\n"
             "return n\n"
             "end tell"
