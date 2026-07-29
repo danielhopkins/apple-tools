@@ -231,9 +231,10 @@ picture survives, the editable strokes do not. *(Inferred from the UTI change;
 not tested against a real drawing, because that would mean writing to a real
 note.)*
 
-⚠️ **Each body round-trip leaks an orphaned table row.** The note still shows one
-table, but `ZICCLOUDSYNCINGOBJECT` gains a row per edit, so a row count is not a
-valid way to count a note's tables. Locked by
+⚠️ **Each body round-trip leaks orphaned table rows**, and how many is not
+deterministic (2 in isolation, 3 under the full suite). The note still shows one
+table, but `ZICCLOUDSYNCINGOBJECT` gains rows, so a row count is not a valid way
+to count a note's tables. Locked by
 `test_table_roundtrip_leaves_orphaned_object_rows`.
 
 For attachments there is a partial preserving path, for images only.
