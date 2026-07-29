@@ -542,5 +542,163 @@ class AttachmentRoundTripTests(unittest.TestCase):
             )
 
 
+TABLE_HTML = (
+    "<table><tr><td>r1c1</td><td>r1c2</td></tr>"
+    "<tr><td>r2c1</td><td>r2c2</td></tr></table>"
+)
+
+
+def object_utis(pk: int) -> dict:
+    """{ZTYPEUTI: count} for the note's embedded objects."""
+    conn = sqlite3.connect(f"file:{h.DB_PATH}?mode=ro", uri=True, timeout=5)
+    try:
+        rows = conn.execute(
+            "SELECT ZTYPEUTI, COUNT(*) FROM ZICCLOUDSYNCINGOBJECT "
+            "WHERE ZNOTE = ? AND ZTYPEUTI IS NOT NULL GROUP BY ZTYPEUTI", (pk,)
+        ).fetchall()
+        return {u: n for u, n in rows}
+    finally:
+        conn.close()
+
+
+class EmbeddedObjectTests(unittest.TestCase):
+    """Native tables behave unlike attachments, and unlike each other's docs.
+
+    An attachment must be harvested and re-added around a body write. A **table
+    round-trips as markup** — leave its `<table>` HTML in the body you write and
+    it simply survives. That makes tables the one embedded object a body edit
+    can preserve without doing anything special.
+    """
+
+    def test_table_html_creates_a_native_table(self):
+        """`<table>` in a written body becomes a real com.apple.notes.table.
+
+        Notably different from `<img src="data:…">`, which produces an empty
+        `public.data` shell — so markup round-tripping is type-specific.
+        """
+        with h.temp_note(body_html=f"<div>ABOVE</div>{TABLE_HTML}<div>BELOW</div>",
+                         label="tblnew") as note_id:
+            pk = h.pk_from_note_id(note_id)
+            self.assertEqual(object_utis(pk).get("com.apple.notes.table"), 1)
+            self.assertIn("<table", h.get_body(note_id).lower())
+            self.assertRegex(h.sqlite_note_text(pk), r"ABOVE\s*￼\s*BELOW")
+
+    def test_table_survives_a_body_roundtrip(self):
+        """Reading the body and writing it back preserves the table and its cells.
+
+        This is the append pattern that destroys every attachment. A table is
+        unaffected, because its content travels in the HTML rather than in a
+        separate record.
+        """
+        with h.temp_note(body_html=f"<div>ABOVE</div>{TABLE_HTML}<div>BELOW</div>",
+                         label="tblrt") as note_id:
+            pk = h.pk_from_note_id(note_id)
+            before = h.get_body(note_id)
+            self.assertEqual(len(re.findall(r"<td", before.lower())), 4)
+
+            h.set_body(note_id, before + "<div>APPENDED</div>")
+
+            after = h.get_body(note_id)
+            self.assertIn("<table", after.lower())
+            self.assertEqual(len(re.findall(r"<td", after.lower())), 4,
+                             "all four cells should survive the round trip")
+            text = h.sqlite_note_text(pk)
+            self.assertIn("APPENDED", text)
+            self.assertEqual(h.object_replacement_count(text), 1,
+                             "still exactly one embedded object in the text")
+
+    def test_table_is_destroyed_when_its_markup_is_dropped(self):
+        """Writing a body without the `<table>` markup removes the table.
+
+        The failure mode is ordinary rather than surprising — but it means a
+        Markdown round trip that cannot represent a table will silently delete
+        one, which is the case `notes edit` has to refuse.
+        """
+        with h.temp_note(body_html=f"<div>ABOVE</div>{TABLE_HTML}<div>BELOW</div>",
+                         label="tbldrop") as note_id:
+            pk = h.pk_from_note_id(note_id)
+            self.assertEqual(h.object_replacement_count(h.sqlite_note_text(pk)), 1)
+
+            title_div = h.get_body(note_id).split("</div>")[0] + "</div>"
+            h.set_body(note_id, title_div + "<div>TABLE DROPPED</div>")
+
+            self.assertEqual(
+                h.object_replacement_count(h.sqlite_note_text(pk)), 0,
+                "the table should be gone from the note text",
+            )
+            self.assertNotIn("<table", h.get_body(note_id).lower())
+
+    def test_table_roundtrip_leaves_orphaned_object_rows(self):
+        """⚠️ A body round-trip leaks table rows that nothing references.
+
+        The note still renders one table, but `ZICCLOUDSYNCINGOBJECT` gains rows.
+        **How many is not deterministic** — 2 in isolation, 3 when the suite runs
+        together — so this asserts only that the count grew while the note's own
+        object count did not.
+
+        The practical consequence: a row count is not a valid way to count a
+        note's tables, and repeated edits accumulate garbage in the store.
+        """
+        with h.temp_note(body_html=f"<div>ABOVE</div>{TABLE_HTML}<div>BELOW</div>",
+                         label="tblorphan") as note_id:
+            pk = h.pk_from_note_id(note_id)
+            before = object_utis(pk).get("com.apple.notes.table")
+            self.assertEqual(before, 1)
+
+            h.set_body(note_id, h.get_body(note_id) + "<div>APPENDED</div>")
+
+            after = object_utis(pk).get("com.apple.notes.table")
+            self.assertGreater(
+                after, before,
+                "expected the known orphan-row leak; if the count stays 1, "
+                "Apple fixed it — update docs/apple-notes-api.md",
+            )
+            # ...while the note itself still shows exactly one table
+            self.assertEqual(h.object_replacement_count(h.sqlite_note_text(pk)), 1)
+
+    def test_image_can_be_dropped_while_a_table_is_kept(self):
+        """The two classes are independent: strip the <img>, keep the <table>.
+
+        This is the shape `notes edit` needs — tables ride along in the markup,
+        images are harvested and re-added, and neither interferes with the other.
+        """
+        fd, png = tempfile.mkstemp(prefix="claude_tbl_", suffix=".png")
+        os.close(fd)
+        with open(png, "wb") as f:
+            f.write(
+                b"\x89PNG\r\n\x1a\n"
+                + struct.pack(">I", 13) + b"IHDR" + struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+                + struct.pack(">I", zlib.crc32(b"IHDR" + struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)) & 0xFFFFFFFF)
+                + (lambda d: struct.pack(">I", len(d)) + b"IDAT" + d
+                   + struct.pack(">I", zlib.crc32(b"IDAT" + d) & 0xFFFFFFFF))(
+                       zlib.compress(b"\x00\x09\x82\x3c"))
+                + struct.pack(">I", 0) + b"IEND" + struct.pack(">I", zlib.crc32(b"IEND") & 0xFFFFFFFF)
+            )
+        self.addCleanup(lambda: os.path.exists(png) and os.remove(png))
+
+        with h.temp_note(body_html=f"<div>ABOVE</div>{TABLE_HTML}<div>BELOW</div>",
+                         label="tblimg") as note_id:
+            pk = h.pk_from_note_id(note_id)
+            h.osascript(
+                'tell application "Notes"\n'
+                f"set n to note id {h._as_str(note_id)}\n"
+                f"make new attachment at end of n with data (POSIX file {h._as_str(png)})\n"
+                "if (count of attachments of n) > 1 then delete last attachment of n\n"
+                "end tell"
+            )
+            self.assertEqual(h.object_replacement_count(h.sqlite_note_text(pk)), 2)
+
+            body = h.get_body(note_id)
+            h.set_body(note_id, re.sub(r"<img[^>]*>", "", body) + "<div>IMAGE DROPPED</div>")
+
+            after = h.get_body(note_id)
+            self.assertIn("<table", after.lower(), "the table must survive")
+            self.assertEqual(len(re.findall(r"<td", after.lower())), 4)
+            self.assertEqual(
+                h.object_replacement_count(h.sqlite_note_text(pk)), 1,
+                "exactly the image should have been removed",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

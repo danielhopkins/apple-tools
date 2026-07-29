@@ -178,14 +178,20 @@ partial one. Verified by reading `src/memo_helpers/edit_memo.py` and
 - **The premise is true, and our docs were wrong.** CLAUDE.md said a note's
   `body` "doesn't include attachments at all". That is true for a **text file**
   — which is what `test_editing_body_destroys_attachments` attaches, and why we
-  generalised wrongly — and false for an **image**, which comes back as
-  `<img src="data:image/png;base64,…"/>` carrying the real bytes. So the rule is
-  per-kind, not blanket:
+  generalised wrongly — and false for images, tables, drawings and Paper docs.
+  Measured against the real store, there are three classes, not two:
 
-  | Attachment kind | Present in `body`? | Recoverable across an edit? |
+  | Object type | In `body` as | Survives a body edit? |
   |---|---|---|
-  | image (png, jpeg…) | yes, as a data URI | **yes**, byte-exact |
-  | anything else (txt, pdf…) | no, renders as `<div><br></div>` | no |
+  | table | `<table>` markup | **yes, for free** — keep the markup |
+  | image | `<img src="data:…">` | yes, but must be harvested and re-added |
+  | drawing / Paper doc | `<img>`, a flat PNG render | picture only, flattens to `public.png` |
+  | PDF / text file / scan | nothing | no |
+
+  memo only handles the image row. Tables are the better find: they need no
+  harvesting at all, just markup that survives the rewrite — and **45% of a real
+  store (427 of 939 notes) carries some embedded object**, so this is the common
+  case, not an edge case.
 
 - **The full round trip works.** Harvest → `set body` (attachments drop to 0) →
   decode each data URI to a file → re-attach. Two distinct images came back with

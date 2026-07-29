@@ -87,7 +87,7 @@ attachment property after creation. The API is **add-only**.
 | **Plain text gets wrapped** | Setting a non-HTML body wraps it in `<div>…</div>`. | `test_editing::test_plaintext_body_is_wrapped_in_div` |
 | **`<h1>` loses its semantics** | A heading round-trips as `<font face=".AppleSystemUIFontBold">` / `<span style="font-size:24px">`, not `<h1>`. | `test_editing::test_h1_heading_roundtrip_loses_semantic_tag` |
 | **`delete` is a soft delete** | Moves the note to Recently Deleted; it is **not** gone. There is no AppleScript API to empty that folder; it auto-purges in ~30 days. After soft delete, `container of note` raises **-1728**, so check the folder via SQLite. | `test_editing::test_delete_moves_to_recently_deleted` |
-| 🛑 **editing `body` destroys attachments** | The first write to `body` deletes them all. Images are recoverable (they appear in `body` as base64 data URIs) — nothing else is. See §3. | `test_attachments::test_editing_body_destroys_attachments` |
+| 🛑 **editing `body` destroys attachments** | The first write deletes every attachment. What survives is per-type: tables ride along in the markup, images must be harvested and re-added, PDFs/text/scans are unrecoverable. See §3. | `test_attachments::test_editing_body_destroys_attachments` |
 
 ---
 
@@ -199,15 +199,44 @@ right shape: catch the error, recover the id from the message. Locked by
 gradual; one write wipes them all. Confirmed on macOS 26 and 27. `set body`
 full-replace and the read-modify-write "append" pattern both trigger it.
 
-**But `body` is not uniformly blind to attachments, and the difference decides
-whether the loss is recoverable:**
+**But `body` is not uniformly blind, and what it carries decides recoverability.
+There are three classes, not two** — measured against the real store by picking
+notes where one object type is the only type present, so attribution is
+unambiguous:
 
-| Attachment kind | In `body`? | Recoverable? |
-|---|---|---|
-| **image** (png, jpeg…) | yes — `<img src="data:image/png;base64,…"/>` | **yes**, harvest and re-add |
-| everything else (txt, pdf…) | no — renders as a bare `<div><br></div>` | **no**, nothing to restore from |
+| Object type | UTI | In `body` as | Survives a body edit? |
+|---|---|---|---|
+| **table** | `com.apple.notes.table` | `<object><table>…` markup | **yes, for free** — keep the markup |
+| image | `public.png` / `jpeg` / `tiff` / `heic` | `<img src="data:…">` | yes, but must be **harvested and re-added** |
+| drawing | `com.apple.drawing.2` | `<img>` — a flat PNG render | picture only; **flattens to `public.png`** |
+| Paper doc | `com.apple.paper` | `<img>` — a flat PNG render | picture only; flattens |
+| scan | `com.apple.paper.doc.scan` | *nothing* | **no** |
+| PDF | `com.adobe.pdf` | *nothing* | **no** |
+| text file | `public.plain-text` | *nothing* | **no** |
 
-So there *is* a partial attachment-preserving edit path, for images only.
+**Tables are the one type a body edit preserves for free.** Their content travels
+in the HTML, so writing back a body that still contains the `<table>` markup
+keeps the table and all its cells. Drop the markup and the table is deleted.
+Locked by `test_table_survives_a_body_roundtrip` and
+`test_table_is_destroyed_when_its_markup_is_dropped`.
+
+⚠️ Markup round-tripping is **type-specific and does not generalise**: putting
+`<table>` HTML in a written body creates a real table, but putting
+`<img src="data:…">` in one creates an *empty* attachment (see below). Images
+must go back as files, not as markup.
+
+⚠️ **A drawing is not an image**, though `body` renders it as one. Recovering it
+through the harvest-and-re-add path necessarily produces a `public.png` — the
+picture survives, the editable strokes do not. *(Inferred from the UTI change;
+not tested against a real drawing, because that would mean writing to a real
+note.)*
+
+⚠️ **Each body round-trip leaks an orphaned table row.** The note still shows one
+table, but `ZICCLOUDSYNCINGOBJECT` gains a row per edit, so a row count is not a
+valid way to count a note's tables. Locked by
+`test_table_roundtrip_leaves_orphaned_object_rows`.
+
+For attachments there is a partial preserving path, for images only.
 Harvest every data URI from `body` before the write, then decode each back to a
 file and re-attach it afterwards. Verified byte-exact and order-preserving by
 `tests/test_attachment_roundtrip.py::test_image_roundtrip_preserves_bytes_and_order`.

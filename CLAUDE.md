@@ -89,15 +89,19 @@ search content, export candidates and grep them.
 **Gotchas** (each locked by a live test in `notes/tests/`, full detail in
 [`docs/apple-notes-api.md`](docs/apple-notes-api.md)):
 
-- 🛑 **Editing `body` destroys all attachments.** The first write wipes every one
-  of them. Treat notes with attachments as read-only unless you run the recovery
-  below. **Images are the one recoverable kind**: they appear in `body` as
-  `<img src="data:image/png;base64,…"/>`, so harvesting those before the write
-  and re-attaching them after is byte-exact. Everything else (txt, pdf) is
-  invisible in `body` and unrecoverable. Costs: filenames are lost and restored
-  images move to the end of the note. 🛑 Do not write the data URI back inline —
-  it creates a nameless attachment `body` can never return, so the *next* edit
-  destroys it silently.
+- 🛑 **Editing `body` destroys attachments.** What survives depends entirely on
+  the embedded object's type — **45% of a real store (427 of 939 notes) carries
+  one**, so check before any edit:
+  - **tables** (`com.apple.notes.table`) survive **for free** — they live in the
+    HTML, so keep the `<table>` markup in the body you write. Dropping it
+    deletes the table.
+  - **images** survive only if you **harvest and re-add** them: they appear as
+    `<img src="data:image/png;base64,…"/>`, and re-attaching the decoded bytes
+    is byte-exact. Costs: filenames are lost, images move to the end.
+  - **drawings** and **Paper docs** appear as flat PNGs, so the picture can be
+    recovered but flattens to `public.png` — the strokes are gone.
+  - **PDFs, text files and scans** are invisible in `body` and **unrecoverable**.
+  🛑 Do not put a `data:` URI back in the body — see below.
 - `set body` is a **full replace**, never a merge.
 - The **first line becomes the title**, silently, on every body write.
 - `delete` is a **soft delete** — the note moves to Recently Deleted and
