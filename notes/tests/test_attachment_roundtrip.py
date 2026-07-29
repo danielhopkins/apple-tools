@@ -641,13 +641,13 @@ class EmbeddedObjectTests(unittest.TestCase):
         with h.temp_note(body_html=f"<div>ABOVE</div>{TABLE_HTML}<div>BELOW</div>",
                          label="tbldrop") as note_id:
             pk = h.pk_from_note_id(note_id)
-            self.assertEqual(h.object_replacement_count(h.sqlite_note_text(pk)), 1)
+            self.assertEqual(settled_placeholders(pk), 1)
 
             title_div = h.get_body(note_id).split("</div>")[0] + "</div>"
             h.set_body(note_id, title_div + "<div>TABLE DROPPED</div>")
 
             self.assertEqual(
-                h.object_replacement_count(h.sqlite_note_text(pk)), 0,
+                settled_placeholders(pk), 0,
                 "the table should be gone from the note text",
             )
             self.assertNotIn("<table", h.get_body(note_id).lower())
@@ -678,7 +678,7 @@ class EmbeddedObjectTests(unittest.TestCase):
                 "Apple fixed it — update docs/apple-notes-api.md",
             )
             # ...while the note itself still shows exactly one table
-            self.assertEqual(h.object_replacement_count(h.sqlite_note_text(pk)), 1)
+            self.assertEqual(settled_placeholders(pk), 1)
 
     def test_image_can_be_dropped_while_a_table_is_kept(self):
         """The two classes are independent: strip the <img>, keep the <table>.
@@ -703,14 +703,24 @@ class EmbeddedObjectTests(unittest.TestCase):
         with h.temp_note(body_html=f"<div>ABOVE</div>{TABLE_HTML}<div>BELOW</div>",
                          label="tblimg") as note_id:
             pk = h.pk_from_note_id(note_id)
+            # The note already holds a table, so the double-insert guard's
+            # threshold is "one more than what is already there" — not 1.
+            # Hardcoding 1 here let the surplus reference survive and the
+            # placeholder count settle on 3, failing intermittently.
+            before_count = h.count_attachments(note_id)
             h.osascript(
                 'tell application "Notes"\n'
                 f"set n to note id {h._as_str(note_id)}\n"
                 f"make new attachment at end of n with data (POSIX file {h._as_str(png)})\n"
-                "if (count of attachments of n) > 1 then delete last attachment of n\n"
+                f"if (count of attachments of n) > {before_count + 1} then\n"
+                "  delete last attachment of n\n"
+                "end if\n"
                 "end tell"
             )
-            self.assertEqual(h.object_replacement_count(h.sqlite_note_text(pk)), 2)
+            # settled_placeholders, not a raw read: the count passes through a
+            # transient on its way to its final value.
+            self.assertEqual(settled_placeholders(pk), 2,
+                             "one table + one image")
 
             body = h.get_body(note_id)
             h.set_body(note_id, re.sub(r"<img[^>]*>", "", body) + "<div>IMAGE DROPPED</div>")
@@ -719,7 +729,7 @@ class EmbeddedObjectTests(unittest.TestCase):
             self.assertIn("<table", after.lower(), "the table must survive")
             self.assertEqual(len(re.findall(r"<td", after.lower())), 4)
             self.assertEqual(
-                h.object_replacement_count(h.sqlite_note_text(pk)), 1,
+                settled_placeholders(pk), 1,
                 "exactly the image should have been removed",
             )
 
