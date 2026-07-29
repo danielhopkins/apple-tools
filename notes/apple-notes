@@ -21,6 +21,8 @@ import os
 import sys
 import argparse
 import re
+import subprocess
+import time
 from pathlib import Path
 
 # Add the proto directory to the path (resolve symlinks so this works when
@@ -120,20 +122,98 @@ def check_access():
                 "Grant Full Disk Access to your terminal in %s." % settings)
 
 
+# --------------------------------------------------------------------------- #
+# Shortcuts — the write path.
+#
+# Reads use SQLite and need only Full Disk Access. Writes go through Notes'
+# AppIntents, driven by `shortcuts run`, because AppleScript cannot express a
+# checklist and its only body write destroys attachments. See
+# docs/apple-notes-shortcuts.md.
+#
+# Each shortcut must be installed once (there is no headless install) and
+# authorised once. Both are per-shortcut, so status reports each separately.
+# --------------------------------------------------------------------------- #
+SHORTCUTS = {
+    "Apple Tools Create Note": "create a note from Markdown",
+    "Apple Tools Append Note": "append Markdown to an existing note",
+}
+
+
+def shortcuts_dir():
+    """Where the .shortcut files live, in a repo checkout or a Homebrew install."""
+    for candidate in (
+        SCRIPT_DIR / "shortcuts",                                   # repo layout
+        SCRIPT_DIR.parent / "share" / "apple-tools" / "shortcuts",  # brew: libexec -> share
+        SCRIPT_DIR / ".." / "share" / "apple-tools" / "shortcuts",
+    ):
+        if candidate.is_dir() and any(candidate.glob("*.shortcut")):
+            return candidate.resolve()
+    return None
+
+
+def installed_shortcuts():
+    """Names present in the user's Shortcuts library, or None if unavailable."""
+    if not os.path.exists("/usr/bin/shortcuts"):
+        return None
+    try:
+        out = subprocess.run(["shortcuts", "list"], capture_output=True,
+                             text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return {line.strip() for line in out.stdout.splitlines() if line.strip()}
+
+
+def shortcuts_status():
+    """Report the write path: which shortcuts are installed and what's missing.
+
+    Deliberately does not run one — running is what triggers the permission
+    prompt, and status must never prompt.
+    """
+    have = installed_shortcuts()
+    if have is None:
+        return {
+            "available": False,
+            "reason": "the `shortcuts` CLI is unavailable",
+            "installed": [], "missing": sorted(SHORTCUTS),
+        }
+    missing = sorted(n for n in SHORTCUTS if n not in have)
+    return {
+        "available": not missing,
+        "installed": sorted(n for n in SHORTCUTS if n in have),
+        "missing": missing,
+        "advice": ("Run `apple notes install-shortcuts` to install them."
+                   if missing else None),
+    }
+
+
 def cmd_status(args):
-    """Report Full Disk Access state. Never prompts — nothing can."""
+    """Report Full Disk Access and the Shortcuts write path. Never prompts."""
     status, usable, advice = check_access()
+    sc = shortcuts_status()
 
     if args.json:
-        payload = {"status": status, "usable": usable}
+        payload = {"status": status, "usable": usable, "shortcuts": sc}
         if advice:
             payload["advice"] = advice
         print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    suffix = "" if usable else "  (cannot read notes)"
+    print("Notes access: %s%s" % (status, suffix))
+    if advice:
+        print(advice)
+
+    if sc["available"]:
+        print("Write path:   shortcuts installed (%d)" % len(sc["installed"]))
     else:
-        suffix = "" if usable else "  (cannot read notes)"
-        print("Notes access: %s%s" % (status, suffix))
-        if advice:
-            print(advice)
+        detail = sc.get("reason") or "%d not installed" % len(sc["missing"])
+        print("Write path:   unavailable — %s" % detail)
+        for name in sc["missing"]:
+            print("                missing: %s" % name)
+        if sc.get("advice"):
+            print("              %s" % sc["advice"])
 
 
 # A password-protected ("locked") note keeps its row in ZICCLOUDSYNCINGOBJECT but
@@ -666,6 +746,71 @@ def format_as_markdown(title, text, links=None):
     return markdown
 
 
+
+def cmd_install_shortcuts(args):
+    """Install the write-path shortcuts, then verify they landed.
+
+    There is no headless install: `shortcuts` can run, list, view and sign, but
+    not add. Writing Shortcuts.sqlite directly would fight CloudKit sync. So
+    this opens each file and waits for it to appear in the library.
+    """
+    src = shortcuts_dir()
+    if src is None:
+        print("error: cannot find the .shortcut files.", file=sys.stderr)
+        print("       Looked next to this script and in share/apple-tools/shortcuts.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if not os.path.exists("/usr/bin/shortcuts"):
+        print("error: /usr/bin/shortcuts is missing; cannot verify installation.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    before = installed_shortcuts() or set()
+    todo = [n for n in SHORTCUTS if n not in before or args.force]
+    if not todo:
+        print("All %d shortcuts are already installed." % len(SHORTCUTS))
+        print("Re-run with --force to reinstall.")
+        return
+
+    print("Installing %d shortcut%s from %s"
+          % (len(todo), "" if len(todo) == 1 else "s", src))
+    print("Shortcuts.app will open and ask you to add each one — accept it.\n")
+
+    for name in todo:
+        path = src / ("%s.shortcut" % name)
+        if not path.exists():
+            print("  ✗ %s — file missing at %s" % (name, path), file=sys.stderr)
+            continue
+        print("  opening %s …" % name)
+        subprocess.run(["open", str(path)], check=False)
+        # Poll rather than sleep blindly; adding is a human action.
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            if name in (installed_shortcuts() or set()):
+                print("  ✓ %s installed" % name)
+                break
+            time.sleep(2)
+        else:
+            print("  ✗ %s did not appear within 90s" % name, file=sys.stderr)
+
+    have = installed_shortcuts() or set()
+    missing = [n for n in SHORTCUTS if n not in have]
+    print()
+    if missing:
+        print("Still missing: %s" % ", ".join(missing), file=sys.stderr)
+        print("Open the files yourself from: %s" % src, file=sys.stderr)
+        sys.exit(1)
+
+    print("All shortcuts installed.\n")
+    print("One more step, the first time each one runs: macOS asks")
+    print('  "Allow <shortcut> to ... a note?"')
+    print("Choose **Always Allow** for unattended use, or **Allow Once** to")
+    print("approve every individual write — that prompt is an OS-enforced")
+    print("review of exactly what is being written, and is worth keeping if an")
+    print("agent is driving. The grant is per shortcut, not per note.")
+
+
 def cmd_search(args):
     """Handle search command"""
     term = " ".join(args.term) if args.term else None
@@ -885,6 +1030,15 @@ Examples:
     url_parser.add_argument("identifier", help="Note ID or title")
     url_parser.add_argument("--json", action="store_true", help="Output as JSON")
 
+    install_parser = subparsers.add_parser(
+        "install-shortcuts",
+        help="Install the Shortcuts that provide the write path",
+    )
+    install_parser.add_argument(
+        "--force", action="store_true",
+        help="Reinstall even if already present",
+    )
+
     status_parser = subparsers.add_parser(
         "status", help="Report Full Disk Access state without requesting it"
     )
@@ -906,6 +1060,8 @@ Examples:
         cmd_get_url(args)
     elif args.command == "status":
         cmd_status(args)
+    elif args.command == "install-shortcuts":
+        cmd_install_shortcuts(args)
 
 
 if __name__ == "__main__":

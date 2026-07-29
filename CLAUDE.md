@@ -79,12 +79,18 @@ apple notes search [TERM] [--limit N] [--json] [--include-locked]  # title searc
 apple notes folders [NAME] [--limit N] [--json]  # all folders, or notes in one folder
 apple notes export ID [-o out.md]                # note body as Markdown
 apple notes get-url ID [--json]                  # applenotes:// deep link
+apple notes install-shortcuts [--force]          # install the write path
+apple notes status [--json]                      # access + write-path state
 ```
 
 `ID` accepts a numeric note ID, a note title, or an `applenotes://` URL.
 
 **Search is title-only.** There is no full-text search over note bodies; to
 search content, export candidates and grep them.
+
+**Writes need `install-shortcuts` first.** `apple notes status` reports whether
+the write path is available and names anything missing; until then Notes is
+read-only.
 
 ⚠️ **The gotchas below are about the AppleScript write path, which is the wrong
 tool for most writes.** It cannot create a checklist at all, and its only body

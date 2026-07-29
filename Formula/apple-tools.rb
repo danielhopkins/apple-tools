@@ -24,6 +24,11 @@ class AppleTools < Formula
     # Claude skills. `apple-tools --skills-dir` is not a thing; point users at
     # the install path in caveats and let them symlink what they want.
     (pkgshare/"skills").install Dir["skills/*"]
+
+    # The signed Shortcuts that provide the Notes write path. apple-notes finds
+    # them by walking up from its own location to share/apple-tools/shortcuts,
+    # so this path is load-bearing — see `shortcuts_dir()` in apple-notes.
+    (pkgshare/"shortcuts").install Dir["shortcuts/*"]
   end
 
   def caveats
@@ -70,6 +75,19 @@ class AppleTools < Formula
 
       apple-contacts also reads that store for contact notes, which the Contacts
       framework cannot expose without an Apple-granted entitlement.
+
+      Writing to Notes needs one extra step. AppleScript cannot create a
+      checklist and its only body write destroys every attachment on the note,
+      so writes go through Notes' own Shortcuts actions instead. Install them
+      once:
+
+        apple notes install-shortcuts
+
+      That opens two shortcuts for you to add; the first run of each then asks
+      "Allow ... to save a note?". Choose Always Allow for unattended use, or
+      Allow Once to review every individual write. Until they are installed,
+      apple-notes is read-only — `apple notes status` reports which are missing.
+      Details in #{HOMEBREW_PREFIX}/share/doc/apple-tools/apple-notes-shortcuts.md
     EOS
   end
 

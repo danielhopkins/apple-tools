@@ -247,13 +247,43 @@ def build_generic_append():
     ])
 
 
+# The installed shortcut takes its NAME from the file name, so these are the
+# user-visible names. Keep them stable — `apple notes install-shortcuts` and
+# `apple notes status` both look them up by name.
+SHIPPED = {
+    "Apple Tools Create Note": "create",
+    "Apple Tools Append Note": "generic-append",
+}
+
+
+def build(which):
+    return {"create": build_create_markdown,
+            "append": build_append_markdown,
+            "generic-append": build_generic_append}[which]()
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--ship":
+        # Emit both shipping shortcuts, signed, into the given directory.
+        import subprocess
+        outdir = pathlib.Path(sys.argv[2] if len(sys.argv) > 2 else ".")
+        outdir.mkdir(parents=True, exist_ok=True)
+        import tempfile
+        for name, which in SHIPPED.items():
+            final = outdir / f"{name}.shortcut"
+            # `shortcuts sign` rejects an input that is not named *.shortcut,
+            # and will not sign in place, so stage the unsigned copy elsewhere.
+            with tempfile.TemporaryDirectory() as td:
+                raw = pathlib.Path(td) / f"{name}.shortcut"
+                raw.write_bytes(plistlib.dumps(build(which), fmt=plistlib.FMT_BINARY))
+                subprocess.run(["shortcuts", "sign", "--mode", "anyone",
+                                "--input", str(raw), "--output", str(final)], check=True)
+            print(f"  {final}  ({final.stat().st_size} bytes)")
+        return
+
     out = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "NotesCreateMarkdown.shortcut")
     which = sys.argv[2] if len(sys.argv) > 2 else "create"
-    wf = {"create": build_create_markdown,
-          "append": build_append_markdown,
-          "generic-append": build_generic_append}[which]()
-    out.write_bytes(plistlib.dumps(wf, fmt=plistlib.FMT_BINARY))
+    out.write_bytes(plistlib.dumps(build(which), fmt=plistlib.FMT_BINARY))
     print(f"wrote {out} ({out.stat().st_size} bytes)")
 
 

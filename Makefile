@@ -211,9 +211,17 @@ dist: set-version completions
 	@# All of docs/, not one named file: CLAUDE.md links to these, and a
 	@# release that ships the link but not the target is worse than neither.
 	cp docs/*.md $(DIST)/docs/
-	mkdir -p $(DIST)/completions $(DIST)/skills
+	mkdir -p $(DIST)/completions $(DIST)/skills $(DIST)/shortcuts
 	cp completions/_* $(DIST)/completions/
 	cp -R skills/* $(DIST)/skills/
+	@# The signed .shortcut files ARE the Notes write path — without them
+	@# `apple notes install-shortcuts` has nothing to install and the tool is
+	@# read-only. Fail loudly rather than shipping a release that silently
+	@# cannot write.
+	@ls notes/shortcuts/*.shortcut >/dev/null 2>&1 \
+		|| { echo "error: no signed shortcuts in notes/shortcuts/; run 'python3 notes/shortcuts/build-shortcut.py --ship notes/shortcuts/'"; exit 1; }
+	cp notes/shortcuts/*.shortcut $(DIST)/shortcuts/
+	cp notes/shortcuts/README.md $(DIST)/shortcuts/
 	@# Bind the embedded Info.plists. `dist` links its own universal binaries,
 	@# so the re-signing done by `build` does not apply to them — without this
 	@# the shipped tools cannot show a permission dialog at all.
