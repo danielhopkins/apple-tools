@@ -287,6 +287,54 @@ Also credits `dunhamsteve/notesutils` as the origin of the embedded-table
 analysis; that repo's `notes.md` is the best single write-up of the format and
 is what to read before extending the protobuf decoder.
 
+### The checklist write problem — nobody has solved it in AppleScript
+
+A body write flattens every checklist into a plain bulleted list and discards
+which items were ticked (see [`apple-notes-api.md`](apple-notes-api.md)). Asked
+whether anyone had beaten this:
+
+**Nobody has, and the reason is structural.** `Notes.sdef` — the app's own
+scripting dictionary — contains **zero** occurrences of `checklist`, `checkbox`,
+`checked` or `todo`, while containing `attachment` 16 times and `note` 35. The
+vocabulary simply does not exist, so no amount of AppleScript cleverness reaches
+it.
+
+- **[macnotesapp #29](https://github.com/RhetTbull/macnotesapp/issues/29)** is
+  open since 2022. RhetTbull, who has done more with Notes scripting than
+  anyone surveyed: *"I've not figured out how to access checklists from Notes
+  programmatically."* The one suggestion in the thread is SiriKit's Lists and
+  Notes domain, never followed up.
+- **No markup works.** We tried 13 candidates — `<input type="checkbox">`
+  (checked and unchecked), `class="Apple-checklist"`, `class="checklist"`,
+  `li class="checked"`, `data-apple-notes-checklist`, `list-style-type:none`,
+  ARIA `role="checkbox"`, `<ol>`, unicode ballot boxes, and literal `- [ ]`
+  text. Every one lands as `style_type: -1` (plain paragraph) instead of the
+  `style_type: 103` + `checklist: {done: n}` a real checklist carries.
+- ⚠️ **`- [ ]` looked like a win and was not.** Our exporter renders a real
+  checklist as `- [ ]`, so writing that literal text made the exporter echo it
+  back and the test appeared to pass. Checking the paragraph style rather than
+  the rendered Markdown showed it was plain text all along. If you re-test this,
+  assert on `style_type`, never on exported Markdown.
+- ⚠️ **A web search claimed `applescript-mcp` had `add_checklist` /
+  `toggle_checklist` / `remove_checklist`.** It does not — reading
+  `src/categories/notes.ts` shows `create`, `createRawHtml` and `list`, and a
+  code search across the repo returns nothing for "checklist". The summary was
+  wrong; the source is the authority.
+
+**Shortcuts is the one route that works.** The Shortcuts app has an **"Append
+checklist item"** action that adds genuinely interactive checklist items to a
+new or existing note — doing through Notes' own intents what the scripting
+interface cannot express. `/usr/bin/shortcuts` can `run` a shortcut from the
+command line and pipe input to it.
+
+The catch is shipping: `shortcuts` has `run`, `list`, `view` and `sign` — **no
+way to author an action**. So a Shortcuts backend means distributing a
+`.shortcut` file the user installs once, which is a real packaging and trust
+cost for a tool that currently installs as a symlink. It is the same lead left
+open for attachment appends, and it is now the single highest-value unknown in
+this whole survey: it is the only known path to both a checklist write *and* an
+attachment-preserving append.
+
 ### Test-case ideas worth stealing
 
 Our 24 live tests in `notes/tests/` are stronger than anything surveyed at

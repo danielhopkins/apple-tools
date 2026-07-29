@@ -254,6 +254,18 @@ contain a checklist.**
 
 Locked by `tests/test_editing.py::test_written_list_is_a_plain_bullet_not_a_checklist`.
 
+**There is no AppleScript fix, structurally.** `Notes.sdef` contains zero
+occurrences of `checklist`, `checkbox`, `checked` or `todo` (against 16 for
+`attachment`, 35 for `note`) — the vocabulary does not exist. 13 candidate
+markups were tried and all land as `style_type: -1` instead of `103`; see
+[`prior-art.md`](prior-art.md). The Shortcuts action **"Append checklist item"**
+is the only known working route, at the cost of shipping a `.shortcut` file,
+since `/usr/bin/shortcuts` can run but not author.
+
+⚠️ When re-testing this, assert on the **paragraph style**, not on exported
+Markdown: the exporter renders a checklist as `- [ ]`, so a note containing that
+literal text makes a naive check pass.
+
 Bold, italic, highlights, links and ordinary bullet lists *do* survive a round
 trip — checklists are the exception.
 
