@@ -649,6 +649,8 @@ notes/shortcuts/          .shortcut build scripts + signed files to install
 docs/apple-mail-store.md  Envelope Index schema, .emlx layout, verified traps
 docs/apple-messages-store.md  chat.db schema, the typedstream body, verified traps
 docs/prior-art.md         other projects solving this; check before building
+docs/todo-deep-links.md   planned: a `url` on every entity, so anything we
+                          name can be opened and cross-linked
 Formula/apple-tools.rb    Homebrew formula
 VERSION                   CalVer YY.MMDD.Patch, stamped in by scripts/set-version
 ```
