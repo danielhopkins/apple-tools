@@ -438,19 +438,27 @@ def find_note(identifier):
             (identifier,),
         )
 
+        # 🛑 Fetch into `result` and return it. An earlier version fetched here
+        # AND again after the if/else, so a successful EXACT match consumed its
+        # own only row and the second fetch returned None — exact-title lookup
+        # never worked, and fell through to nothing rather than to the partial
+        # match. Only the numeric-id path was exercised, so it stayed hidden.
         result = cursor.fetchone()
-        if not result:
-            # Try partial match
-            cursor.execute(
-                """
-                SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, nd.ZDATA,
-                       COALESCE(n.ZISPASSWORDPROTECTED, 0)
-                FROM ZICCLOUDSYNCINGOBJECT n
-                JOIN ZICNOTEDATA nd ON nd.ZNOTE = n.Z_PK
-                WHERE n.ZTITLE1 LIKE ?
-            """,
-                (f"%{identifier}%",),
-            )
+        if result:
+            conn.close()
+            return result
+
+        # No exact hit — try a partial match.
+        cursor.execute(
+            """
+            SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, nd.ZDATA,
+                   COALESCE(n.ZISPASSWORDPROTECTED, 0)
+            FROM ZICCLOUDSYNCINGOBJECT n
+            JOIN ZICNOTEDATA nd ON nd.ZNOTE = n.Z_PK
+            WHERE n.ZTITLE1 LIKE ?
+        """,
+            (f"%{identifier}%",),
+        )
 
     result = cursor.fetchone()
     conn.close()
@@ -963,6 +971,205 @@ def cmd_get_url(args):
         print(url)
 
 
+
+# --------------------------------------------------------------------------- #
+# Writes.
+#
+# These hide a wart in the Shortcuts layer: Create takes plain Markdown as its
+# input while Append needs a JSON object naming the target, and `shortcuts run`
+# types its input by FILE EXTENSION — .md/.txt/.text deliver, .json is dropped
+# silently and the run exits 0 having done nothing. Callers should not have to
+# know any of that, so the payload shape and the extension are chosen here.
+#
+# Body input follows the same convention as `apple mail draft`:
+#   --body TEXT        literal
+#   --body-file FILE   from a file
+#   --body-file -      from stdin
+# --------------------------------------------------------------------------- #
+
+
+def read_body(args):
+    """Resolve the body from --body, --body-file, or stdin."""
+    if args.body is not None and args.body_file is not None:
+        print("error: pass --body or --body-file, not both", file=sys.stderr)
+        sys.exit(2)
+    if args.body is not None:
+        return args.body
+    if args.body_file == "-":
+        return sys.stdin.read()
+    if args.body_file:
+        try:
+            with open(args.body_file, "r", encoding="utf-8") as f:
+                return f.read()
+        except OSError as exc:
+            print("error: cannot read %s: %s" % (args.body_file, exc), file=sys.stderr)
+            sys.exit(1)
+    if not sys.stdin.isatty():          # piped input with no flag
+        return sys.stdin.read()
+    print("error: no body given — use --body, --body-file, or pipe stdin",
+          file=sys.stderr)
+    sys.exit(2)
+
+
+def require_shortcuts():
+    """Refuse early, with the fix, rather than failing obscurely mid-write."""
+    sc = shortcuts_status()
+    if sc["available"]:
+        return
+    detail = sc.get("reason") or "missing: %s" % ", ".join(sc["missing"])
+    print("error: the Notes write path is unavailable — %s" % detail, file=sys.stderr)
+    print("       Run `apple notes install-shortcuts`.", file=sys.stderr)
+    sys.exit(1)
+
+
+def run_shortcut(name, payload, suffix):
+    """Run a shortcut with `payload` as its input.
+
+    `suffix` matters: `shortcuts run --input-path` types the input from the file
+    extension, and anything outside the shortcut's declared input classes is
+    dropped without an error. Always .md or .txt here — never .json.
+    """
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False,
+                                     encoding="utf-8") as f:
+        f.write(payload)
+        path = f.name
+    try:
+        proc = subprocess.run(["shortcuts", "run", name, "--input-path", path],
+                              capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        print("error: `%s` timed out after 120s." % name, file=sys.stderr)
+        print("       A hang usually means the shortcut is waiting on a "
+              "permission dialog — check Shortcuts.app.", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    if proc.returncode != 0:
+        print("error: `%s` failed: %s" % (name, proc.stderr.strip()), file=sys.stderr)
+        sys.exit(1)
+
+
+def note_pks_titled(title):
+    """Every live note Z_PK with exactly this title."""
+    conn = sqlite3.connect("file:%s?mode=ro" % get_db_path(), uri=True)
+    try:
+        return [r[0] for r in conn.execute(
+            "SELECT n.Z_PK FROM ZICCLOUDSYNCINGOBJECT n "
+            "LEFT JOIN ZICCLOUDSYNCINGOBJECT f ON n.ZFOLDER = f.Z_PK "
+            "WHERE n.ZTITLE1 = ? AND n.ZMARKEDFORDELETION = 0 "
+            "AND COALESCE(f.ZTITLE2, '') != 'Recently Deleted'", (title,)).fetchall()]
+    finally:
+        conn.close()
+
+
+def cmd_create(args):
+    """Create a note from Markdown. Checklists and tables come out native."""
+    require_shortcuts()
+    body = read_body(args)
+    if args.title:
+        body = "%s\n\n%s" % (args.title, body.lstrip("\n"))
+    # The first line becomes the note's title either way — that is Notes'
+    # behaviour on every write, not something this adds.
+    title = body.splitlines()[0].strip() if body.strip() else ""
+
+    before = len(note_pks_titled(title)) if title else 0
+    run_shortcut("Apple Tools Create Note", body, ".md")
+
+    # Verify through the store, never through AppleScript.
+    pk = None
+    for _ in range(20):
+        pks = note_pks_titled(title)
+        if len(pks) > before:
+            pk = max(pks)
+            break
+        time.sleep(0.5)
+
+    if args.json:
+        out = {"created": pk is not None, "title": title}
+        if pk:
+            out["id"] = pk
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+    elif pk:
+        print("Created note %d: %s" % (pk, title))
+    else:
+        print("note: the shortcut ran but no new note appeared yet; Notes may "
+              "still be settling.", file=sys.stderr)
+
+
+def cmd_append(args):
+    """Append Markdown to an existing note, preserving attachments and checklists."""
+    require_shortcuts()
+    body = read_body(args)
+
+    found = find_note(args.identifier)
+    if not found:
+        print("Note not found: %s" % args.identifier, file=sys.stderr)
+        sys.exit(1)
+    pk, title, _ident, _data, locked = found
+    if locked:
+        print("error: note %d is password-protected and cannot be written."
+              % pk, file=sys.stderr)
+        sys.exit(2)
+    if not title:
+        print("error: note %d has no title, and the write path targets a note "
+              "by title." % pk, file=sys.stderr)
+        sys.exit(1)
+
+    # The shortcut matches on Name, and names are not unique. Appending to every
+    # match would be a silent, unrecoverable mistake, so refuse — the same rule
+    # `apple messages` applies to an ambiguous chat reference.
+    matches = note_pks_titled(title)
+    if len(matches) > 1:
+        print("error: %d notes are titled %r; refusing to append to all of them."
+              % (len(matches), title), file=sys.stderr)
+        print("       ids: %s" % ", ".join(str(m) for m in sorted(matches)),
+              file=sys.stderr)
+        print("       Rename one in Notes.app, then retry.", file=sys.stderr)
+        sys.exit(1)
+
+    payload = json.dumps({"note": title, "text": body})
+    run_shortcut("Apple Tools Append Note", payload, ".txt")
+
+    marker = body.strip().splitlines()[0].strip() if body.strip() else ""
+    landed = False
+    for _ in range(20):
+        text = sqlite_text_for(pk)
+        if text and marker and marker in text:
+            landed = True
+            break
+        time.sleep(0.5)
+
+    if args.json:
+        print(json.dumps({"appended": landed, "id": pk, "title": title},
+                         indent=2, ensure_ascii=False))
+    elif landed:
+        print("Appended to note %d: %s" % (pk, title))
+    else:
+        print("note: the shortcut ran but the text has not appeared yet; Notes "
+              "may still be settling.", file=sys.stderr)
+
+
+def sqlite_text_for(pk):
+    """Decoded note text for a Z_PK, or None."""
+    conn = sqlite3.connect("file:%s?mode=ro" % get_db_path(), uri=True)
+    try:
+        row = conn.execute(
+            "SELECT ZDATA FROM ZICNOTEDATA WHERE ZNOTE = ? AND ZDATA IS NOT NULL",
+            (pk,)).fetchone()
+    finally:
+        conn.close()
+    if not row or not row[0]:
+        return None
+    try:
+        text, _runs = parse_note_content(row[0])
+    except Exception:
+        return None
+    return text
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="apple-notes",
@@ -1030,6 +1237,24 @@ Examples:
     url_parser.add_argument("identifier", help="Note ID or title")
     url_parser.add_argument("--json", action="store_true", help="Output as JSON")
 
+    def add_body_args(sp):
+        """--body / --body-file / stdin, matching `apple mail draft`."""
+        sp.add_argument("--body", help="Body text (Markdown)")
+        sp.add_argument("--body-file", metavar="FILE",
+                        help="Read the body from FILE, or - for stdin")
+
+    create_parser = subparsers.add_parser(
+        "create", help="Create a note from Markdown (checklists, tables)")
+    create_parser.add_argument("--title", help="Prepend a title line")
+    add_body_args(create_parser)
+    create_parser.add_argument("--json", action="store_true", help="Output as JSON")
+
+    append_parser = subparsers.add_parser(
+        "append", help="Append Markdown to an existing note")
+    append_parser.add_argument("identifier", help="Note ID, title, or applenotes:// URL")
+    add_body_args(append_parser)
+    append_parser.add_argument("--json", action="store_true", help="Output as JSON")
+
     install_parser = subparsers.add_parser(
         "install-shortcuts",
         help="Install the Shortcuts that provide the write path",
@@ -1062,6 +1287,10 @@ Examples:
         cmd_status(args)
     elif args.command == "install-shortcuts":
         cmd_install_shortcuts(args)
+    elif args.command == "create":
+        cmd_create(args)
+    elif args.command == "append":
+        cmd_append(args)
 
 
 if __name__ == "__main__":

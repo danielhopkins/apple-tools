@@ -79,9 +79,22 @@ apple notes search [TERM] [--limit N] [--json] [--include-locked]  # title searc
 apple notes folders [NAME] [--limit N] [--json]  # all folders, or notes in one folder
 apple notes export ID [-o out.md]                # note body as Markdown
 apple notes get-url ID [--json]                  # applenotes:// deep link
+apple notes create [--title T] [--body TEXT | --body-file FILE|-] [--json]
+apple notes append ID  [--body TEXT | --body-file FILE|-] [--json]
 apple notes install-shortcuts [--force]          # install the write path
 apple notes status [--json]                      # access + write-path state
 ```
+
+**Writes go through Shortcuts, and the CLI hides that.** `create` and `append`
+take a body the same way `mail draft` does — `--body`, `--body-file FILE`,
+`--body-file -`, or a bare pipe — and the tool picks the payload shape and file
+extension the underlying shortcut needs. Markdown becomes native structure:
+`- [ ]` and `- [x]` are real checklists with their checked state, pipe tables
+are real tables.
+
+`append` is a genuine append: it **preserves attachments and existing
+checklists**, unlike the AppleScript body write. It refuses when the title
+matches more than one note rather than appending to all of them.
 
 `ID` accepts a numeric note ID, a note title, or an `applenotes://` URL.
 
