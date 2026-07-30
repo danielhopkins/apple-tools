@@ -217,8 +217,10 @@ problems = []
 for name, info in records:
     pane = META.get(name, ("", ""))[0]
     ok = info.get("usable") is True
-    print("%-10s %-30s %s" % (
-        paint(name, "1;35"), pane,
+    # Pad before painting: %-10s counts the escape bytes, so a coloured name is
+    # already wider than the field and never gets padded at all.
+    print("%s %-30s %s" % (
+        paint("%-10s" % name, "1;35"), pane,
         paint("✓", "32") if ok else paint("✗", "31")))
     if not ok:
         problems.append((name, info.get("status", "unknown"), info.get("advice")))
