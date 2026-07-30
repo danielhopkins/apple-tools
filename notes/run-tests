@@ -9,16 +9,44 @@
 # Usage:
 #   ./run-tests                 # run everything, verbose
 #   ./run-tests test_attachments  # run a single test module
+#
+# 🛑 Only one instance may run at a time, and this script enforces it.
+# Every module's setUp/tearDown calls sweep_test_notes(), which deletes EVERY
+# note carrying the prefix — including notes belonging to a run already in
+# flight. Two concurrent runs therefore destroy each other's fixtures and fail
+# in ways that look like real bugs:
+#   "Notes got an error: Can't modify a note in Recently Deleted. (-10000)"
+#   "Can't make «class cid » of item 2 of every «class atts» ... (-1700)"
+# Both were chased as flaky tests before the cause turned out to be two suites
+# running at once.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 PY="$(command -v python3)"   # stdlib only; no virtualenv needed
 
+# mkdir is atomic everywhere; macOS has no flock(1).
+LOCKDIR="${TMPDIR:-/tmp}/apple-notes-live-tests.lock"
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+  OWNER="$(cat "$LOCKDIR/pid" 2>/dev/null || true)"
+  if [ -n "$OWNER" ] && kill -0 "$OWNER" 2>/dev/null; then
+    echo "error: live Notes tests are already running (pid $OWNER)." >&2
+    echo "       Concurrent runs sweep each other's test notes and fail in ways" >&2
+    echo "       that look like real bugs. Wait for that run to finish." >&2
+    exit 1
+  fi
+  # stale lock from a killed run
+  echo "note: clearing stale lock from pid ${OWNER:-unknown}" >&2
+  rm -rf "$LOCKDIR"
+  mkdir "$LOCKDIR" || { echo "error: cannot create $LOCKDIR" >&2; exit 1; }
+fi
+echo "$$" > "$LOCKDIR/pid"
+trap 'rm -rf "$LOCKDIR"' EXIT INT TERM
+
 cd "$ROOT"
 export RUN_LIVE_NOTES_TESTS=1
 
 if [ "$#" -gt 0 ]; then
-  exec "$PY" -m unittest -v "tests.$1"
+  "$PY" -m unittest -v "tests.$1"
 else
-  exec "$PY" -m unittest discover -s tests -t . -v
+  "$PY" -m unittest discover -s tests -t . -v
 fi

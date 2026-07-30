@@ -45,6 +45,45 @@ out the Recently Deleted folder, e.g. `AND f.ZTITLE2 != 'Recently Deleted'`
 
 Locked by `tests/test_reading.py::test_recently_deleted_is_visible_to_reader`.
 
+### Locked (password-protected) notes
+
+A locked note keeps its `ZICCLOUDSYNCINGOBJECT` row, flagged
+`ZISPASSWORDPROTECTED = 1`, but **its body is not present at all**:
+`ZICNOTEDATA.ZDATA` is `NULL`. There is nothing to decode and no read path — the
+key derives from the user's note password, or the device passcode on iOS 16+,
+which the CLI neither holds nor should ask for. The related columns
+(`ZCRYPTOSALT`, `ZCRYPTOWRAPPEDKEY`, `ZCRYPTOITERATIONCOUNT`,
+`ZPASSWORDHINT`, `ZLOCKEDNOTESMODE`) are all on the same table.
+
+⚠️ **A locked row may also have `ZTITLE1 = NULL` and `ZMODIFICATIONDATE1 =
+NULL`.** Both were true of the only locked note on this machine, which matters
+twice: a `WHERE ZTITLE1 IS NOT NULL` filter hides it *incidentally* rather than
+deliberately, and `ORDER BY ZMODIFICATIONDATE1 DESC` sorts it dead last, so a
+listing with a small `--limit` will not reach it.
+
+The CLI detects the flag and **skips locked notes by default** across `search`,
+`folders` and folder listings, announcing the omission on stderr so the gap is
+never silent:
+
+```
+note: skipped 1 password-protected note (contents are encrypted; pass
+      --include-locked to list them)
+```
+
+- `--include-locked` lists them with `locked: true`, and relaxes the title
+  filter so a title-less locked note still appears (shown as `<locked note>`).
+- `export` **refuses with exit code 2** and names the reason. It previously
+  printed "Failed to parse note content", blaming the parser for content that
+  was never there. Exit 2 is distinct from exit 1 ("not found") so a caller can
+  tell the two apart.
+- `get-url` still works and sets `locked: true` — a deep link is harmless, since
+  Notes.app prompts for the password itself.
+
+Locked by `tests/test_locked_notes.py` (9 tests). Those tests copy the store to
+a temp directory and flip the flag on a throwaway row, so they run whether or
+not the machine owns a locked note — and they are the **only notes tests that
+need neither Notes.app nor iCloud**, running in ~3s.
+
 ### Unknown protobuf fields
 
 Our trimmed `.proto` omits many fields that real notes carry; parsing leaves them
@@ -87,7 +126,7 @@ attachment property after creation. The API is **add-only**.
 | **Plain text gets wrapped** | Setting a non-HTML body wraps it in `<div>…</div>`. | `test_editing::test_plaintext_body_is_wrapped_in_div` |
 | **`<h1>` loses its semantics** | A heading round-trips as `<font face=".AppleSystemUIFontBold">` / `<span style="font-size:24px">`, not `<h1>`. | `test_editing::test_h1_heading_roundtrip_loses_semantic_tag` |
 | **`delete` is a soft delete** | Moves the note to Recently Deleted; it is **not** gone. There is no AppleScript API to empty that folder; it auto-purges in ~30 days. After soft delete, `container of note` raises **-1728**, so check the folder via SQLite. | `test_editing::test_delete_moves_to_recently_deleted` |
-| 🛑 **editing `body` destroys attachments** | `body` omits attachments entirely, so the first write to it deletes them all. See §3. | `test_attachments::test_editing_body_destroys_attachments` |
+| 🛑 **editing `body` destroys attachments** | The first write deletes every attachment. What survives is per-type: tables ride along in the markup, images must be harvested and re-added, PDFs/text/scans are unrecoverable. See §3. | `test_attachments::test_editing_body_destroys_attachments` |
 
 ---
 
@@ -120,26 +159,194 @@ This reproduces with both `at end of <note>` and the plain
 `tell <note> to make new attachment` form, so it is not a placement-syntax
 artifact. This is very likely the source of past attachment problems.
 
-**Workarounds:** add once then delete the surplus attachment; or drive
-attachments through Shortcuts instead of AppleScript; or verify
-`count of attachments` afterward and reconcile.
+**It is one attachment record referenced twice, not two records.** Both entries
+report the *same* `ICAttachment` id, while the body carries two `<img>` tags and
+the decoded text two `￼`. So the user really does see the file twice — but
+"dedupe the attachments listing by id", which is what macnotesapp does, reports
+1 and hides the visible defect rather than fixing it.
 
-Locked by `tests/test_attachments.py::test_make_attachment_double_inserts`. If
-that test starts seeing **1**, Apple fixed the bug — update this section.
+**Workaround for images only** — add, then immediately delete the surplus:
+
+```applescript
+make new attachment at end of n with data (POSIX file "…")
+if (count of attachments of n) > EXPECTED then delete last attachment of n
+```
+
+For an **image** this lands the count on `EXPECTED` with exactly one `￼` per
+attachment. Locked by
+`tests/test_attachment_roundtrip.py::test_guarded_add_defeats_double_insert_for_images`.
+
+**For a PDF the guard is a no-op**, because the count it tests is always 0 (see
+below). Guarded and unguarded adds are indistinguishable: **two placeholders in
+the text, one file on disk**. The PDF is intact and the user sees it twice, and
+there is no AppleScript route to fix that — you cannot delete a reference you
+cannot enumerate. Locked by
+`tests/test_attachment_roundtrip.py::test_pdf_double_inserts_and_the_guard_cannot_fix_it`.
+
+For a **text file** the count lands on 1 but the placeholder count is unstable
+across runs. Any `notes attach` must branch on attachment type; there is no
+universal guard.
+
+### 🛑 `count of attachments` is blind to PDFs
+
+A note with a PDF reports `count of attachments` = **0**, and `attachments of n`
+enumerates nothing — while the file sits on disk under
+`Accounts/<uuid>/Media/…`, byte-exact. AppleScript simply cannot see PDF
+attachments.
+
+Consequences, all load-bearing for a write path:
+
+- **A count of 0 does not mean "no attachments."** It never proves an attachment
+  was deleted, which is exactly the false conclusion this repo drew once.
+- **Verify writes through the store**, not through AppleScript: count `￼` in the
+  decoded note text and check for the file under `Accounts/`. The CLI already
+  has that read path; use it.
+- Any per-type reconciliation keyed on `count of attachments` silently does
+  nothing for PDFs.
+
+Locked by `tests/test_attachment_roundtrip.py::test_applescript_count_is_blind_to_pdf_attachments`.
+
+### ⚠️ The decoded placeholder count has a transient
+
+After an attachment write the decoded note text briefly shows **one** `￼` before
+settling on **two**. Any assertion that reads the first non-empty decode (which
+is what the test harness's `poll` returns) gets the mid-write value. Use
+`settled_placeholders()`, which waits for the count to stop changing. Locked by
+`tests/test_attachment_roundtrip.py::test_placeholder_count_has_a_transient`.
+
+Locked by `tests/test_attachments.py::test_make_attachment_double_inserts` and
+`tests/test_attachment_roundtrip.py::test_double_insert_is_one_attachment_referenced_twice`.
+If either starts seeing **1**, Apple fixed the bug — update this section.
+
+### ⚠️ Attaching a PDF errors when you read back its id
+
+`make new attachment` with a PDF creates the attachment but fails on `id of` the
+result:
+
+```
+Notes got an error: Can't get attachment id "x-coredata://…/ICAttachment/p3594". (-1728)
+```
+
+The attachment exists; only the id read fails, and the id itself is in the error
+text. macnotesapp handles this with a `parse_id_from_error` helper, which is the
+right shape: catch the error, recover the id from the message. Locked by
+`tests/test_attachment_roundtrip.py::test_pdf_attach_cannot_read_back_its_id`.
+
+### 🛑 Data-loss bug: a body write flattens checklists
+
+A Notes checklist is a paragraph style, not an embedded object, and **`body`
+carries none of it**. A real checklist reads back as:
+
+```html
+<ul><li>·</li><li>·</li></ul>
+```
+
+with no class, no `data-` attribute, no `<input type="checkbox">`, no checked
+state, no marker character — verified by inspecting real checklist notes on this
+machine. Writing that HTML back produces a **plain bulleted list**: the CLI
+renders a written `<ul><li>` as `- alpha`, never `- [ ] alpha`.
+
+So any body write converts every checklist on the note into a plain list and
+discards which items were ticked. It is unrecoverable (the state was never in
+the body), invisible (the note still looks like a list), and it applies to the
+append pattern as much as to a full rewrite. **48 of 672 live notes here (7%)
+contain a checklist.**
+
+Locked by `tests/test_editing.py::test_written_list_is_a_plain_bullet_not_a_checklist`.
+
+**There is no AppleScript fix, structurally.** `Notes.sdef` contains zero
+occurrences of `checklist`, `checkbox`, `checked` or `todo` (against 16 for
+`attachment`, 35 for `note`) — the vocabulary does not exist. 13 candidate
+markups were tried and all land as `style_type: -1` instead of `103`; see
+[`prior-art.md`](prior-art.md). The Shortcuts action **"Append checklist item"**
+is the only known working route, at the cost of shipping a `.shortcut` file,
+since `/usr/bin/shortcuts` can run but not author.
+
+⚠️ When re-testing this, assert on the **paragraph style**, not on exported
+Markdown: the exporter renders a checklist as `- [ ]`, so a note containing that
+literal text makes a naive check pass.
+
+Bold, italic, highlights, links and ordinary bullet lists *do* survive a round
+trip — checklists are the exception.
 
 ### 🛑 Data-loss bug: editing `body` destroys all attachments
 
-Reading a note's `body` returns **only its text/HTML — attachments are not
-represented in it at all** (no `<object>`, no `￼` placeholder). Therefore *any*
-write to `body` replaces the note with attachment-free content, so **the first
-body edit deletes every attachment on the note.** This is not gradual; one write
-wipes them all. Confirmed on macOS 26 and 27. `set body` full-replace and the
-read-modify-write "append" pattern both trigger it.
+*Any* write to `body` deletes **every attachment on the note**. This is not
+gradual; one write wipes them all. Confirmed on macOS 26 and 27. `set body`
+full-replace and the read-modify-write "append" pattern both trigger it.
 
-**There is no attachment-preserving edit path through `body`.** Treat a note with
-attachments as effectively read-only via AppleScript body editing. If you must
-edit such a note, plan to re-add the attachments afterward (and remember the
-double-insertion bug when you do), or edit it by hand in the UI.
+**But `body` is not uniformly blind, and what it carries decides recoverability.
+There are three classes, not two** — measured against the real store by picking
+notes where one object type is the only type present, so attribution is
+unambiguous:
+
+| Object type | UTI | In `body` as | Survives a body edit? |
+|---|---|---|---|
+| **table** | `com.apple.notes.table` | `<object><table>…` markup | **yes, for free** — keep the markup |
+| image | `public.png` / `jpeg` / `tiff` / `heic` | `<img src="data:…">` | yes, but must be **harvested and re-added** |
+| drawing | `com.apple.drawing.2` | `<img>` — a flat PNG render | picture only; **flattens to `public.png`** |
+| Paper doc | `com.apple.paper` | `<img>` — a flat PNG render | picture only; flattens |
+| scan | `com.apple.paper.doc.scan` | *nothing* | **no** |
+| PDF | `com.adobe.pdf` | *nothing* | **no** |
+| text file | `public.plain-text` | *nothing* | **no** |
+
+**Tables are the one type a body edit preserves for free.** Their content travels
+in the HTML, so writing back a body that still contains the `<table>` markup
+keeps the table and all its cells. Drop the markup and the table is deleted.
+Locked by `test_table_survives_a_body_roundtrip` and
+`test_table_is_destroyed_when_its_markup_is_dropped`.
+
+⚠️ Markup round-tripping is **type-specific and does not generalise**: putting
+`<table>` HTML in a written body creates a real table, but putting
+`<img src="data:…">` in one creates an *empty* attachment (see below). Images
+must go back as files, not as markup.
+
+⚠️ **A drawing is not an image**, though `body` renders it as one. Recovering it
+through the harvest-and-re-add path necessarily produces a `public.png` — the
+picture survives, the editable strokes do not. *(Inferred from the UTI change;
+not tested against a real drawing, because that would mean writing to a real
+note.)*
+
+⚠️ **Each body round-trip leaks orphaned table rows**, and how many is not
+deterministic (2 in isolation, 3 under the full suite). The note still shows one
+table, but `ZICCLOUDSYNCINGOBJECT` gains rows, so a row count is not a valid way
+to count a note's tables. Locked by
+`test_table_roundtrip_leaves_orphaned_object_rows`.
+
+For attachments there is a partial preserving path, for images only.
+Harvest every data URI from `body` before the write, then decode each back to a
+file and re-attach it afterwards. Verified byte-exact and order-preserving by
+`tests/test_attachment_roundtrip.py::test_image_roundtrip_preserves_bytes_and_order`.
+The technique is from [antoniorodr/memo](https://github.com/antoniorodr/memo);
+see [`prior-art.md`](prior-art.md).
+
+Its costs, all verified: non-image attachments are still destroyed silently;
+original filenames do not survive (the attachments are rebuilt, so they take the
+name of the temp file); and every restored image lands at the **end** of the
+note, because `make new attachment` cannot place one mid-text.
+
+🛑 **Do not "improve" this by writing the data URI inline. It stores nothing.**
+
+`set body` with an `<img src="data:image/png;base64,…"/>` creates an attachment
+row and puts the placeholder at the **correct position** in the text rather than
+at the end — the only thing that can place an attachment mid-note, so it looks
+strictly better than `make new attachment`. It is pure data loss. The row is
+empty:
+
+```
+ZFILENAME = NULL   ZFILESIZE = 0   ZTYPEUTI = 'public.data'
+```
+
+and **no file is ever written** — polled 30s, and nothing appears under
+`Accounts/`. The bytes are discarded. True for `image/png`, `application/pdf`
+and `text/plain` alike, via `<img src>` or `<object data>`, so there is no safe
+variant. (`<embed>` is ignored entirely; `<a href="data:…">` keeps the base64 in
+the body as a link and creates no attachment at all — the one form that does
+preserve the payload, though only as link text.)
+
+**There is therefore no way to place an attachment mid-note.** Everything lands
+at the end. Locked by
+`tests/test_attachment_roundtrip.py::test_inline_data_uri_write_discards_the_payload`.
 
 Locked by `tests/test_attachments.py::test_editing_body_destroys_attachments`. If
 it starts preserving attachments, Apple fixed it — update this section.

@@ -212,14 +212,28 @@ def _silent_delete(note_id: str) -> None:
 
 
 def sweep_test_notes() -> int:
-    """Delete every note whose name starts with TEST_PREFIX. Returns count deleted."""
+    """Delete every note whose name starts with TEST_PREFIX. Returns count deleted.
+
+    Each delete is wrapped in its own `try`, because the enumeration and the
+    deletions are not atomic: a note can vanish between the two — already
+    soft-deleted, or removed by a run that was interrupted — and an unguarded
+    loop then aborts the whole sweep with
+
+        Notes got an error: Can't get note id "x-coredata://…". (-1728)
+
+    leaving every remaining test note behind. Cleanup must be best-effort, since
+    the thing it is cleaning up after is usually a run that already went wrong.
+    """
     return int(
         osascript(
             'tell application "Notes"\n'
             f"set victims to (notes whose name starts with {_as_str(TEST_PREFIX)})\n"
-            "set n to count of victims\n"
+            "set n to 0\n"
             "repeat with v in victims\n"
-            "  delete v\n"
+            "  try\n"
+            "    delete v\n"
+            "    set n to n + 1\n"
+            "  end try\n"
             "end repeat\n"
             "return n\n"
             "end tell"
@@ -293,7 +307,7 @@ def export_markdown(pk: int) -> str | None:
     res = cli.find_note(str(pk))
     if not res:
         return None
-    _pk, title, _ident, zdata = res
+    _pk, title, _ident, zdata, _locked = res
     text, runs = cli.parse_note_content(zdata)
     labels = cli.get_attachment_labels(
         [r["attachment"]["identifier"] for r in runs if r.get("attachment")]
@@ -306,11 +320,23 @@ def object_replacement_count(text: str) -> int:
     return text.count("￼")
 
 
-def poll(fn, *, timeout: float = 10.0, interval: float = 0.3):
+def poll(fn, *, timeout: float = 25.0, interval: float = 0.3):
     """Poll fn() until it returns a truthy value or timeout; returns last value.
 
     Local AppleScript edits propagate to NoteStore.sqlite with a short lag, so
     SQLite assertions must wait rather than read immediately.
+
+    The default was 10s and produced roughly one spurious failure per four
+    full-suite runs once the suite grew past ~7 minutes: the lag scales with how
+    busy Notes.app is, and a long suite keeps it busy. Raising it costs nothing
+    on success — poll returns as soon as the value is truthy — and only slows
+    genuine failures down.
+
+    ⚠️ This waits for *truthy*, so it returns the first non-empty value, which
+    for a value still settling is a mid-write state. When the quantity itself
+    changes over time (an attachment write briefly shows one placeholder before
+    settling on two), poll for stability instead — see `settled_placeholders` in
+    test_attachment_roundtrip.py.
     """
     deadline = time.time() + timeout
     val = fn()

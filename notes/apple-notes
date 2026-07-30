@@ -21,6 +21,8 @@ import os
 import sys
 import argparse
 import re
+import subprocess
+import time
 from pathlib import Path
 
 # Add the proto directory to the path (resolve symlinks so this works when
@@ -74,7 +76,7 @@ class Style:
         return cls._wrap(text, "35")
 
 
-__version__ = "26.728.5"
+__version__ = "26.730.0"
 
 
 def get_db_path():
@@ -120,35 +122,139 @@ def check_access():
                 "Grant Full Disk Access to your terminal in %s." % settings)
 
 
+# --------------------------------------------------------------------------- #
+# Shortcuts — the write path.
+#
+# Reads use SQLite and need only Full Disk Access. Writes go through Notes'
+# AppIntents, driven by `shortcuts run`, because AppleScript cannot express a
+# checklist and its only body write destroys attachments. See
+# docs/apple-notes-shortcuts.md.
+#
+# Each shortcut must be installed once (there is no headless install) and
+# authorised once. Both are per-shortcut, so status reports each separately.
+# --------------------------------------------------------------------------- #
+SHORTCUTS = {
+    "Apple Tools Create Note": "create a note from Markdown",
+    "Apple Tools Append Note": "append Markdown to an existing note",
+}
+
+
+def shortcuts_dir():
+    """Where the .shortcut files live, in a repo checkout or a Homebrew install."""
+    for candidate in (
+        SCRIPT_DIR / "shortcuts",                                   # repo layout
+        SCRIPT_DIR.parent / "share" / "apple-tools" / "shortcuts",  # brew: libexec -> share
+        SCRIPT_DIR / ".." / "share" / "apple-tools" / "shortcuts",
+    ):
+        if candidate.is_dir() and any(candidate.glob("*.shortcut")):
+            return candidate.resolve()
+    return None
+
+
+def installed_shortcuts():
+    """Names present in the user's Shortcuts library, or None if unavailable."""
+    if not os.path.exists("/usr/bin/shortcuts"):
+        return None
+    try:
+        out = subprocess.run(["shortcuts", "list"], capture_output=True,
+                             text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return {line.strip() for line in out.stdout.splitlines() if line.strip()}
+
+
+def shortcuts_status():
+    """Report the write path: which shortcuts are installed and what's missing.
+
+    Deliberately does not run one — running is what triggers the permission
+    prompt, and status must never prompt.
+    """
+    have = installed_shortcuts()
+    if have is None:
+        return {
+            "available": False,
+            "reason": "the `shortcuts` CLI is unavailable",
+            "installed": [], "missing": sorted(SHORTCUTS),
+        }
+    missing = sorted(n for n in SHORTCUTS if n not in have)
+    return {
+        "available": not missing,
+        "installed": sorted(n for n in SHORTCUTS if n in have),
+        "missing": missing,
+        "advice": ("Run `apple notes install-shortcuts` to install them."
+                   if missing else None),
+    }
+
+
 def cmd_status(args):
-    """Report Full Disk Access state. Never prompts — nothing can."""
+    """Report Full Disk Access and the Shortcuts write path. Never prompts."""
     status, usable, advice = check_access()
+    sc = shortcuts_status()
 
     if args.json:
-        payload = {"status": status, "usable": usable}
+        payload = {"status": status, "usable": usable, "shortcuts": sc}
         if advice:
             payload["advice"] = advice
         print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    suffix = "" if usable else "  (cannot read notes)"
+    print("Notes access: %s%s" % (status, suffix))
+    if advice:
+        print(advice)
+
+    if sc["available"]:
+        print("Write path:   shortcuts installed (%d)" % len(sc["installed"]))
     else:
-        suffix = "" if usable else "  (cannot read notes)"
-        print("Notes access: %s%s" % (status, suffix))
-        if advice:
-            print(advice)
+        detail = sc.get("reason") or "%d not installed" % len(sc["missing"])
+        print("Write path:   unavailable — %s" % detail)
+        for name in sc["missing"]:
+            print("                missing: %s" % name)
+        if sc.get("advice"):
+            print("              %s" % sc["advice"])
 
 
-def search_notes(term=None, limit=50):
-    """Search notes by title or list recent notes."""
+# A password-protected ("locked") note keeps its row in ZICCLOUDSYNCINGOBJECT but
+# its body is encrypted and not exposed to us at all — ZICNOTEDATA.ZDATA is NULL.
+# There is no read path: the key is derived from the user's note password (or the
+# device passcode on iOS 16+), which we neither have nor should ask for. So these
+# are skipped by default rather than surfaced as notes that mysteriously fail.
+#
+# Verified against the live store; see docs/apple-notes-api.md §4.
+NOT_LOCKED = "COALESCE(n.ZISPASSWORDPROTECTED, 0) = 0"
+
+
+def search_notes(term=None, limit=50, include_locked=False):
+    """Search notes by title or list recent notes.
+
+    Locked notes are excluded unless include_locked, in which case they come
+    back with locked=True and no readable body.
+    """
     db_path = get_db_path()
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
+    # With --include-locked the title filter is relaxed too: a locked note may
+    # carry no title at all, and omitting it after the user explicitly asked to
+    # see locked notes would be the same silent gap the flag exists to close.
+    if include_locked:
+        lock_clause = ""
+        title_clause = "(n.ZTITLE1 IS NOT NULL OR COALESCE(n.ZISPASSWORDPROTECTED, 0) = 1)"
+    else:
+        lock_clause = f"AND {NOT_LOCKED}"
+        title_clause = "n.ZTITLE1 IS NOT NULL"
+
     if term:
         cursor.execute(
-            """
-            SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, n.ZMODIFICATIONDATE1
+            f"""
+            SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, n.ZMODIFICATIONDATE1,
+                   COALESCE(n.ZISPASSWORDPROTECTED, 0)
             FROM ZICCLOUDSYNCINGOBJECT n
-            WHERE n.ZTITLE1 IS NOT NULL
+            WHERE {title_clause}
             AND n.ZMARKEDFORDELETION = 0
+            {lock_clause}
             AND n.ZTITLE1 LIKE ?
             ORDER BY n.ZMODIFICATIONDATE1 DESC
             LIMIT ?
@@ -157,11 +263,13 @@ def search_notes(term=None, limit=50):
         )
     else:
         cursor.execute(
-            """
-            SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, n.ZMODIFICATIONDATE1
+            f"""
+            SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, n.ZMODIFICATIONDATE1,
+                   COALESCE(n.ZISPASSWORDPROTECTED, 0)
             FROM ZICCLOUDSYNCINGOBJECT n
-            WHERE n.ZTITLE1 IS NOT NULL
+            WHERE {title_clause}
             AND n.ZMARKEDFORDELETION = 0
+            {lock_clause}
             ORDER BY n.ZMODIFICATIONDATE1 DESC
             LIMIT ?
         """,
@@ -170,12 +278,49 @@ def search_notes(term=None, limit=50):
 
     results = []
     for row in cursor.fetchall():
-        results.append(
-            {"pk": row[0], "title": row[1], "identifier": row[2], "modified": row[3]}
-        )
+        entry = {
+            "pk": row[0],
+            "title": row[1],
+            "identifier": row[2],
+            "modified": row[3],
+        }
+        if row[4]:
+            entry["locked"] = True
+            if entry["title"] is None:
+                entry["title"] = "<locked note>"
+        results.append(entry)
 
     conn.close()
     return results
+
+
+def count_locked_notes():
+    """How many live notes are locked — used to tell the user what was skipped."""
+    conn = sqlite3.connect(get_db_path())
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) FROM ZICCLOUDSYNCINGOBJECT n "
+            "WHERE COALESCE(n.ZISPASSWORDPROTECTED, 0) = 1 "
+            "AND n.ZMARKEDFORDELETION = 0"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def warn_locked_skipped(include_locked):
+    """Say on stderr that locked notes were omitted, so the gap is never silent."""
+    if include_locked:
+        return
+    try:
+        n = count_locked_notes()
+    except sqlite3.Error:
+        return
+    if n:
+        print(
+            f"note: skipped {n} password-protected note{'s' if n != 1 else ''} "
+            "(contents are encrypted; pass --include-locked to list them)",
+            file=sys.stderr,
+        )
 
 
 def list_folders():
@@ -191,6 +336,7 @@ def list_folders():
         LEFT JOIN ZICCLOUDSYNCINGOBJECT n ON n.ZFOLDER = f.Z_PK
             AND n.ZMARKEDFORDELETION = 0
             AND n.ZTITLE1 IS NOT NULL
+            AND COALESCE(n.ZISPASSWORDPROTECTED, 0) = 0
         WHERE f.ZTITLE2 IS NOT NULL
         AND f.ZMARKEDFORDELETION = 0
         GROUP BY f.Z_PK, f.ZTITLE2
@@ -220,6 +366,7 @@ def search_by_folder(folder_name, limit=100):
         WHERE f.ZTITLE2 LIKE ?
         AND n.ZMARKEDFORDELETION = 0
         AND n.ZTITLE1 IS NOT NULL
+        AND COALESCE(n.ZISPASSWORDPROTECTED, 0) = 0
         ORDER BY n.ZMODIFICATIONDATE1 DESC
         LIMIT ?
     """,
@@ -252,7 +399,8 @@ def find_note(identifier):
     if identifier.isdigit():
         cursor.execute(
             """
-            SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, nd.ZDATA
+            SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, nd.ZDATA,
+                   COALESCE(n.ZISPASSWORDPROTECTED, 0)
             FROM ZICCLOUDSYNCINGOBJECT n
             JOIN ZICNOTEDATA nd ON nd.ZNOTE = n.Z_PK
             WHERE n.Z_PK = ?
@@ -266,7 +414,8 @@ def find_note(identifier):
             note_id = match.group(1)
             cursor.execute(
                 """
-                SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, nd.ZDATA
+                SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, nd.ZDATA,
+                       COALESCE(n.ZISPASSWORDPROTECTED, 0)
                 FROM ZICCLOUDSYNCINGOBJECT n
                 JOIN ZICNOTEDATA nd ON nd.ZNOTE = n.Z_PK
                 WHERE n.ZIDENTIFIER = ?
@@ -280,7 +429,8 @@ def find_note(identifier):
         # Search by title (exact match first, then partial)
         cursor.execute(
             """
-            SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, nd.ZDATA
+            SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, nd.ZDATA,
+                   COALESCE(n.ZISPASSWORDPROTECTED, 0)
             FROM ZICCLOUDSYNCINGOBJECT n
             JOIN ZICNOTEDATA nd ON nd.ZNOTE = n.Z_PK
             WHERE n.ZTITLE1 = ?
@@ -288,18 +438,27 @@ def find_note(identifier):
             (identifier,),
         )
 
+        # 🛑 Fetch into `result` and return it. An earlier version fetched here
+        # AND again after the if/else, so a successful EXACT match consumed its
+        # own only row and the second fetch returned None — exact-title lookup
+        # never worked, and fell through to nothing rather than to the partial
+        # match. Only the numeric-id path was exercised, so it stayed hidden.
         result = cursor.fetchone()
-        if not result:
-            # Try partial match
-            cursor.execute(
-                """
-                SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, nd.ZDATA
-                FROM ZICCLOUDSYNCINGOBJECT n
-                JOIN ZICNOTEDATA nd ON nd.ZNOTE = n.Z_PK
-                WHERE n.ZTITLE1 LIKE ?
-            """,
-                (f"%{identifier}%",),
-            )
+        if result:
+            conn.close()
+            return result
+
+        # No exact hit — try a partial match.
+        cursor.execute(
+            """
+            SELECT n.Z_PK, n.ZTITLE1, n.ZIDENTIFIER, nd.ZDATA,
+                   COALESCE(n.ZISPASSWORDPROTECTED, 0)
+            FROM ZICCLOUDSYNCINGOBJECT n
+            JOIN ZICNOTEDATA nd ON nd.ZNOTE = n.Z_PK
+            WHERE n.ZTITLE1 LIKE ?
+        """,
+            (f"%{identifier}%",),
+        )
 
     result = cursor.fetchone()
     conn.close()
@@ -595,25 +754,100 @@ def format_as_markdown(title, text, links=None):
     return markdown
 
 
+
+def cmd_install_shortcuts(args):
+    """Install the write-path shortcuts, then verify they landed.
+
+    There is no headless install: `shortcuts` can run, list, view and sign, but
+    not add. Writing Shortcuts.sqlite directly would fight CloudKit sync. So
+    this opens each file and waits for it to appear in the library.
+    """
+    src = shortcuts_dir()
+    if src is None:
+        print("error: cannot find the .shortcut files.", file=sys.stderr)
+        print("       Looked next to this script and in share/apple-tools/shortcuts.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if not os.path.exists("/usr/bin/shortcuts"):
+        print("error: /usr/bin/shortcuts is missing; cannot verify installation.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    before = installed_shortcuts() or set()
+    todo = [n for n in SHORTCUTS if n not in before or args.force]
+    if not todo:
+        print("All %d shortcuts are already installed." % len(SHORTCUTS))
+        print("Re-run with --force to reinstall.")
+        return
+
+    print("Installing %d shortcut%s from %s"
+          % (len(todo), "" if len(todo) == 1 else "s", src))
+    print("Shortcuts.app will open and ask you to add each one — accept it.\n")
+
+    for name in todo:
+        path = src / ("%s.shortcut" % name)
+        if not path.exists():
+            print("  ✗ %s — file missing at %s" % (name, path), file=sys.stderr)
+            continue
+        print("  opening %s …" % name)
+        subprocess.run(["open", str(path)], check=False)
+        # Poll rather than sleep blindly; adding is a human action.
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            if name in (installed_shortcuts() or set()):
+                print("  ✓ %s installed" % name)
+                break
+            time.sleep(2)
+        else:
+            print("  ✗ %s did not appear within 90s" % name, file=sys.stderr)
+
+    have = installed_shortcuts() or set()
+    missing = [n for n in SHORTCUTS if n not in have]
+    print()
+    if missing:
+        print("Still missing: %s" % ", ".join(missing), file=sys.stderr)
+        print("Open the files yourself from: %s" % src, file=sys.stderr)
+        sys.exit(1)
+
+    print("All shortcuts installed.\n")
+    print("One more step, the first time each one runs: macOS asks")
+    print('  "Allow <shortcut> to ... a note?"')
+    print("Choose **Always Allow** for unattended use, or **Allow Once** to")
+    print("approve every individual write — that prompt is an OS-enforced")
+    print("review of exactly what is being written, and is worth keeping if an")
+    print("agent is driving. The grant is per shortcut, not per note.")
+
+
 def cmd_search(args):
     """Handle search command"""
     term = " ".join(args.term) if args.term else None
-    results = search_notes(term, limit=args.limit)
+    include_locked = getattr(args, "include_locked", False)
+    results = search_notes(term, limit=args.limit, include_locked=include_locked)
 
     if getattr(args, "json", False):
-        print(json.dumps(
-            [{"id": n["pk"], "title": n["title"]} for n in results],
-            indent=2, ensure_ascii=False))
+        payload = []
+        for n in results:
+            entry = {"id": n["pk"], "title": n["title"]}
+            if n.get("locked"):
+                entry["locked"] = True
+            payload.append(entry)
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        warn_locked_skipped(include_locked)
         return
 
     if not results:
         print("No notes found.")
+        warn_locked_skipped(include_locked)
         return
 
     print(Style.dim(f"{'ID':>5}  Title"))
     print(Style.dim("-" * 60))
     for note in results:
-        print(f"{Style.identifier('%5d' % note['pk'])}  {Style.title(note['title'])}")
+        suffix = Style.dim("  [locked]") if note.get("locked") else ""
+        print(f"{Style.identifier('%5d' % note['pk'])}  "
+              f"{Style.title(note['title'])}{suffix}")
+    warn_locked_skipped(include_locked)
 
 
 def cmd_folders(args):
@@ -666,7 +900,19 @@ def cmd_export(args):
         print(f"Note not found: {args.identifier}", file=sys.stderr)
         sys.exit(1)
 
-    pk, title, identifier, compressed_data = result
+    pk, title, identifier, compressed_data, locked = result
+
+    # A locked note has no readable body — say so, rather than blaming the
+    # parser for content that was never there.
+    if locked:
+        print(
+            f"Note {pk} is password-protected; its contents are encrypted and "
+            "cannot be exported.\nUnlock it in Notes.app and copy the text out "
+            "manually — there is no API to decrypt it.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     print(f"Found note: {title} (ID: {pk})", file=sys.stderr)
 
     # Parse the note content using protobuf
@@ -704,17 +950,224 @@ def cmd_get_url(args):
         print(f"Note not found: {args.identifier}", file=sys.stderr)
         sys.exit(1)
 
-    pk, title, identifier, _ = result
+    pk, title, identifier, _, locked = result
 
     if not identifier:
         print(f"Note has no identifier: {title}", file=sys.stderr)
         sys.exit(1)
 
+    # A deep link to a locked note still works — Notes.app prompts for the
+    # password — so this is reported, not refused.
     url = f"applenotes://note/{identifier}"
     if getattr(args, "json", False):
-        print(json.dumps({"id": pk, "title": title, "url": url}, indent=2, ensure_ascii=False))
+        payload = {"id": pk, "title": title, "url": url}
+        if locked:
+            payload["locked"] = True
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
+        if locked:
+            print("note: this note is password-protected; opening it will "
+                  "prompt for the password", file=sys.stderr)
         print(url)
+
+
+
+# --------------------------------------------------------------------------- #
+# Writes.
+#
+# These hide a wart in the Shortcuts layer: Create takes plain Markdown as its
+# input while Append needs a JSON object naming the target, and `shortcuts run`
+# types its input by FILE EXTENSION — .md/.txt/.text deliver, .json is dropped
+# silently and the run exits 0 having done nothing. Callers should not have to
+# know any of that, so the payload shape and the extension are chosen here.
+#
+# Body input follows the same convention as `apple mail draft`:
+#   --body TEXT        literal
+#   --body-file FILE   from a file
+#   --body-file -      from stdin
+# --------------------------------------------------------------------------- #
+
+
+def read_body(args):
+    """Resolve the body from --body, --body-file, or stdin."""
+    if args.body is not None and args.body_file is not None:
+        print("error: pass --body or --body-file, not both", file=sys.stderr)
+        sys.exit(2)
+    if args.body is not None:
+        return args.body
+    if args.body_file == "-":
+        return sys.stdin.read()
+    if args.body_file:
+        try:
+            with open(args.body_file, "r", encoding="utf-8") as f:
+                return f.read()
+        except OSError as exc:
+            print("error: cannot read %s: %s" % (args.body_file, exc), file=sys.stderr)
+            sys.exit(1)
+    if not sys.stdin.isatty():          # piped input with no flag
+        return sys.stdin.read()
+    print("error: no body given — use --body, --body-file, or pipe stdin",
+          file=sys.stderr)
+    sys.exit(2)
+
+
+def require_shortcuts():
+    """Refuse early, with the fix, rather than failing obscurely mid-write."""
+    sc = shortcuts_status()
+    if sc["available"]:
+        return
+    detail = sc.get("reason") or "missing: %s" % ", ".join(sc["missing"])
+    print("error: the Notes write path is unavailable — %s" % detail, file=sys.stderr)
+    print("       Run `apple notes install-shortcuts`.", file=sys.stderr)
+    sys.exit(1)
+
+
+def run_shortcut(name, payload, suffix):
+    """Run a shortcut with `payload` as its input.
+
+    `suffix` matters: `shortcuts run --input-path` types the input from the file
+    extension, and anything outside the shortcut's declared input classes is
+    dropped without an error. Always .md or .txt here — never .json.
+    """
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False,
+                                     encoding="utf-8") as f:
+        f.write(payload)
+        path = f.name
+    try:
+        proc = subprocess.run(["shortcuts", "run", name, "--input-path", path],
+                              capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        print("error: `%s` timed out after 120s." % name, file=sys.stderr)
+        print("       A hang usually means the shortcut is waiting on a "
+              "permission dialog — check Shortcuts.app.", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    if proc.returncode != 0:
+        print("error: `%s` failed: %s" % (name, proc.stderr.strip()), file=sys.stderr)
+        sys.exit(1)
+
+
+def note_pks_titled(title):
+    """Every live note Z_PK with exactly this title."""
+    conn = sqlite3.connect("file:%s?mode=ro" % get_db_path(), uri=True)
+    try:
+        return [r[0] for r in conn.execute(
+            "SELECT n.Z_PK FROM ZICCLOUDSYNCINGOBJECT n "
+            "LEFT JOIN ZICCLOUDSYNCINGOBJECT f ON n.ZFOLDER = f.Z_PK "
+            "WHERE n.ZTITLE1 = ? AND n.ZMARKEDFORDELETION = 0 "
+            "AND COALESCE(f.ZTITLE2, '') != 'Recently Deleted'", (title,)).fetchall()]
+    finally:
+        conn.close()
+
+
+def cmd_create(args):
+    """Create a note from Markdown. Checklists and tables come out native."""
+    require_shortcuts()
+    body = read_body(args)
+    if args.title:
+        body = "%s\n\n%s" % (args.title, body.lstrip("\n"))
+    # The first line becomes the note's title either way — that is Notes'
+    # behaviour on every write, not something this adds.
+    title = body.splitlines()[0].strip() if body.strip() else ""
+
+    before = len(note_pks_titled(title)) if title else 0
+    run_shortcut("Apple Tools Create Note", body, ".md")
+
+    # Verify through the store, never through AppleScript.
+    pk = None
+    for _ in range(20):
+        pks = note_pks_titled(title)
+        if len(pks) > before:
+            pk = max(pks)
+            break
+        time.sleep(0.5)
+
+    if args.json:
+        out = {"created": pk is not None, "title": title}
+        if pk:
+            out["id"] = pk
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+    elif pk:
+        print("Created note %d: %s" % (pk, title))
+    else:
+        print("note: the shortcut ran but no new note appeared yet; Notes may "
+              "still be settling.", file=sys.stderr)
+
+
+def cmd_append(args):
+    """Append Markdown to an existing note, preserving attachments and checklists."""
+    require_shortcuts()
+    body = read_body(args)
+
+    found = find_note(args.identifier)
+    if not found:
+        print("Note not found: %s" % args.identifier, file=sys.stderr)
+        sys.exit(1)
+    pk, title, _ident, _data, locked = found
+    if locked:
+        print("error: note %d is password-protected and cannot be written."
+              % pk, file=sys.stderr)
+        sys.exit(2)
+    if not title:
+        print("error: note %d has no title, and the write path targets a note "
+              "by title." % pk, file=sys.stderr)
+        sys.exit(1)
+
+    # The shortcut matches on Name, and names are not unique. Appending to every
+    # match would be a silent, unrecoverable mistake, so refuse — the same rule
+    # `apple messages` applies to an ambiguous chat reference.
+    matches = note_pks_titled(title)
+    if len(matches) > 1:
+        print("error: %d notes are titled %r; refusing to append to all of them."
+              % (len(matches), title), file=sys.stderr)
+        print("       ids: %s" % ", ".join(str(m) for m in sorted(matches)),
+              file=sys.stderr)
+        print("       Rename one in Notes.app, then retry.", file=sys.stderr)
+        sys.exit(1)
+
+    payload = json.dumps({"note": title, "text": body})
+    run_shortcut("Apple Tools Append Note", payload, ".txt")
+
+    marker = body.strip().splitlines()[0].strip() if body.strip() else ""
+    landed = False
+    for _ in range(20):
+        text = sqlite_text_for(pk)
+        if text and marker and marker in text:
+            landed = True
+            break
+        time.sleep(0.5)
+
+    if args.json:
+        print(json.dumps({"appended": landed, "id": pk, "title": title},
+                         indent=2, ensure_ascii=False))
+    elif landed:
+        print("Appended to note %d: %s" % (pk, title))
+    else:
+        print("note: the shortcut ran but the text has not appeared yet; Notes "
+              "may still be settling.", file=sys.stderr)
+
+
+def sqlite_text_for(pk):
+    """Decoded note text for a Z_PK, or None."""
+    conn = sqlite3.connect("file:%s?mode=ro" % get_db_path(), uri=True)
+    try:
+        row = conn.execute(
+            "SELECT ZDATA FROM ZICNOTEDATA WHERE ZNOTE = ? AND ZDATA IS NOT NULL",
+            (pk,)).fetchone()
+    finally:
+        conn.close()
+    if not row or not row[0]:
+        return None
+    try:
+        text, _runs = parse_note_content(row[0])
+    except Exception:
+        return None
+    return text
 
 
 def main():
@@ -752,6 +1205,11 @@ Examples:
         "--limit", "-n", type=int, default=50, help="Max results (default: 50)"
     )
     search_parser.add_argument("--json", action="store_true", help="Output as JSON")
+    search_parser.add_argument(
+        "--include-locked",
+        action="store_true",
+        help="List password-protected notes too (their contents stay unreadable)",
+    )
 
     # folders command
     folders_parser = subparsers.add_parser(
@@ -779,6 +1237,33 @@ Examples:
     url_parser.add_argument("identifier", help="Note ID or title")
     url_parser.add_argument("--json", action="store_true", help="Output as JSON")
 
+    def add_body_args(sp):
+        """--body / --body-file / stdin, matching `apple mail draft`."""
+        sp.add_argument("--body", help="Body text (Markdown)")
+        sp.add_argument("--body-file", metavar="FILE",
+                        help="Read the body from FILE, or - for stdin")
+
+    create_parser = subparsers.add_parser(
+        "create", help="Create a note from Markdown (checklists, tables)")
+    create_parser.add_argument("--title", help="Prepend a title line")
+    add_body_args(create_parser)
+    create_parser.add_argument("--json", action="store_true", help="Output as JSON")
+
+    append_parser = subparsers.add_parser(
+        "append", help="Append Markdown to an existing note")
+    append_parser.add_argument("identifier", help="Note ID, title, or applenotes:// URL")
+    add_body_args(append_parser)
+    append_parser.add_argument("--json", action="store_true", help="Output as JSON")
+
+    install_parser = subparsers.add_parser(
+        "install-shortcuts",
+        help="Install the Shortcuts that provide the write path",
+    )
+    install_parser.add_argument(
+        "--force", action="store_true",
+        help="Reinstall even if already present",
+    )
+
     status_parser = subparsers.add_parser(
         "status", help="Report Full Disk Access state without requesting it"
     )
@@ -800,6 +1285,12 @@ Examples:
         cmd_get_url(args)
     elif args.command == "status":
         cmd_status(args)
+    elif args.command == "install-shortcuts":
+        cmd_install_shortcuts(args)
+    elif args.command == "create":
+        cmd_create(args)
+    elif args.command == "append":
+        cmd_append(args)
 
 
 if __name__ == "__main__":

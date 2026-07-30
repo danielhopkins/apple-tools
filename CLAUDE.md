@@ -75,30 +75,99 @@ Reads `NoteStore.sqlite` directly, ungzips the protobuf body, and renders
 Markdown (preserves `==highlights==`, bold, headings, lists, checklists).
 
 ```
-apple notes search [TERM] [--limit N] [--json]   # title search; lists recent if TERM omitted
+apple notes search [TERM] [--limit N] [--json] [--include-locked]  # title search
 apple notes folders [NAME] [--limit N] [--json]  # all folders, or notes in one folder
 apple notes export ID [-o out.md]                # note body as Markdown
 apple notes get-url ID [--json]                  # applenotes:// deep link
+apple notes create [--title T] [--body TEXT | --body-file FILE|-] [--json]
+apple notes append ID  [--body TEXT | --body-file FILE|-] [--json]
+apple notes install-shortcuts [--force]          # install the write path
+apple notes status [--json]                      # access + write-path state
 ```
+
+**Writes go through Shortcuts, and the CLI hides that.** `create` and `append`
+take a body the same way `mail draft` does — `--body`, `--body-file FILE`,
+`--body-file -`, or a bare pipe — and the tool picks the payload shape and file
+extension the underlying shortcut needs. Markdown becomes native structure:
+`- [ ]` and `- [x]` are real checklists with their checked state, pipe tables
+are real tables.
+
+`append` is a genuine append: it **preserves attachments and existing
+checklists**, unlike the AppleScript body write. It refuses when the title
+matches more than one note rather than appending to all of them.
 
 `ID` accepts a numeric note ID, a note title, or an `applenotes://` URL.
 
 **Search is title-only.** There is no full-text search over note bodies; to
 search content, export candidates and grep them.
 
+**Writes need `install-shortcuts` first.** `apple notes status` reports whether
+the write path is available and names anything missing; until then Notes is
+read-only.
+
+⚠️ **The gotchas below are about the AppleScript write path, which is the wrong
+tool for most writes.** It cannot create a checklist at all, and its only body
+write is a full replace that destroys attachments and flattens checklists.
+**Shortcuts can do all of it** — a genuine append that preserves attachments and
+checklist state, and Markdown interpreted into native structure, in ~0.3s. It
+costs a one-time install and permission grant per shortcut. See
+[`docs/apple-notes-shortcuts.md`](docs/apple-notes-shortcuts.md); build scripts
+in `notes/shortcuts/`.
+
 **Gotchas** (each locked by a live test in `notes/tests/`, full detail in
 [`docs/apple-notes-api.md`](docs/apple-notes-api.md)):
 
-- 🛑 **Editing `body` destroys all attachments.** A note's `body` doesn't include
-  attachments at all, so the first write wipes every one of them. There is no
-  attachment-preserving edit path. Treat notes with attachments as read-only.
+- 🛑 **Editing `body` destroys attachments.** What survives depends entirely on
+  the embedded object's type — **45% of a real store (427 of 939 notes) carries
+  one**, so check before any edit:
+  - **tables** (`com.apple.notes.table`) survive **for free** — they live in the
+    HTML, so keep the `<table>` markup in the body you write. Dropping it
+    deletes the table.
+  - **images** survive only if you **harvest and re-add** them: they appear as
+    `<img src="data:image/png;base64,…"/>`, and re-attaching the decoded bytes
+    is byte-exact. Costs: filenames are lost, images move to the end.
+  - **drawings** and **Paper docs** appear as flat PNGs, so the picture can be
+    recovered but flattens to `public.png` — the strokes are gone.
+  - **PDFs, text files and scans** are invisible in `body` and **unrecoverable**.
+  🛑 Do not put a `data:` URI back in the body — see below.
+- 🛑 **A body write flattens every checklist into a plain bulleted list**, losing
+  which items were ticked. A real checklist comes back from `body` as a bare
+  `<ul><li>` with no checkbox information at all, so it cannot be written back —
+  unrecoverable, invisible (it still looks like a list), and it applies to the
+  innocuous append pattern too. 7% of notes here (48 of 672) have one.
+- ⚠️ **Writes need a second grant.** Reads use SQLite (Full Disk Access); every
+  write goes through AppleScript, which needs **Automation → Notes** for the
+  calling terminal and **launches Notes.app** if it is closed. `apple status`
+  currently reports only the read grant.
+- ⚠️ **A shared note pushes to other people**, not just your other devices, and
+  there is no undo. Check `ZSERVERSHAREDATA` before writing.
 - `set body` is a **full replace**, never a merge.
 - The **first line becomes the title**, silently, on every body write.
 - `delete` is a **soft delete** — the note moves to Recently Deleted and
   auto-purges in ~30 days. There is no API to empty that folder.
 - The SQLite reader **can see Recently Deleted notes**. Filter them out if the
   user asked for live notes.
-- `make new attachment` **double-inserts** on macOS 27.
+- **Locked notes are skipped by default.** A password-protected note has no
+  readable body (`ZDATA` is NULL) and no decrypt path. `search`/`folders` omit
+  them and say so on stderr; `--include-locked` lists them as `locked: true`.
+  `export` refuses with **exit 2** (distinct from 1, "not found"); `get-url`
+  still works, since Notes.app prompts for the password itself.
+- `make new attachment` **double-inserts** on macOS 27 — one attachment record,
+  referenced twice, so the user sees the file twice. Deleting the surplus
+  immediately (`if (count of attachments of n) > EXPECTED then delete last
+  attachment of n`) fixes it **for images**. For a PDF it is a no-op and the
+  duplicate is unfixable.
+- 🛑 **`count of attachments` is blind to PDFs** — it returns 0 for a note that
+  holds one, and `attachments of n` enumerates nothing, while the file sits on
+  disk byte-exact. Never treat a count of 0 as "no attachments". **Verify writes
+  through the SQLite store** (count `￼` in the decoded text, check for the file
+  under `Accounts/`), not through AppleScript.
+- **Attaching a PDF errors on reading the id back** (`-1728, Can't get attachment
+  id`). The attachment is created; only the id read fails, and the id is in the
+  error text.
+- 🛑 **Writing a `data:` URI into `body` stores nothing** — it creates an empty
+  `public.data` attachment (0 bytes, no file) at the right position. There is no
+  way to place an attachment mid-note; everything lands at the end.
 
 Stdlib only — `notestore.py` decodes the gzipped-protobuf note body directly,
 so no virtualenv is involved.
@@ -593,9 +662,16 @@ swift/                    one Swift package, five binaries
 notes/                    Python; apple-notes, notestore.py, notestore.proto,
                           tests/ (live Notes.app suite)
 docs/apple-notes-api.md   NoteStore schema, AppleScript API, verified bugs
+docs/apple-notes-shortcuts.md  driving Notes' AppIntents from the CLI —
+                          the only route to checklist writes and a real append
+notes/shortcuts/          .shortcut build scripts + signed files to install
 docs/apple-mail-store.md  Envelope Index schema, .emlx layout, verified traps
 docs/apple-messages-store.md  chat.db schema, the typedstream body, verified traps
 docs/prior-art.md         other projects solving this; check before building
+docs/todo-deep-links.md   planned: a `url` on every entity, so anything we
+                          name can be opened and cross-linked
+docs/todo-offline-tests.md  planned: move the Notes suite off live Notes.app
+                          so it can run in CI at all
 Formula/apple-tools.rb    Homebrew formula
 VERSION                   CalVer YY.MMDD.Patch, stamped in by scripts/set-version
 ```

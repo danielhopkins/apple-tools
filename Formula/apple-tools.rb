@@ -1,8 +1,8 @@
 class AppleTools < Formula
   desc "Local CLIs for Notes, Mail, Messages, Reminders, Calendar and Contacts"
   homepage "https://github.com/danielhopkins/apple-tools"
-  url "https://github.com/danielhopkins/apple-tools/releases/download/v26.728.5/apple-tools-26.728.5.tar.gz"
-  sha256 "7ba2dec91dd21c1b81fc93c943ee8c59452be7ff8dfa33b1a83f487f340725dd"
+  url "https://github.com/danielhopkins/apple-tools/releases/download/v26.730.0/apple-tools-26.730.0.tar.gz"
+  sha256 "a91fa24d7e7d3744d62bf9eec3c5830b6defe236b722e93796064aa69a33bb60"
   license "MIT"
 
   depends_on :macos
@@ -24,6 +24,11 @@ class AppleTools < Formula
     # Claude skills. `apple-tools --skills-dir` is not a thing; point users at
     # the install path in caveats and let them symlink what they want.
     (pkgshare/"skills").install Dir["skills/*"]
+
+    # The signed Shortcuts that provide the Notes write path. apple-notes finds
+    # them by walking up from its own location to share/apple-tools/shortcuts,
+    # so this path is load-bearing — see `shortcuts_dir()` in apple-notes.
+    (pkgshare/"shortcuts").install Dir["shortcuts/*"]
   end
 
   def caveats
@@ -70,6 +75,19 @@ class AppleTools < Formula
 
       apple-contacts also reads that store for contact notes, which the Contacts
       framework cannot expose without an Apple-granted entitlement.
+
+      Writing to Notes needs one extra step. AppleScript cannot create a
+      checklist and its only body write destroys every attachment on the note,
+      so writes go through Notes' own Shortcuts actions instead. Install them
+      once:
+
+        apple notes install-shortcuts
+
+      That opens two shortcuts for you to add; the first run of each then asks
+      "Allow ... to save a note?". Choose Always Allow for unattended use, or
+      Allow Once to review every individual write. Until they are installed,
+      apple-notes is read-only — `apple notes status` reports which are missing.
+      Details in #{HOMEBREW_PREFIX}/share/doc/apple-tools/apple-notes-shortcuts.md
     EOS
   end
 
@@ -87,5 +105,17 @@ class AppleTools < Formula
 
     # --help must work without any TCC grant, so it is safe in a sandbox.
     assert_match "events", shell_output("#{bin}/apple-calendar --help")
+
+    # The Notes write path is the signed shortcuts plus the commands that drive
+    # them. `make dist` cannot know this formula's install list, so a shortcut
+    # added to the repo can ship inside the tarball and never be installed —
+    # the same trap that silently unlinked apple-messages in v26.728.5.
+    assert_predicate pkgshare/"shortcuts/Apple Tools Create Note.shortcut", :exist?
+    assert_predicate pkgshare/"shortcuts/Apple Tools Append Note.shortcut", :exist?
+
+    # And the commands must be reachable. --help needs no grant.
+    notes_help = shell_output("#{bin}/apple-notes --help")
+    assert_match "install-shortcuts", notes_help
+    assert_match "append", notes_help
   end
 end
