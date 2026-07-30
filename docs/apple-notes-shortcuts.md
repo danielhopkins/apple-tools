@@ -200,6 +200,17 @@ for name, data in c.execute("SELECT s.ZNAME, a.ZDATA FROM ZSHORTCUT s "
 
 Copy the file before reading it — the live one has a busy WAL.
 
+**Read the intent's real parameter names.** Reading a working shortcut gives the
+*serialized* plist names; [`util/appintents-dump`](../util/appintents-dump/)
+gives the *conceptual* side — each action's true identifier, types, and
+parameter names/optionality, parsed straight from `Metadata.appintents` with no
+permission. `./appintents-dump --action AppendToNote` is how you learn that
+`Append to Note` really takes `operation`, `entity`, `text`, `section`,
+`ignoreWhitespace`, `interpretAsMarkdown` — the two views together resolve
+trap 1's metadata-vs-plist name mismatch. Read-only: it cannot *execute* an
+intent (that needs a restricted entitlement AMFI won't grant a third-party
+binary — see the tool's README).
+
 **Verify your own shortcut after import** by reading it back the same way and
 checking that every `OutputUUID` resolves to some action's `UUID`. A dangling
 reference is a silent no-op.
