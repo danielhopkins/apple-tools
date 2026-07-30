@@ -21,6 +21,8 @@ import os
 import sys
 import argparse
 import re
+import subprocess
+import ctypes
 from pathlib import Path
 
 # Add the proto directory to the path (resolve symlinks so this works when
@@ -120,20 +122,333 @@ def check_access():
                 "Grant Full Disk Access to your terminal in %s." % settings)
 
 
+class _AEDesc(ctypes.Structure):
+    _fields_ = [("descriptorType", ctypes.c_uint32), ("dataHandle", ctypes.c_void_p)]
+
+
+def _fourcc(code):
+    return int.from_bytes(code.encode(), "big")
+
+
+def check_automation():
+    """Report Automation → Notes state without requesting it.
+
+    AEDeterminePermissionToAutomateTarget with askUserIfNeeded = false is the
+    only way to read this without side effects; sending a real Apple Event to
+    find out would trigger the very dialog a status command must not trigger.
+    This is the same call `apple mail status` makes, reached through ctypes
+    because this tool is Python.
+
+    Returns (status, ok, advice).
+    """
+    settings = "System Settings → Privacy & Security → Automation"
+    try:
+        lib = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+        )
+        lib.AECreateDesc.argtypes = [
+            ctypes.c_uint32, ctypes.c_char_p, ctypes.c_long, ctypes.POINTER(_AEDesc)
+        ]
+        lib.AECreateDesc.restype = ctypes.c_int16
+        lib.AEDeterminePermissionToAutomateTarget.argtypes = [
+            ctypes.POINTER(_AEDesc), ctypes.c_uint32, ctypes.c_uint32, ctypes.c_bool
+        ]
+        lib.AEDeterminePermissionToAutomateTarget.restype = ctypes.c_int32
+        lib.AEDisposeDesc.argtypes = [ctypes.POINTER(_AEDesc)]
+
+        desc = _AEDesc()
+        bundle = b"com.apple.Notes"
+        if lib.AECreateDesc(_fourcc("bund"), bundle, len(bundle), ctypes.byref(desc)) != 0:
+            return ("unknown", False, None)
+        try:
+            code = lib.AEDeterminePermissionToAutomateTarget(
+                ctypes.byref(desc), _fourcc("****"), _fourcc("****"), False
+            )
+        finally:
+            lib.AEDisposeDesc(ctypes.byref(desc))
+    except OSError:
+        return ("unknown", False, None)
+
+    if code == 0:
+        return ("authorized", True, None)
+    if code == -1743:
+        return ("denied", False, "Re-enable Notes under %s." % settings)
+    if code == -1744:
+        return ("notDetermined", False,
+                "Run any `apple notes` write once to trigger the prompt.")
+    if code == -600:
+        return ("notesNotRunning", False,
+                "Automation state cannot be read while Notes is not running; "
+                "this says nothing about whether the grant exists.")
+    return ("unknown(%d)" % code, False, None)
+
+
 def cmd_status(args):
-    """Report Full Disk Access state. Never prompts — nothing can."""
+    """Report both grants. Never prompts — neither check can."""
     status, usable, advice = check_access()
+    automation, automation_ok, automation_advice = check_automation()
 
     if args.json:
-        payload = {"status": status, "usable": usable}
+        # `usable` tracks reads only, matching what it has always meant and what
+        # `apple status` aggregates. Writes are reported alongside rather than
+        # folded in, so a read-only setup is not called broken.
+        payload = {
+            "status": status,
+            "usable": usable,
+            "full_disk_access": usable,
+            "automation": automation,
+            "can_write": automation_ok,
+        }
         if advice:
             payload["advice"] = advice
+        if automation_advice:
+            payload["automation_advice"] = automation_advice
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
         suffix = "" if usable else "  (cannot read notes)"
         print("Notes access: %s%s" % (status, suffix))
         if advice:
             print(advice)
+        print("Automation → Notes: %s%s" % (
+            automation, "" if automation_ok else "  (cannot write)"))
+        if automation_advice:
+            print(automation_advice)
+
+
+# --------------------------------------------------------------------------- #
+# Write path
+#
+# Reads come from NoteStore.sqlite; writes have to go through AppleScript,
+# because there is no supported way to write that store directly and doing it
+# anyway would corrupt a database Notes syncs to every device.
+#
+# Two different grants are therefore involved: Full Disk Access for the reads
+# and Automation -> Notes for the writes. `status` reports both.
+# --------------------------------------------------------------------------- #
+
+# The only writable properties on a note are `name` and `body`. `container` is
+# read-only, so there is no folder-move command here; the sdef offers no `move`
+# either. Verified against Notes.sdef on macOS 27.
+
+
+class AppleScriptError(RuntimeError):
+    pass
+
+
+def run_applescript(script, timeout=60):
+    """Run AppleScript, returning trimmed stdout.
+
+    A missing Automation grant surfaces here as a -1743, which is a permission
+    problem rather than a bug in the script, so it gets its own message.
+    """
+    try:
+        proc = subprocess.run(
+            ["osascript", "-"],
+            input=script,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise AppleScriptError(
+            "Notes did not respond within %ds. It may be showing a dialog, or "
+            "syncing a large account." % timeout
+        )
+    if proc.returncode != 0:
+        message = proc.stderr.strip() or "osascript exit %d" % proc.returncode
+        if "-1743" in message or "not allowed" in message.lower():
+            raise AppleScriptError(
+                "Not permitted to control Notes. Approve this terminal under "
+                "System Settings → Privacy & Security → Automation → Notes.\n"
+                "  (%s)" % message
+            )
+        raise AppleScriptError(message)
+    return proc.stdout.rstrip("\n")
+
+
+def applescript_string(value):
+    """Quote a Python string as an AppleScript literal.
+
+    Backslashes first, then quotes — the other order double-escapes. AppleScript
+    string literals have no escape for a raw newline, so those are re-joined
+    with `& return &`, which is what makes multi-line bodies work at all.
+    """
+    if value is None:
+        value = ""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    parts = escaped.split("\n")
+    if len(parts) == 1:
+        return '"%s"' % parts[0]
+    return " & return & ".join('"%s"' % part for part in parts)
+
+
+def store_uuid():
+    """The CoreData store UUID that AppleScript note ids are namespaced by."""
+    conn = sqlite3.connect("file:%s?mode=ro" % get_db_path(), uri=True)
+    try:
+        row = conn.execute("SELECT Z_UUID FROM Z_METADATA").fetchone()
+    finally:
+        conn.close()
+    if not row or not row[0]:
+        raise AppleScriptError("Could not read the Notes store UUID.")
+    return row[0]
+
+
+def applescript_note_id(pk):
+    """SQLite Z_PK -> the id AppleScript addresses a note by.
+
+    Verified by round-trip on a real store: the id is
+    x-coredata://<store-uuid>/ICNote/p<Z_PK>, and fetching p17 returns exactly
+    the note whose Z_PK is 17.
+    """
+    return "x-coredata://%s/ICNote/p%d" % (store_uuid(), pk)
+
+
+def note_attachments(pk):
+    """Attachments on a note, as [(uti, label)].
+
+    This is the guard for every body write. Attachments hang off
+    ZICCLOUDSYNCINGOBJECT.ZNOTE; the UTI matters because "attachment" here
+    covers far more than photos — com.apple.notes.table is a table,
+    com.apple.drawing.2 a sketch, public.url an inline link preview. All of them
+    are destroyed by a body write.
+    """
+    conn = sqlite3.connect("file:%s?mode=ro" % get_db_path(), uri=True)
+    try:
+        rows = conn.execute(
+            """
+            SELECT ZTYPEUTI, ZFILENAME, ZTITLE, ZALTTEXT, ZURLSTRING
+              FROM ZICCLOUDSYNCINGOBJECT
+             WHERE ZNOTE = ?
+            """,
+            (pk,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    attachments = []
+    for uti, filename, title, alt, url in rows:
+        label = next(
+            (c.strip() for c in (filename, title, alt, url) if c and c.strip()), None
+        )
+        attachments.append((uti or "unknown", label or describe_uti(uti)))
+    return attachments
+
+
+# Names for the embedded objects that carry no filename of their own. Without
+# these a refusal reads "unknown (unknown)", which tells the user nothing about
+# what they are about to lose.
+UTI_LABELS = {
+    "com.apple.notes.table": "a table",
+    "com.apple.drawing.2": "a drawing",
+    "com.apple.drawing": "a drawing",
+    "com.apple.notes.gallery": "an image gallery",
+    "com.apple.paper": "a handwriting/paper item",
+    "com.apple.paper.doc.scan": "a scanned document",
+    "public.url": "an inline link preview",
+}
+
+
+def describe_uti(uti):
+    if not uti:
+        return "an embedded object"
+    return UTI_LABELS.get(uti, uti)
+
+
+def guard_body_write(pk, title, force, action):
+    """Refuse a body write that would destroy attachments.
+
+    🛑 This is the whole reason writing was withheld until now. A note's `body`
+    does not include its attachments, so `set body` — and `set body to body &
+    ...`, which is how appending works — deletes every one of them. There is no
+    attachment-preserving edit path in the API, and no undo: the attachments do
+    not go to Recently Deleted, they are simply gone.
+
+    On a real store this is not an edge case. 232 of 928 notes carry at least
+    one attachment.
+    """
+    attachments = note_attachments(pk)
+    if not attachments:
+        return
+
+    listing = "\n".join(
+        "    - %s  (%s)" % (label, uti) for uti, label in attachments[:10]
+    )
+    if len(attachments) > 10:
+        listing += "\n    ... and %d more" % (len(attachments) - 10)
+
+    if not force:
+        print(
+            "Refusing to %s '%s': it has %d attachment(s), and writing a note's\n"
+            "body destroys every one of them. There is no attachment-preserving\n"
+            "edit path and no undo — they do not go to Recently Deleted.\n\n"
+            "%s\n\n"
+            "Edit this note in Notes.app, or pass --force to proceed and lose them."
+            % (action, title, len(attachments), listing),
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    print(
+        "warning: --force given; %s '%s' will destroy %d attachment(s):\n%s"
+        % (action, title, len(attachments), listing),
+        file=sys.stderr,
+    )
+
+
+def html_escape(text):
+    """Escape text destined for a note body, which is HTML."""
+    return (
+        text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    )
+
+
+def text_to_note_html(text):
+    """Render plain text as the HTML a note body expects.
+
+    Notes wraps a non-HTML body in a <div> of its own, but does not turn blank
+    lines into paragraph breaks, so line structure is lost unless it is spelled
+    out here.
+    """
+    lines = text.split("\n")
+    return "".join("<div>%s</div>" % (html_escape(line) or "<br>") for line in lines)
+
+
+def read_body_argument(args):
+    """Body text from --body, or --body-file (with '-' meaning stdin)."""
+    if getattr(args, "body_file", None):
+        if args.body_file == "-":
+            return sys.stdin.read()
+        with open(args.body_file, "r", encoding="utf-8") as handle:
+            return handle.read()
+    return args.body or ""
+
+
+def resolve_note_for_write(identifier):
+    """find_note, but erroring the same way for every write command."""
+    result = find_note(identifier)
+    if not result:
+        print("Note not found: %s" % identifier, file=sys.stderr)
+        sys.exit(1)
+    return result
+
+
+def note_title_and_folder(pk):
+    """Current title and folder name for a note, for reporting after a write."""
+    conn = sqlite3.connect("file:%s?mode=ro" % get_db_path(), uri=True)
+    try:
+        row = conn.execute(
+            """
+            SELECT n.ZTITLE1, f.ZTITLE2
+              FROM ZICCLOUDSYNCINGOBJECT n
+              LEFT JOIN ZICCLOUDSYNCINGOBJECT f ON f.Z_PK = n.ZFOLDER
+             WHERE n.Z_PK = ?
+            """,
+            (pk,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return (row[0] if row else None, row[1] if row else None)
 
 
 def search_notes(term=None, limit=50):
@@ -696,6 +1011,190 @@ def cmd_export(args):
         print(markdown)
 
 
+def cmd_create(args):
+    """Create a note. The only write with nothing to destroy."""
+    body = read_body_argument(args)
+    if not body and not args.title:
+        print("Nothing to create: pass a title, --body, or --body-file.", file=sys.stderr)
+        sys.exit(1)
+
+    # The first line of the body becomes the title, always — Notes re-derives it
+    # on every body write. So a --title is prepended as that first line rather
+    # than set separately, which would be silently overwritten.
+    text = body
+    if args.title:
+        text = args.title + ("\n" + body if body else "")
+
+    html = text_to_note_html(text)
+
+    if args.folder:
+        script = (
+            'tell application "Notes"\n'
+            "  set matches to every folder whose name is %s\n"
+            "  if (count of matches) is 0 then error "
+            '"no folder named " & %s number 8001\n'
+            "  set f to item 1 of matches\n"
+            "  set n to make new note at f with properties {body:%s}\n"
+            "  return id of n\n"
+            "end tell"
+        ) % (
+            applescript_string(args.folder),
+            applescript_string(args.folder),
+            applescript_string(html),
+        )
+    else:
+        script = (
+            'tell application "Notes"\n'
+            "  set n to make new note with properties {body:%s}\n"
+            "  return id of n\n"
+            "end tell"
+        ) % applescript_string(html)
+
+    try:
+        note_id = run_applescript(script)
+    except AppleScriptError as exc:
+        message = str(exc)
+        if "8001" in message or "no folder named" in message:
+            print(
+                "No folder named '%s'. Run `apple notes folders` to see what exists."
+                % args.folder,
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print("Could not create the note: %s" % message, file=sys.stderr)
+        sys.exit(1)
+
+    pk = None
+    match = re.search(r"/ICNote/p(\d+)$", note_id)
+    if match:
+        pk = int(match.group(1))
+    title, folder = note_title_and_folder(pk) if pk else (None, None)
+
+    if args.json:
+        payload = {"created": True, "applescript_id": note_id}
+        if pk:
+            payload["id"] = pk
+        if title:
+            payload["title"] = title
+        if folder:
+            payload["folder"] = folder
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        label = title or (args.title or "(untitled)")
+        where = " in %s" % folder if folder else ""
+        print("%s Created '%s'%s%s" % (
+            Style.success("✓"), label, where,
+            "  (id %d)" % pk if pk else ""))
+
+
+def cmd_edit(args):
+    """Replace a note's body. Full replace, never a merge."""
+    pk, title, identifier, _data = resolve_note_for_write(args.identifier)
+    body = read_body_argument(args)
+    if not body:
+        print(
+            "Refusing to write an empty body — that would erase the note.\n"
+            "Pass --body/--body-file with content, or use `delete`.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    guard_body_write(pk, title, args.force, "edit")
+
+    html = text_to_note_html(body)
+    script = (
+        'tell application "Notes"\n'
+        "  set n to note id %s\n"
+        "  set body of n to %s\n"
+        "  return name of n\n"
+        "end tell"
+    ) % (applescript_string(applescript_note_id(pk)), applescript_string(html))
+
+    try:
+        new_title = run_applescript(script)
+    except AppleScriptError as exc:
+        print("Could not edit the note: %s" % exc, file=sys.stderr)
+        sys.exit(1)
+
+    # The title is re-derived from the first line on every body write, so it can
+    # change without being asked to. Say so rather than let it be discovered.
+    if args.json:
+        print(json.dumps(
+            {"id": pk, "edited": True, "title": new_title,
+             "title_changed": new_title != title},
+            indent=2, sort_keys=True))
+    else:
+        print("%s Edited note %d" % (Style.success("✓"), pk))
+        if new_title != title:
+            print("  title is now '%s' (taken from the first line, as always)"
+                  % new_title)
+
+
+def cmd_append(args):
+    """Append to a note's body.
+
+    Implemented as `set body to body & ...`, which is still a body write — so it
+    destroys attachments exactly like `edit` does and carries the same guard.
+    """
+    pk, title, identifier, _data = resolve_note_for_write(args.identifier)
+    text = read_body_argument(args)
+    if not text:
+        print("Nothing to append: pass --body or --body-file.", file=sys.stderr)
+        sys.exit(1)
+
+    guard_body_write(pk, title, args.force, "append to")
+
+    html = text_to_note_html(text)
+    script = (
+        'tell application "Notes"\n'
+        "  set n to note id %s\n"
+        "  set body of n to (body of n) & %s\n"
+        "  return name of n\n"
+        "end tell"
+    ) % (applescript_string(applescript_note_id(pk)), applescript_string(html))
+
+    try:
+        new_title = run_applescript(script)
+    except AppleScriptError as exc:
+        print("Could not append to the note: %s" % exc, file=sys.stderr)
+        sys.exit(1)
+
+    if args.json:
+        print(json.dumps(
+            {"id": pk, "appended": True, "title": new_title,
+             "title_changed": new_title != title},
+            indent=2, sort_keys=True))
+    else:
+        print("%s Appended to note %d" % (Style.success("✓"), pk))
+        if new_title != title:
+            print("  title is now '%s'" % new_title)
+
+
+def cmd_delete(args):
+    """Soft-delete a note: it moves to Recently Deleted."""
+    pk, title, identifier, _data = resolve_note_for_write(args.identifier)
+
+    script = (
+        'tell application "Notes"\n'
+        "  delete note id %s\n"
+        "end tell"
+    ) % applescript_string(applescript_note_id(pk))
+
+    try:
+        run_applescript(script)
+    except AppleScriptError as exc:
+        print("Could not delete the note: %s" % exc, file=sys.stderr)
+        sys.exit(1)
+
+    if args.json:
+        print(json.dumps(
+            {"id": pk, "deleted": True, "title": title, "recoverable": True},
+            indent=2, sort_keys=True))
+    else:
+        print("%s Moved '%s' to Recently Deleted" % (Style.success("✓"), title))
+        print("  Recoverable there for ~30 days; there is no API to purge it.")
+
+
 def cmd_get_url(args):
     """Handle get-url command"""
     result = find_note(args.identifier)
@@ -779,8 +1278,57 @@ Examples:
     url_parser.add_argument("identifier", help="Note ID or title")
     url_parser.add_argument("--json", action="store_true", help="Output as JSON")
 
+    # --- writes ---------------------------------------------------------- #
+    # These drive Notes.app through AppleScript; reads never do. Every one of
+    # them needs Automation → Notes on top of the Full Disk Access reads use.
+
+    create_parser = subparsers.add_parser("create", help="Create a new note")
+    create_parser.add_argument(
+        "title", nargs="?", help="Title — becomes the first line of the body"
+    )
+    create_parser.add_argument("--body", help="Body text")
+    create_parser.add_argument(
+        "--body-file", help="Read the body from a file, or '-' for stdin"
+    )
+    create_parser.add_argument("--folder", help="Folder to create it in")
+    create_parser.add_argument("--json", action="store_true", help="Output as JSON")
+
+    edit_parser = subparsers.add_parser(
+        "edit", help="Replace a note's body (full replace, never a merge)"
+    )
+    edit_parser.add_argument("identifier", help="Note ID, title, or applenotes:// URL")
+    edit_parser.add_argument("--body", help="New body text")
+    edit_parser.add_argument(
+        "--body-file", help="Read the new body from a file, or '-' for stdin"
+    )
+    edit_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Proceed even though it will destroy the note's attachments",
+    )
+    edit_parser.add_argument("--json", action="store_true", help="Output as JSON")
+
+    append_parser = subparsers.add_parser("append", help="Append to a note's body")
+    append_parser.add_argument("identifier", help="Note ID, title, or applenotes:// URL")
+    append_parser.add_argument("--body", help="Text to append")
+    append_parser.add_argument(
+        "--body-file", help="Read the text from a file, or '-' for stdin"
+    )
+    append_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Proceed even though it will destroy the note's attachments",
+    )
+    append_parser.add_argument("--json", action="store_true", help="Output as JSON")
+
+    delete_parser = subparsers.add_parser(
+        "delete", help="Move a note to Recently Deleted"
+    )
+    delete_parser.add_argument("identifier", help="Note ID, title, or applenotes:// URL")
+    delete_parser.add_argument("--json", action="store_true", help="Output as JSON")
+
     status_parser = subparsers.add_parser(
-        "status", help="Report Full Disk Access state without requesting it"
+        "status", help="Report access state without requesting it"
     )
     status_parser.add_argument("--json", action="store_true", help="Output as JSON")
 
@@ -798,6 +1346,14 @@ Examples:
         cmd_export(args)
     elif args.command == "get-url":
         cmd_get_url(args)
+    elif args.command == "create":
+        cmd_create(args)
+    elif args.command == "edit":
+        cmd_edit(args)
+    elif args.command == "append":
+        cmd_append(args)
+    elif args.command == "delete":
+        cmd_delete(args)
     elif args.command == "status":
         cmd_status(args)
 
