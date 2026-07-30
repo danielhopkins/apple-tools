@@ -76,7 +76,7 @@ class Style:
         return cls._wrap(text, "35")
 
 
-__version__ = "26.728.5"
+__version__ = "26.730.0"
 
 
 def get_db_path():
