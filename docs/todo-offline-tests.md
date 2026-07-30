@@ -1,22 +1,34 @@
 # TODO: get the Notes suite off live Notes.app
 
-**Problem.** A full run takes **~5.5 minutes** and cannot run in CI, because
-almost every test drives live Notes.app and writes to the user's real iCloud.
-That makes the suite something you avoid running, which is the opposite of what
-a suite pinning this much fragile behaviour should be.
+**Problem.** The suite cannot run in CI and writes to the user's real iCloud
+data, because almost every test drives live Notes.app. Speed is a secondary
+concern — see the correction below.
 
-**The number is lopsided**, and that is the whole argument:
+⚠️ **A number in an earlier draft of this file was wrong.** It claimed ~5.5
+minutes per run and used that as the headline argument. Re-measured with
+Notes.app idle:
 
-| | tests | time | needs Notes.app? |
-|---|---|---|---|
-| `test_locked_notes` | 9 | **3.1s** | no |
-| everything else | 42 | ~337s | yes |
+| condition | full suite |
+|---|---|
+| Notes.app idle | **84s, 89s, 81s** |
+| Notes.app busy (concurrent shortcut runs, probes) | 328s, 357s, 356s |
 
-**8 seconds per live test against 0.3 for an offline one** — roughly 25×. The
-cost is not compute, it is waiting: each live test creates a note through
-AppleScript, waits for it to propagate into SQLite, asserts, then deletes it.
-The waiting is not incidental — propagation lag is precisely what several of
-these tests exist to pin.
+The 5.5-minute figure was measured while the same machine was hammering Notes
+with Shortcuts calls and attachment probes. It was self-inflicted load, not the
+suite's cost. **Propagation lag scales with how busy Notes.app is**, which is
+worth knowing in its own right — but it means speed is a weak argument for this
+work, and the honest case is narrower:
+
+- **It cannot run in CI.** No Notes.app, no iCloud, no grant. So none of the
+  rendering or reading behaviour is covered anywhere but one laptop.
+- **It writes to real data.** Gated behind `RUN_LIVE_NOTES_TESTS=1` for exactly
+  that reason, which also means it is rarely run.
+- **It depends on one person's notes.** Several assertions would read
+  differently on a store with different content.
+
+The remaining speed gap is real but modest: 9 offline tests take 3.1s (0.34s
+each) against ~42 live ones in ~81s (~1.9s each), so roughly 6× — not the 25×
+the earlier draft claimed.
 
 ## The pattern already works
 
@@ -53,9 +65,9 @@ The attachment and editing tests are testing *what AppleScript does* — the
 double-insert, the body-write destruction, the checklist flattening. Verifying
 that requires doing it, against the real app. They stay live and stay gated.
 
-Realistic outcome: ~10 tests move, 5.5 min → ~4. The real prize is not the
-minute saved but that the rendering half becomes CI-able and stops depending on
-the contents of one person's Notes.
+Realistic outcome: ~10 tests move and the suite drops by perhaps 20s. **The
+time saved is not the point** — the prize is that the rendering half becomes
+CI-able and stops depending on the contents of one person's Notes.
 
 ## Related
 

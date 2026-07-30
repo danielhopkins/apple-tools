@@ -658,7 +658,7 @@ docs/prior-art.md         other projects solving this; check before building
 docs/todo-deep-links.md   planned: a `url` on every entity, so anything we
                           name can be opened and cross-linked
 docs/todo-offline-tests.md  planned: move the Notes suite off live Notes.app
-                          (5.5 min today, and it cannot run in CI)
+                          so it can run in CI at all
 Formula/apple-tools.rb    Homebrew formula
 VERSION                   CalVer YY.MMDD.Patch, stamped in by scripts/set-version
 ```
