@@ -17,7 +17,7 @@ these tools is that the edge cases are already handled.
 
 | Tool | Reads | Writes |
 |------|-------|--------|
-| `apple notes` | titles, folders, note bodies as Markdown | no |
+| `apple notes` | titles, folders, note bodies as Markdown | **yes**, once shortcuts are installed |
 | `apple mail` | accounts, message search, message bodies | **drafts** (send is guarded) |
 | `apple messages` | conversations, message search, attachments | no |
 | `apple reminders` | lists, items, due dates | **yes** |
@@ -55,6 +55,8 @@ apple calendar add --help # every flag, with defaults
 # Notes — title search only; there is no full-text search over bodies
 apple notes search "budget" --json
 apple notes export 261                    # body as Markdown
+apple notes create --title "Trip" --body-file -            # Markdown on stdin
+apple notes append 261 --body "- [ ] pack charger"         # real checklist item
 
 # Mail — reads Mail's own store; fast, and works with Mail.app closed
 apple mail accounts --json
@@ -94,6 +96,42 @@ apple contacts edit <id> --birthday 1980-04-12 --date "death:2020-05-01"
 apple contacts groups                          # list groups with counts
 apple contacts groups add "Family" <contact-id>
 ```
+
+## Writing notes
+
+`apple notes create` and `apple notes append` take a body the same way `mail
+draft` does — `--body TEXT`, `--body-file FILE`, `--body-file -`, or a bare
+pipe. Markdown becomes **native structure**: `- [ ]` and `- [x]` are real
+checklists carrying their checked state, and pipe tables are real tables.
+
+`append` is a genuine append — it **preserves attachments and existing
+checklists**. Prefer it over reconstructing a note. It refuses when the title
+matches more than one note rather than appending to all of them.
+
+⚠️ **It needs a one-time setup the user must do**, because macOS has no headless
+way to install a Shortcut:
+
+```
+apple notes install-shortcuts
+```
+
+Check `apple notes status` before a write; it reports whether the write path is
+available and names anything missing. If it is unavailable, tell the user to run
+that command — you cannot do it for them, and the first run of each shortcut
+also raises a permission dialog only they can answer.
+
+🛑 **Never edit a note by exporting and re-writing the body.** That path
+destroys every attachment on the note and flattens every checklist into a plain
+bulleted list, losing which items were ticked. Both are silent and
+unrecoverable, and 45% of a real store carries an embedded object. Use `append`,
+or leave the note alone.
+
+Notes cannot be *edited* in place, only appended to. If the user wants existing
+text changed, say so rather than reaching for the destructive path.
+
+⚠️ **A password-protected note cannot be read or written at all.** Its body is
+encrypted and simply absent. `search` and `folders` skip locked notes and say so
+on stderr; `export` exits 2 naming the reason.
 
 ## Traps that will bite you
 
