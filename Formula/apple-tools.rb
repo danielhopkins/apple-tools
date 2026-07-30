@@ -105,5 +105,17 @@ class AppleTools < Formula
 
     # --help must work without any TCC grant, so it is safe in a sandbox.
     assert_match "events", shell_output("#{bin}/apple-calendar --help")
+
+    # The Notes write path is the signed shortcuts plus the commands that drive
+    # them. `make dist` cannot know this formula's install list, so a shortcut
+    # added to the repo can ship inside the tarball and never be installed —
+    # the same trap that silently unlinked apple-messages in v26.728.5.
+    assert_predicate pkgshare/"shortcuts/Apple Tools Create Note.shortcut", :exist?
+    assert_predicate pkgshare/"shortcuts/Apple Tools Append Note.shortcut", :exist?
+
+    # And the commands must be reachable. --help needs no grant.
+    notes_help = shell_output("#{bin}/apple-notes --help")
+    assert_match "install-shortcuts", notes_help
+    assert_match "append", notes_help
   end
 end
