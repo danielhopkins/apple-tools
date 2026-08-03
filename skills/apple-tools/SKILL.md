@@ -225,12 +225,27 @@ store). It prints `note: scanned N message bodies of M candidates` on stderr, so
 you can always see how deep it went. If that is too slow, add `--since` or
 `--mailbox`: those filter in SQL *before* any file is opened.
 
-**If a search comes back empty, check stderr before reporting "nothing found".**
-The file-system engine either answers or errors — it has no silent-empty mode.
-But `--engine applescript` (the fallback, used when Full Disk Access is missing)
-still hits a ~120s Apple Event timeout that returns `[]` with exit status 0. A
-`note: falling back to AppleScript` line on stderr plus an empty result and a
-two-minute wait means the search *failed*, not that the inbox is empty.
+**An empty search result now means what it says.** Both engines either answer or
+error — the AppleScript path's old silent-empty mode (a ~120s Apple Event timeout
+that returned `[]` with exit status 0) is an error now, so you no longer have to
+read stderr to know whether a short list was real.
+
+**Never reach for `--engine applescript` to work around a search problem.** That
+path drives Mail.app, and driving Mail with a whole-mailbox query is what makes
+Mail's scripting interface stop answering — for every client on the machine,
+until the user restarts it. The tool guards itself here (it refuses to launch
+Mail, refuses `--field content` / `--field all` / `--has-attachment` on that
+engine, and gives up on a deadline instead of hanging), so an error from those
+guards is the tool working. Do not route around it with `osascript` by hand.
+
+**A missing Full Disk Access grant is a permissions problem, not a search
+problem.** `search` reports it and stops rather than falling back. The fix is for
+the *user* to grant it — say so, and don't try the AppleScript engine instead.
+
+**If Mail seems broken, ask before piling on.** `apple mail status --json` reports
+`mail_app.responsive`. `false` means Mail is running but wedged: nothing that
+drives it will work until the user quits and reopens Mail.app. Reads from the
+index still work fine, so answer from those and tell them what is stuck.
 
 **Note search is title-only.** To search note *content*, export candidates and
 grep them.

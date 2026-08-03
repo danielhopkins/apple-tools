@@ -195,6 +195,13 @@ struct Status: AsyncParsableCommand {
     }
     let fileSystemOK = indexPath != nil
 
+    // Whether Mail is actually answering, which is a different question from
+    // whether we are allowed to ask. Only probed when the grant is already
+    // authorized: on `notDetermined` the probe *is* the consent dialog this
+    // command exists to avoid triggering.
+    let mailRunning = isMailRunning()
+    let responsive: Bool? = (automationOK && mailRunning) ? MailPreflight.isResponsive() : nil
+
     let usable = fileSystemOK || automationOK
     let advice: String? = {
       if fileSystemOK && automationOK { return nil }
@@ -217,13 +224,22 @@ struct Status: AsyncParsableCommand {
       if let indexCount { fileSystem["messages"] = indexCount }
       if let indexError { fileSystem["error"] = indexError }
 
+      var mailApp: [String: Any] = ["running": mailRunning]
+      if let responsive { mailApp["responsive"] = responsive }
+
       var payload: [String: Any] = [
         "status": fileSystemOK ? (automationOK ? "authorized" : "readOnly") : automation,
         "usable": usable,
         "automation": automation,
         "filesystem": fileSystem,
+        "mail_app": mailApp,
       ]
       if let advice { payload["advice"] = advice }
+      if responsive == false {
+        payload["advice"] =
+          "Mail.app is running but not answering Apple Events — drafting and sending will "
+          + "not work until it is restarted. \(wedgedAdvice)"
+      }
       let data = try? JSONSerialization.data(
         withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
       print(data.flatMap { String(data: $0, encoding: .utf8) } ?? "{}")
@@ -237,7 +253,13 @@ struct Status: AsyncParsableCommand {
       } else {
         print("Mail index (search/export):  unreadable — \(indexError ?? "unknown")")
       }
+      switch responsive {
+      case true: print("Mail.app:                    running, answering Apple Events")
+      case false: print("Mail.app:                    running but WEDGED — not answering")
+      case nil: print("Mail.app:                    \(mailRunning ? "running" : "not running")")
+      }
       if let advice { print(advice) }
+      if responsive == false { print(wedgedAdvice) }
     }
   }
 }
@@ -275,6 +297,19 @@ struct Accounts: AsyncParsableCommand {
         if engine == .filesystem { throw error }
         warn("note: file-system accounts unavailable (\(error.localizedDescription))")
       }
+    }
+
+    // Mail is up, so asking it is the better answer — unless it has stopped
+    // answering, in which case the store's account list (minus `enabled`) beats
+    // hanging on an event that will never come back.
+    do {
+      try MailPreflight.check("Listing accounts from Mail")
+    } catch {
+      if engine == .applescript { throw error }
+      warn("note: \(error.localizedDescription)")
+      warn("note: reading accounts from the on-disk store instead; `enabled` will be missing.")
+      try runFileSystem()
+      return
     }
     try runAppleScript_()
   }
@@ -341,7 +376,7 @@ struct Accounts: AsyncParsableCommand {
         return output
       end tell
       """
-    let result = try runAppleScript(script)
+    let result = try runAppleScript(script, deadline: MailDeadline.search)
 
     var accounts: [[String: Any]] = []
     for line in result.split(separator: "\n", omittingEmptySubsequences: true) {
@@ -400,9 +435,14 @@ struct Search: AsyncParsableCommand {
     discussion: """
       Reads Mail's own index and message files directly, so a search covers
       every mailbox, runs in milliseconds, and works with Mail.app closed. That
-      needs Full Disk Access; without it this falls back to driving Mail over
-      AppleScript, which is slow enough to need --since and --limit and returns
-      an EMPTY list rather than an error when it times out.
+      needs Full Disk Access; without it this reports the missing grant rather
+      than falling back to AppleScript, because driving Mail with a
+      whole-mailbox query is what wedges Mail.
+
+      --engine applescript asks for that path anyway. It refuses --field
+      content, --field all and --has-attachment (each makes Mail open every
+      message body), requires Mail to be already running and answering, and
+      gives up after 60s instead of hanging.
 
       --field content greps message bodies, which the AppleScript path could
       never finish. It reads files, so it is the one slow mode; narrowing with
@@ -460,6 +500,33 @@ struct Search: AsyncParsableCommand {
   @Option(name: .long, help: "Read engine: auto, filesystem, applescript")
   var engine: MailEngine = .auto
 
+  /// The two ways to ask Mail for something it cannot do without reading every
+  /// message body. Refused rather than warned about: the warning went to stderr
+  /// while the request went to Mail anyway, and this is the single most
+  /// reliable way to lock Mail up for minutes.
+  func validate() throws {
+    guard engine == .applescript else { return }
+
+    if field == "content" || field == "all" {
+      throw ValidationError("""
+        refusing `--field \(field)` on the AppleScript engine. `content contains` makes Mail
+        materialise every message body in the mailbox — a network fetch each, on an IMAP
+        account — and it wedges Mail long before it answers.
+        Grant Full Disk Access and drop --engine: the same search runs on Mail's index in
+        about 0.2s. `--field subject` and `--field sender` are safe here.
+        """)
+    }
+
+    if hasAttachment {
+      throw ValidationError("""
+        refusing --has-attachment on the AppleScript engine: counting attachments asks Mail
+        to open every candidate message one at a time.
+        Grant Full Disk Access and drop --engine — the index records attachment counts, so
+        this costs nothing there.
+        """)
+    }
+  }
+
   func run() async throws {
     if engine != .applescript {
       do {
@@ -469,16 +536,25 @@ struct Search: AsyncParsableCommand {
         // --engine filesystem is a request for that engine specifically, so a
         // silent fallback would hide exactly what the caller asked to see.
         if engine == .filesystem { throw error }
-        warn("note: file-system search unavailable (\(error.localizedDescription))")
-        warn("note: falling back to AppleScript — slower, and Mail.app must be running.")
+        // `auto` used to fall back to AppleScript here. It no longer does. The
+        // fallback silently swapped a millisecond index read for the one code
+        // path that launches Mail and drives it with a whole-mailbox predicate,
+        // so the effect of a missing grant was not "slower search" but "wedged
+        // Mail". Ask for that explicitly if you want it.
+        throw MailUnavailable(message: """
+          cannot search: \(error.localizedDescription)
+          Search reads Mail's own index, which needs Full Disk Access for this terminal
+          (System Settings → Privacy & Security → Full Disk Access).
+          Not falling back to AppleScript on its own: that path launches Mail.app and hands it
+          a whole-mailbox query, which is what wedges Mail. If you want it anyway, ask for it
+          with --engine applescript --field subject.
+          """)
       }
     }
 
-    if field == "content" || field == "all" {
-      warn(
-        "note: AppleScript body search reads every message one at a time and usually "
-          + "times out. Grant Full Disk Access to use the file-system engine instead.")
-    }
+    // Bounded, and refuses to start on a Mail that is down or already stuck.
+    try MailPreflight.check("Searching over AppleScript")
+
     // searchAppleScript sorts on Mail's locale date *string* ("Monday, July
     // 27, 2026 at ..."), which orders alphabetically — so April sorts above
     // July. Re-sort once the strings have been parsed into real dates.
@@ -616,7 +692,8 @@ struct Search: AsyncParsableCommand {
         accountExpr: "name of account of mailbox of msg",
         mailboxNameExpr: "name of mailbox of msg"
       )
-      allResults.append(contentsOf: try parseResults(try runAppleScript(script)))
+      allResults.append(
+        contentsOf: parseResults(try runAppleScript(script, deadline: MailDeadline.search)))
     }
 
     // Search per-account mailboxes (for things like Archive that have no unified view)
@@ -634,7 +711,7 @@ struct Search: AsyncParsableCommand {
             return output
           end tell
           """
-        let acctResult = try runAppleScript(acctScript)
+        let acctResult = try runAppleScript(acctScript, deadline: MailDeadline.search)
         accounts = acctResult.split(separator: "\n").map(String.init)
       }
 
@@ -649,7 +726,25 @@ struct Search: AsyncParsableCommand {
             accountExpr: "\"\(acctName)\"",
             mailboxNameExpr: "\"\(mboxName)\""
           )
-          allResults.append(contentsOf: (try? parseResults(try runAppleScript(script))) ?? [])
+          // A missing mailbox is expected — not every account has an "Archive"
+          // — so a failure here is skipped rather than fatal. But a *timeout* is
+          // not a missing mailbox: it means Mail is going under, and swallowing
+          // it silently drops whole accounts from the results and invites the
+          // next query on top. Stop and say so.
+          do {
+            allResults.append(
+              contentsOf: parseResults(try runAppleScript(script, deadline: MailDeadline.search))
+            )
+          } catch let error as AppleScriptError where error.timedOut {
+            throw MailUnavailable(message: """
+              Mail stopped answering partway through the search (\(acctName)/\(mboxName)): \
+              \(error.message)
+              Results would be missing whole accounts, so this is an error rather than a short list.
+              \(wedgedAdvice)
+              """)
+          } catch {
+            continue
+          }
         }
       }
     }
@@ -784,6 +879,11 @@ struct Export: AsyncParsableCommand {
       // would mean silently returning something else.
       throw ValidationError("--raw and --json need the file-system engine (Full Disk Access).")
     }
+    // Unlike search, export keeps its AppleScript fallback: it is the only way
+    // to read a message whose body Mail has not downloaded yet. But it only
+    // runs when Mail is already up and answering — never by launching Mail, and
+    // never onto a queue that is already stuck.
+    try MailPreflight.check("Exporting over AppleScript")
     try runAppleScript_()
   }
 
@@ -854,7 +954,7 @@ struct Export: AsyncParsableCommand {
           return output
         end tell
         """
-      let acctResult = try runAppleScript(acctScript)
+      let acctResult = try runAppleScript(acctScript, deadline: MailDeadline.search)
       accounts = acctResult.split(separator: "\n").map(String.init)
     }
 
@@ -970,11 +1070,23 @@ struct Export: AsyncParsableCommand {
           return ""
         end findMessage
         """
-      if let result = try? runAppleScript(script, arguments: [messageId, acctName]),
-        !result.isEmpty
-      {
-        print(result)
-        return
+      // An account that cannot be walked is skipped so the next one still gets a
+      // turn — but a timeout means Mail is under, and continuing would spend the
+      // next account's deadline finding that out again.
+      do {
+        let result = try runAppleScript(
+          script, arguments: [messageId, acctName], deadline: MailDeadline.export)
+        if !result.isEmpty {
+          print(result)
+          return
+        }
+      } catch let error as AppleScriptError where error.timedOut {
+        throw MailUnavailable(message: """
+          Mail stopped answering while walking '\(acctName)' for the message: \(error.message)
+          \(wedgedAdvice)
+          """)
+      } catch {
+        continue
       }
     }
 
@@ -1760,7 +1872,139 @@ struct Send: AsyncParsableCommand {
 
 // MARK: - AppleScript Helper
 
-func runAppleScript(_ source: String, arguments: [String] = []) throws -> String {
+/// Wall-clock budgets for the scripts that drive Mail. These bound *this
+/// process*, not Mail: killing `osascript` mid-request does not call off the
+/// work Mail already started, so a deadline stops us hanging and stops us
+/// queueing more, but it is not a way to un-wedge Mail.
+///
+/// Overridable with APPLE_MAIL_SCRIPT_TIMEOUT for diagnosis and for the tests,
+/// which use a tiny value to exercise the kill path.
+enum MailDeadline {
+  private static func env(_ name: String) -> TimeInterval? {
+    guard let raw = ProcessInfo.processInfo.environment[name], let seconds = Double(raw) else {
+      return nil
+    }
+    return seconds
+  }
+
+  /// One bounded Apple Event, used only to decide whether Mail is answering.
+  /// A healthy Mail answers in ~0.2s, so seconds already mean trouble.
+  static var probe: TimeInterval { env("APPLE_MAIL_PROBE_TIMEOUT") ?? 5 }
+
+  /// A search script. The Apple Event timeout is ~120s and the script swallows
+  /// it, so without this a wedged Mail hangs the CLI indefinitely.
+  static var search: TimeInterval { env("APPLE_MAIL_SCRIPT_TIMEOUT") ?? 60 }
+
+  /// The export walk enumerates every mailbox of every account and legitimately
+  /// takes tens of seconds when Mail is cold, so it gets a much longer rope.
+  static var export: TimeInterval { env("APPLE_MAIL_SCRIPT_TIMEOUT") ?? 300 }
+
+  /// Composing deliberately has none. A deadline that fires mid-save would kill
+  /// `osascript` with the message half-written, and a partly-saved draft is
+  /// worse than a slow one.
+  static let compose: TimeInterval? = nil
+}
+
+/// Mail is running but cannot be driven, or is not running and must not be
+/// launched. Distinct from AppleScriptError so callers can tell "Mail said no"
+/// from "we refused to ask".
+struct MailUnavailable: LocalizedError {
+  let message: String
+  var errorDescription: String? { message }
+}
+
+let wedgedAdvice = """
+  Mail's scripting interface stops servicing Apple Events under load and does not
+  recover on its own. Quit and reopen Mail.app, then retry.
+  """
+
+/// Everything that talks to Mail goes through here first.
+///
+/// Two failures it exists to prevent, both of which used to be reachable from a
+/// plain read command:
+///
+///  1. **Launching Mail to read from it.** `tell application "Mail"` starts the
+///     app when it is down, so a search without Full Disk Access would cold-start
+///     Mail and then hand it a whole-mailbox predicate — the worst first request
+///     it can be given.
+///  2. **Piling onto a Mail that is already under.** Once it stops answering,
+///     every further event queues behind the ones already stuck. One bounded
+///     probe tells us to stop instead.
+enum MailPreflight {
+  /// A wedged Mail still answers static properties instantly — `name` came back
+  /// at once from an app macOS was reporting as not responding — so the probe
+  /// has to touch the message store, which is the thing it cannot do. Counting
+  /// an account's mailboxes is the cheapest request that does.
+  private static let probeScript =
+    "tell application \"Mail\" to return (count of every mailbox of account 1) as string"
+
+  /// Throws unless Mail is up and answering. `action` completes the sentence
+  /// "<action> needs Mail.app", so phrase it as a gerund.
+  static func check(_ action: String) throws {
+    guard isMailRunning() else {
+      throw MailUnavailable(message: """
+        \(action) needs Mail.app, and Mail is not running. Refusing to launch it: a cold \
+        Mail driven by a whole-mailbox query is how Mail gets wedged.
+        Either grant Full Disk Access so reads use Mail's index instead (no Mail.app, \
+        milliseconds), or open Mail yourself first.
+        """)
+    }
+
+    do {
+      let answer = try runAppleScript(probeScript, deadline: probe)
+      // A wedged Mail returns success with empty output as readily as it errors,
+      // so an empty answer counts as a failure rather than as zero mailboxes.
+      guard !answer.isEmpty else {
+        throw MailUnavailable(message: """
+          \(action) needs Mail.app, and Mail answered an Apple Event with nothing at all — \
+          it is wedged.
+          \(wedgedAdvice)
+          """)
+      }
+    } catch let error as MailUnavailable {
+      throw error
+    } catch let error as AppleScriptError where error.timedOut {
+      throw MailUnavailable(message: """
+        \(action) needs Mail.app, and Mail did not answer a trivial Apple Event within \
+        \(Int(probe))s — it is wedged. Not sending the real request on top of it.
+        \(wedgedAdvice)
+        """)
+    } catch {
+      // A prompt refusal is Mail being healthy and saying no — a denied
+      // Automation grant, or an account layout the probe did not expect. Pass
+      // it through rather than reporting a wedge that isn't one.
+      let detail = error.localizedDescription
+      if detail.localizedCaseInsensitiveContains("not allowed")
+        || detail.localizedCaseInsensitiveContains("not authorized")
+        || detail.contains("-1743")
+      {
+        throw MailUnavailable(message: """
+          \(action) needs Automation → Mail, which is not granted: \(detail)
+          Grant it under System Settings → Privacy & Security → Automation.
+          """)
+      }
+    }
+  }
+
+  private static var probe: TimeInterval { MailDeadline.probe }
+
+  /// Whether Mail is answering, for `status`. Never throws and never prompts —
+  /// only call it once the Automation grant is known to be authorized, or the
+  /// probe becomes the consent dialog `status` exists to avoid.
+  static func isResponsive() -> Bool {
+    guard isMailRunning() else { return false }
+    guard let answer = try? runAppleScript(probeScript, deadline: probe) else { return false }
+    return !answer.isEmpty
+  }
+}
+
+/// Run an AppleScript, optionally under a wall-clock deadline.
+///
+/// `deadline: nil` waits as long as the script takes, which is right for
+/// composing and wrong for everything else.
+func runAppleScript(
+  _ source: String, arguments: [String] = [], deadline: TimeInterval? = nil
+) throws -> String {
   let process = Process()
   process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
   // Values go through argv, never string-interpolated into the script. Quotes,
@@ -1773,22 +2017,88 @@ func runAppleScript(_ source: String, arguments: [String] = []) throws -> String
   process.standardOutput = stdout
   process.standardError = stderr
 
-  try process.run()
-  process.waitUntilExit()
-
-  let outData = stdout.fileHandleForReading.readDataToEndOfFile()
-  let errData = stderr.fileHandleForReading.readDataToEndOfFile()
-
-  if process.terminationStatus != 0 {
-    let errStr = String(data: errData, encoding: .utf8) ?? "Unknown AppleScript error"
-    throw AppleScriptError(message: errStr.trimmingCharacters(in: .whitespacesAndNewlines))
+  // Drain both pipes while the script runs. Reading them only after it exits
+  // deadlocks as soon as the output outgrows the 64 KB pipe buffer: osascript
+  // blocks writing, we block waiting for it to exit, and neither side moves —
+  // reachable with a large `search --limit`.
+  let collected = ScriptOutput()
+  let drained = DispatchGroup()
+  for (handle, isStdout) in [
+    (stdout.fileHandleForReading, true), (stderr.fileHandleForReading, false),
+  ] {
+    drained.enter()
+    DispatchQueue.global().async {
+      let data = handle.readDataToEndOfFile()
+      collected.store(data, isStdout: isStdout)
+      drained.leave()
+    }
   }
 
-  return String(data: outData, encoding: .utf8)?
+  let exited = DispatchSemaphore(value: 0)
+  process.terminationHandler = { _ in exited.signal() }
+  try process.run()
+
+  var killed = false
+  if let deadline {
+    if exited.wait(timeout: .now() + deadline) == .timedOut {
+      // Leaving the child alive would orphan an osascript that is still driving
+      // Mail — Ctrl-C on the CLI does not reach it, so it has to die here.
+      killed = true
+      process.terminate()
+      if exited.wait(timeout: .now() + 2) == .timedOut {
+        kill(process.processIdentifier, SIGKILL)
+        _ = exited.wait(timeout: .now() + 5)
+      }
+    }
+  } else {
+    exited.wait()
+  }
+
+  // Safe now either way: the child is gone, so both pipe write ends are closed
+  // and the readers finish.
+  drained.wait()
+
+  if killed {
+    throw AppleScriptError(
+      message: "Mail did not answer within \(Int(deadline ?? 0))s; gave up and killed the script.",
+      timedOut: true)
+  }
+
+  if process.terminationStatus != 0 {
+    let errStr = String(data: collected.err, encoding: .utf8) ?? "Unknown AppleScript error"
+    let trimmed = errStr.trimmingCharacters(in: .whitespacesAndNewlines)
+    // -1712 is Mail's own Apple Event timeout, which means the same thing as
+    // ours: it is too far behind to answer.
+    let itTimedOut = trimmed.contains("-1712") || trimmed.localizedCaseInsensitiveContains("timed out")
+    throw AppleScriptError(message: trimmed, timedOut: itTimedOut)
+  }
+
+  return String(data: collected.out, encoding: .utf8)?
     .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+}
+
+/// Somewhere for the two pipe readers to put what they read. A plain pair of
+/// captured locals would be two threads writing one closure context; this makes
+/// the handoff explicit and locked.
+private final class ScriptOutput: @unchecked Sendable {
+  private let lock = NSLock()
+  private var stdoutData = Data()
+  private var stderrData = Data()
+
+  func store(_ data: Data, isStdout: Bool) {
+    lock.lock()
+    defer { lock.unlock() }
+    if isStdout { stdoutData = data } else { stderrData = data }
+  }
+
+  var out: Data { lock.withLock { stdoutData } }
+  var err: Data { lock.withLock { stderrData } }
 }
 
 struct AppleScriptError: LocalizedError {
   let message: String
+  /// Whether the failure was a timeout — ours or Mail's -1712. Both mean "stop
+  /// sending events", which a caller cannot infer from the message text.
+  var timedOut: Bool = false
   var errorDescription: String? { message }
 }

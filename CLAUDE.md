@@ -197,13 +197,45 @@ apple mail send  <same flags> --confirm
 ```
 
 All three read commands take `--engine auto|filesystem|applescript`. Leave it
-alone; `auto` uses the files and falls back to AppleScript when it can't (no
-Full Disk Access, or a message whose body Mail hasn't downloaded yet).
-`--engine filesystem` fails loudly instead of falling back, which is what you
-want when diagnosing.
+alone; `auto` uses the files. `--engine filesystem` fails loudly instead of
+falling back, which is what you want when diagnosing.
 
 Measured on a 41k-message store, same binary, same query, Mail running:
 `--engine filesystem` 0.04s, `--engine applescript` 154s.
+
+🛑 **The AppleScript engine is the thing that wedges Mail, so `auto` no longer
+drifts into it.** Driving Mail with a whole-mailbox predicate is how Mail's
+scripting interface stops answering — permanently, until it is restarted, for
+every client on the machine. So:
+
+- **`search` never falls back.** Without Full Disk Access it reports the missing
+  grant and stops. It used to warn on stderr and drive Mail anyway, which turned
+  "grant missing" into "Mail wedged". Ask for the old path deliberately with
+  `--engine applescript` if you really want it.
+- **`export` still falls back**, because reading a body Mail hasn't downloaded is
+  a real reason to ask Mail — but only when Mail is *already running and
+  answering*.
+- **No read command launches Mail.** If Mail is closed, every AppleScript path
+  refuses rather than cold-starting it and handing it a mailbox query.
+- **Every AppleScript read is bounded** — one health probe (5s), searches 60s,
+  the export walk 300s — and the child `osascript` is killed on expiry rather
+  than left driving Mail. `APPLE_MAIL_PROBE_TIMEOUT` /
+  `APPLE_MAIL_SCRIPT_TIMEOUT` override those. Composing has *no* deadline on
+  purpose: killing a save half-written is worse than waiting.
+- **`--field content`, `--field all` and `--has-attachment` are refused on the
+  AppleScript engine** (exit 64), because each makes Mail open every message body
+  in the mailbox. They are free on the index — the refusal is about the engine,
+  not the query.
+
+⚠️ **Killing our `osascript` does not call off the work Mail already started.**
+The deadlines stop *us* hanging and stop us queueing more events; they are not a
+way to un-wedge Mail. Only restarting Mail.app does that.
+
+**`apple mail status` answers "is Mail wedged?"** — `mail_app.running` and
+`mail_app.responsive` in the JSON. `responsive` is only present when Automation
+is already authorized and Mail is up, because probing otherwise would trigger
+the consent dialog `status` exists to avoid. `responsive: false` means drafting
+and sending will not work until Mail is restarted.
 
 **Searching is now cheap — search widely.** No `--limit`/`--since` discipline is
 required, and there is no timeout to trip. The default covers every mailbox
@@ -294,7 +326,9 @@ not themselves valid senders. Run `accounts --json` rather than guessing.
 only Mail knows whether an account is `enabled`, and its account names are what
 `--from` matches. It asks Mail when Mail is already running and reads the store
 when it is not — rather than launching Mail just to list accounts, which is
-what it used to do. Consequence: **the file-system answer has no `enabled`
+what it used to do. It also reads the store when Mail is running but *not
+answering*, so a wedged Mail costs you the `enabled` field rather than hanging
+the command. Consequence: **the file-system answer has no `enabled`
 key**, so read it as `account.get("enabled", True)`. It also lists the local
 "On My Mac" store, which the AppleScript path omits.
 
@@ -367,19 +401,27 @@ trash and junk, which are excluded by default — except when `--mailbox trash`
 asks for them by name, which is honoured. Account names can contain emoji and
 spaces — get exact strings from `apple mail accounts` rather than guessing.
 
-⚠️ **The timeout trap applies only to `--engine applescript`.** AppleScript's
-event timeout is ~120s; when it trips, `search` prints `[]` and exits 0, which
-is indistinguishable from "no matches". If you ever see a search take about two
-minutes and return nothing, it failed — don't report it as an empty inbox. The
-file-system engine has no such mode: it either answers or errors. If `auto`
-fell back it says so on stderr, so read stderr before believing an empty result.
+⚠️ **The timeout trap applied only to `--engine applescript`, and is now an
+error rather than a silent one.** AppleScript's event timeout is ~120s, and the
+script swallowed it, so `search` printed `[]` and exited 0 — indistinguishable
+from "no matches". A timeout now fails loudly instead, whether it is Mail's
+-1712 or our own deadline, including one that hits partway through a multi-account
+walk (a short list from a half-finished search is a wrong answer, not a small one).
+The file-system engine never had this mode: it either answers or errors.
 
 ⚠️ **Mailbox names are not unique** — three accounts can each have an `Archive`.
 Every result carries both `account` and `mailbox`; use the pair.
 
 ⚠️ **A message can be in the index but not on disk** when Mail hasn't downloaded
 the body. `export` says so explicitly rather than reporting the message missing,
-and `auto` falls back to AppleScript, which can still fetch it.
+and `auto` falls back to AppleScript, which can still fetch it — provided Mail is
+already running and answering. With Mail closed it reports that instead of
+launching it.
+
+**`APPLE_MAIL_INDEX_PATH`** points the index reader at a specific file, or at a
+path that doesn't exist to see what a command does without Full Disk Access. The
+error names the variable, so an unreadable override never masquerades as a
+missing grant.
 
 ### messages — `apple messages`
 
@@ -718,10 +760,27 @@ The `tests/` suites drive the real binaries against real data, each behind its
 own flag:
 
 ```
-./tests/run-tests              # calendar writes (25 tests)
+./tests/run-tests              # calendar writes (25) + mail wedge guards (21)
 ./tests/run-tests --mail       # + mail drafts (19)
 ./tests/run-tests --contacts   # + contacts writes (28)
 ```
+
+`test_mail_wedge.py` is the exception to the flag rule: it is read-only — it
+creates nothing and sweeps nothing — so it always runs. It pins the guards that
+keep a read command from wedging Mail: the refusals, the no-launch rule, the
+deadlines, and the fact that the child `osascript` really dies. **Run it twice,
+once with Mail.app open and once closed.** Some assertions only mean anything in
+one state, and each half skips in the other rather than failing, so a single run
+silently covers about two thirds of it.
+
+Two seams make that testable without breaking anything:
+`APPLE_MAIL_INDEX_PATH` pointed at a nonexistent file stands in for a missing
+Full Disk Access grant, and `APPLE_MAIL_PROBE_TIMEOUT` shrunk to 0.05s makes a
+*healthy* Mail trip the give-up path — the only safe way to exercise it, since
+there is no way to wedge Mail on purpose. Set `APPLE_MAIL_BIN` to test a
+specific build; the default prefers `.build/release`, so a stale release binary
+otherwise tests the old code — and lets the unguarded AppleScript paths loose on
+Mail while doing it (8 minutes, once, here).
 
 Contacts fixtures have `__claude_contacts_test__` as their **exact** first name
 and the sweep refuses anything else — contact writes sync everywhere and cannot

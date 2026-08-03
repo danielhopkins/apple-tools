@@ -9,10 +9,14 @@
 # in the year 2099 so a stray leftover never appears in a real week view.
 #
 # Usage:
-#   ./tests/run-tests                        # calendar only
+#   ./tests/run-tests                        # calendar writes + mail read guards
 #   ./tests/run-tests --mail                 # + the mail draft suite
 #   ./tests/run-tests --contacts             # + the contacts write suite
 #   ./tests/run-tests test_calendar_write    # one module
+#
+# test_mail_wedge is read-only and always on. Some of it only applies with
+# Mail.app closed and some only with it open, so run it both ways to cover
+# everything; each half skips in the wrong state rather than failing.
 #
 # Pick the calendar fixtures land on (defaults to the first writable one):
 #   APPLE_CALENDAR_TEST_CALENDAR="Personal" ./tests/run-tests
@@ -32,6 +36,10 @@ PY="$(command -v python3)"
 
 cd "$ROOT"
 export RUN_LIVE_CALENDAR_TESTS=1
+# The mail wedge-guard suite is read-only — it creates nothing and sweeps
+# nothing — so it runs by default rather than behind a flag. Its most expensive
+# act is one bounded health probe.
+export RUN_LIVE_MAIL_READ_TESTS=1
 while [ "$#" -gt 0 ]; do
   case "${1:-}" in
     --mail)
