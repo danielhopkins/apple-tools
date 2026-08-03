@@ -629,7 +629,13 @@ struct Search: AsyncParsableCommand {
 
   func searchAppleScript() throws -> [[String: String]] {
     let predicate: String
-    let escapedQuery = query.replacingOccurrences(of: "\"", with: "\\\"")
+    // The one value in this tool that still gets interpolated into a script
+    // rather than passed as argv — a `whose` predicate is part of the query
+    // expression Mail compiles, so it cannot come from an argument.
+    // `escapedForAppleScriptLiteral` is what makes that safe; see its doc
+    // comment for which characters break a literal and, more importantly,
+    // which look like they should and must be left alone.
+    let escapedQuery = escapedForAppleScriptLiteral(query)
     switch field {
     case "sender":
       predicate = "sender contains \"\(escapedQuery)\""
@@ -692,8 +698,19 @@ struct Search: AsyncParsableCommand {
         accountExpr: "name of account of mailbox of msg",
         mailboxNameExpr: "name of mailbox of msg"
       )
-      allResults.append(
-        contentsOf: parseResults(try runAppleScript(script, deadline: MailDeadline.search)))
+      // Same reasoning as the per-account walk below: a timeout here has left
+      // whole mailboxes unsearched, so report the wedge rather than a short
+      // list that looks complete.
+      do {
+        allResults.append(
+          contentsOf: parseResults(try runAppleScript(script, deadline: MailDeadline.search)))
+      } catch let error as AppleScriptError where error.timedOut {
+        throw MailUnavailable(message: """
+          Mail stopped answering partway through the search (\(mboxRef)): \(error.message)
+          Results would be missing whole mailboxes, so this is an error rather than a short list.
+          \(wedgedAdvice)
+          """)
+      }
     }
 
     // Search per-account mailboxes (for things like Archive that have no unified view)
@@ -703,13 +720,15 @@ struct Search: AsyncParsableCommand {
         accounts = [account]
       } else {
         let acctScript = """
-          tell application "Mail"
-            set output to ""
-            repeat with acct in every account
-              set output to output & name of acct & linefeed
-            end repeat
-            return output
-          end tell
+          with timeout of \(MailDeadline.inScript(under: MailDeadline.search)) seconds
+            tell application "Mail"
+              set output to ""
+              repeat with acct in every account
+                set output to output & name of acct & linefeed
+              end repeat
+              return output
+            end tell
+          end timeout
           """
         let acctResult = try runAppleScript(acctScript, deadline: MailDeadline.search)
         accounts = acctResult.split(separator: "\n").map(String.init)
@@ -717,14 +736,19 @@ struct Search: AsyncParsableCommand {
 
       for acctName in accounts {
         for mboxName in perAccountToSearch {
+          // Both are interpolated, so both are escaped: the mailbox name comes
+          // straight from `--mailbox`, and an account name is whatever the user
+          // called the account — emoji and quotes included.
+          let box = escapedForAppleScriptLiteral(mboxName)
+          let acct = escapedForAppleScriptLiteral(acctName)
           let script = buildSearchScript(
-            mailboxExpr: "mailbox \"\(mboxName)\" of account \"\(acctName)\"",
+            mailboxExpr: "mailbox \"\(box)\" of account \"\(acct)\"",
             predicate: predicate,
             filterSuffix: filterSuffix,
             limit: limit,
             hasAttachment: hasAttachment,
-            accountExpr: "\"\(acctName)\"",
-            mailboxNameExpr: "\"\(mboxName)\""
+            accountExpr: "\"\(acct)\"",
+            mailboxNameExpr: "\"\(box)\""
           )
           // A missing mailbox is expected — not every account has an "Archive"
           // — so a failure here is skipped rather than fatal. But a *timeout* is
@@ -765,33 +789,47 @@ struct Search: AsyncParsableCommand {
     mailboxExpr: String, predicate: String, filterSuffix: String,
     limit: Int, hasAttachment: Bool, accountExpr: String, mailboxNameExpr: String
   ) -> String {
+    // Both callers run this under `MailDeadline.search`, so that is the budget
+    // the in-script timeout has to expire inside of.
+    let inScript = MailDeadline.inScript(under: MailDeadline.search)
     var lines = [
       "tell application \"Mail\"",
       "  set output to \"\"",
       "  set matchCount to 0",
       "  try",
-      "    set msgs to (messages of \(mailboxExpr) whose \(predicate)\(filterSuffix))",
-      "    repeat with msg in msgs",
-      "      if matchCount ≥ \(limit) then exit repeat",
+      "    with timeout of \(inScript) seconds",
+      "      set msgs to (messages of \(mailboxExpr) whose \(predicate)\(filterSuffix))",
+      "      repeat with msg in msgs",
+      "        if matchCount ≥ \(limit) then exit repeat",
     ]
     if hasAttachment {
-      lines.append("      if (count of mail attachments of msg) > 0 then")
+      lines.append("        if (count of mail attachments of msg) > 0 then")
     }
     lines.append(contentsOf: [
-      "      set msgSubject to subject of msg",
-      "      set msgSender to sender of msg",
-      "      set msgDate to date received of msg",
-      "      set msgId to message id of msg",
-      "      set msgAccount to \(accountExpr)",
-      "      set msgMailbox to \(mailboxNameExpr)",
-      "      set output to output & \"SUBJECT:\" & msgSubject & linefeed & \"FROM:\" & msgSender & linefeed & \"DATE:\" & (msgDate as string) & linefeed & \"ACCOUNT:\" & msgAccount & linefeed & \"MAILBOX:\" & msgMailbox & linefeed & \"MSGID:\" & msgId & linefeed & \"---\" & linefeed",
-      "      set matchCount to matchCount + 1",
+      "        set msgSubject to subject of msg",
+      "        set msgSender to sender of msg",
+      "        set msgDate to date received of msg",
+      "        set msgId to message id of msg",
+      "        set msgAccount to \(accountExpr)",
+      "        set msgMailbox to \(mailboxNameExpr)",
+      "        set output to output & \"SUBJECT:\" & msgSubject & linefeed & \"FROM:\" & msgSender & linefeed & \"DATE:\" & (msgDate as string) & linefeed & \"ACCOUNT:\" & msgAccount & linefeed & \"MAILBOX:\" & msgMailbox & linefeed & \"MSGID:\" & msgId & linefeed & \"---\" & linefeed",
+      "        set matchCount to matchCount + 1",
     ])
     if hasAttachment {
-      lines.append("      end if")
+      lines.append("        end if")
     }
     lines.append(contentsOf: [
-      "    end repeat",
+      "      end repeat",
+      "    end timeout",
+      // The `try` is here because a missing mailbox is expected — not every
+      // account has an "Archive" — and swallowing that is what lets the walk
+      // continue. A timeout is not a missing mailbox: swallowing it returns
+      // whatever `output` had accumulated, which reads as a complete result
+      // and is instead a search that stopped early against a Mail that is
+      // going under. Re-raise it so `runAppleScript` sees -1712 and the caller
+      // can tell the two apart.
+      "  on error errMsg number errNum",
+      "    if errNum is -1712 then error errMsg number errNum",
       "  end try",
       "  return output",
       "end tell",
@@ -1903,6 +1941,24 @@ enum MailDeadline {
   /// `osascript` with the message half-written, and a partly-saved draft is
   /// worse than a slow one.
   static let compose: TimeInterval? = nil
+
+  /// The budget to hand AppleScript *inside* the script, sized to expire a few
+  /// seconds before the process deadline above so the interpreter abandons the
+  /// Apple Event and exits on its own.
+  ///
+  /// This does not un-wedge Mail — nothing short of restarting it does, and the
+  /// work Mail has already started keeps running either way. What it buys is
+  /// the manner of the give-up: a clean -1712 that `osascript` reports and
+  /// exits on, instead of a SIGKILL that leaves Mail holding a reply for a
+  /// process that no longer exists. The outer deadline stays as the backstop
+  /// for a script that ignores its own timeout.
+  ///
+  /// Floored at 5s so a shrunken `APPLE_MAIL_SCRIPT_TIMEOUT` — the tests use
+  /// fractions of a second — cannot produce a zero or negative `with timeout`,
+  /// which AppleScript rejects at compile time.
+  static func inScript(under deadline: TimeInterval) -> Int {
+    max(Int(deadline) - 5, 5)
+  }
 }
 
 /// Mail is running but cannot be driven, or is not running and must not be

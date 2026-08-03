@@ -217,11 +217,21 @@ every client on the machine. So:
   answering*.
 - **No read command launches Mail.** If Mail is closed, every AppleScript path
   refuses rather than cold-starting it and handing it a mailbox query.
-- **Every AppleScript read is bounded** — one health probe (5s), searches 60s,
-  the export walk 300s — and the child `osascript` is killed on expiry rather
-  than left driving Mail. `APPLE_MAIL_PROBE_TIMEOUT` /
-  `APPLE_MAIL_SCRIPT_TIMEOUT` override those. Composing has *no* deadline on
-  purpose: killing a save half-written is worse than waiting.
+- **Every AppleScript read is bounded twice.** A wall-clock deadline on the
+  child process — one health probe (5s), searches 60s, the export walk 300s —
+  after which `osascript` is killed rather than left driving Mail; and a
+  `with timeout` *inside* the script, set 5s under that, so the interpreter
+  abandons the Apple Event and exits on its own with a clean -1712 instead of
+  being SIGKILLed mid-request. `APPLE_MAIL_PROBE_TIMEOUT` /
+  `APPLE_MAIL_SCRIPT_TIMEOUT` override the outer one and the inner one follows.
+  Composing has *no* deadline on purpose: killing a save half-written is worse
+  than waiting.
+- ⚠️ **A timeout is never swallowed into a short result.** The search script
+  wraps its walk in `try` so that a missing mailbox — not every account has an
+  `Archive` — is skipped rather than fatal. That handler re-raises -1712 and
+  swallows everything else, because a timeout returning whatever it had
+  accumulated reads as a complete search and is instead one that stopped
+  partway against a Mail that is going under.
 - **`--field content`, `--field all` and `--has-attachment` are refused on the
   AppleScript engine** (exit 64), because each makes Mail open every message body
   in the mailbox. They are free on the index — the refusal is about the engine,

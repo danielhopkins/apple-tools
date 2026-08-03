@@ -423,6 +423,194 @@ surveyed uses it. Unverified and it needs a pre-installed shortcut, which is
 awkward to ship, but if it works it is the real fix for the one data-loss bug in
 this tool.
 
+## Mail specifically — the search side
+
+**Gathered 2026-08-03.** The same question the Notes section asks about writes,
+asked about mail search: *has anyone solved this better than we have?* Since the
+July survey the field went from a handful of general Apple-app projects to
+**~25 mail-specific ones**, nearly all created in 2026 and nearly all **MCP
+servers rather than CLIs**. The CLI niche this repo occupies is close to
+uncontested; the crowd went to MCP.
+
+**The architecture argument is over and we are on the winning side.** Every
+serious 2026 entrant reads the Envelope Index and `.emlx` directly, and most say
+so in their README while naming AppleScript timeouts as the reason. When we took
+that idea from `apple-pim` it was a minority position; it is now the default.
+
+### The field
+
+| Project | Lang | ★ | Pushed | License | Architecture | Body search |
+|---|---|---|---|---|---|---|
+| [patrickfreyer/apple-mail-mcp](https://github.com/patrickfreyer/apple-mail-mcp) | Python | 189 | 2026-07-05 | MIT | AppleScript | times out |
+| [sweetrb/apple-mail-mcp](https://github.com/sweetrb/apple-mail-mcp) | TS | 56 | 2026-08-03 | MIT | AppleScript + **opt-in IMAP/SMTP** | server-side |
+| [imdinu/apple-mail-mcp](https://github.com/imdinu/apple-mail-mcp) | Python | 51 | 2026-07-30 | **GPL-3.0** | index + `.emlx` + **FTS5** | full, ~28ms |
+| [like-a-freedom/rusty_apple_mail_mcp](https://github.com/like-a-freedom/rusty_apple_mail_mcp) | Rust | 8 | 2026-08-02 | **none** | index + `.emlx` | none |
+| [PsychQuant/che-apple-mail-mcp](https://github.com/PsychQuant/che-apple-mail-mcp) | Swift | 7 | 2026-08-01 | MIT | index | none (despite the claim) |
+| [BastianZim/apple-mail-mcp](https://github.com/BastianZim/apple-mail-mcp) | Python | 0 | 2026-06-23 | MIT | index + `.emlx` | capped at 5k newest |
+| [fledgeling-co/sift-apple-mail-mcp](https://github.com/fledgeling-co/sift-apple-mail-mcp) | TS | 0 | 2026-08-03 | MIT | daemon + **FTS5** + PDF text | full, ~4ms claimed |
+| [joargp/amcli](https://github.com/joargp/amcli) | Node | 0 | 2026-07-14 | MIT | index + `.emlx` | preview only |
+| [macos-cli-tools/apple-mail-cli](https://github.com/macos-cli-tools/apple-mail-cli) | Bash | 0 | 2026-03-19 | MIT | AppleScript | — |
+| [zenghao-stat/apple-mail-cli](https://github.com/zenghao-stat/apple-mail-cli) | Swift | 0 | 2026-08-03 | MIT | AppleScript | — |
+| [smarzola/apple-mail-mcp](https://github.com/smarzola/apple-mail-mcp) | Rust | 1 | 2026-07-25 | MIT | AppleScript | — |
+
+Star counts and dates are a snapshot; re-run the loop at the bottom of this file.
+**Architecture and body-search columns are from READMEs and metadata** except
+where a subsection below says the source was read.
+
+### Somebody benchmarked the field, and it corroborates the wedge work
+
+imdinu publishes a [head-to-head benchmark](https://imdinu.github.io/apple-mail-mcp/benchmarks/)
+run at the MCP protocol level — subprocess per server, real tool calls over
+JSON-RPC/stdio, 5 warmups then 10 measured runs, median with p5/p95, a 10s probe
+screening out non-functional tools. **~73.5k messages, M4 Max, macOS 26.5,
+2026-05-28.**
+
+| Operation | index-based | patrickfreyer (AS) | sweetrb (AS) | titouancreach (AS) |
+|---|---|---|---|---|
+| List accounts | ~1 ms | ~150 ms+ | ~150 ms+ | ~150 ms+ |
+| Fetch 50 emails | ~3–5 ms | **TIMEOUT** | **TIMEOUT** | **TIMEOUT** |
+| Search subject | ~3–10 ms | ~570 ms | ~9 s+ | **TIMEOUT** |
+| Search body | ~28 ms | **TIMEOUT** | n/a | n/a |
+
+Their diagnosis is ours verbatim: *"body search via `whose body contains` lacks
+OS-level indexing, causing timeouts at the 180-second osascript limit."* That is
+independent confirmation of the 154s → 0.04s measurement in
+[`apple-mail-store.md`](apple-mail-store.md), on someone else's mailbox and
+hardware.
+
+⚠️ **It is the author's own benchmark of their own competitors** and we have not
+reproduced it. Treat the ranking as corroborated and the exact figures as
+unverified. Two side notes from it worth keeping: a 78★ server broke entirely on
+macOS 26 with AppleScript enumeration errors, and `pl-lyfx` ships hardcoded
+placeholder paths.
+
+### The two that go past us — a body index
+
+Both solve the open idea below: *content search re-reads and re-decodes 3.4 GB
+every time.*
+
+**[imdinu](https://github.com/imdinu/apple-mail-mcp)** — 83 files, ~14 test
+modules, GPL-3.0. *Verified by reading `index/watcher.py` and
+`benchmarks/competitors.py`:* a persistent FTS5 index built by an explicit
+`apple-mail-mcp index` run, plus an optional `--watch` using `watchfiles` on
+`~/Library/Mail/V10/` with 500 ms debounce, a `MAX_PENDING_CHANGES` cap against
+unbounded memory, a 200 ms retry for files Mail is still writing, and a path
+regex that pulls account UUID and rowid out of the path — including
+`(?:\.partial)?\.emlx`, matching our own handling at
+`EnvelopeIndex.swift:537`. Has an `index/lock.py`, so concurrent builds were a
+real problem for them too.
+
+🛑 **GPL-3.0 against our MIT — ideas only, never code.**
+
+**[sift](https://github.com/fledgeling-co/sift-apple-mail-mcp)** — created
+2026-08-03, 30 commits, 0 stars, MIT. **Entirely unproven, and every number in
+its README is self-reported.** But *verified by reading `src/index/build.ts` and
+`src/index/schema.ts`*, the design is the most careful thing in this survey and
+the reasoning is worth more than the code:
+
+- **Contentless FTS5** — `content=''`, `contentless_delete=1`, `detail=full`,
+  `prefix='2 3'`, `unicode61 remove_diacritics 2` so "resume" finds "résumé".
+  They cite SQLite's own email-corpus measurement, 743 MiB for `detail=full`
+  against 134 MiB for `detail=none`, and take the size for phrase search.
+- 🛑 **The change fingerprint is four fields, not two** — `(inode, mtimeMs,
+  ctimeMs, sizeBytes)`. Their note: `(mtime, size)` silently skips a
+  size-preserving edit inside one mtime tick, and mistakes a reused path for an
+  unchanged file. This is the trap we would have walked into.
+- **Resume by fingerprint, sweep by stamp.** Every discovered path is stamped
+  with the build id; unstamped occurrences are then deleted, then orphaned docs.
+  That is what makes a moved or deleted message actually leave the index.
+- 🛑 **Separate `docs` and `occurrences` tables** — one row per message, one per
+  file on disk. Two copies of one message have different mtimes and different
+  outcomes, so the ledger cannot live on the message. This is our "mailbox names
+  are not unique, use the account/mailbox pair" problem in index form.
+- **Publishes sealed generations mid-build**, so a first build answers queries
+  while it is still running rather than being all-or-nothing.
+- Refresh: a cheap counter plus `max(ROWID)` and row count to tell real arrival
+  from a mark-as-read; full reconciliation every 15 minutes; builder detached.
+- **PDF text extraction** — 342 of 400 PDFs, scanned ones marked
+  `no-text-layer`. That is our documented non-feature.
+
+If we ever build the index, read these two first.
+
+### What the AppleScript camp independently discovered
+
+*Verified by reading `plugin/apple_mail_mcp/core.py` and
+`tests/test_orphan_watcher.py` in [patrickfreyer](https://github.com/patrickfreyer/apple-mail-mcp)*
+— the most-adopted server in the field arrived at half of our Tier 1 on its own:
+
+- Every in-flight `osascript` `Popen` goes into a lock-guarded set, killed from
+  `atexit` and from chained SIGTERM/SIGHUP handlers (chained, not clobbered, so
+  FastMCP's own handler survives). Same conclusion we reached: an orphaned
+  `osascript` still driving Mail is the hazard.
+- An orphan watcher exits the server when its PPID changes.
+- **The idea we took:** every script is wrapped in `with timeout of max(N-5, 5)
+  seconds`, sized just under the Python-side kill, so the interpreter abandons
+  the Apple Event and exits cleanly instead of being killed mid-request. We had
+  this on the export walk and *not* on the search script. Now we do — see below.
+
+Good corroboration that the wedge is not a quirk of this machine. Note they have
+no equivalent of the preflight, the no-launch rule, or `mail_app.responsive`.
+
+### Verified dead ends
+
+- 🛑 **`mdfind`/Spotlight cannot search mail, and Full Disk Access does not fix
+  it.** Confirmed on [Apple's own forums](https://developer.apple.com/forums/thread/121187?page=2):
+  Spotlight mail search works through neither `MDQueryRef` nor `mdfind` even
+  with the grant. Not a permissions problem — don't spend time on it.
+- **IMAP instead of Mail.app.** sweetrb ships this as an opt-in fast path
+  (credentials in the Keychain), and it is what [himalaya](https://github.com/pimalaya/himalaya),
+  notmuch and mu do generally. It works and gives server-side search, but it
+  costs credentials, network round-trips and a second source of truth. Different
+  product from "read the user's real local data"; not a direction for this repo.
+- **`che-apple-mail-mcp`'s "millisecond search across 250K+ emails"** is
+  subject/sender/recipient/date only. Its own comparison table says so two rows
+  below the claim. A reminder to read the table, not the headline.
+
+### What we took from this survey
+
+Both landed on 2026-08-03, both pinned by tests:
+
+1. **An in-script `with timeout` on the search path**, from patrickfreyer, at
+   `MailDeadline.inScript(under:)` — sized 5s under the process deadline and
+   floored at 5s so a shrunken `APPLE_MAIL_SCRIPT_TIMEOUT` cannot emit a
+   `with timeout of 0`, which AppleScript rejects at compile time. It does not
+   un-wedge Mail; it changes *how* we give up, from SIGKILL to a clean -1712.
+   It required fixing the swallowing `try` at the same time: the handler now
+   re-raises -1712 and swallows everything else, because a timeout inside a
+   `try` that eats it returns a partial result that reads as complete.
+2. **A real backslash escape**, found while checking their ` ` handling.
+
+🛑 **And the borrowed escape list was wrong for us, which is the more useful
+finding.** patrickfreyer escapes `\`, `"`, newline, tab and U+2028/U+2029. We
+measured each against `osascript -e` on macOS 27 before copying:
+
+| In a literal | `length of "a?b"` |
+|---|---|
+| `\` | **syntax error (-2741)** |
+| `"` | **syntax error (-2741)** |
+| raw newline, tab, U+2028, U+2029 | 3 — all legal |
+
+Because `osascript -e` takes the script as an argv string rather than a parsed
+file, only the two structural characters break a literal. Escaping the others
+would have **silently changed the query**: `character id` of the second
+character of `"a\nb"` is 10 where a raw U+2028 is 8232. A wrong query is worse
+than the syntax error the escape was meant to prevent, so
+`escapedForAppleScriptLiteral` handles exactly two characters and the tests pin
+the omissions as deliberately as the inclusions.
+
+The live bug this exposed was real and predated the survey: the search escaped
+`"` and not `\`, so `apple mail search 'back\slash' --engine applescript` failed
+with `Expected “"” but found unknown token`. Reproduced against 26.803.2 and
+fixed. The same interpolation sites also passed `--mailbox` and the account name
+through unescaped.
+
+### Still not taken
+
+- **A body index.** The open idea below, now with two worked designs to read.
+- **PDF text extraction**, from sift — we say "there is no PDF text extraction".
+- **An orphan watcher.** We kill the child on deadline expiry, but a SIGTERM to
+  `apple mail` itself does not currently reach an in-flight `osascript`.
+
 ## What we have that they don't
 
 Recorded so we don't "discover" it again, and so it's obvious what's actually
@@ -441,6 +629,17 @@ load-bearing here:
   row by row rather than spot-checked: 99,022 exact matches.
 - **The trap list in [CLAUDE.md](../CLAUDE.md)** — every entry cost a real
   debugging session and is pinned by a test.
+- **Guards against wedging Mail, and tests for them.** The preflight, the
+  no-launch rule, the refusal of body-reading predicates on the AppleScript
+  engine, and `tests/test_mail_wedge.py`'s 21 read-only assertions. Of the ~25
+  mail projects surveyed, only patrickfreyer engages with the problem at all
+  (in-flight child tracking, in-script timeouts) and none tests it. imdinu's
+  harness is the only comparably serious testing in the field and it measures
+  speed, not safety.
+- **Two grants reported separately.** `apple mail status` distinguishes Full
+  Disk Access from Automation → Mail and reports `mail_app.responsive`. Nothing
+  surveyed tells a user which half is broken; `doctor` commands in amcli and
+  sweetrb come closest.
 
 ## Open ideas sourced from here
 
@@ -476,7 +675,21 @@ load-bearing here:
 - **A body index.** Content search re-reads and re-decodes 3.4 GB every time.
   Mail's own `Protected Index Journals` may already hold something usable; if
   not, a local SQLite FTS table over decoded bodies would make it instant, at
-  the cost of staleness and a cache to invalidate.
+  the cost of staleness and a cache to invalidate. **Two worked designs now
+  exist** — see the mail section: imdinu's FTS5 index plus `watchfiles` watcher,
+  and sift's four-field fingerprint, docs/occurrences split and mid-build
+  generation publishing. Read both before starting.
+- **PDF text extraction for `--field content`** — from sift, which reports 342
+  of 400 PDFs extracted and marks scanned ones `no-text-layer`. We currently
+  never decode a non-text part.
+- **An orphan watcher / kill-on-own-exit** — from patrickfreyer. Our deadline
+  kills the child when it expires, but a SIGTERM to `apple mail` itself leaves
+  an in-flight `osascript` driving Mail.
+- ~~**An in-script `with timeout` on the search path**~~ — done, from
+  patrickfreyer, along with re-raising -1712 out of the swallowing `try`.
+- ~~**Escaping the search term properly**~~ — done, but see the mail section:
+  the borrowed escape list was wrong for `osascript -e` and copying it whole
+  would have silently altered queries.
 
 ## Refreshing this
 
@@ -486,9 +699,24 @@ for r in supermemoryai/apple-mcp more-io/claude-apple-bridges \
          schappim/ekctl BRO3886/ical \
          threeplanetssoftware/apple_cloud_notes_parser antoniorodr/memo \
          RhetTbull/macnotesapp RhetTbull/apple-notes-parser \
-         dunhamsteve/notesutils xwmx/notes-app-cli; do
+         dunhamsteve/notesutils xwmx/notes-app-cli \
+         patrickfreyer/apple-mail-mcp sweetrb/apple-mail-mcp \
+         imdinu/apple-mail-mcp like-a-freedom/rusty_apple_mail_mcp \
+         PsychQuant/che-apple-mail-mcp BastianZim/apple-mail-mcp \
+         fledgeling-co/sift-apple-mail-mcp joargp/amcli \
+         macos-cli-tools/apple-mail-cli zenghao-stat/apple-mail-cli \
+         smarzola/apple-mail-mcp; do
   gh api "repos/$r" --jq '"\(.full_name)\t★\(.stargazers_count)\tpushed \(.pushed_at[0:10])\tarchived=\(.archived)"'
 done
+```
+
+The mail half of the field turns over fast — most of those repos did not exist
+in July 2026 — so re-run this before trusting the table, and search for new ones
+rather than assuming the list is still the field:
+
+```
+gh search repos "apple mail mcp" --limit 30 --json fullName,stargazersCount,pushedAt
+gh search repos "apple mail cli" --limit 30 --json fullName,stargazersCount,pushedAt
 ```
 
 To check whether a project handles something before we build it:
