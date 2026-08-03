@@ -869,6 +869,13 @@ struct Export: AsyncParsableCommand {
     //
     // The walk recurses: `every mailbox of account` returns only top-level
     // mailboxes, and Exchange accounts routinely nest user folders under them.
+    //
+    // Two things make the walk survivable. `whose message id is` costs a linear
+    // scan per mailbox, so the well-known mailboxes are swept first and the rest
+    // only if that misses — finding a sent message went 28s -> 0.9s here. And
+    // every Mail interaction raises the Apple Event timeout, because the default
+    // is ~120s and a cold walk of three accounts exceeded it, failing with -1712
+    // where the old code would have answered (wrongly) at once.
     for acctName in accounts {
       // Values go through argv rather than being interpolated, so a message id
       // containing quotes or backslashes cannot break or inject into the script.
@@ -877,13 +884,44 @@ struct Export: AsyncParsableCommand {
           set targetId to item 1 of argv
           set acctName to item 2 of argv
           set boxes to {}
-          tell application "Mail"
-            try
-              set boxes to every mailbox of account acctName
-            end try
-          end tell
-          return my findMessage(boxes, targetId, acctName)
+          with timeout of 900 seconds
+            tell application "Mail"
+              try
+                set boxes to every mailbox of account acctName
+              end try
+            end tell
+          end timeout
+          set preferred to {}
+          set others to {}
+          repeat with mbox in boxes
+            set nm to ""
+            with timeout of 900 seconds
+              tell application "Mail"
+                try
+                  set nm to name of mbox
+                end try
+              end tell
+            end timeout
+            if my isLikely(nm) then
+              set end of preferred to mbox
+            else
+              set end of others to mbox
+            end if
+          end repeat
+          set found to my findMessage(preferred, targetId, acctName)
+          if found is not "" then return found
+          return my findMessage(others, targetId, acctName)
         end run
+
+        -- Where a message almost always is, across the account types Mail
+        -- supports. Only an ordering hint: a miss here still falls through to
+        -- every remaining mailbox, so an unusual layout stays correct.
+        on isLikely(nm)
+          ignoring case
+            return nm is in {"inbox", "sent", "sent items", "sent messages", ¬
+              "sent mail", "archive", "drafts", "all mail"}
+          end ignoring
+        end isLikely
 
         on findMessage(mboxList, targetId, acctName)
           -- Coercing a list of addresses to string joins on the delimiter, which
@@ -891,37 +929,39 @@ struct Export: AsyncParsableCommand {
           -- unparseable token. The file-system engine joins on ", ", so match it.
           set AppleScript's text item delimiters to ", "
           repeat with mbox in mboxList
-            tell application "Mail"
-              try
-                set msgs to (messages of mbox whose message id is targetId)
-                if (count of msgs) > 0 then
-                  set msg to item 1 of msgs
-                  set output to "Subject: " & subject of msg & linefeed
-                  set output to output & "From: " & sender of msg & linefeed
-                  -- A message in a Sent folder may carry no `date received`.
-                  try
-                    set output to output & "Date: " & (date received of msg as string) & linefeed
-                  on error
+            set kids to {}
+            with timeout of 900 seconds
+              tell application "Mail"
+                try
+                  set msgs to (messages of mbox whose message id is targetId)
+                  if (count of msgs) > 0 then
+                    set msg to item 1 of msgs
+                    set output to "Subject: " & subject of msg & linefeed
+                    set output to output & "From: " & sender of msg & linefeed
+                    -- A message in a Sent folder may carry no `date received`.
                     try
-                      set output to output & "Date: " & (date sent of msg as string) & linefeed
+                      set output to output & "Date: " & (date received of msg as string) & linefeed
+                    on error
+                      try
+                        set output to output & "Date: " & (date sent of msg as string) & linefeed
+                      end try
                     end try
-                  end try
-                  set output to output & "To: " & ((address of every to recipient of msg) as string) & linefeed
-                  try
-                    set output to output & "Cc: " & ((address of every cc recipient of msg) as string) & linefeed
-                  end try
-                  set output to output & "Account: " & acctName & linefeed
-                  set output to output & "Mailbox: " & (name of mbox) & linefeed
-                  set output to output & linefeed
-                  set output to output & content of msg
-                  return output
-                end if
-              end try
-              set kids to {}
-              try
-                set kids to every mailbox of mbox
-              end try
-            end tell
+                    set output to output & "To: " & ((address of every to recipient of msg) as string) & linefeed
+                    try
+                      set output to output & "Cc: " & ((address of every cc recipient of msg) as string) & linefeed
+                    end try
+                    set output to output & "Account: " & acctName & linefeed
+                    set output to output & "Mailbox: " & (name of mbox) & linefeed
+                    set output to output & linefeed
+                    set output to output & content of msg
+                    return output
+                  end if
+                end try
+                try
+                  set kids to every mailbox of mbox
+                end try
+              end tell
+            end timeout
             if (count of kids) > 0 then
               set nested to my findMessage(kids, targetId, acctName)
               if nested is not "" then return nested
