@@ -764,6 +764,12 @@ struct Export: AsyncParsableCommand {
   var engine: MailEngine = .auto
 
   func run() async throws {
+    // An empty id is not a harmless no-op: both engines match it against a
+    // message whose Message-ID is itself empty, so it silently exports an
+    // arbitrary message rather than reporting that nothing was asked for.
+    guard !messageId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      throw ValidationError("MESSAGE-ID is empty — pass an id from `apple-mail search`.")
+    }
     if engine != .applescript {
       do {
         try runFileSystem()
@@ -852,38 +858,83 @@ struct Export: AsyncParsableCommand {
       accounts = acctResult.split(separator: "\n").map(String.init)
     }
 
-    let mailboxes = ["INBOX", "Archive", "Sent Messages", "Drafts", "Junk", "Trash"]
-    let escapedId = messageId.replacingOccurrences(of: "\"", with: "\\\"")
-
+    // Mailbox names are per-account and localised, so a hardcoded English list
+    // ("INBOX", "Sent Messages", "Junk", "Trash") silently misses whole folders
+    // on an Exchange account, whose real names are "Inbox", "Sent Items",
+    // "Junk Email", "Deleted Items". Every mismatched by-name specifier throws,
+    // the `try` swallows it, and the message reports as not found even though
+    // Mail can see it. So enumerate the account's actual mailboxes and match on
+    // message id, which is the one identifier that does not vary by account
+    // type or language.
+    //
+    // The walk recurses: `every mailbox of account` returns only top-level
+    // mailboxes, and Exchange accounts routinely nest user folders under them.
     for acctName in accounts {
-      for mboxName in mailboxes {
-        let script = """
+      // Values go through argv rather than being interpolated, so a message id
+      // containing quotes or backslashes cannot break or inject into the script.
+      let script = """
+        on run argv
+          set targetId to item 1 of argv
+          set acctName to item 2 of argv
+          set boxes to {}
           tell application "Mail"
             try
-              set msgs to (messages of mailbox "\(mboxName)" of account "\(acctName)" whose message id is "\(escapedId)")
-              if (count of msgs) > 0 then
-                set msg to item 1 of msgs
-                set output to "Subject: " & subject of msg & linefeed
-                set output to output & "From: " & sender of msg & linefeed
-                set output to output & "Date: " & (date received of msg as string) & linefeed
-                set output to output & "To: " & (address of every to recipient of msg as string) & linefeed
-                try
-                  set output to output & "Cc: " & (address of every cc recipient of msg as string) & linefeed
-                end try
-                set output to output & "Account: \(acctName)" & linefeed
-                set output to output & "Mailbox: \(mboxName)" & linefeed
-                set output to output & linefeed
-                set output to output & content of msg
-                return output
-              end if
+              set boxes to every mailbox of account acctName
             end try
-            return ""
           end tell
-          """
-        if let result = try? runAppleScript(script), !result.isEmpty {
-          print(result)
-          return
-        }
+          return my findMessage(boxes, targetId, acctName)
+        end run
+
+        on findMessage(mboxList, targetId, acctName)
+          -- Coercing a list of addresses to string joins on the delimiter, which
+          -- is "" by default: two recipients would run together into one
+          -- unparseable token. The file-system engine joins on ", ", so match it.
+          set AppleScript's text item delimiters to ", "
+          repeat with mbox in mboxList
+            tell application "Mail"
+              try
+                set msgs to (messages of mbox whose message id is targetId)
+                if (count of msgs) > 0 then
+                  set msg to item 1 of msgs
+                  set output to "Subject: " & subject of msg & linefeed
+                  set output to output & "From: " & sender of msg & linefeed
+                  -- A message in a Sent folder may carry no `date received`.
+                  try
+                    set output to output & "Date: " & (date received of msg as string) & linefeed
+                  on error
+                    try
+                      set output to output & "Date: " & (date sent of msg as string) & linefeed
+                    end try
+                  end try
+                  set output to output & "To: " & ((address of every to recipient of msg) as string) & linefeed
+                  try
+                    set output to output & "Cc: " & ((address of every cc recipient of msg) as string) & linefeed
+                  end try
+                  set output to output & "Account: " & acctName & linefeed
+                  set output to output & "Mailbox: " & (name of mbox) & linefeed
+                  set output to output & linefeed
+                  set output to output & content of msg
+                  return output
+                end if
+              end try
+              set kids to {}
+              try
+                set kids to every mailbox of mbox
+              end try
+            end tell
+            if (count of kids) > 0 then
+              set nested to my findMessage(kids, targetId, acctName)
+              if nested is not "" then return nested
+            end if
+          end repeat
+          return ""
+        end findMessage
+        """
+      if let result = try? runAppleScript(script, arguments: [messageId, acctName]),
+        !result.isEmpty
+      {
+        print(result)
+        return
       }
     }
 
