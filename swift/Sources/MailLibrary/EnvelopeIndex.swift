@@ -134,8 +134,25 @@ public final class EnvelopeIndex {
   /// True when the WAL had to be bypassed, so reads may miss recent mail.
   public private(set) var isStale = false
 
+  /// Set to read a specific index instead of discovering one. Pointing it at a
+  /// path that does not exist is how the tests exercise the no-Full-Disk-Access
+  /// path without revoking a grant, and how you can check what a command does
+  /// when the index is unreadable.
+  public static let overrideEnvironmentKey = "APPLE_MAIL_INDEX_PATH"
+
+  public static var overridePath: String? {
+    ProcessInfo.processInfo.environment[overrideEnvironmentKey].flatMap {
+      $0.isEmpty ? nil : $0
+    }
+  }
+
   /// Newest `~/Library/Mail/V<n>/MailData/Envelope Index` that we can read.
   public static func discover(home: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL? {
+    if let override = overridePath {
+      let url = URL(fileURLWithPath: (override as NSString).expandingTildeInPath)
+      return FileManager.default.isReadableFile(atPath: url.path) ? url : nil
+    }
+
     let mailDirectory = home.appendingPathComponent("Library/Mail")
     guard
       let entries = try? FileManager.default.contentsOfDirectory(
@@ -157,6 +174,11 @@ public final class EnvelopeIndex {
     -> EnvelopeIndex
   {
     guard let path = discover(home: home) else {
+      if let override = overridePath {
+        throw EnvelopeIndexError.unavailable(
+          "\(overrideEnvironmentKey) is set to '\(override)', which is not a readable file. "
+            + "Unset it to discover the index normally.")
+      }
       throw EnvelopeIndexError.unavailable(
         "No readable Envelope Index under ~/Library/Mail/V*. Reading it needs Full Disk "
           + "Access for this terminal (System Settings → Privacy & Security → Full Disk Access).")
