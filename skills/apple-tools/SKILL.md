@@ -1,6 +1,6 @@
 ---
 name: apple-tools
-description: Read and write the user's local Apple app data — Notes, Mail, Messages, Reminders, Calendar, Contacts — through the `apple` CLI. Use whenever the user refers to their own notes, email, texts, iMessages, reminders, todos, calendar, meetings, schedule, or contacts ("what's on my calendar", "find that email from", "what did they text me", "remind me to", "look up their number", "search my notes"). Everything runs locally against real data, so writes need care.
+description: Read and write the user's local Apple app data — Notes, Mail, Messages, Phone calls, Reminders, Calendar, Contacts — through the `apple` CLI. Use whenever the user refers to their own notes, email, texts, iMessages, phone calls, missed calls, voicemail, reminders, todos, calendar, meetings, schedule, or contacts ("what's on my calendar", "find that email from", "what did they text me", "who called me", "call Alice", "remind me to", "look up their number", "search my notes"). Everything runs locally against real data, so writes need care.
 ---
 
 # apple-tools
@@ -13,13 +13,14 @@ Check availability with `apple --version`. If the command is missing, say so
 rather than falling back to AppleScript or `osascript` by hand; the point of
 these tools is that the edge cases are already handled.
 
-## The six tools
+## The seven tools
 
 | Tool | Reads | Writes |
 |------|-------|--------|
 | `apple notes` | titles, folders, note bodies as Markdown | **yes**, once shortcuts are installed |
 | `apple mail` | accounts, message search, message bodies | **drafts** (send is guarded) |
 | `apple messages` | conversations, message search, attachments | no |
+| `apple phone` | call history with names, blocked list, stats | **`dial` only** (you confirm in Phone.app) |
 | `apple reminders` | lists, items, due dates | **yes** |
 | `apple calendar` | calendars, events | **yes** |
 | `apple contacts` | names, emails, phones, addresses, notes | **yes** (except notes) |
@@ -77,6 +78,15 @@ apple messages search "dinner" --since 30 --json # whole history, ~0.1s
 apple messages search "bikes" --chat 8 --json    # within one conversation
 apple messages export 8 --limit 50               # transcript, oldest first
 apple messages attachments 8 --save ~/Downloads
+
+# Phone — reads CallHistory; works with Phone.app closed. Read-only except dial.
+apple phone recents --json                       # recent calls, callers named
+apple phone recents --missed --since 7 --json    # who called while they were out
+apple phone recents --unknown --since 30 --json  # callers not in Contacts
+apple phone search "denver" --json               # by name, number, or place
+apple phone stats --since 90                     # counts, talk time, top callers
+apple phone blocked --json                       # read-only, cannot be written
+apple phone dial "Alice"                         # Phone.app asks them to confirm
 
 # Reminders
 apple reminders show-lists --json
@@ -167,6 +177,27 @@ candidates rather than guessing.
 **Handles are phone numbers and emails, never names.** Messages has no contact
 lookup. If the user asks "what did Sarah text me", find her number with `apple
 contacts search "Sarah" --json` first, then pass it as `--handle`.
+
+**Phone is the exception: it resolves names itself.** Unlike messages, every call
+comes back with a `name` and a `known` flag, so "who called me yesterday" is one
+command. `--unknown` lists callers not in Contacts, which is the natural first
+step for "add whoever called me to my contacts" — take the number from there and
+pass it to `apple contacts add`.
+
+⚠️ **Three things `phone` cannot do, and none are worth retrying:**
+
+- **Blocking.** There is no `block` command, by design. The system API is walled
+  behind an Apple-internal entitlement and *fails silently*, so a command would
+  claim success and change nothing. Tell the user to block in Phone.app or
+  System Settings. `apple phone blocked` reads the list.
+- **Voicemail.** Nothing is stored on the Mac — no list, no transcripts, nothing
+  to mark read. It lives on the iPhone.
+- **Answering, ending, or muting a live call.** No API exists.
+
+**`dial` places a real call.** Phone.app always shows a confirmation panel, which
+is the user's to click — never try to click it for them. Only run `dial` when the
+user asked for the call in that turn, and prefer telling them the number
+otherwise. `--dry-run` shows the URL without dialing.
 
 Not every row is a text: check the `kind` field, which is `message`, `tapback`,
 `systemEvent`, or `appMessage`. Group joins and renames are excluded unless you

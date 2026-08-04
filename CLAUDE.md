@@ -1,6 +1,6 @@
 # apple-tools
 
-CLIs for reading and writing local Apple app data: Notes, Mail, Messages,
+CLIs for reading and writing local Apple app data: Notes, Mail, Messages, Phone,
 Reminders, Calendar, Contacts. Everything runs locally against the user's real data — no
 network, no sync service, no API keys.
 
@@ -21,6 +21,11 @@ installed via `make install`.
 | List conversations | `apple messages chats --json` |
 | Search messages | `apple messages search "dinner" --json` |
 | Read a conversation | `apple messages export 8 --limit 50` |
+| Recent calls | `apple phone recents --json` |
+| Who called while out | `apple phone recents --missed --since 7 --json` |
+| Callers not in Contacts | `apple phone recents --unknown --since 30 --json` |
+| Blocked callers | `apple phone blocked --json` |
+| Place a call | `apple phone dial "Alice"` |
 | Today's reminders | `apple reminders show-all --due-date today --include-overdue --json` |
 | Add a reminder | `apple reminders add Soon "Buy milk" --due-date "tomorrow 9am"` |
 | This week's events | `apple calendar events --days 7 --json` |
@@ -34,7 +39,7 @@ its shape is not stable. Use `apple --which` to see which binary each name
 resolves to.
 
 **Check permissions before diagnosing an access failure.** `apple status`
-reports all six in one table, never prompts, and exits non-zero if anything is
+reports all seven in one table, never prompts, and exits non-zero if anything is
 unusable:
 
 ```
@@ -53,10 +58,12 @@ also answers `status` on its own.
 
 1. **`--json` for anything you parse.** Plain-text layouts change; JSON keys don't.
 2. **Reads are free, writes are not.** `notes export`, `mail search`, `contacts
-   search/get/list`, `calendar events`, `reminders show*` only read. Anything
-   that creates, edits, completes, or deletes touches the user's real data —
-   confirm with them first unless they clearly asked for the write. Contacts
-   writes sync to every device and there is no undo.
+   search/get/list`, `calendar events`, `reminders show*`, and every `phone`
+   subcommand except `dial` only read. Anything that creates, edits, completes,
+   or deletes touches the user's real data — confirm with them first unless they
+   clearly asked for the write. Contacts writes sync to every device and there is
+   no undo. `phone dial` places a real, billable call: Phone.app will ask the
+   user to confirm, and that panel is theirs to click, never yours.
 3. **Never edit a note that has attachments.** See the Notes section; one body
    write destroys every attachment on the note. This is unrecoverable.
 4. **IDs are per-tool and not interchangeable.** Notes use integer PKs, Mail uses
@@ -503,6 +510,99 @@ See [`docs/apple-messages-store.md`](docs/apple-messages-store.md) for the
 schema, the typedstream layout, and why searching the two body sources needs two
 queries rather than one.
 
+### phone — `apple phone`
+
+Reads `CallHistory.storedata` directly, the same way messages reads `chat.db`,
+and resolves caller names out of the AddressBook stores under the same grant.
+Works with Phone.app closed. **Read-only except `dial`.**
+
+```
+apple phone recents [--limit N] [--since DAYS] [--before DAYS]
+                    [--missed | --incoming | --outgoing] [--unknown] [--blocked-only]
+                    [--kind phone|facetime-audio|facetime-video] [--handle H] [--json]
+apple phone search QUERY  <same filters>            # name, number, or place
+apple phone stats  <same filters> [--json]          # counts, talk time, top callers
+apple phone blocked [--json]                        # read-only
+apple phone dial TARGET [--facetime-audio] [--dry-run] [--json]
+apple phone status [--json]
+```
+
+`recents` is the default subcommand, so `apple phone` alone lists recent calls.
+
+**Names are the whole point.** `ZNAME` in the store is empty (1 row of 289), so
+every caller is resolved against Contacts and reported with a `name` and a
+`known` flag. `--unknown` narrows to callers you have not saved, which is the
+short path from "who called me yesterday" to `apple contacts add`.
+
+🛑 **Blocking a caller is impossible, and the API lies about it.** The
+`CommunicationsFilter` C functions are reachable by `dlopen` from an unsigned
+binary and *appear* to work — `CreateCMFItemFromString` returns the right
+dictionary — but the XPC to `cmfsyncagent` needs
+`com.apple.private.communicationsfilter`, and it is **denied silently**:
+`CMFBlockListIsItemBlocked` returns `false` for a number that is demonstrably on
+the list. So there is no `block` command; one would report success and change
+nothing. `blocked` reads the list, and `recents` flags callers already on it.
+Signing and notarising the tool would not change this — private entitlements need
+`platform-application`. Block in Phone.app or System Settings instead; the iPhone
+is what filters relayed calls anyway.
+
+🛑 **Voicemail is not on this Mac at all.** No local store exists (`ZHASMESSAGE`
+is `0` on every row), `vmd` does not exist on macOS, and `vmshow://` needs a UUID
+nothing local can enumerate. `voicemail-*.m4a` files under
+`~/Library/Messages/Attachments` are ones people *forwarded over iMessage*, not
+an inbox. There is nothing to list and nothing to mark read.
+
+**`dial` hands a `tel:` URL to Phone.app and Phone.app always asks you to
+confirm** — skipping the prompt needs `com.apple.FaceTime.NoPrompt`, an
+Apple-internal entitlement. That prompt is the gate, so unlike `mail send` there
+is no `--confirm` flag; and the tool will never click the panel for you. Use
+`--dry-run` to see the URL without placing anything. `TARGET` may be a number, an
+Apple ID, or a contact name — a name resolves against the address book, prefers
+the number that person most recently used, and an ambiguous name is an error
+rather than a guess.
+
+⚠️ **This is a relay mirror, not full history.** Four months here against an
+iPhone that keeps years. Say "recents", never "all calls".
+
+**Traps** (each pinned by a test in `swift/Tests/PhoneTests/`, full detail in
+[`docs/apple-phone-store.md`](docs/apple-phone-store.md)):
+
+- 🛑 **`ZDATE` is Apple-epoch *seconds*; `chat.db` is nanoseconds.** Sharing a
+  converter between the two is wrong by 10⁹ and still yields a plausible date.
+- 🛑 **`ZDATE` is a `REAL`, so comparing it to `strftime('%s',…)` text matches
+  nothing** — no error, just an empty result indistinguishable from "no calls".
+  Bind a double. This broke `--since` on the first attempt.
+- 🛑 **`ZANSWERED` means "answered by me", so it is `0` on every outgoing call.**
+  Treating it as "connected" reports everything you dialled as missed. Connected
+  is `ZDURATION > 0`, which is orthogonal to direction.
+- ⚠️ **`ZADDRESS` is unnormalised** — `8005551212`, `18005551212`,
+  `+13035551212` and an Apple ID all coexist. Match on trailing 10 digits.
+- 🛑 **Never open the AddressBook stores with `immutable=1`.** Contacts leaves a
+  3 MB write-ahead log, and `immutable=1` does not replay it — so a contact added
+  minutes ago is invisible and its caller is reported as plainly `unknown`. The
+  handle count also moved 1367 → 1365 once the log was replayed, because it
+  carries deletions too: the immutable snapshot was stale in *both* directions.
+  Plain read-only open first, `immutable=1` only as a fallback. (`NoteStore` in
+  `AppleContacts` still uses `immutable=1` for the same files — fine for notes
+  today, but the same latent staleness.)
+- 🛑 **Opening a SQLite file validates nothing.** `sqlite3_open_v2` never reads
+  the header, and sqlite treats a **0- or 1-byte file as a valid empty
+  database** — so a truncated address book looks like "opened, no contacts" and
+  silently reports every caller as unknown. Probe for the expected *schema*.
+- **Contact resolution has three states, not a boolean**: `available`,
+  `noAddressBook` (nothing to read — correct and silent), and `unreadable` (a
+  grant problem). `--unknown` **refuses** in the last case, because with an
+  unreadable address book every caller would match and the whole store would come
+  back looking like an answer. `--json` **omits `known` entirely** there rather
+  than emitting `false`, and sets `contacts_unavailable: true`.
+- **A missing address book is not an error.** Call history still reads; only
+  names go missing.
+
+`--json` keys: `status` (`outgoing`/`incoming`/`missed`), `kind`, `handle`,
+`number`, `duration`, `connected`, `known`, `blocked`, `name`, `contact_id`,
+`location`, plus `call_type` so an unrecognised type is visible rather than
+hidden behind `kind: "unknown"`.
+
 ### reminders — `apple reminders`
 
 Swift + EventKit. Full CRUD. Fork of `keith/reminders-cli` with editing and
@@ -704,10 +804,11 @@ has no reverse lookup and it would mean scanning every group per contact.
 
 ```
 bin/apple                 dispatcher — routes to the tools below
-swift/                    one Swift package, five binaries
+swift/                    one Swift package, six binaries
   Sources/reminders/      + RemindersLibrary/
   Sources/AppleMail/      + MailLibrary/ (Envelope Index reader, .emlx/MIME)
   Sources/AppleMessages/  + MessagesLibrary/ (chat.db reader, typedstream decoder)
+  Sources/ApplePhone/     + PhoneLibrary/ (CallHistory reader, AddressBook resolver)
   Sources/AppleCalendar/
   Sources/AppleContacts/  + Notes.swift (SQLite note reader)
   Tests/RemindersTests/ MailTests/ MessagesTests/
@@ -719,6 +820,7 @@ docs/apple-notes-shortcuts.md  driving Notes' AppIntents from the CLI —
 notes/shortcuts/          .shortcut build scripts + signed files to install
 docs/apple-mail-store.md  Envelope Index schema, .emlx layout, verified traps
 docs/apple-messages-store.md  chat.db schema, the typedstream body, verified traps
+docs/apple-phone-store.md  CallHistory schema, the entitlement walls, verified traps
 docs/prior-art.md         other projects solving this; check before building
 docs/todo-deep-links.md   planned: a `url` on every entity, so anything we
                           name can be opened and cross-linked
@@ -733,11 +835,11 @@ VERSION                   CalVer YY.MMDD.Patch, stamped in by scripts/set-versio
 ## Building
 
 ```
-make build      # swift build -c release → all five binaries
+make build      # swift build -c release → all six binaries
 make install    # symlink dispatcher + tools into ~/bin
 make dev        # debug build, shaded ahead of the installed copy — see below
 make check      # smoke-test that every tool responds
-make test       # Swift unit tests
+make test       # Swift unit tests (mail, messages, phone, reminders — all offline)
 make bump       # next CalVer for today, stamped into every tool
 make dist       # universal release tarball + sha256 for the Homebrew tap
 ```
@@ -809,6 +911,7 @@ Each tool needs a one-time TCC grant, prompted on first run **from a terminal**:
 | calendar | Privacy & Security → Calendars |
 | mail | Full Disk Access to read; Automation → Mail to draft/send |
 | messages | Full Disk Access for the calling terminal (reads chat.db directly) |
+| phone | Full Disk Access for the calling terminal (reads CallHistory + AddressBook) |
 | contacts | Privacy & Security → Contacts |
 | notes | Full Disk Access for the calling terminal (reads sqlite directly) |
 
@@ -819,7 +922,7 @@ status` reports both and counts the tool usable if either is present, so "mail
 ✓" can mean reads work and sending does not. Check the detail line before
 concluding which half is broken.
 
-`apple status` reports all six at once without prompting — start there rather
+`apple status` reports all seven at once without prompting — start there rather
 than running each tool to see which one errors.
 
 If a tool reports an access error, the fix is for the **user** to run it once in
@@ -841,10 +944,19 @@ binary rather than to the terminal that launched it. Practical consequences:
 - An already-working grant skips the re-exec entirely, so this is invisible when
   everything is set up.
 
-`mail`, `messages` and `notes` are *not* covered by this: Automation and Full Disk Access
-are still attributed to the calling terminal, so those two really do depend on
-which terminal is running. This now covers mail's read path too — reading the
-Envelope Index needs Full Disk Access for whatever terminal launched the tool.
+`mail`, `messages`, `phone` and `notes` are *not* covered by this: Automation and
+Full Disk Access are still attributed to the calling terminal, so those four
+really do depend on which terminal is running. This now covers mail's read path
+too — reading the Envelope Index needs Full Disk Access for whatever terminal
+launched the tool.
+
+⚠️ **`phone` cannot ever join the disclaiming group, and this is load-bearing.**
+Disclaiming makes a process its own responsible process, which is exactly what
+Full Disk Access is attributed to — so a disclaiming `apple-phone` would lose the
+terminal's grant and stop being able to read call history at all. That is also
+why it resolves caller names out of the AddressBook SQLite stores rather than
+through `CNContactStore`: taking a Contacts grant would mean disclaiming, and
+disclaiming would break the read the tool exists for.
 
 ⚠️ **macOS only prompts when the status is `notDetermined`.** Once it is anything
 else the request returns silently and no dialog ever appears. The trap is

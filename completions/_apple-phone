@@ -1,0 +1,195 @@
+#compdef apple-phone
+
+__apple-phone_complete() {
+    local -ar non_empty_completions=("${@:#(|:*)}")
+    local -ar empty_completions=("${(M)@:#(|:*)}")
+    _describe -V '' non_empty_completions -- empty_completions -P $'\'\''
+}
+
+__apple-phone_custom_complete() {
+    local -a completions
+    completions=("${(@f)"$("${command_name}" "${@}" "${command_line[@]}")"}")
+    if [[ "${#completions[@]}" -gt 1 ]]; then
+        __apple-phone_complete "${completions[@]:0:-1}"
+    fi
+}
+
+__apple-phone_cursor_index_in_current_word() {
+    if [[ -z "${QIPREFIX}${IPREFIX}${PREFIX}" ]]; then
+        printf 0
+    else
+        printf %s "${#${(z)LBUFFER}[-1]}"
+    fi
+}
+
+_apple-phone() {
+    emulate -RL zsh -G
+    setopt extendedglob nullglob numericglobsort
+    unsetopt aliases banghist
+
+    local -xr SAP_SHELL=zsh
+    local -x SAP_SHELL_VERSION
+    SAP_SHELL_VERSION="$(builtin emulate zsh -c 'printf %s "${ZSH_VERSION}"')"
+    local -r SAP_SHELL_VERSION
+
+    local context state state_descr line
+    local -A opt_args
+
+    local -r command_name="${words[1]}"
+    local -ar command_line=("${words[@]}")
+    local -ir current_word_index="$((CURRENT - 1))"
+
+    local -i ret=1
+    local -ar arg_specs=(
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+        '(-): :->command'
+        '(-)*:: :->arg'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+    case "${state}" in
+    command)
+        local -ar subcommands=(
+            'recents:List recent calls, newest first'
+            'search:Find calls by name, number, or place'
+            'blocked:List blocked callers (read-only)'
+            'stats:Summarise call activity'
+            'dial:Place a call by handing it to Phone.app'
+            'status:Report permission state without requesting it'
+            'help:Show subcommand help information.'
+        )
+        _describe -V subcommand subcommands && ret=0
+        ;;
+    arg)
+        case "${words[1]}" in
+        recents|search|blocked|stats|dial|status|help)
+            "_apple-phone_${words[1]}" && ret=0
+            ;;
+        esac
+        ;;
+    esac
+
+    return "${ret}"
+}
+
+_apple-phone_recents() {
+    local -i ret=1
+    local -ar arg_specs=(
+        '--since[Only calls from the last N days]:since:'
+        '--before[Only calls older than N days]:before:'
+        '--missed[Only calls you missed]'
+        '--incoming[Only calls you received]'
+        '--outgoing[Only calls you placed]'
+        '--unknown[Only callers who are not in Contacts]'
+        '--blocked-only[Only callers on your blocked list]'
+        '--kind[Restrict to phone, facetime-audio, or facetime-video]:kind:'
+        '--handle[Restrict to one number or Apple ID]:handle:'
+        '--limit[Maximum calls to list]:limit:'
+        '--json[Output as JSON]'
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+_apple-phone_search() {
+    local -i ret=1
+    local -ar arg_specs=(
+        ':query:'
+        '--since[Only calls from the last N days]:since:'
+        '--before[Only calls older than N days]:before:'
+        '--missed[Only calls you missed]'
+        '--incoming[Only calls you received]'
+        '--outgoing[Only calls you placed]'
+        '--unknown[Only callers who are not in Contacts]'
+        '--blocked-only[Only callers on your blocked list]'
+        '--kind[Restrict to phone, facetime-audio, or facetime-video]:kind:'
+        '--handle[Restrict to one number or Apple ID]:handle:'
+        '--limit[Maximum results]:limit:'
+        '--json[Output as JSON]'
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+_apple-phone_blocked() {
+    local -i ret=1
+    local -ar arg_specs=(
+        '--json[Output as JSON]'
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+_apple-phone_stats() {
+    local -i ret=1
+    local -ar arg_specs=(
+        '--since[Only calls from the last N days]:since:'
+        '--before[Only calls older than N days]:before:'
+        '--missed[Only calls you missed]'
+        '--incoming[Only calls you received]'
+        '--outgoing[Only calls you placed]'
+        '--unknown[Only callers who are not in Contacts]'
+        '--blocked-only[Only callers on your blocked list]'
+        '--kind[Restrict to phone, facetime-audio, or facetime-video]:kind:'
+        '--handle[Restrict to one number or Apple ID]:handle:'
+        '--json[Output as JSON]'
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+_apple-phone_dial() {
+    local -i ret=1
+    local -ar arg_specs=(
+        ':target:'
+        '--facetime-audio[Place a FaceTime Audio call instead of a phone call]'
+        '--dry-run[Print the URL that would be opened and stop]'
+        '--json[Output as JSON]'
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+_apple-phone_status() {
+    local -i ret=1
+    local -ar arg_specs=(
+        '--json[Output as JSON]'
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+_apple-phone_help() {
+    local -i ret=1
+    local -ar arg_specs=(
+        '*:subcommands:'
+        '--version[Show the version.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+if [[ "${funcstack[1]}" = _apple-phone ]]; then
+    _apple-phone "${@}"
+else
+    compdef _apple-phone apple-phone
+fi
