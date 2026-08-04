@@ -1,8 +1,8 @@
 class AppleTools < Formula
-  desc "Local CLIs for Notes, Mail, Messages, Reminders, Calendar and Contacts"
+  desc "Local CLIs for Notes, Mail, Messages, Phone, Reminders, Calendar, Contacts"
   homepage "https://github.com/danielhopkins/apple-tools"
-  url "https://github.com/danielhopkins/apple-tools/releases/download/v26.803.3/apple-tools-26.803.3.tar.gz"
-  sha256 "3facccb7dba57fb9acb0d3966b104b39f07f17101e5d37865bf0d75c9613cf86"
+  url "https://github.com/danielhopkins/apple-tools/releases/download/v26.804.0/apple-tools-26.804.0.tar.gz"
+  sha256 "03d5a5bb3ae160a8c833a26eb8bd989820991ad88e7f84549866facf898c77c0"
   license "MIT"
 
   depends_on :macos
@@ -15,7 +15,7 @@ class AppleTools < Formula
     bin.install_symlink libexec/"apple-notes"
 
     bin.install "apple", "apple-contacts", "apple-mail", "apple-messages",
-                "apple-calendar", "reminders"
+                "apple-phone", "apple-calendar", "reminders"
 
     doc.install "README.md", "CLAUDE.md", "docs"
 
@@ -61,8 +61,8 @@ class AppleTools < Formula
       in System Settings under their own names. Upgrading this formula
       occasionally asks for a grant again; that is expected, not a fault.
 
-      apple-notes, apple-mail and apple-messages read Apple's SQLite stores
-      directly, which requires Full Disk Access for your terminal app:
+      apple-notes, apple-mail, apple-messages and apple-phone read Apple's
+      SQLite stores directly, which requires Full Disk Access for your terminal:
       System Settings -> Privacy & Security -> Full Disk Access
 
       For apple-mail that covers search, export and accounts — they read Mail's
@@ -72,6 +72,12 @@ class AppleTools < Formula
 
       apple-messages is read-only and needs nothing beyond that Full Disk
       Access; it reads ~/Library/Messages/chat.db and never drives Messages.app.
+
+      apple-phone needs nothing beyond it either, and covers both halves of what
+      it does: the call history store and the address book it resolves callers
+      against. Phone.app is not scriptable at all, so there is no Automation
+      grant to give it. `apple phone dial` hands a tel: URL to Phone.app, which
+      always asks you to confirm before it dials.
 
       apple-contacts also reads that store for contact notes, which the Contacts
       framework cannot expose without an Apple-granted entitlement.
@@ -99,6 +105,7 @@ class AppleTools < Formula
     assert_match version.to_s, shell_output("#{bin}/apple-mail --version")
     assert_match version.to_s, shell_output("#{bin}/apple-calendar --version")
     assert_match version.to_s, shell_output("#{bin}/apple-messages --version")
+    assert_match version.to_s, shell_output("#{bin}/apple-phone --version")
 
     # The dispatcher must find each tool as a sibling in bin.
     assert_match "apple-notes", shell_output("#{bin}/apple --which")
