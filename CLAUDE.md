@@ -698,8 +698,8 @@ apple contacts groups create NAME [--container ID]
 apple contacts groups rename GROUP NEW-NAME
 apple contacts groups delete GROUP
 apple contacts groups members GROUP [--plain]
-apple contacts groups add GROUP CONTACT-ID
-apple contacts groups remove GROUP CONTACT-ID
+apple contacts groups add GROUP CONTACT-ID [--json]
+apple contacts groups remove GROUP CONTACT-ID [--json]
 ```
 
 `GROUP` accepts a group id **or** an unambiguous group name.
@@ -782,6 +782,37 @@ Because the fallback is deprecated API that could eventually stop working, the
 command re-reads the membership afterwards and fails loudly if the contact is
 still in the group rather than trusting either call's return value. Don't report
 a removal as done without that confirmation.
+
+🛑 **Group membership must never be handed a *unified* contact.** This is what
+made `groups add` fail for freshly created contacts with nothing but
+`Save operation could not be completed.`. `unifiedContact(withIdentifier:)`
+returns a synthetic merge of every linked record, and `CNSaveRequest.addMember`
+needs the **container-backed** record — so both `groups add` and `groups remove`
+fetch with `unifyResults = false`.
+
+It presents as intermittent, which is the trap: a brand-new contact is usually
+unlinked, so its unified form is indistinguishable from its backing record and
+the add works. Once macOS links it to another card, the unified contact's
+`identifier` can belong to a *different* linked record, the save is refused, and
+it stays refused — through delete-and-recreate, because the linking happens
+again. So "it worked the first time" is not evidence the path is sound.
+
+⚠️ **`changed` is the field to read on `groups add` / `groups remove`, not the
+exit code.** Both accept `--json` and return
+`{group, contact_id, member, changed}`: `member` is the membership state after
+the call, re-read to confirm it; `changed` says whether *this* invocation did
+it. Adding someone already in the group, or removing someone who was never in
+it, is a no-op the framework accepts silently and both used to report as an
+action. Both also now fail loudly if the save reports success without taking
+effect, rather than trusting the exit code.
+
+⚠️ **A `CNSaveRequest` failure says only "Save operation could not be
+completed."** That is `CNError`'s entire `localizedDescription` for every
+failure mode. Everything diagnostic is in `userInfo` —
+`CNErrorUserInfoKeyPathsKey`, `CNErrorUserInfoAffectedRecordIdentifiersKey`,
+`CNErrorUserInfoValidationErrorsKey`, `NSUnderlyingErrorKey` — so the group
+commands print all of it. If you add a new write path, do the same; the generic
+string alone costs hours.
 
 ⚠️ **Multi-value flags replace, they don't append.** Passing `--email` on `edit`
 replaces *every* existing email on that contact. Read the contact first and

@@ -274,6 +274,77 @@ private func contact(withId id: String) throws -> CNContact {
     }
 }
 
+/// The contact as its container actually stores it, rather than the unified merge.
+///
+/// 🛑 **Group membership must not be given a unified contact.** `unifiedContact`
+/// returns a synthetic merge of every linked record, and `CNSaveRequest`'s
+/// `addMember` needs a contact backed by a real container record — hand it the
+/// merge and the save fails with nothing but
+/// `"Save operation could not be completed."`.
+///
+/// This is why the failure looked intermittent and unrelated to the group. A
+/// freshly created contact is usually unlinked, so its unified form is
+/// indistinguishable from its backing record and the add works. Once macOS links
+/// it to another record, the unified contact's `identifier` can be some *other*
+/// linked record's id, and the membership save is rejected — permanently, and
+/// through delete-and-recreate, because the linking happens again.
+///
+/// `unifyResults = false` is the whole point: it returns the one record whose
+/// identifier was asked for. Falls back to the unified fetch when nothing
+/// matches, so a caller is never worse off than before.
+private func containerContact(withId id: String) throws -> CNContact {
+    let request = CNContactFetchRequest(keysToFetch: readKeys)
+    request.predicate = CNContact.predicateForContacts(withIdentifiers: [id])
+    request.unifyResults = false
+
+    var found: CNContact?
+    do {
+        try store.enumerateContacts(with: request) { candidate, stop in
+            found = candidate
+            stop.pointee = true
+        }
+    } catch {
+        // Enumeration itself failed; the unified path still has a chance.
+        found = nil
+    }
+    if let found { return found }
+    return try contact(withId: id)
+}
+
+/// What actually went wrong in a `CNSaveRequest`.
+///
+/// `CNError`'s `localizedDescription` is the useless
+/// `"Save operation could not be completed."` for every failure mode. Everything
+/// diagnostic lives in `userInfo` — which key paths were rejected, and any
+/// underlying error — so a save failure reports all of it rather than making the
+/// next person reverse-engineer it from behaviour.
+private func saveFailureDetail(_ error: Error) -> String {
+    let nsError = error as NSError
+    var parts = ["\(nsError.localizedDescription) (\(nsError.domain) \(nsError.code))"]
+
+    if let keyPaths = nsError.userInfo[CNErrorUserInfoKeyPathsKey] as? [Any], !keyPaths.isEmpty {
+        parts.append("key paths: \(keyPaths.map { "\($0)" }.joined(separator: ", "))")
+    }
+    if let ids = nsError.userInfo[CNErrorUserInfoAffectedRecordIdentifiersKey] as? [Any],
+        !ids.isEmpty
+    {
+        parts.append("affected ids: \(ids.map { "\($0)" }.joined(separator: ", "))")
+    }
+    if let validation = nsError.userInfo[CNErrorUserInfoValidationErrorsKey] as? [Error],
+        !validation.isEmpty
+    {
+        parts.append(
+            "validation: "
+            + validation.map { ($0 as NSError).localizedDescription }.joined(separator: " | "))
+    }
+    if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
+        parts.append(
+            "underlying: \(underlying.localizedDescription) "
+            + "(\(underlying.domain) \(underlying.code))")
+    }
+    return parts.joined(separator: "; ")
+}
+
 /// Whether a contact is currently in a group.
 /// Whether a contact is currently in a group.
 ///
@@ -990,6 +1061,27 @@ struct GroupInfo: Encodable {
     let count: Int
 }
 
+/// The result of a membership change, for both `add` and `remove`.
+///
+/// Two separate facts, because exiting 0 does not mean anything happened:
+/// `member` is the membership state *after* the call, confirmed by re-reading;
+/// `changed` says whether this invocation is what changed it. Adding someone
+/// already in the group, or removing someone who was never in it, is a no-op the
+/// framework accepts silently — those come back `changed: false`.
+struct GroupMembershipResult: Encodable {
+    let group: String
+    let contactId: String
+    let member: Bool
+    let changed: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case group
+        case contactId = "contact_id"
+        case member
+        case changed
+    }
+}
+
 struct Groups: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "groups",
@@ -1137,15 +1229,59 @@ struct GroupAdd: ParsableCommand {
     @Argument(help: "Contact id, from `search --json`")
     var contactId: String
 
+    @Flag(name: .long, help: "Output as JSON")
+    var json = false
+
     func run() throws {
         try requireContactsAccess()
         let target = try resolveGroup(group)
-        let member = try contact(withId: contactId)
+        // The container-backed record, never the unified merge — see
+        // `containerContact` for why handing a unified contact to `addMember`
+        // fails with a bare "Save operation could not be completed."
+        let member = try containerContact(withId: contactId)
+
+        // Adding someone who is already in the group is a no-op the framework
+        // accepts silently. Say so rather than reporting an addition that did
+        // not happen.
+        if isMember(member.identifier, of: target.identifier) {
+            if json {
+                printJSON(
+                    GroupMembershipResult(
+                        group: target.name, contactId: member.identifier, member: true,
+                        changed: false))
+            } else {
+                print("'\(displayName(member))' is already in '\(target.name)'. Nothing to do.")
+            }
+            return
+        }
 
         let request = CNSaveRequest()
         request.addMember(member, to: target)
-        try store.execute(request)
-        print("Added '\(displayName(member))' to '\(target.name)'")
+        do {
+            try store.execute(request)
+        } catch {
+            throw ValidationError(
+                "could not add '\(displayName(member))' to '\(target.name)': "
+                + saveFailureDetail(error))
+        }
+
+        // This whole family of calls has a history of reporting success while
+        // doing nothing, so confirm rather than trusting the exit code — the same
+        // rule `groups remove` already follows.
+        guard isMember(member.identifier, of: target.identifier) else {
+            throw ValidationError(
+                "the save reported success but '\(displayName(member))' is not in "
+                + "'\(target.name)'. Nothing was changed.")
+        }
+
+        if json {
+            printJSON(
+                GroupMembershipResult(
+                    group: target.name, contactId: member.identifier, member: true,
+                    changed: true))
+        } else {
+            print("Added '\(displayName(member))' to '\(target.name)'")
+        }
     }
 }
 
@@ -1159,10 +1295,32 @@ struct GroupRemove: ParsableCommand {
     @Argument(help: "Contact id, from `search --json`")
     var contactId: String
 
+    @Flag(name: .long, help: "Output as JSON")
+    var json = false
+
     func run() throws {
         try requireContactsAccess()
         let target = try resolveGroup(group)
-        let member = try contact(withId: contactId)
+        // Container-backed, for the same reason as `add`: a unified contact is
+        // the wrong object to hand a membership change, and its `identifier` may
+        // not even be the id that was asked for — which would make the
+        // `isMember` checks below silently answer about a different record.
+        let member = try containerContact(withId: contactId)
+
+        // Removing someone who was never in the group would otherwise run the
+        // whole fallback dance and then report "Removed", which is a no-op
+        // dressed up as an action — the mirror of the bug `add` had.
+        guard isMember(member.identifier, of: target.identifier) else {
+            if json {
+                printJSON(
+                    GroupMembershipResult(
+                        group: target.name, contactId: member.identifier, member: false,
+                        changed: false))
+            } else {
+                print("'\(displayName(member))' is not in '\(target.name)'. Nothing to do.")
+            }
+            return
+        }
 
         // The framework first — it works, but only for some containers.
         // `CNSaveRequest.removeMember` saves without error and changes nothing
@@ -1186,6 +1344,13 @@ struct GroupRemove: ParsableCommand {
             throw ValidationError(
                 "'\(displayName(member))' is still a member of '\(target.name)'. "
                 + "Nothing was changed.")
+        }
+        if json {
+            printJSON(
+                GroupMembershipResult(
+                    group: target.name, contactId: member.identifier, member: false,
+                    changed: true))
+            return
         }
         print("Removed '\(displayName(member))' from '\(target.name)'. The contact was not deleted.")
     }
