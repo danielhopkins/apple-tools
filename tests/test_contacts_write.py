@@ -279,6 +279,90 @@ class Groups(LiveContactsTest):
         self.assertIn(contact["id"], [m["id"] for m in members])
         self.assertEqual(group["name"], self.group_name("ByName"))
 
+    def test_adding_a_freshly_created_contact_works_repeatedly(self):
+        """The reported bug: a contact from `add` could not join an iCloud group.
+
+        `groups add` fetched its contact with `unifiedContact(withIdentifier:)`,
+        and `CNSaveRequest.addMember` rejects a unified contact — it needs the
+        container-backed record. The failure was
+        `Save operation could not be completed.` and nothing else.
+
+        It looked intermittent because a brand-new contact is usually unlinked,
+        so its unified form is indistinguishable from its backing record and the
+        add succeeds. Once macOS links it, the unified contact's identifier can
+        belong to a *different* linked record and the save is refused. The
+        original report saw the first contact of a session succeed and every one
+        after it fail, so this runs the whole cycle twice — the second iteration
+        is the one that reproduced it.
+        """
+        group = self.create_group("FreshMembers")
+
+        for attempt in range(2):
+            contact = self.add(f"Fresh{attempt}")
+
+            result = run_json("groups", "add", group["id"], contact["id"], "--json")
+            self.assertTrue(
+                result["changed"],
+                f"attempt {attempt}: add reported no change: {result}")
+            self.assertTrue(result["member"], f"attempt {attempt}: {result}")
+
+            # Confirm through a separate read, not the command's own word.
+            members = run_json("groups", "members", group["id"])
+            self.assertIn(
+                contact["id"], [m["id"] for m in members],
+                f"attempt {attempt}: contact is not in the group after a successful add")
+
+            # The report's sequence: remove and delete before the next round,
+            # since that ordering immediately preceded the first failure.
+            run("groups", "remove", group["id"], contact["id"])
+            run("delete", contact["id"])
+
+    def test_adding_an_existing_member_reports_no_change(self):
+        """Exiting 0 is not the same as having done something.
+
+        The framework accepts a duplicate add silently, and the command used to
+        print "Added ..." for it — a no-op dressed up as an action.
+        """
+        group = self.create_group("Duplicate")
+        contact = self.add("Twice")
+
+        first = run_json("groups", "add", group["id"], contact["id"], "--json")
+        self.assertTrue(first["changed"])
+
+        second = run_json("groups", "add", group["id"], contact["id"], "--json")
+        self.assertFalse(second["changed"], f"a repeat add claimed to change something: {second}")
+        self.assertTrue(second["member"])
+
+        # And it really is in there exactly once.
+        members = run_json("groups", "members", group["id"])
+        self.assertEqual([m["id"] for m in members].count(contact["id"]), 1)
+
+    def test_removing_a_non_member_reports_no_change(self):
+        """The mirror of the above, which had the same flaw."""
+        group = self.create_group("NeverJoined")
+        contact = self.add("Outsider")
+
+        result = run_json("groups", "remove", group["id"], contact["id"], "--json")
+        self.assertFalse(result["changed"], f"removing a non-member claimed a change: {result}")
+        self.assertFalse(result["member"])
+        self.assertTrue(self.exists(contact["id"]))
+
+    def test_membership_commands_accept_json(self):
+        """`--json` is the documented contract for anything parsed, and these
+        two commands used to reject it outright."""
+        group = self.create_group("JsonShape")
+        contact = self.add("Shaped")
+
+        added = run_json("groups", "add", group["id"], contact["id"], "--json")
+        self.assertEqual(
+            set(added), {"group", "contact_id", "member", "changed"}, f"unexpected shape: {added}")
+        self.assertEqual(added["contact_id"], contact["id"])
+        self.assertEqual(added["group"], self.group_name("JsonShape"))
+
+        removed = run_json("groups", "remove", group["id"], contact["id"], "--json")
+        self.assertEqual(set(removed), {"group", "contact_id", "member", "changed"})
+        self.assertFalse(removed["member"])
+
     def test_get_reports_group_membership(self):
         group = self.create_group("Reported")
         contact = self.add("Reportee")

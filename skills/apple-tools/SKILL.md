@@ -321,6 +321,12 @@ id or an unambiguous name. Deleting a group does not delete its contacts, and
 removing a member does not either — say so if the user seems to expect otherwise.
 Only `get` reports a contact's group membership; `search` and `list` omit it.
 
+Both take `--json` and return `{group, contact_id, member, changed}`. **Read
+`changed`, not the exit code**: `member` is the membership state afterwards
+(re-read to confirm), while `changed` says whether this call did it. Adding
+someone already in the group, or removing someone who was never in it, exits 0
+with `changed: false` — so don't report an addition that did not happen.
+
 **Contact notes cannot be written.** They are readable, but writing needs an
 Apple-granted entitlement no CLI can hold, so `--note` is rejected. Tell the user
 to edit the note in Contacts.app rather than trying another route.
@@ -344,11 +350,11 @@ grant works from any terminal, `terminal` means it may not.
   the calling terminal. Contacts needs its own grant, plus Full Disk Access if
   you want contact notes.
 - Mail needs Automation access and Mail.app running.
-- `apple contacts groups remove` needs no extra permission. The Contacts
+- `apple contacts groups add` / `remove` need no extra permission. The Contacts
   framework's remove-member call silently does nothing for an iCloud group (it
-  works for a local "On My Mac" one), so the command falls back to the legacy
-  AddressBook framework, which does work. It always confirms the removal before
-  reporting success, so trust its result rather than re-checking yourself.
+  works for a local "On My Mac" one), so `remove` falls back to the legacy
+  AddressBook framework, which does work. Both confirm the change by re-reading
+  before reporting success, so trust the result rather than re-checking yourself.
 
 Reminders, Calendar and Contacts hold their **own** grants, independent of the
 terminal — they re-execute themselves so macOS attributes the request to the
