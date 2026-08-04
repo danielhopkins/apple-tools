@@ -21,7 +21,7 @@ TARBALL     := $(DIST).tar.gz
 # them costs nothing, and messages reads chat.db under the same Full Disk
 # Access grant. Override to work on one of the others:
 #   make dev DEV_TOOLS="apple-contacts"
-DEV_TOOLS ?= apple-mail apple-notes apple-messages
+DEV_TOOLS ?= apple-mail apple-notes apple-messages apple-phone
 DEVBIN    := $(ROOT)/.dev-bin
 
 .PHONY: build debug install uninstall test clean check set-version bump dist tag \
@@ -46,7 +46,7 @@ debug:
 ## Generate zsh completions for the ArgumentParser tools into completions/
 ## (_apple, _apple-notes and _apple-contacts are hand-written and committed)
 completions: build
-	@for tool in reminders apple-mail apple-calendar apple-contacts apple-messages; do \
+	@for tool in reminders apple-mail apple-calendar apple-contacts apple-messages apple-phone; do \
 		$(RELEASE_DIR)/$$tool --generate-completion-script zsh > completions/_$$tool \
 			&& echo "  completions/_$$tool"; \
 	done
@@ -105,6 +105,7 @@ install: build
 	ln -sf $(ROOT)/$(RELEASE_DIR)/apple-contacts $(PREFIX)/apple-contacts
 	ln -sf $(ROOT)/$(RELEASE_DIR)/apple-mail $(PREFIX)/apple-mail
 	ln -sf $(ROOT)/$(RELEASE_DIR)/apple-messages $(PREFIX)/apple-messages
+	ln -sf $(ROOT)/$(RELEASE_DIR)/apple-phone $(PREFIX)/apple-phone
 	ln -sf $(ROOT)/$(RELEASE_DIR)/apple-calendar $(PREFIX)/apple-calendar
 	ln -sf $(ROOT)/$(RELEASE_DIR)/reminders $(PREFIX)/reminders
 	@echo "Installed to $(PREFIX). Ensure it is on your PATH."
@@ -112,7 +113,7 @@ install: build
 uninstall:
 	rm -f $(PREFIX)/apple $(PREFIX)/apple-notes $(PREFIX)/apple-contacts \
 	      $(PREFIX)/apple-mail $(PREFIX)/apple-calendar $(PREFIX)/reminders \
-	      $(PREFIX)/apple-messages
+	      $(PREFIX)/apple-messages $(PREFIX)/apple-phone
 
 ## Build debug and shade the installed tools with it, for fast iteration.
 ##
@@ -139,7 +140,7 @@ dev: debug
 	done
 	@# Everything not being worked on points at the installed copy, so
 	@# `apple status` stays truthful and no grant gets re-prompted.
-	@for name in apple-notes apple-mail apple-calendar apple-contacts apple-messages reminders; do \
+	@for name in apple-notes apple-mail apple-calendar apple-contacts apple-messages apple-phone reminders; do \
 		case " $(DEV_TOOLS) " in *" $$name "*) continue ;; esac; \
 		if installed="$$(command -v $$name 2>/dev/null)"; then \
 			ln -sf "$$installed" "$(DEVBIN)/$$name"; \
@@ -169,7 +170,7 @@ test:
 check: debug
 	@bin/apple --which
 	@echo
-	@for tool in notes mail messages reminders calendar contacts; do \
+	@for tool in notes mail messages phone reminders calendar contacts; do \
 		printf '%-10s ' "$$tool"; \
 		bin/apple $$tool --help >/dev/null 2>&1 && echo ok || echo FAILED; \
 	done
@@ -204,6 +205,7 @@ dist: set-version completions
 	   "$$(cd $(SWIFT_DIR) && swift build $(SWIFT_UNIV) --show-bin-path)"/apple-calendar \
 	   "$$(cd $(SWIFT_DIR) && swift build $(SWIFT_UNIV) --show-bin-path)"/apple-contacts \
 	   "$$(cd $(SWIFT_DIR) && swift build $(SWIFT_UNIV) --show-bin-path)"/apple-messages \
+	   "$$(cd $(SWIFT_DIR) && swift build $(SWIFT_UNIV) --show-bin-path)"/apple-phone \
 	   $(DIST)/
 	cp bin/apple $(DIST)/
 	cp notes/apple-notes notes/notestore.py notes/notestore.proto $(DIST)/
@@ -231,7 +233,7 @@ dist: set-version completions
 			|| { echo "error: $$b has no bound Info.plist"; exit 1; }; \
 	done
 	@# Confirm the binaries really are universal before shipping them.
-	@for b in reminders apple-mail apple-calendar apple-contacts apple-messages; do \
+	@for b in reminders apple-mail apple-calendar apple-contacts apple-messages apple-phone; do \
 		archs="$$(lipo -archs $(DIST)/$$b)"; \
 		case "$$archs" in \
 			*arm64*) ;; \

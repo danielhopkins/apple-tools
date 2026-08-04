@@ -107,13 +107,14 @@ Homebrew installs these automatically.
 
 ## Usage
 
-One dispatcher fronts all six tools:
+One dispatcher fronts all seven tools:
 
 ```
 apple notes search "budget" --json
 apple mail search "invoice" --json
 apple mail search "budget" --field content --json      # full-text over bodies
 apple messages search "dinner" --since 30 --json       # whole chat history
+apple phone recents --missed --since 7                 # who called while I was out
 apple reminders show-all --due-date today --include-overdue
 apple calendar add "Dentist" --start "tomorrow 2pm" --duration 45
 apple contacts search "smith"
@@ -121,7 +122,8 @@ apple contacts export --group "Family" -o family.vcf
 ```
 
 Each is also installed under its own name (`apple-notes`, `apple-mail`,
-`apple-messages`, `reminders`, `apple-calendar`, `apple-contacts`). Run `apple <tool> --help` for
+`apple-messages`, `apple-phone`, `reminders`, `apple-calendar`, `apple-contacts`). Run
+`apple <tool> --help` for
 full options, or `apple --which` to see what resolves where.
 
 `apple status` reports every tool's permission state in one table, never
@@ -155,6 +157,7 @@ isn't guaranteed; JSON is.
 | `notes` | `NoteStore.sqlite` + protobuf | Search titles, list folders, export notes as Markdown, deep links. Read-only. |
 | `mail` | `Envelope Index` + `.emlx` (reads), AppleScript (writes) | Search by subject, sender, or full body text with date and flag filters; export a message; draft and send. |
 | `messages` | `chat.db` | Search and export iMessage/SMS/RCS history, list conversations, save attachments. Read-only. |
+| `phone` | `CallHistory.storedata` + AddressBook | Recent calls with callers resolved to names, missed/unknown filters, talk-time stats, blocked list. Read-only apart from `dial`, which hands a `tel:` URL to Phone.app for you to confirm. |
 | `reminders` | EventKit | Full CRUD: add, edit, complete, delete, lists, priorities, recurrence, natural-language dates. |
 | `calendar` | EventKit | List and search events, create, edit, delete; recurring-event spans. |
 | `contacts` | Contacts framework | Search by name, company, email, or phone; create, edit, delete. Notes are read-only. |
@@ -218,10 +221,13 @@ plist into `__TEXT,__info_plist` at link time — and `make build` re-signs
 afterwards, because macOS ignores a plist that isn't covered by the signature.
 `make dist` verifies the binding and fails the build if it is missing.
 
-`apple-mail`, `apple-messages` and `apple-notes` are the exceptions, and all
-three are attributed to the calling terminal rather than the binary.
-`apple-notes` and `apple-messages` need Full Disk Access — they read
-`NoteStore.sqlite` and `chat.db` directly. `apple-mail` needs Full Disk Access
+`apple-mail`, `apple-messages`, `apple-phone` and `apple-notes` are the
+exceptions, and all four are attributed to the calling terminal rather than the
+binary. `apple-notes`, `apple-messages` and `apple-phone` need Full Disk Access —
+they read `NoteStore.sqlite`, `chat.db` and `CallHistory.storedata` directly.
+`apple-phone` in particular *cannot* be made to disclaim: doing so would make it
+its own responsible process and lose the terminal's Full Disk Access, which is
+the grant it depends on. `apple-mail` needs Full Disk Access
 to read (search, export, accounts) and Automation → Mail to write (draft, send)
 — two grants for two halves, and `apple mail status` reports them separately.
 
@@ -229,7 +235,7 @@ to read (search, export, accounts) and Automation → Mail to write (draft, send
 
 ```
 bin/apple        dispatcher
-swift/           one Swift package → reminders, apple-mail, apple-messages,
+swift/           one Swift package → reminders, apple-mail, apple-messages, apple-phone,
                  apple-calendar, apple-contacts
 notes/           Python: apple-notes, notestore.py decoder, live Notes.app tests
 skills/          Claude skills (apple-tools, daily-brief, meeting-prep, inbox-triage)

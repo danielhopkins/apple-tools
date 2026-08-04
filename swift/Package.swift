@@ -12,6 +12,7 @@ let package = Package(
         .executable(name: "apple-calendar", targets: ["apple-calendar"]),
         .executable(name: "apple-contacts", targets: ["apple-contacts"]),
         .executable(name: "apple-messages", targets: ["apple-messages"]),
+        .executable(name: "apple-phone", targets: ["apple-phone"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.3.1"),
@@ -138,9 +139,34 @@ let package = Package(
             ],
             path: "Sources/AppleMessages"
         ),
+        .target(
+            name: "PhoneLibrary",
+            dependencies: ["AppleToolsSearch"],
+            linkerSettings: [
+                // CallHistory.storedata is a Core Data SQLite store, read
+                // directly the same way MessagesLibrary reads chat.db. Phone.app
+                // has no scripting dictionary at all, so unlike mail there is no
+                // AppleScript path to fall back to.
+                .linkedLibrary("sqlite3"),
+            ]
+        ),
+        .executableTarget(
+            name: "apple-phone",
+            dependencies: [
+                "AppleToolsVersion",
+                "AppleToolsStyle",
+                "PhoneLibrary",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "Sources/ApplePhone"
+        ),
         .testTarget(
             name: "MailTests",
             dependencies: ["MailLibrary", "AppleToolsSearch"]
+        ),
+        .testTarget(
+            name: "PhoneTests",
+            dependencies: ["PhoneLibrary"]
         ),
         .testTarget(
             name: "MessagesTests",
