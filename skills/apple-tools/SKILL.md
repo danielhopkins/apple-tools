@@ -105,6 +105,7 @@ apple contacts edit <id> --relation "daughter:Margot Hopkins"
 apple contacts edit <id> --birthday 1980-04-12 --date "death:2020-05-01"
 apple contacts groups                          # list groups with counts
 apple contacts groups add "Family" <contact-id>
+apple contacts containers --json               # accounts; which is default
 ```
 
 ## Writing notes
@@ -326,6 +327,14 @@ Both take `--json` and return `{group, contact_id, member, changed}`. **Read
 (re-read to confirm), while `changed` says whether this call did it. Adding
 someone already in the group, or removing someone who was never in it, exits 0
 with `changed: false` — so don't report an addition that did not happen.
+
+🛑 **A contact can only join a group in its own account.** If `groups add` fails
+saying the two are in different accounts, the contact is in the wrong container
+and no retry will help — **there is no move API**. Create it in the group's
+account instead (`apple contacts add --container "<id from containers>"`), or
+tell the user to drag the card between accounts in Contacts.app. `add` reports
+which container it used, and `get`/`groups` report theirs, so you can check
+before writing rather than after failing.
 
 **Contact notes cannot be written.** They are readable, but writing needs an
 Apple-granted entitlement no CLI can hold, so `--note` is rejected. Tell the user
