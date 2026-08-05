@@ -108,6 +108,57 @@ def run_json(*args):
     return json.loads(out)
 
 
+def _contacts_applescript(script):
+    """Run a snippet against Contacts.app, or return None if that is not on.
+
+    ⚠️ **The only dependency in this suite that is not the tool itself.** It
+    launches Contacts.app and needs Automation → Contacts for whichever terminal
+    is running the tests, so callers skip rather than fail when it returns None.
+    """
+    try:
+        proc = subprocess.run(
+            ["osascript", "-e", f'tell application "Contacts"\n{script}\nend tell'],
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip()
+
+
+def set_note(contact_id, text):
+    """Put a note on a fixture contact. True if it took.
+
+    apple-contacts cannot do this and never will — writing a note needs the
+    com.apple.developer.contacts.notes entitlement — but a note is exactly what
+    stops CNContactStore saving anything *else* about a contact, so the
+    regression for that needs one. AppleScript is not subject to the
+    entitlement, which is how the bug was originally reproduced.
+    """
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    result = _contacts_applescript(
+        f'set p to first person whose id is "{contact_id}"\n'
+        f'set note of p to "{escaped}"\n'
+        "save"
+    )
+    return result is not None
+
+
+def note_of(contact_id):
+    """The note Contacts.app holds, read back the same way it was written.
+
+    Not `get --json`: that reads the AddressBook SQLite store, which lags a
+    write made through another process, so it would make this flaky for a
+    reason that has nothing to do with what is being tested.
+    """
+    return _contacts_applescript(
+        f'return note of (first person whose id is "{contact_id}")'
+    )
+
+
 def access_granted():
     """True when this binary can actually read contacts."""
     code, out, _ = run("status", "--json", check=False)

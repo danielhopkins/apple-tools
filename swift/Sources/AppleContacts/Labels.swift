@@ -12,23 +12,40 @@ enum Labels {
         "\(openWrapper)\(name)\(closeWrapper)"
     }
 
+    /// The handful of built-in labels Contacts stores *unwrapped*.
+    ///
+    /// Everything else Apple defines arrives as `_$!<Home>!$_`, which is what
+    /// tells a built-in label apart from one the user typed. These three are
+    /// bare strings and so are indistinguishable from a custom label except by
+    /// being on this list.
+    private static let bareBuiltInLabels: Set<String> = [
+        CNLabelEmailiCloud,            // "iCloud"
+        CNLabelPhoneNumberiPhone,      // "iPhone"
+        CNLabelPhoneNumberAppleWatch,  // "Apple Watch"
+    ]
+
     /// `_$!<Father>!$_` -> "father"; a custom label is returned as written.
     ///
-    /// `CNLabeledValue.localizedString(forLabel:)` handles the labels Apple
-    /// knows about, but returns unrecognised wrapped labels verbatim, so strip
-    /// the wrapper by hand as a fallback.
+    /// ⚠️ **A custom label keeps its case.** Contacts stores a label the user
+    /// invented verbatim — "LinkedIn", not "linkedin" — and lowercasing it here
+    /// made `get` → `edit` → `get` lossy: re-passing exactly what was read wrote
+    /// back a different label than the one that had been there. Only built-in
+    /// labels are normalised, because their friendly spelling is ours to choose.
     static func decode(_ raw: String?) -> String? {
         guard let raw, !raw.isEmpty else { return nil }
 
+        let wrapped = raw.hasPrefix(openWrapper) && raw.hasSuffix(closeWrapper)
+        guard wrapped || bareBuiltInLabels.contains(raw) else { return raw }
+
+        // `CNLabeledValue.localizedString(forLabel:)` handles the labels Apple
+        // knows about, but returns unrecognised wrapped labels verbatim, so
+        // strip the wrapper by hand as a fallback.
         let localized = CNLabeledValue<NSString>.localizedString(forLabel: raw)
         if !localized.hasPrefix(openWrapper) {
             return localized.lowercased()
         }
-        if raw.hasPrefix(openWrapper), raw.hasSuffix(closeWrapper) {
-            return String(raw.dropFirst(openWrapper.count).dropLast(closeWrapper.count))
-                .lowercased()
-        }
-        return raw
+        return String(raw.dropFirst(openWrapper.count).dropLast(closeWrapper.count))
+            .lowercased()
     }
 
     /// "younger-sister", "younger sister" and "youngerSister" all normalise to
@@ -49,12 +66,33 @@ enum Labels {
         "other": CNLabelOther, "mobile": CNLabelPhoneNumberMobile,
         "iphone": CNLabelPhoneNumberiPhone, "main": CNLabelPhoneNumberMain,
         "homefax": CNLabelPhoneNumberHomeFax, "workfax": CNLabelPhoneNumberWorkFax,
-        "pager": CNLabelPhoneNumberPager,
+        "otherfax": CNLabelPhoneNumberOtherFax, "pager": CNLabelPhoneNumberPager,
+        "applewatch": CNLabelPhoneNumberAppleWatch,
     ]
 
-    static func email(_ name: String) -> String? { emailLabels[normalize(name)] }
-    static func phone(_ name: String) -> String? { phoneLabels[normalize(name)] }
-    static func url(_ name: String) -> String? { emailLabels[normalize(name)] }
+    /// URLs have their own vocabulary — `homepage`, and none of email's
+    /// `icloud`. This used to be `emailLabels`, a copy-paste that accepted a
+    /// label URLs do not have and rejected the one they do.
+    private static let urlLabels: [String: String] = [
+        "home": CNLabelHome, "work": CNLabelWork, "school": CNLabelSchool,
+        "other": CNLabelOther, "homepage": CNLabelURLAddressHomePage,
+    ]
+
+    /// A name Contacts knows becomes its constant; anything else is kept
+    /// verbatim, as the custom label it is.
+    ///
+    /// 🛑 These used to return `Optional`, and the call sites used `flatMap`, so
+    /// an unrecognised label was **silently dropped** and the value written
+    /// unlabelled with a zero exit code. Re-passing what `get` had just printed
+    /// therefore destroyed the label — the documented "read it first, re-pass
+    /// what you want to keep" workflow could not round-trip its own output.
+    ///
+    /// Contacts stores a label the user invented as a plain string, which is
+    /// what `relation` and `date` below have always done, so there was never a
+    /// reason to refuse one here.
+    static func email(_ name: String) -> String { emailLabels[normalize(name)] ?? name }
+    static func phone(_ name: String) -> String { phoneLabels[normalize(name)] ?? name }
+    static func url(_ name: String) -> String { urlLabels[normalize(name)] ?? name }
 
     /// Relations resolve against the generated SDK vocabulary. Anything else is
     /// kept as a plain custom label, which is exactly how Contacts.app stores a

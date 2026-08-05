@@ -17,8 +17,10 @@ from contacts_harness import (
     LiveContactsTest,
     find_test_contacts,
     find_test_groups,
+    note_of,
     run,
     run_json,
+    set_note,
 )
 
 
@@ -196,6 +198,107 @@ class MultiValueFields(LiveContactsTest):
                          {"mobile": "+15555550123"})
         self.assertEqual(self.labelled(fetched["emails"], "address"),
                          {"home": "b@example.invalid"})
+
+
+class LabelsAndSchemes(LiveContactsTest):
+    """The label and value parsing that used to damage data on write.
+
+    All three of these exited 0 while storing something other than the input,
+    which is the worst way for an address-book tool to be wrong.
+    """
+
+    def urls_of(self, contact_id):
+        return [(u.get("label"), u["url"]) for u in self.get(contact_id).get("urls", [])]
+
+    def test_a_bare_url_keeps_its_scheme(self):
+        """`https` is a scheme, not a label — cutting on the first colon ate it."""
+        created = self.add("Scheme", "--url", "https://www.example.invalid/in/alice")
+        self.assertEqual(
+            self.urls_of(created["id"]),
+            [(None, "https://www.example.invalid/in/alice")])
+
+    def test_schemes_without_slashes_survive_too(self):
+        """`mailto:` and `tel:` have no `//` to give them away."""
+        created = self.add(
+            "Schemeless",
+            "--email", "mailto:a@example.invalid",
+            "--phone", "tel:+15555550123",
+        )
+        fetched = self.get(created["id"])
+        self.assertEqual(fetched["emails"][0]["address"], "mailto:a@example.invalid")
+        self.assertEqual(fetched["phones"][0]["number"], "tel:+15555550123")
+
+    def test_a_label_that_looks_like_a_scheme_still_labels(self):
+        """Only `scheme://` and the schemeless list are exempt, not every word."""
+        created = self.add("Labelled", "--url", "work:https://example.invalid")
+        self.assertEqual(self.urls_of(created["id"]), [("work", "https://example.invalid")])
+
+    def test_custom_labels_are_written_not_dropped(self):
+        """`work`/`home`/`other` used to be the only labels that survived."""
+        created = self.add(
+            "Custom",
+            "--url", "url:https://a.example.invalid",
+            "--url", "instagram:https://b.example.invalid",
+            "--email", "newsletter:c@example.invalid",
+            "--phone", "cabin:+15555550124",
+        )
+        fetched = self.get(created["id"])
+        self.assertEqual(
+            self.labelled(fetched["urls"], "url"),
+            {"url": "https://a.example.invalid", "instagram": "https://b.example.invalid"})
+        self.assertEqual(self.labelled(fetched["emails"], "address"),
+                         {"newsletter": "c@example.invalid"})
+        self.assertEqual(self.labelled(fetched["phones"], "number"),
+                         {"cabin": "+15555550124"})
+
+    def test_custom_label_case_is_preserved(self):
+        """Contacts stores what the user typed; lowercasing it broke round trips."""
+        created = self.add("Case", "--url", "LinkedIn:https://example.invalid/in/x")
+        self.assertEqual(self.urls_of(created["id"]),
+                         [("LinkedIn", "https://example.invalid/in/x")])
+
+    def test_urls_take_homepage_rather_than_icloud(self):
+        """`url()` looked up the *email* table: it had icloud and no homepage."""
+        created = self.add("HomePage", "--url", "homepage:https://example.invalid")
+        self.assertEqual(self.urls_of(created["id"]), [("homepage", "https://example.invalid")])
+
+    def test_read_then_repass_is_a_no_op(self):
+        """The whole class of bug in one assertion.
+
+        The docs tell you to read a contact and re-pass what you want to keep,
+        because the multi-value flags replace rather than append. That is only
+        safe if re-passing exactly what `get` printed reproduces it.
+        """
+        created = self.add(
+            "RoundTrip",
+            "--url", "https://bare.example.invalid",
+            "--url", "LinkedIn:https://example.invalid/in/x",
+            "--url", "url:https://plain.example.invalid",
+            "--email", "work:a@example.invalid",
+            "--email", "Personal:b@example.invalid",
+            "--email", "mailto:c@example.invalid",
+            "--phone", "mobile:+15555550123",
+            "--phone", "Cabin:+15555550124",
+        )
+        before = self.get(created["id"])
+
+        args = []
+        for entry in before["emails"]:
+            args += ["--email", self.rejoin(entry, "address")]
+        for entry in before["phones"]:
+            args += ["--phone", self.rejoin(entry, "number")]
+        for entry in before["urls"]:
+            args += ["--url", self.rejoin(entry, "url")]
+        self.edit(created["id"], *args)
+
+        after = self.get(created["id"])
+        for key in ("emails", "phones", "urls"):
+            self.assertEqual(before[key], after[key], f"{key} did not round-trip")
+
+    def rejoin(self, entry, key):
+        """Turn one `get` entry back into the flag value that produced it."""
+        label = entry.get("label")
+        return f"{label}:{entry[key]}" if label else entry[key]
 
 
 class Search(LiveContactsTest):
@@ -637,6 +740,90 @@ class Deletion(LiveContactsTest):
         code, _, err = run("delete", "not-a-real-id:ABPerson", check=False)
         self.assertNotEqual(code, 0)
         self.assertTrue(err.strip())
+
+
+class NoteBearingContacts(GroupFixtures):
+    """Writes to a contact that carries a note.
+
+    🛑 A note makes `CNContactStore` refuse *every* save on that contact, not
+    just one touching the note: the save faults the record, faulting reads the
+    note, and reading it needs an entitlement no CLI can hold. 52 of 669
+    contacts on the machine this was found on carry one, so ~8% of a real
+    address book was uneditable and un-groupable, with a raw CoreData dump as
+    the only explanation.
+
+    Every test here needs Contacts.app automation to plant the note, and skips
+    without it — see contacts_harness.set_note.
+    """
+
+    NOTE = "regression fixture note"
+
+    def noted(self, last, *extra):
+        created = self.add(last, *extra)
+        if not set_note(created["id"], self.NOTE):
+            self.skipTest(
+                "could not set a note through Contacts.app; this suite needs "
+                "Automation → Contacts for the terminal running it")
+        return created
+
+    def test_an_ordinary_edit_succeeds(self):
+        created = self.noted("Noted", "--company", "Before")
+        self.edit(created["id"], "--company", "After")
+        self.assertEqual(self.get(created["id"])["company"], "After")
+
+    def test_no_raw_coredata_dump_reaches_stderr(self):
+        """The fault is handled, so its framework log should not be output."""
+        created = self.noted("Quiet")
+        _, _, err = run("edit", created["id"], "--company", "Acme")
+        self.assertNotIn("CoreData", err)
+
+    def test_every_field_survives_the_fallback(self):
+        """The fallback is a different framework, so it needs the full sweep."""
+        created = self.noted("Fallback")
+        self.edit(
+            created["id"],
+            "--nickname", "Nick",
+            "--job-title", "Principal",
+            "--url", "LinkedIn:https://example.invalid/in/x",
+            "--url", "https://bare.example.invalid",
+            "--email", "work:a@example.invalid",
+            "--phone", "cabin:+15555550124",
+            "--relation", "father:Robert Test",
+            "--birthday=--04-13",
+            "--date", "death:2020-05-01",
+        )
+        fetched = self.get(created["id"])
+        self.assertEqual(fetched["nickname"], "Nick")
+        self.assertEqual(fetched["job_title"], "Principal")
+        # A year-less birthday is why the fallback writes the *Components*
+        # property; AddressBook's plain birthday is an NSDate and cannot hold one.
+        self.assertEqual(fetched["birthday"], "--04-13")
+        self.assertEqual(self.labelled(fetched["dates"], "date"), {"death": "2020-05-01"})
+        self.assertEqual(self.labelled(fetched["relations"], "name"), {"father": "Robert Test"})
+        self.assertEqual(self.labelled(fetched["emails"], "address"), {"work": "a@example.invalid"})
+        self.assertEqual(self.labelled(fetched["phones"], "number"), {"cabin": "+15555550124"})
+        self.assertEqual(
+            [(u.get("label"), u["url"]) for u in fetched["urls"]],
+            [("LinkedIn", "https://example.invalid/in/x"), (None, "https://bare.example.invalid")])
+
+    def test_the_note_is_left_alone(self):
+        """The fallback must not become a way to lose the note it works around."""
+        created = self.noted("Kept")
+        self.edit(created["id"], "--company", "Acme")
+        self.assertEqual(note_of(created["id"]), self.NOTE)
+
+    def test_group_membership_works_both_ways(self):
+        """`addMember` faults the contact too, so it hit the same wall."""
+        group = self.create_group("NoteGroup")
+        created = self.noted("Grouped")
+
+        added = run_json("groups", "add", group["id"], created["id"], "--json")
+        self.assertTrue(added["member"])
+        self.assertTrue(added["changed"])
+
+        removed = run_json("groups", "remove", group["id"], created["id"], "--json")
+        self.assertFalse(removed["member"])
+        self.assertTrue(removed["changed"])
 
 
 if __name__ == "__main__":

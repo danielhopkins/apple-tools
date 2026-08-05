@@ -560,9 +560,31 @@ private func memberIdentifiers(of groupId: String) -> Set<String> {
 /// fallback rather than the primary path, and why the caller confirms the
 /// membership afterwards instead of trusting the return values.
 private func removeMemberViaAddressBook(contactId: String, groupId: String) throws {
+    try membershipViaAddressBook(contactId: contactId, groupId: groupId, what: "removal") {
+        $0.removeMember($1)
+    }
+}
+
+/// Add a contact to a group through the legacy AddressBook framework.
+///
+/// The counterpart to `removeMemberViaAddressBook`, needed for a different
+/// reason: `CNSaveRequest.addMember` faults the contact, and a contact carrying
+/// a note cannot be faulted without the notes entitlement — see
+/// `notePropertyFaultCode`. So membership in either direction was impossible for
+/// the same 8% of contacts that could not be edited.
+private func addMemberViaAddressBook(contactId: String, groupId: String) throws {
+    try membershipViaAddressBook(contactId: contactId, groupId: groupId, what: "addition") {
+        $0.addMember($1)
+    }
+}
+
+private func membershipViaAddressBook(
+    contactId: String, groupId: String, what: String,
+    change: (ABGroup, ABPerson) -> Bool
+) throws {
     guard let book = ABAddressBook.shared() else {
         throw ValidationError(
-            "could not open the AddressBook store to remove the group member.")
+            "could not open the AddressBook store to apply the group \(what).")
     }
     guard let group = book.record(forUniqueId: groupId) as? ABGroup else {
         throw ValidationError("no group with id '\(groupId)' in the AddressBook store.")
@@ -571,12 +593,153 @@ private func removeMemberViaAddressBook(contactId: String, groupId: String) thro
         throw ValidationError("no contact with id '\(contactId)' in the AddressBook store.")
     }
 
-    let removed = group.removeMember(person)
-    let saved = book.save()
-    guard removed, saved else {
+    let changed = change(group, person)
+    // The note wall costs the first save and no more — see `editViaAddressBook`
+    // for the measurement — so one retry is the difference between working and
+    // not for a contact that has a note.
+    var saved = book.save()
+    if !saved { saved = book.save() }
+    guard changed, saved else {
         throw ValidationError(
-            "the AddressBook store refused the removal "
-            + "(removeMember: \(removed), save: \(saved)).")
+            "the AddressBook store refused the \(what) "
+            + "(changed: \(changed), save: \(saved)).")
+    }
+}
+
+// MARK: - The note entitlement wall
+
+/// Core Data's code for the wall a note puts in front of *every* save.
+///
+/// 🛑 **A contact that has a note cannot be written through `CNContactStore` at
+/// all**, whatever field is being changed. The save faults the whole record,
+/// faulting reads the note attribute, and reading that needs
+/// `com.apple.developer.contacts.notes` — the entitlement Apple grants only to
+/// signed apps on request, which no command-line tool can hold. So an
+/// unrelated, unentitled `--company` edit is collateral damage.
+///
+/// It surfaces as a bare `NSCocoaErrorDomain 134092` with an empty `userInfo`
+/// and a raw `CoreData: error: Unhandled error occurred during faulting` on
+/// stderr, naming neither the contact nor the note. 52 of 669 contacts here
+/// carry one, so this was ~8% of a real address book the tool could not edit.
+private let notePropertyFaultCode = 134092
+
+/// Is this the note wall, at any depth?
+///
+/// AddressBook wraps it in an `ABAddressBookErrorDomain` error of its own, and
+/// Contacts reports it directly, so the whole `NSUnderlyingErrorKey` chain has
+/// to be walked rather than just the outermost code.
+private func isNotePropertyFault(_ error: Error) -> Bool {
+    var current: NSError? = error as NSError
+    while let nsError = current {
+        if nsError.domain == NSCocoaErrorDomain, nsError.code == notePropertyFaultCode {
+            return true
+        }
+        current = nsError.userInfo[NSUnderlyingErrorKey] as? NSError
+    }
+    return false
+}
+
+/// Apply an edit through the legacy AddressBook framework instead of Contacts.
+///
+/// The way past `notePropertyFaultCode`. AddressBook writes the same records
+/// under the same `UUID:ABPerson` identifiers, needs no permission beyond the
+/// Contacts access this process already holds, and — unlike `CNContactStore` —
+/// is not blocked from saving a record that has a note, as long as it is not
+/// the note itself being written. It is already the fallback that removes
+/// members from iCloud groups, so nothing new is being taken on.
+///
+/// ⚠️ **The first save fails and the second one works.** Faulting the record
+/// trips the note wall once; afterwards the fault is settled and the pending
+/// changes commit. Measured on a contact whose note was set outside this tool:
+/// save 1 → `ABAddressBookErrorDomain 0` wrapping 134092, save 2 → OK, value
+/// present in the store. So a single failure here means nothing, which is
+/// precisely why the caller re-reads the contact instead of trusting a return
+/// value from either framework.
+private func editViaAddressBook(id: String, fields: ContactFields) throws {
+    guard let book = ABAddressBook.shared() else {
+        throw RuntimeError("could not open the AddressBook store.")
+    }
+    guard let person = book.record(forUniqueId: id) as? ABPerson else {
+        throw RuntimeError("no contact with id '\(id)' in the AddressBook store.")
+    }
+    guard fields.apply(to: person) else {
+        throw RuntimeError("the AddressBook store refused one of the values.")
+    }
+
+    var lastFailure: Error?
+    // Two is all the note fault costs; the third is margin, not a busy-wait.
+    for _ in 1...3 {
+        do {
+            try book.saveAndReturnError()
+            return
+        } catch {
+            lastFailure = error
+        }
+    }
+    throw RuntimeError(
+        "the AddressBook store refused the save: "
+        + (lastFailure.map(saveFailureDetail) ?? "no error reported"))
+}
+
+// MARK: - Confirming a write
+
+/// Read the contact back and check it really holds what was asked for.
+///
+/// Every bug in this family wrote something *other* than the input and still
+/// exited 0 — a URL scheme eaten as a label, a custom label dropped on the
+/// floor. For a tool that mutates an address book with no undo, that failure
+/// mode is worse than an error, so the record is compared against the request
+/// afterwards, the same rule `groups add` and `groups remove` already follow.
+///
+/// A **subset** check, deliberately: `get` returns the unified contact, which
+/// merges every linked card, so a saved record can legitimately carry values
+/// this edit never mentioned. What must never happen is one of ours going
+/// missing.
+private func confirmWritten(_ fields: ContactFields, on saved: CNContact, name: String) throws {
+    var missing: [String] = []
+
+    func check(
+        _ flag: String,
+        wanted: [(label: String?, value: String)],
+        stored: [(label: String?, value: String)]
+    ) {
+        // A unit separator, so a label ending in a colon cannot forge a match.
+        let have = Set(stored.map { "\($0.label ?? "")\u{1f}\($0.value)" })
+        for want in wanted where !have.contains("\(want.label ?? "")\u{1f}\(want.value)") {
+            let label = Labels.decode(want.label).map { "\($0):" } ?? ""
+            missing.append("--\(flag) \(label)\(want.value)")
+        }
+    }
+
+    check(
+        "email", wanted: fields.emails,
+        stored: saved.emailAddresses.map { ($0.label, $0.value as String) })
+    check(
+        "url", wanted: fields.urls,
+        stored: saved.urlAddresses.map { ($0.label, $0.value as String) })
+    check(
+        "relation", wanted: fields.relations,
+        stored: saved.contactRelations.map { ($0.label, $0.value.name) })
+    check(
+        "date",
+        wanted: fields.dates.map { ($0.label, ContactDate.format($0.value) ?? "") },
+        stored: saved.dates.map { ($0.label, ContactDate.format($0.value as DateComponents) ?? "") })
+    // Digits, not punctuation. How a number is formatted is the store's
+    // business — `search` already compares them this way — and this check exists
+    // to catch a value that went missing, not one that was tidied.
+    func digits(_ value: String) -> String { value.filter(\.isNumber) }
+    check(
+        "phone", wanted: fields.phones.map { ($0.label, digits($0.value)) },
+        stored: saved.phoneNumbers.map { ($0.label, digits($0.value.stringValue)) })
+
+    guard missing.isEmpty else {
+        throw RuntimeError(
+            """
+            the save reported success but '\(name)' does not hold what was asked for. \
+            Missing:
+            \(missing.map { "  \($0)" }.joined(separator: "\n"))
+            Check the contact before trusting anything else this command reported.
+            """)
     }
 }
 
@@ -867,11 +1030,42 @@ struct ContactFields: ParsableArguments {
 
     /// Splits "father:Robert Hopkins" on the FIRST colon only, so values that
     /// contain colons (URLs, times) survive intact.
+    ///
+    /// 🛑 **The first colon is not always a label separator.** A bare
+    /// `https://example.com` has one too, and cutting there stored
+    /// `//example.com` under a label of `https` — which then failed label
+    /// lookup, was dropped, and left a mangled URL written with a zero exit
+    /// code. `--url` is documented as *optionally* labelled, so a bare URL is a
+    /// supported input and has to survive.
+    ///
+    /// So a prefix that parses as a URI scheme is treated as part of the value:
+    /// either because what follows starts with `//` (`https:`, `ftp:`), or
+    /// because it is one of the schemes that never does (`mailto:`, `tel:`).
+    /// The cost is that those words cannot be used as labels, which is a trade
+    /// nobody will notice.
     private func split(_ input: String) -> (label: String?, value: String) {
         guard let separator = input.firstIndex(of: ":") else { return (nil, input) }
         let label = String(input[input.startIndex..<separator])
         let value = String(input[input.index(after: separator)...])
+        let looksLikeScheme = Self.isURIScheme(label)
+            && (value.hasPrefix("//") || Self.schemesWithoutSlashes.contains(label.lowercased()))
+        if looksLikeScheme { return (nil, input) }
         return (label.isEmpty ? nil : label, value)
+    }
+
+    /// Schemes whose value does not begin `//`, so the `//` test alone cannot
+    /// recognise them. Kept deliberately short: every entry is a word that can
+    /// no longer be used as a label.
+    private static let schemesWithoutSlashes: Set<String> = [
+        "mailto", "tel", "sms", "callto", "facetime", "facetime-audio", "skype", "xmpp",
+    ]
+
+    /// RFC 3986 §3.1: `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`.
+    private static func isURIScheme(_ text: String) -> Bool {
+        guard let first = text.first, first.isASCII, first.isLetter else { return false }
+        return text.allSatisfy {
+            $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "+" || $0 == "-" || $0 == ".")
+        }
     }
 
     func validate() throws {
@@ -931,45 +1125,123 @@ struct ContactFields: ParsableArguments {
         if let jobTitle { contact.jobTitle = jobTitle }
         if let birthday { contact.birthday = ContactDate.parse(birthday) }
 
-        if !email.isEmpty {
-            contact.emailAddresses = email.map { raw in
-                let (label, value) = split(raw)
-                return CNLabeledValue(label: label.flatMap(Labels.email), value: value as NSString)
+        if !emails.isEmpty {
+            contact.emailAddresses = emails.map {
+                CNLabeledValue(label: $0.label, value: $0.value as NSString)
             }
         }
-        if !phone.isEmpty {
-            contact.phoneNumbers = phone.map { raw in
-                let (label, value) = split(raw)
-                return CNLabeledValue(
-                    label: label.flatMap(Labels.phone), value: CNPhoneNumber(stringValue: value))
+        if !phones.isEmpty {
+            contact.phoneNumbers = phones.map {
+                CNLabeledValue(label: $0.label, value: CNPhoneNumber(stringValue: $0.value))
             }
         }
-        if !url.isEmpty {
-            contact.urlAddresses = url.map { raw in
-                let (label, value) = split(raw)
-                return CNLabeledValue(label: label.flatMap(Labels.url), value: value as NSString)
+        if !urls.isEmpty {
+            contact.urlAddresses = urls.map {
+                CNLabeledValue(label: $0.label, value: $0.value as NSString)
             }
         }
-        if !relation.isEmpty {
-            contact.contactRelations = relation.map { raw in
-                let (label, value) = split(raw)
-                return CNLabeledValue(
-                    label: label.map(Labels.relation),
-                    value: CNContactRelation(name: value))
+        if !relations.isEmpty {
+            contact.contactRelations = relations.map {
+                CNLabeledValue(label: $0.label, value: CNContactRelation(name: $0.value))
             }
+        }
+        if !dates.isEmpty {
+            contact.dates = dates.map {
+                CNLabeledValue(label: $0.label, value: $0.value as NSDateComponents)
+            }
+        }
+    }
+
+    /// The same edit, expressed against the legacy AddressBook record.
+    ///
+    /// Only reached when `CNContactStore` refuses the save because the contact
+    /// carries a note — see `editViaAddressBook`. AddressBook uses the identical
+    /// `_$!<Home>!$_` label spellings, so nothing is translated but the property
+    /// names and the multi-value wrappers.
+    ///
+    /// Returns false if AddressBook rejected any of the writes, before the save
+    /// is even attempted.
+    func apply(to person: ABPerson) -> Bool {
+        var ok = true
+        func set(_ value: Any?, _ property: String) {
+            ok = person.setValue(value, forProperty: property) && ok
+        }
+        func setMulti(_ entries: [(label: String?, value: Any)], _ property: String) {
+            let multi = ABMutableMultiValue()
+            for entry in entries {
+                // AddressBook has no nil label; the empty string is what it
+                // stores for an unlabelled value, and Contacts reads it back
+                // as no label at all.
+                _ = multi.add(entry.value, withLabel: entry.label ?? "")
+            }
+            set(multi, property)
         }
 
-        // --anniversary is sugar for a labelled date, so merge the two inputs.
-        var dateEntries = date
-        if let anniversary { dateEntries.append("anniversary:\(anniversary)") }
-        if !dateEntries.isEmpty {
-            contact.dates = dateEntries.compactMap { raw in
-                let (label, value) = split(raw)
-                guard let components = ContactDate.parse(value) else { return nil }
-                return CNLabeledValue(
-                    label: label.map(Labels.date),
-                    value: components as NSDateComponents)
-            }
+        if let first { set(first as NSString, kABFirstNameProperty) }
+        if let middle { set(middle as NSString, kABMiddleNameProperty) }
+        if let last { set(last as NSString, kABLastNameProperty) }
+        if let namePrefix { set(namePrefix as NSString, kABTitleProperty) }
+        if let nameSuffix { set(nameSuffix as NSString, kABSuffixProperty) }
+        if let nickname { set(nickname as NSString, kABNicknameProperty) }
+        if let company { set(company as NSString, kABOrganizationProperty) }
+        if let department { set(department as NSString, kABDepartmentProperty) }
+        if let jobTitle { set(jobTitle as NSString, kABJobTitleProperty) }
+        // The *Components* property, not kABBirthdayProperty: the latter is an
+        // NSDate and cannot express the year-less `--MM-DD` birthday Contacts
+        // supports and this tool accepts.
+        if let birthday, let components = ContactDate.parse(birthday) {
+            set(components as NSDateComponents, kABBirthdayComponentsProperty)
+        }
+
+        if !emails.isEmpty {
+            setMulti(emails.map { ($0.label, $0.value as NSString) }, kABEmailProperty)
+        }
+        if !phones.isEmpty {
+            setMulti(phones.map { ($0.label, $0.value as NSString) }, kABPhoneProperty)
+        }
+        if !urls.isEmpty {
+            setMulti(urls.map { ($0.label, $0.value as NSString) }, kABURLsProperty)
+        }
+        if !relations.isEmpty {
+            setMulti(relations.map { ($0.label, $0.value as NSString) }, kABRelatedNamesProperty)
+        }
+        if !dates.isEmpty {
+            setMulti(
+                dates.map { ($0.label, $0.value as NSDateComponents) },
+                kABOtherDateComponentsProperty)
+        }
+        return ok
+    }
+
+    // MARK: Parsed inputs
+
+    /// `"work:a@b.com"` → (`_$!<Work>!$_`, `a@b.com`).
+    ///
+    /// One place turns a flag into the label and value the store will hold, so
+    /// the Contacts path, the AddressBook fallback and the post-write check
+    /// cannot disagree about what was asked for.
+    private func parse(
+        _ entries: [String], _ encode: (String) -> String
+    ) -> [(label: String?, value: String)] {
+        entries.map { raw in
+            let (label, value) = split(raw)
+            return (label.map(encode), value)
+        }
+    }
+
+    var emails: [(label: String?, value: String)] { parse(email, Labels.email) }
+    var phones: [(label: String?, value: String)] { parse(phone, Labels.phone) }
+    var urls: [(label: String?, value: String)] { parse(url, Labels.url) }
+    var relations: [(label: String?, value: String)] { parse(relation, Labels.relation) }
+
+    /// `--anniversary` is sugar for a labelled date, so the two inputs merge.
+    var dates: [(label: String?, value: DateComponents)] {
+        var entries = date
+        if let anniversary { entries.append("anniversary:\(anniversary)") }
+        // validate() has already rejected anything unparseable, so compactMap
+        // drops nothing here.
+        return parse(entries, Labels.date).compactMap { entry in
+            ContactDate.parse(entry.value).map { (entry.label, $0) }
         }
     }
 }
@@ -1014,7 +1286,15 @@ struct Add: ParsableCommand {
         // treated as nil and the contact lands in the default container.
         let targetContainer = try container.map { try resolveContainer($0) }
         request.add(draft, toContainerWithIdentifier: targetContainer)
-        try store.execute(request)
+        do {
+            try store.execute(request)
+        } catch {
+            // A new contact cannot carry a note, so there is no note wall to
+            // fall back around here — only the generic save failure, which is
+            // worth naming rather than leaving as CNError's one useless string.
+            throw RuntimeError(
+                "could not create '\(displayName(draft))': \(saveFailureDetail(error))")
+        }
 
         // Which account it landed in, reported rather than left to be discovered
         // later by a failed `groups add`. A contact can only join groups in its
@@ -1022,9 +1302,12 @@ struct Add: ParsableCommand {
         // whole cross-container trap starts with this being invisible.
         let landedIn = targetContainer ?? store.defaultContainerIdentifier()
 
+        // Re-read so both the check and the output reflect what the store
+        // actually saved, rather than the draft we hoped it would.
+        let saved = try contact(withId: draft.identifier)
+        try confirmWritten(fields, on: saved, name: displayName(saved))
+
         if json {
-            // Re-read so the output reflects what the store actually saved.
-            let saved = try contact(withId: draft.identifier)
             printJSON(info(saved, notes: NoteStore.allNotes(), container: landedIn))
         } else {
             print("Created '\(displayName(draft))' (id: \(draft.identifier))")
@@ -1072,9 +1355,37 @@ struct Edit: ParsableCommand {
 
         let request = CNSaveRequest()
         request.update(mutable)
-        try store.execute(request)
+        do {
+            try store.execute(request)
+        } catch where isNotePropertyFault(error) {
+            // Nothing here asked for the note; the save faults the whole record
+            // and faulting is what reads it. AddressBook writes the same store
+            // without hitting the entitlement, so use it rather than telling
+            // the caller that 8% of their contacts are simply uneditable.
+            //
+            // The container-backed id, not whatever was passed: AddressBook has
+            // no record under a unified identifier, and `add` can hand one back.
+            let backing = (try? containerContact(withId: id))?.identifier ?? id
+            do {
+                try editViaAddressBook(id: backing, fields: fields)
+            } catch {
+                throw RuntimeError(
+                    """
+                    could not update '\(displayName(existing))'. Contacts refuses to save any \
+                    change to a contact that carries a note, because the save reads the note and \
+                    that needs the com.apple.developer.contacts.notes entitlement, which no \
+                    command-line tool can hold. The AddressBook fallback did not work either: \
+                    \(error.localizedDescription)
+                    Edit this contact in Contacts.app.
+                    """)
+            }
+        } catch {
+            throw RuntimeError(
+                "could not update '\(displayName(existing))': \(saveFailureDetail(error))")
+        }
 
         let refreshed = try contact(withId: id)
+        try confirmWritten(fields, on: refreshed, name: displayName(refreshed))
         if json {
             printJSON(info(refreshed, notes: NoteStore.allNotes()))
         } else {
@@ -1545,6 +1856,25 @@ struct GroupAdd: ParsableCommand {
         request.addMember(member, to: target)
         do {
             try store.execute(request)
+        } catch where isNotePropertyFault(error) {
+            // `addMember` faults the contact, and a contact with a note cannot
+            // be faulted without the notes entitlement. AddressBook can, and is
+            // already how the other direction reaches iCloud groups.
+            do {
+                try addMemberViaAddressBook(
+                    contactId: member.identifier, groupId: target.identifier)
+            } catch {
+                throw RuntimeError(
+                    """
+                    could not add '\(displayName(member))' to '\(target.name)'. Contacts refuses \
+                    to save a membership change for a contact that carries a note, because the \
+                    save reads the note and that needs the \
+                    com.apple.developer.contacts.notes entitlement, which no command-line tool \
+                    can hold. The AddressBook fallback did not work either: \
+                    \(error.localizedDescription)
+                    Add this contact to the group in Contacts.app.
+                    """)
+            }
         } catch {
             // A runtime failure, so RuntimeError rather than ValidationError:
             // the latter makes ArgumentParser print a usage block, which tells
@@ -1653,6 +1983,18 @@ private func displayName(_ contact: CNContact) -> String {
     if !contact.organizationName.isEmpty { return contact.organizationName }
     return contact.identifier
 }
+
+// Core Data prints the note-entitlement fault to stderr itself, before anything
+// here sees the error:
+//
+//   CoreData: error: Unhandled error occurred during faulting: Error
+//   Domain=NSCocoaErrorDomain Code=134092 "(null)" ({ })
+//
+// It names neither the contact nor the note, so there is nothing a caller can
+// do with it, and the commands now catch that failure and explain it. Keep the
+// raw dump out of the output rather than printing both. The registration domain
+// is in-memory, so this changes nothing on disk and no other process's logging.
+UserDefaults.standard.register(defaults: ["com.apple.CoreData.Logging.stderr": 0])
 
 // Claim the TCC identity before anything can write to stdout or stderr.
 //
