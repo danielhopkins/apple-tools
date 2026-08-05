@@ -368,8 +368,18 @@ private func containerInfos() -> [ContainerInfo] {
 }
 
 /// The container a contact lives in, or nil if it cannot be determined.
+///
+/// Matches on both the identifier given and the container-backed record it
+/// resolves to. A unified identifier appears in no container's own enumeration —
+/// only its backing records do — so comparing the caller's id alone reported
+/// `container: null` for exactly the linked contacts that need it most.
 private func containerId(forContact id: String) -> String? {
-    allContainers().first { container in
+    var wanted: Set<String> = [id]
+    if let backing = try? containerContact(withId: id) {
+        wanted.insert(backing.identifier)
+    }
+
+    return allContainers().first { container in
         let predicate = CNContact.predicateForContactsInContainer(
             withIdentifier: container.identifier)
         let request = CNContactFetchRequest(keysToFetch: [CNContactIdentifierKey as CNKeyDescriptor])
@@ -377,7 +387,7 @@ private func containerId(forContact id: String) -> String? {
         request.unifyResults = false
         var hit = false
         try? store.enumerateContacts(with: request) { candidate, stop in
-            if candidate.identifier == id {
+            if wanted.contains(candidate.identifier) {
                 hit = true
                 stop.pointee = true
             }
@@ -501,11 +511,40 @@ struct RuntimeError: Error, LocalizedError {
 /// happened, and a reused store would be the obvious thing to blame if the
 /// answer were ever stale.
 private func isMember(_ contactId: String, of groupId: String) -> Bool {
+    memberIdentifiers(of: groupId).contains(contactId)
+}
+
+/// Every identifier by which a group's members can legitimately be named.
+///
+/// 🛑 Unified and container-backed identifiers are **different strings for the
+/// same person**, and a membership check that mixes them silently answers "no".
+/// This bit for real: `groups add` fetches its contact non-unified (it must —
+/// `addMember` rejects a unified contact), so it holds a backing-record id like
+/// `D065726A-…:ABPerson`, while a `unifiedContacts` fetch of the same group
+/// returns `BD00169D-…`. Comparing across the two made a *successful* add report
+/// "the save reported success but X is not in the group" — a false alarm that
+/// makes the command unusable for any contact macOS has linked.
+///
+/// So both spellings go into the set: the unified fetch for unified ids, and a
+/// non-unified enumeration for backing ids.
+private func memberIdentifiers(of groupId: String) -> Set<String> {
     let predicate = CNContact.predicateForContactsInGroup(withIdentifier: groupId)
-    let members = (try? CNContactStore().unifiedContacts(
-        matching: predicate,
-        keysToFetch: [CNContactIdentifierKey as CNKeyDescriptor])) ?? []
-    return members.contains { $0.identifier == contactId }
+    let keys = [CNContactIdentifierKey as CNKeyDescriptor]
+    // A fresh store: this confirms a write that has just happened, and a reused
+    // one would be the obvious thing to blame if the answer were ever stale.
+    let freshStore = CNContactStore()
+
+    var identifiers = Set(
+        ((try? freshStore.unifiedContacts(matching: predicate, keysToFetch: keys)) ?? [])
+            .map(\.identifier))
+
+    let request = CNContactFetchRequest(keysToFetch: keys)
+    request.predicate = predicate
+    request.unifyResults = false
+    try? freshStore.enumerateContacts(with: request) { contact, _ in
+        identifiers.insert(contact.identifier)
+    }
+    return identifiers
 }
 
 /// Remove a contact from a group through the legacy AddressBook framework.

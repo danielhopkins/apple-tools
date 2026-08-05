@@ -820,6 +820,21 @@ command re-reads the membership afterwards and fails loudly if the contact is
 still in the group rather than trusting either call's return value. Don't report
 a removal as done without that confirmation.
 
+🛑 **A contact has two identifiers, and mixing them silently answers "no".**
+The unified id (`BD00169D-…`) and the container-backed id (`D065726A-…:ABPerson`)
+name the same person. Group membership work must use the backing record, so any
+membership *check* has to accept both spellings — comparing a backing id against
+a `unifiedContacts` fetch of the group made a **successful** add report *"the save
+reported success but X is not in the group"*, and made `container` come back null
+for exactly the linked contacts that need it. `memberIdentifiers(of:)` unions a
+unified fetch with a non-unified enumeration for this reason.
+
+⚠️ **`add` can return an identifier the store does not use.** Creating a contact
+with an explicit `--container` handed back a bare `BD00169D-…` while the record
+in the store was `D065726A-…:ABPerson`. Both resolve through `get`, so the id is
+usable — but do not assume the string you got back is the one in the address
+book, and never build a comparison on that assumption.
+
 🛑 **Group membership must never be handed a *unified* contact.** This is what
 made `groups add` fail for freshly created contacts with nothing but
 `Save operation could not be completed.`. `unifiedContact(withIdentifier:)`
