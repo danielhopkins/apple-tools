@@ -219,17 +219,21 @@ class Notes(LiveContactsTest):
         self.assertIn("entitlement", err.lower())
 
 
-class Groups(LiveContactsTest):
+class GroupFixtures(LiveContactsTest):
+    """Group fixture helpers, shared by the group and container suites."""
+
     def group_name(self, suffix):
         return f"{TEST_PREFIX} {suffix}"
 
-    def create_group(self, suffix):
-        run("groups", "create", self.group_name(suffix), check=True)
+    def create_group(self, suffix, *extra):
+        run("groups", "create", self.group_name(suffix), *extra, check=True)
         matches = [g for g in find_test_groups()
                    if g["name"] == self.group_name(suffix)]
         self.assertEqual(len(matches), 1, f"group {suffix!r} not created")
         return matches[0]
 
+
+class Groups(GroupFixtures):
     def test_create_and_delete_a_group(self):
         group = self.create_group("Create")
         self.assertEqual(group["count"], 0)
@@ -371,6 +375,112 @@ class Groups(LiveContactsTest):
         # `groups` is a list of names; Contacts has no reverse lookup, so only
         # `get` populates it.
         self.assertIn(self.group_name("Reported"), fetched.get("groups", []))
+
+
+class Containers(GroupFixtures):
+    """Container handling, which is what actually broke `groups add`.
+
+    A `CNSaveRequest` cannot span two containers: adding a contact from one
+    account to a group in another fails with Core Data's
+    `NSPersistentStoreIncompleteSaveError` (134040), which names neither store.
+    Nothing in the Contacts API surfaces a contact's container, so the mismatch
+    was invisible — the contact was simply in the wrong account, permanently, and
+    no amount of retrying helped.
+    """
+
+    def containers(self):
+        return run_json("containers", "--json")
+
+    def other_container(self):
+        """A container that is not the default, or skip."""
+        containers = self.containers()
+        others = [c for c in containers if not c["default"]]
+        if not others:
+            self.skipTest("only one container on this machine")
+        return others[0]
+
+    def test_containers_lists_accounts_with_exactly_one_default(self):
+        containers = self.containers()
+        self.assertTrue(containers, "no containers at all")
+        for entry in containers:
+            self.assertEqual(
+                set(entry), {"id", "name", "type", "default"}, f"unexpected shape: {entry}")
+            self.assertTrue(entry["name"], "a container with a blank name is unreadable")
+        self.assertEqual(
+            [c["default"] for c in containers].count(True), 1,
+            "exactly one container must be the default")
+
+    def test_add_reports_which_container_it_used(self):
+        created = self.add("Landed")
+        self.assertIn("container", created)
+        default = [c["id"] for c in self.containers() if c["default"]][0]
+        self.assertEqual(
+            created["container"], default,
+            "a plain add must land in the default container, and must say so")
+
+    def test_add_honours_an_explicit_container_by_name(self):
+        target = self.other_container()
+        created = run_json(
+            "add", "--first", TEST_PREFIX, "--last", "Explicit",
+            "--container", target["name"], "--json")
+        self.assertEqual(created["container"], target["id"])
+
+    def test_an_unknown_container_is_rejected_not_ignored(self):
+        """It used to be silently ignored.
+
+        `add(_:toContainerWithIdentifier:)` treats an unknown identifier as nil
+        and files the record in the default container, so the command reported
+        success and put the contact somewhere else — which is what makes a later
+        cross-container failure impossible to explain.
+        """
+        code, _, err = run(
+            "add", "--first", TEST_PREFIX, "--last", "BadContainer",
+            "--container", "___no_such_container___", "--json", check=False)
+        self.assertNotEqual(code, 0, "an unknown container must not succeed")
+        self.assertIn("no container", err)
+        # And it must name the valid ones, or the caller still cannot proceed.
+        for entry in self.containers():
+            self.assertIn(entry["id"], err)
+        # Nothing was created.
+        self.assertEqual(
+            [c for c in find_test_contacts() if c["last_name"] == "BadContainer"], [])
+
+    def test_get_and_groups_report_their_container(self):
+        group = self.create_group("Located")
+        contact = self.add("Located")
+
+        self.assertIsNotNone(self.get(contact["id"]).get("container"))
+        listed = [g for g in run_json("groups", "--json") if g["id"] == group["id"]][0]
+        self.assertIsNotNone(listed.get("container"), "groups must report their container")
+
+    def test_cross_container_add_names_the_mismatch(self):
+        """The reported failure, and the message that ends the investigation.
+
+        Before, this was `Save operation could not be completed.` — or after the
+        first fix, that plus `NSCocoaErrorDomain 134040`, which is Core Data's
+        "one or more stores returned an error" and names neither.
+        """
+        target = self.other_container()
+        group = self.create_group("SameAccount")  # default container
+        contact = run_json(
+            "add", "--first", TEST_PREFIX, "--last", "Elsewhere",
+            "--container", target["id"], "--json")
+        self.assertEqual(contact["container"], target["id"])
+
+        code, out, err = run("groups", "add", group["id"], contact["id"], check=False)
+        self.assertNotEqual(code, 0, "a cross-container add cannot succeed")
+
+        # It must name both sides. That is the whole point.
+        self.assertIn("different accounts", err)
+        self.assertIn(target["name"], err)
+
+        # A runtime failure is not an argument error, so no usage block and not
+        # ArgumentParser's exit 64.
+        self.assertNotIn("Usage:", err + out)
+        self.assertEqual(code, 1)
+
+        # And it really did not join.
+        self.assertEqual(run_json("groups", "members", group["id"]), [])
 
 
 class LocalContainerGroups(LiveContactsTest):

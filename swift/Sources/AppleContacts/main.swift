@@ -124,6 +124,10 @@ struct ContactInfo: Encodable {
     let groups: [String]?
     let note: String?
     let contact_url: String?
+    /// Which account this contact lives in. Only `get` fills this in: finding it
+    /// means scanning each container, which is fine for one contact and far too
+    /// slow for `list`. It matters because group membership cannot cross accounts.
+    let container: String?
 }
 
 private func blankToNil(_ value: String?) -> String? {
@@ -132,7 +136,8 @@ private func blankToNil(_ value: String?) -> String? {
 }
 
 private func info(
-    _ contact: CNContact, notes: [String: String], groups: [String] = []
+    _ contact: CNContact, notes: [String: String], groups: [String] = [],
+    container: String? = nil
 ) -> ContactInfo {
     let emails = contact.emailAddresses.map {
         EmailInfo(label: Labels.decode($0.label), address: $0.value as String)
@@ -195,7 +200,8 @@ private func info(
         dates: dates.isEmpty ? nil : dates,
         groups: groups.isEmpty ? nil : groups,
         note: notes[contact.identifier],
-        contact_url: "addressbook://\(contact.identifier)")
+        contact_url: "addressbook://\(contact.identifier)",
+        container: container)
 }
 
 private func printJSON<T: Encodable>(_ value: T) {
@@ -311,6 +317,119 @@ private func containerContact(withId id: String) throws -> CNContact {
     return try contact(withId: id)
 }
 
+// MARK: - Containers
+
+/// Which account a contact or group physically lives in.
+///
+/// This matters far more than it looks. A `CNSaveRequest` **cannot span two
+/// containers**: adding a contact from account A to a group in account B fails
+/// with Core Data's `NSPersistentStoreIncompleteSaveError` (134040) and no
+/// indication of which stores disagreed. Nothing in the Contacts API surfaces a
+/// contact's container, so the mismatch is invisible at the call site — which is
+/// why `apple contacts add` followed by `groups add` could fail forever while
+/// the same group accepted contacts that happened to already live in it.
+struct ContainerInfo: Encodable {
+    let id: String
+    let name: String
+    let type: String
+    let isDefault: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, type
+        case isDefault = "default"
+    }
+}
+
+private func containerTypeName(_ type: CNContainerType) -> String {
+    switch type {
+    case .local: return "local"
+    case .exchange: return "exchange"
+    case .cardDAV: return "cardDAV"
+    case .unassigned: return "unassigned"
+    @unknown default: return "unknown"
+    }
+}
+
+private func allContainers() -> [CNContainer] {
+    (try? store.containers(matching: nil)) ?? []
+}
+
+private func containerInfos() -> [ContainerInfo] {
+    let defaultId = store.defaultContainerIdentifier()
+    return allContainers().map {
+        ContainerInfo(
+            id: $0.identifier,
+            // A local container's name is empty; "On My Mac" is what Contacts.app
+            // shows, and a blank column would read as a bug.
+            name: $0.name.isEmpty ? "On My Mac" : $0.name,
+            type: containerTypeName($0.type),
+            isDefault: $0.identifier == defaultId)
+    }
+}
+
+/// The container a contact lives in, or nil if it cannot be determined.
+private func containerId(forContact id: String) -> String? {
+    allContainers().first { container in
+        let predicate = CNContact.predicateForContactsInContainer(
+            withIdentifier: container.identifier)
+        let request = CNContactFetchRequest(keysToFetch: [CNContactIdentifierKey as CNKeyDescriptor])
+        request.predicate = predicate
+        request.unifyResults = false
+        var hit = false
+        try? store.enumerateContacts(with: request) { candidate, stop in
+            if candidate.identifier == id {
+                hit = true
+                stop.pointee = true
+            }
+        }
+        return hit
+    }?.identifier
+}
+
+/// The container a group lives in, or nil if it cannot be determined.
+private func containerId(forGroup id: String) -> String? {
+    allContainers().first { container in
+        let groups = (try? store.groups(
+            matching: CNGroup.predicateForGroupsInContainer(
+                withIdentifier: container.identifier))) ?? []
+        return groups.contains { $0.identifier == id }
+    }?.identifier
+}
+
+/// Turn a `--container` value into a real container identifier.
+///
+/// Accepts an identifier or a name, case-insensitively, so `--container "On My
+/// Mac"` works as well as `_local:ABAccount`.
+///
+/// ⚠️ An unrecognised value used to be **silently ignored**: `CNSaveRequest`'s
+/// `add(_:toContainerWithIdentifier:)` treats an unknown identifier as nil and
+/// files the record in the default container instead, with no error. So
+/// `--container "___probe___"` reported success and put the contact somewhere
+/// else entirely — which is exactly the kind of quiet wrong answer that makes a
+/// later cross-container failure impossible to explain.
+private func resolveContainer(_ reference: String) throws -> String {
+    let containers = containerInfos()
+    if let exact = containers.first(where: { $0.id == reference }) { return exact.id }
+
+    let byName = containers.filter { $0.name.lowercased() == reference.lowercased() }
+    if byName.count == 1 { return byName[0].id }
+    if byName.count > 1 {
+        throw ValidationError(
+            "several containers are named '\(reference)'; use the id from "
+            + "`apple contacts containers --json`")
+    }
+    throw ValidationError(
+        "no container '\(reference)'. Available: "
+        + containers.map { "\($0.name) [\($0.id)]" }.joined(separator: ", "))
+}
+
+/// Human-readable "name (type)" for a container id, for error messages.
+private func describeContainer(_ id: String?) -> String {
+    guard let id else { return "unknown" }
+    guard let match = containerInfos().first(where: { $0.id == id }) else { return id }
+    return "\(match.name) (\(match.type))"
+}
+
 /// What actually went wrong in a `CNSaveRequest`.
 ///
 /// `CNError`'s `localizedDescription` is the useless
@@ -337,12 +456,42 @@ private func saveFailureDetail(_ error: Error) -> String {
             "validation: "
             + validation.map { ($0 as NSError).localizedDescription }.joined(separator: " | "))
     }
+    // Core Data's own keys, which is where the useful detail actually is for a
+    // save that spans stores: NSPersistentStoreIncompleteSaveError (134040) says
+    // "stores/objects that failed will be in userInfo", and none of the CNError
+    // keys above are populated for it. Omitting these is why the first version
+    // of this printed a domain and code and nothing else.
+    if let stores = nsError.userInfo[NSAffectedStoresErrorKey] as? [Any], !stores.isEmpty {
+        parts.append("affected stores: \(stores.count)")
+    }
+    if let objects = nsError.userInfo[NSAffectedObjectsErrorKey] as? [Any], !objects.isEmpty {
+        parts.append("affected objects: \(objects.count)")
+    }
+    if let detailed = nsError.userInfo[NSDetailedErrorsKey] as? [NSError], !detailed.isEmpty {
+        parts.append(
+            "detailed: "
+            + detailed.prefix(5)
+                .map { "\($0.localizedDescription) (\($0.domain) \($0.code))" }
+                .joined(separator: " | "))
+    }
     if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
         parts.append(
             "underlying: \(underlying.localizedDescription) "
             + "(\(underlying.domain) \(underlying.code))")
     }
     return parts.joined(separator: "; ")
+}
+
+/// A failure that happened while doing the work, not while parsing arguments.
+///
+/// `ValidationError` makes ArgumentParser print the usage block, which is right
+/// for a bad flag and wrong for a save that failed — usage tells the caller
+/// nothing about a Core Data error and buries the message. Conforming to
+/// `LocalizedError` instead prints just the message and exits non-zero.
+struct RuntimeError: Error, LocalizedError {
+    let message: String
+    init(_ message: String) { self.message = message }
+    var errorDescription: String? { message }
 }
 
 /// Whether a contact is currently in a group.
@@ -465,10 +614,47 @@ struct AppleContacts: ParsableCommand {
           """,
         version: appleToolsVersion,
         subcommands: [Search.self, Get.self, List.self, Add.self, Edit.self, Delete.self,
-                      Export.self, Groups.self, Status.self],
+                      Export.self, Groups.self, Containers.self, Status.self],
         defaultSubcommand: Search.self)
 
     static func plainText(_ contacts: [ContactInfo]) -> String { plain(contacts) }
+}
+
+struct Containers: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "containers",
+        abstract: "List the accounts contacts and groups can live in",
+        discussion: """
+          A container is an account: iCloud, an Exchange account, or the local
+          "On My Mac" store. Which one a contact is in matters because a single
+          save cannot span two of them — adding a contact to a group in a
+          different container fails, so `groups add` reports the mismatch by name.
+
+          The `default` container is where `add` puts a new contact when no
+          --container is given.
+          """)
+
+    @Flag(name: .long, help: "Output as JSON")
+    var json = false
+
+    func run() throws {
+        try requireContactsAccess()
+        let containers = containerInfos()
+
+        if json {
+            printJSON(containers)
+            return
+        }
+        guard !containers.isEmpty else {
+            print("No containers found.")
+            return
+        }
+        for container in containers {
+            let marker = container.isDefault ? Style.success(" (default)") : ""
+            print("\(Style.title(container.name))\(marker)")
+            print("    \(Style.dim(container.type))  \(Style.identifier(container.id))")
+        }
+    }
 }
 
 struct Status: ParsableCommand {
@@ -543,7 +729,10 @@ struct Get: ParsableCommand {
     func run() throws {
         try requireContactsAccess()
         let match = try contact(withId: id)
-        output.emitOne(info(match, notes: NoteStore.allNotes(), groups: groupNames(for: id)))
+        output.emitOne(
+            info(
+                match, notes: NoteStore.allNotes(), groups: groupNames(for: id),
+                container: containerId(forContact: match.identifier)))
     }
 }
 
@@ -782,15 +971,25 @@ struct Add: ParsableCommand {
         fields.apply(to: draft)
 
         let request = CNSaveRequest()
-        request.add(draft, toContainerWithIdentifier: container)
+        // Resolved, not passed through: an unknown identifier is silently
+        // treated as nil and the contact lands in the default container.
+        let targetContainer = try container.map { try resolveContainer($0) }
+        request.add(draft, toContainerWithIdentifier: targetContainer)
         try store.execute(request)
+
+        // Which account it landed in, reported rather than left to be discovered
+        // later by a failed `groups add`. A contact can only join groups in its
+        // own container, and the default is not always the one you expect — the
+        // whole cross-container trap starts with this being invisible.
+        let landedIn = targetContainer ?? store.defaultContainerIdentifier()
 
         if json {
             // Re-read so the output reflects what the store actually saved.
             let saved = try contact(withId: draft.identifier)
-            printJSON(info(saved, notes: NoteStore.allNotes()))
+            printJSON(info(saved, notes: NoteStore.allNotes(), container: landedIn))
         } else {
             print("Created '\(displayName(draft))' (id: \(draft.identifier))")
+            print("  in \(describeContainer(landedIn))")
         }
     }
 }
@@ -1059,6 +1258,9 @@ struct GroupInfo: Encodable {
     let id: String
     let name: String
     let count: Int
+    /// Which account the group lives in. A contact can only join a group in its
+    /// own account, so this is the other half of diagnosing a failed `groups add`.
+    let container: String?
 }
 
 /// The result of a membership change, for both `add` and `remove`.
@@ -1101,12 +1303,25 @@ struct GroupList: ParsableCommand {
     func run() throws {
         try requireContactsAccess()
         let groups = (try? store.groups(matching: nil)) ?? []
+
+        // One pass over the containers, not one per group: `containerId(forGroup:)`
+        // would re-enumerate every container for every group.
+        var containerByGroup: [String: String] = [:]
+        for container in allContainers() {
+            let inContainer = (try? store.groups(
+                matching: CNGroup.predicateForGroupsInContainer(
+                    withIdentifier: container.identifier))) ?? []
+            for group in inContainer { containerByGroup[group.identifier] = container.identifier }
+        }
+
         let infos = groups.map { group -> GroupInfo in
             let predicate = CNContact.predicateForContactsInGroup(withIdentifier: group.identifier)
             let members = (try? store.unifiedContacts(
                 matching: predicate,
                 keysToFetch: [CNContactIdentifierKey as CNKeyDescriptor])) ?? []
-            return GroupInfo(id: group.identifier, name: group.name, count: members.count)
+            return GroupInfo(
+                id: group.identifier, name: group.name, count: members.count,
+                container: containerByGroup[group.identifier])
         }.sorted { $0.name.lowercased() < $1.name.lowercased() }
 
         if json {
@@ -1141,13 +1356,18 @@ struct GroupCreate: ParsableCommand {
         group.name = name
 
         let request = CNSaveRequest()
-        request.add(group, toContainerWithIdentifier: container)
+        let targetContainer = try container.map { try resolveContainer($0) }
+        request.add(group, toContainerWithIdentifier: targetContainer)
         try store.execute(request)
 
         if json {
-            printJSON(GroupInfo(id: group.identifier, name: group.name, count: 0))
+            printJSON(
+                GroupInfo(
+                    id: group.identifier, name: group.name, count: 0,
+                    container: containerId(forGroup: group.identifier)))
         } else {
             print("Created group '\(name)' (id: \(group.identifier))")
+            print("  in \(describeContainer(targetContainer ?? store.defaultContainerIdentifier()))")
         }
     }
 }
@@ -1255,12 +1475,42 @@ struct GroupAdd: ParsableCommand {
             return
         }
 
+        // 🛑 A CNSaveRequest cannot span two containers. Adding a contact from
+        // one account to a group in another fails with Core Data's
+        // NSPersistentStoreIncompleteSaveError (134040) — "one or more of the
+        // stores returned an error" — which names neither store and is
+        // indistinguishable from any other save failure.
+        //
+        // This is permanent, not a sync race: the contact is simply in the wrong
+        // store and no amount of waiting changes that. Nor is it fixable here.
+        // There is no move API, and copying into the target container would mint
+        // a new identifier and orphan every reference to the old one — too
+        // destructive to do behind the caller's back. So the mismatch is detected
+        // and named, which is the one thing that turns a dead end into a fix.
+        let memberContainer = containerId(forContact: member.identifier)
+        let groupContainer = containerId(forGroup: target.identifier)
+        if let memberContainer, let groupContainer, memberContainer != groupContainer {
+            throw RuntimeError(
+                """
+                cannot add '\(displayName(member))' to '\(target.name)': they are in different \
+                accounts, and one save cannot span two.
+                  contact: \(describeContainer(memberContainer))
+                  group:   \(describeContainer(groupContainer))
+                Create the contact in the group's account instead:
+                  apple contacts add --container "\(groupContainer)" …
+                or move it in Contacts.app, then retry.
+                """)
+        }
+
         let request = CNSaveRequest()
         request.addMember(member, to: target)
         do {
             try store.execute(request)
         } catch {
-            throw ValidationError(
+            // A runtime failure, so RuntimeError rather than ValidationError:
+            // the latter makes ArgumentParser print a usage block, which tells
+            // the caller nothing about a Core Data error and buries the message.
+            throw RuntimeError(
                 "could not add '\(displayName(member))' to '\(target.name)': "
                 + saveFailureDetail(error))
         }
@@ -1269,7 +1519,7 @@ struct GroupAdd: ParsableCommand {
         // doing nothing, so confirm rather than trusting the exit code — the same
         // rule `groups remove` already follows.
         guard isMember(member.identifier, of: target.identifier) else {
-            throw ValidationError(
+            throw RuntimeError(
                 "the save reported success but '\(displayName(member))' is not in "
                 + "'\(target.name)'. Nothing was changed.")
         }
@@ -1341,7 +1591,7 @@ struct GroupRemove: ParsableCommand {
         // This operation has a history of reporting success while doing
         // nothing, so confirm it rather than trusting the exit code.
         guard !isMember(member.identifier, of: target.identifier) else {
-            throw ValidationError(
+            throw RuntimeError(
                 "'\(displayName(member))' is still a member of '\(target.name)'. "
                 + "Nothing was changed.")
         }

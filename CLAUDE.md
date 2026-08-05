@@ -33,6 +33,7 @@ installed via `make install`.
 | Find a person | `apple contacts search "smith" --json` |
 | Update a contact | `apple contacts edit <id> --company "New Co"` |
 | Export contacts | `apple contacts export --group "Family" -o family.vcf` |
+| List contact accounts | `apple contacts containers --json` |
 
 **Every tool supports `--json`.** Prefer it — the plain output is for humans and
 its shape is not stable. Use `apple --which` to see which binary each name
@@ -691,6 +692,7 @@ apple contacts add [FIELDS] [--container NAME] [--json]
 apple contacts edit ID [FIELDS] [--json]
 apple contacts delete ID
 apple contacts export ID... [--group GROUP] [-o FILE]   # vCard 3.0
+apple contacts containers [--json]                 # accounts, and which is default
 apple contacts status [--json]                     # permission state, never prompts
 
 apple contacts groups                              # list, with member counts
@@ -759,6 +761,41 @@ for the name affixes are `prefix` and `suffix`, though the flags are
 ⚠️ **`--MM-DD` needs `=`.** `--birthday --04-13` fails, because the parser reads
 the value as the next flag. Write `--birthday=--04-13`, and likewise for
 `--anniversary` and `--date`.
+
+🛑 **A contact can only join a group in its own account, and nothing in the API
+says which account anything is in.** One `CNSaveRequest` cannot span two
+containers: adding a contact from account A to a group in account B fails with
+Core Data's `NSPersistentStoreIncompleteSaveError` (**`NSCocoaErrorDomain
+134040`**, "one or more of the stores returned an error"), which names neither
+store. The contact is simply in the wrong account, permanently — retrying, waiting
+for sync, and deleting-and-recreating all change nothing.
+
+`groups add` now detects this before saving and names both sides:
+
+```
+Error: cannot add 'Kyle Zehner' to 'Recruiters': they are in different accounts,
+and one save cannot span two.
+  contact: On My Mac (local)
+  group:   🌈 (cardDAV)
+```
+
+**There is no move.** `CNSaveRequest`'s entire mutation surface is add / update /
+delete for contacts and groups plus add / remove member — the container is fixed
+at `addContact:toContainerWithIdentifier:` and `updateContact:` cannot change it.
+Copying into the target container and deleting the original would mint a **new
+identifier** (breaking every stored reference and its group memberships) and
+**drop the note**, since notes are unwritable here. So the fix is to create the
+contact in the right account, or move the card in Contacts.app.
+
+⚠️ **`apple contacts containers` is how you find a valid `--container`**, and
+`get`, `groups` and `add` all report a `container` now. `add` prints where it
+landed, because the default is not always the account you expect — that is how a
+contact ends up somewhere that can never join your groups.
+
+⚠️ **An unrecognised `--container` used to be silently ignored.**
+`add(_:toContainerWithIdentifier:)` treats an unknown identifier as nil and files
+the record in the default container, reporting success. It is now a hard error
+listing the valid containers. Names work as well as ids: `--container "On My Mac"`.
 
 ⚠️ **`groups remove` depends on which account the group lives in.**
 `CNSaveRequest.removeMember` saves without error and changes *nothing* for a
