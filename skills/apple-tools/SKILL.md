@@ -328,6 +328,10 @@ Both take `--json` and return `{group, contact_id, member, changed}`. **Read
 someone already in the group, or removing someone who was never in it, exits 0
 with `changed: false` — so don't report an addition that did not happen.
 
+⚠️ **Don't compare contact ids you got from different commands.** A contact has
+both a unified id and a container-backed one, and they are different strings for
+the same person. Match on the id a single command gave you, or re-read with `get`.
+
 🛑 **A contact can only join a group in its own account.** If `groups add` fails
 saying the two are in different accounts, the contact is in the wrong container
 and no retry will help — **there is no move API**. Create it in the group's

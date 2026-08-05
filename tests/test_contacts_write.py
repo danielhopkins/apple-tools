@@ -321,6 +321,37 @@ class Groups(GroupFixtures):
             run("groups", "remove", group["id"], contact["id"])
             run("delete", contact["id"])
 
+    def test_membership_check_spans_both_identifier_forms(self):
+        """A membership check must not compare a unified id against a backing one.
+
+        `groups add` fetches its contact non-unified — it has to, since
+        `addMember` rejects a unified contact — so it holds a backing-record id
+        like `D065726A-…:ABPerson`, while a `unifiedContacts` fetch of the group
+        returns `BD00169D-…` for the same person. Comparing across the two made a
+        *successful* add report "the save reported success but X is not in the
+        group", which makes the command unusable for any contact macOS has linked.
+
+        Adding twice is the cheap way to catch it: the second call must see the
+        first one's membership, whichever spelling each side used.
+        """
+        group = self.create_group("IdForms")
+        contact = self.add("Linked")
+
+        first = run_json("groups", "add", group["id"], contact["id"], "--json")
+        self.assertTrue(first["changed"])
+
+        # If the two identifier forms were compared naively, this reports
+        # changed:true again — or the add path throws its "reported success but
+        # is not in the group" false alarm.
+        second = run_json("groups", "add", group["id"], contact["id"], "--json")
+        self.assertFalse(second["changed"])
+        self.assertTrue(second["member"])
+
+        # And a removal must see it too, or it would refuse as a non-member.
+        removed = run_json("groups", "remove", group["id"], contact["id"], "--json")
+        self.assertTrue(removed["changed"], "remove could not see the membership")
+        self.assertEqual(run_json("groups", "members", group["id"]), [])
+
     def test_adding_an_existing_member_reports_no_change(self):
         """Exiting 0 is not the same as having done something.
 
