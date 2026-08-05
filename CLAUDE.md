@@ -721,8 +721,26 @@ FIELDS, shared by `add` and `edit`:
 ```
 
 Labels are friendly names: `home`, `work`, `school`, `other`, plus `mobile`,
-`iphone`, `main`, `pager` for phones. `--email work:a@b.com`. Unlabelled values
-are accepted for email/phone/url.
+`iphone`, `main`, `pager`, `applewatch` for phones, `icloud` for email and
+`homepage` for URLs. `--email work:a@b.com`. Unlabelled values are accepted for
+email/phone/url.
+
+**Any other label is kept as a custom label**, exactly as Contacts.app stores
+one the user typed, and **with its case** — `--url "LinkedIn:https://…"` reads
+back as `LinkedIn`, not `linkedin`. This is what makes the documented "read it
+first, re-pass what you want to keep" workflow safe: **`get` → `edit` → `get` is
+a no-op** for every multi-value field, pinned by a test.
+
+⚠️ **A bare URL is fine; the scheme is not read as a label.** `--url
+"https://x.com"` stores the whole thing — the split is on the first colon, but a
+prefix that parses as a URI scheme followed by `//`, or one of `mailto` `tel`
+`sms` `callto` `facetime` `facetime-audio` `skype` `xmpp`, is treated as part of
+the value. The cost is that those words cannot be used as labels.
+
+**Every write is read back and checked.** `add` and `edit` re-read the contact
+and confirm each labelled value asked for is really there, failing loudly
+otherwise. It is a subset check, because `get` returns the unified contact and a
+linked card can contribute values this edit never mentioned.
 
 **Relations.** `--relation father:"Robert Hopkins"`. All 216 relation labels the
 Contacts SDK defines are accepted — `father`, `mother`, `son`, `daughter`,
@@ -876,6 +894,34 @@ grants only to signed apps on request — no CLI can hold it. Notes are read
 straight from the AddressBook SQLite store instead. Note edits must happen in
 Contacts.app.
 
+🛑 **A note blocks *every* `CNContactStore` write to that contact, not just the
+note.** The save faults the whole record, faulting reads the note attribute, and
+reading it hits the same entitlement — so an unrelated `--company` change is
+collateral damage. It fails as a bare `NSCocoaErrorDomain 134092` with an empty
+`userInfo`, naming neither the contact nor the note, plus a raw `CoreData:
+error: Unhandled error occurred during faulting` on stderr. **52 of 669 contacts
+here carry a note**, so this was ~8% of a real address book that could not be
+edited or added to a group at all.
+
+`edit` and `groups add` now catch it and rewrite through the **legacy
+`AddressBook` framework**, which writes the same records under the same
+`UUID:ABPerson` identifiers, needs no permission beyond the Contacts access the
+tool already has, and is not subject to the note wall for other properties.
+Consequences worth knowing:
+
+- ⚠️ **AddressBook's first save always fails and the second one works.**
+  Faulting trips the wall once; afterwards the pending changes commit. So a lone
+  failure means nothing there, and the write is confirmed by re-reading rather
+  than by any return value.
+- The fallback writes `kABBirthdayComponentsProperty` and
+  `kABOtherDateComponentsProperty`, not the plain `NSDate` ones, because those
+  cannot express a year-less `--MM-DD`.
+- The note itself still cannot be written by either path, and is left untouched.
+- The raw CoreData dump is suppressed (`com.apple.CoreData.Logging.stderr`, in
+  the in-memory registration domain) since the tool now explains the failure
+  itself. If the fallback also fails, the error names the contact, the note, and
+  Contacts.app.
+
 ⚠️ **`delete` is permanent.** Unlike Notes there is no Recently Deleted, and the
 deletion syncs everywhere. Always confirm with the user first. Deleting a
 *group* keeps its contacts; removing a member keeps the contact too.
@@ -957,7 +1003,7 @@ own flag:
 ```
 ./tests/run-tests              # calendar writes (25) + mail wedge guards (21)
 ./tests/run-tests --mail       # + mail drafts (19)
-./tests/run-tests --contacts   # + contacts writes (28)
+./tests/run-tests --contacts   # + contacts writes (60)
 ```
 
 `test_mail_wedge.py` is the exception to the flag rule: it is read-only — it
@@ -983,6 +1029,11 @@ be undone, so never loosen that to a prefix match. Set `APPLE_CONTACTS_BIN` to
 run against a specific binary; TCC grants are per path, so the copy you just
 built may not be the approved one, and an unapproved one hangs on XPC rather
 than failing cleanly.
+
+`NoteBearingContacts` is the one class in that suite with a dependency outside
+the tool: it plants its fixture note through **Contacts.app AppleScript**,
+because writing a note is exactly what the tool cannot do. Without Automation →
+Contacts for the calling terminal it skips rather than fails.
 
 ## Permissions
 

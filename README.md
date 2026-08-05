@@ -160,7 +160,7 @@ isn't guaranteed; JSON is.
 | `phone` | `CallHistory.storedata` + AddressBook | Recent calls with callers resolved to names, missed/unknown filters, talk-time stats, blocked list. Read-only apart from `dial`, which hands a `tel:` URL to Phone.app for you to confirm. |
 | `reminders` | EventKit | Full CRUD: add, edit, complete, delete, lists, priorities, recurrence, natural-language dates. |
 | `calendar` | EventKit | List and search events, create, edit, delete; recurring-event spans. |
-| `contacts` | Contacts framework | Search by name, company, email, or phone; create, edit, delete. Notes are read-only. |
+| `contacts` | Contacts framework, with a legacy `AddressBook` fallback | Search by name, company, email, or phone; create, edit, delete. Notes are read-only, and a contact that has one can only be written through the fallback. |
 
 The Notes reader decodes Apple's gzipped-protobuf note bodies directly rather
 than going through AppleScript, so it preserves highlights, headings, lists, and
@@ -276,7 +276,7 @@ opting in to one more surface:
 ```
 ./tests/run-tests              # calendar write paths       (25 tests)
 ./tests/run-tests --mail       # + mail drafts              (19)
-./tests/run-tests --contacts   # + contacts writes          (28)
+./tests/run-tests --contacts   # + contacts writes          (60)
 ./notes/run-tests              # live Notes.app
 ```
 
