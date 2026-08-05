@@ -15,3 +15,8 @@ completions/_apple-contacts
 
 # Local path-shading dev install (make dev)
 .dev-bin/
+
+# A stray root .build/ appears if swift build is run from the repo root
+# rather than swift/, and .claude/ holds local agent state and worktrees.
+.build/
+.claude/
