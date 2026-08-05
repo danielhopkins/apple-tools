@@ -1,8 +1,8 @@
 class AppleTools < Formula
   desc "Local CLIs for Notes, Mail, Messages, Phone, Reminders, Calendar, Contacts"
   homepage "https://github.com/danielhopkins/apple-tools"
-  url "https://github.com/danielhopkins/apple-tools/releases/download/v26.804.1/apple-tools-26.804.1.tar.gz"
-  sha256 "b979d692544b7fa0bcf690c149957f8040c920256c6cfce33337fce390a8ee5f"
+  url "https://github.com/danielhopkins/apple-tools/releases/download/v26.804.2/apple-tools-26.804.2.tar.gz"
+  sha256 "66b5d1ca0f342524b3e8eab38bd29eed4224323b5474536814a34f67d166b557"
   license "MIT"
 
   depends_on :macos
