@@ -1,8 +1,8 @@
 class AppleTools < Formula
   desc "Local CLIs for Notes, Mail, Messages, Phone, Reminders, Calendar, Contacts"
   homepage "https://github.com/danielhopkins/apple-tools"
-  url "https://github.com/danielhopkins/apple-tools/releases/download/v26.805.0/apple-tools-26.805.0.tar.gz"
-  sha256 "9b4fd328d8ed0c35bb8f9a076214bd58d56ad59cd45e7abc02c3747cf2707bf4"
+  url "https://github.com/danielhopkins/apple-tools/releases/download/v26.810.0/apple-tools-26.810.0.tar.gz"
+  sha256 "e7c5183635f26b5e3ca86a6e81a116360742ab5e13bd118d696be698325849d8"
   license "MIT"
 
   depends_on :macos
@@ -54,8 +54,6 @@ class AppleTools < Formula
         apple-calendar calendars   # Calendar access
         apple-contacts list        # Contacts access
 
-        apple-mail draft --help    # Automation access for Mail, for draft/send
-
       reminders, apple-calendar and apple-contacts hold their own grants rather
       than borrowing the terminal's, so they work from any terminal and appear
       in System Settings under their own names. Upgrading this formula
@@ -65,10 +63,12 @@ class AppleTools < Formula
       SQLite stores directly, which requires Full Disk Access for your terminal:
       System Settings -> Privacy & Security -> Full Disk Access
 
-      For apple-mail that covers search, export and accounts — they read Mail's
-      own index and message files, so they are fast and work with Mail.app
-      closed. Only draft and send need the Automation grant above. Run
-      `apple mail status` to see both.
+      For apple-mail that covers everything it does — search, export,
+      attachments and accounts all read Mail's own index and message files, so
+      they are fast and work with Mail.app closed. apple-mail does not compose:
+      draft, reply, forward and send were removed in 26.810.0 because Mail
+      re-wraps any scripted body as a quotation the moment the draft is opened.
+      Compose in Mail.app. Run `apple mail status` for the grant detail.
 
       apple-messages is read-only and needs nothing beyond that Full Disk
       Access; it reads ~/Library/Messages/chat.db and never drives Messages.app.
