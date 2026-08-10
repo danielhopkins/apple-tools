@@ -155,7 +155,7 @@ isn't guaranteed; JSON is.
 | Tool | Backed by | Capability |
 |------|-----------|------------|
 | `notes` | `NoteStore.sqlite` + protobuf | Search titles, list folders, export notes as Markdown, deep links. Read-only. |
-| `mail` | `Envelope Index` + `.emlx` | Search by subject, sender, or full body text with date and flag filters; export a message; save its attachments. **Read-only** — composing was removed in 26.810.0, see [`docs/apple-mail-drafts.md`](docs/apple-mail-drafts.md). |
+| `mail` | `Envelope Index` + `.emlx` (reads), AppleScript + pasteboard (compose) | Search by subject, sender, or full body text with date and flag filters; export a message; save its attachments. `compose`/`reply`/`forward` open a Mail window with everything but the body and put that on the clipboard — **the tool never writes a body**, see [`docs/apple-mail-drafts.md`](docs/apple-mail-drafts.md). |
 | `messages` | `chat.db` | Search and export iMessage/SMS/RCS history, list conversations, save attachments. Read-only. |
 | `phone` | `CallHistory.storedata` + AddressBook | Recent calls with callers resolved to names, missed/unknown filters, talk-time stats, blocked list. Read-only apart from `dial`, which hands a `tel:` URL to Phone.app for you to confirm. |
 | `reminders` | EventKit | Full CRUD: add, edit, complete, delete, lists, priorities, recurrence, natural-language dates. |
@@ -227,10 +227,9 @@ binary. `apple-notes`, `apple-messages` and `apple-phone` need Full Disk Access 
 they read `NoteStore.sqlite`, `chat.db` and `CallHistory.storedata` directly.
 `apple-phone` in particular *cannot* be made to disclaim: doing so would make it
 its own responsible process and lose the terminal's Full Disk Access, which is
-the grant it depends on. `apple-mail` needs Full Disk Access for everything it does — search, export,
-attachments, accounts. Automation → Mail is still read, since `export` can fall
-back to asking Mail for a body it has not downloaded, but nothing headline
-depends on it; `apple mail status` reports both separately.
+the grant it depends on. `apple-mail` needs Full Disk Access to read — search, export, attachments,
+accounts — and Automation → Mail to open a compose window for `compose`, `reply`
+and `forward`. `apple mail status` reports both separately.
 
 ## Layout
 

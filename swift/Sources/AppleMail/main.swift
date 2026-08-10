@@ -114,19 +114,21 @@ struct AppleMail: AsyncParsableCommand {
     commandName: "apple-mail",
     abstract: "Search and export Apple Mail messages",
     discussion: """
-      Reading only. Composing was removed in 26.810.0 — Mail re-wraps any body
-      written by a script in <blockquote type="cite"> the moment the draft is
-      opened, so every draft this tool wrote reached recipients as a quotation.
-      See docs/apple-mail-drafts.md. Compose in Mail.app.
+      compose/reply/forward open a Mail window with everything filled in except
+      the body, and put the body on the clipboard for you to paste. This tool
+      never writes a body: one written by a script is wrapped in
+      <blockquote type="cite"> and reaches recipients as a quotation. There is no
+      send — send from Mail.app. See docs/apple-mail-drafts.md.
 
       Examples:
-        apple-mail accounts --json                        # accounts and mailboxes
         apple-mail search "invoice" --since 30 --json     # bounded search
         apple-mail export <message-id> --json             # one message
+        apple-mail compose --to a@b.com --subject "Hi" --body "text"
       """,
     version: appleToolsVersion,
     subcommands: [
-      Search.self, Export.self, Attachments.self, Accounts.self, DeleteDraft.self, Status.self,
+      Search.self, Export.self, Attachments.self, Accounts.self,
+      Compose.self, Reply.self, Forward.self, DeleteDraft.self, Status.self,
     ]
   )
 }

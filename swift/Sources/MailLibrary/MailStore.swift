@@ -384,6 +384,62 @@ public final class MailStore {
     return (message.summary, files)
   }
 
+  // MARK: Addressing one message for a script
+
+  /// Enough about one message for AppleScript to address it directly.
+  ///
+  /// 🛑 **`rowid` is Mail's AppleScript numeric `id`** — the Envelope Index
+  /// ROWID and the `.emlx` filename are the same number. That equivalence is
+  /// what makes `first message of mailbox M of account A whose id is N`
+  /// possible, and it is the only safe way to hand Mail one message: a
+  /// script-side `repeat` over a mailbox to find it is the pattern that stops
+  /// Mail servicing Apple Events, for every client on the machine, until it is
+  /// restarted. Measured at 0.13s on a small mailbox and 5.7s on one holding
+  /// 37,194 messages — versus a wedge.
+  public struct MessageReference: Sendable {
+    public let rowid: Int64
+    public let messageID: String
+    /// Mail's *display* name for the account, which is what AppleScript matches.
+    public let account: String
+    public let mailbox: String
+    public let subject: String
+
+    /// A draft has no sender, so there is nothing to reply to — and handing one
+    /// to Mail's `reply` verb wedged Mail during development. Callers refuse on
+    /// this before spending an Apple Event.
+    public var isDraft: Bool { MailboxNames.aliases["drafts"]?.contains(mailbox.lowercased()) ?? false }
+  }
+
+  /// Resolve a Message-ID to something a script can address, off the index alone.
+  ///
+  /// ⚠️ The same Message-ID can exist in several mailboxes and accounts; this
+  /// takes the newest, which `messages(withMessageID:)` orders first, and
+  /// `account` narrows when that matters.
+  public func messageReference(messageID: String, account: String? = nil) throws
+    -> MessageReference
+  {
+    var rows: [[String: Any]] = []
+    for candidate in messageIDCandidates(messageID) {
+      rows = try index.messages(withMessageID: candidate)
+      if !rows.isEmpty { break }
+    }
+    let summaries = rows.compactMap(summary)
+    let matching =
+      account.map { wanted in
+        summaries.filter { $0.account.localizedCaseInsensitiveContains(wanted) }
+      } ?? summaries
+
+    guard let found = matching.first else {
+      throw EnvelopeIndexError.notFound(
+        "No message with Message-ID '\(messageID)'. "
+          + "Message-IDs change when a draft is edited and saved — re-read it with "
+          + "`apple mail search \"\" --mailbox drafts --json` if this was a draft.")
+    }
+    return MessageReference(
+      rowid: found.rowid, messageID: found.id, account: found.account,
+      mailbox: found.mailbox, subject: found.subject)
+  }
+
   // MARK: Accounts
 
   public struct AccountSummary: Sendable {

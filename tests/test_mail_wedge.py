@@ -426,3 +426,75 @@ class TestFastPathStillWorks(MailGuardTest):
         self.assertIn("mail_app", payload)
         self.assertIsInstance(payload["mail_app"]["running"], bool)
 
+
+
+class TestComposeRefusalsAreFree(MailGuardTest):
+    """The compose commands refuse bad requests off the index, before Mail.
+
+    🛑 These matter more than they look. `compose`/`reply`/`forward` open a real
+    window in front of the user, and the refusals are what stop a malformed
+    request from doing that — or, worse, from asking Mail to find a message by
+    enumerating a mailbox, which is the pattern that wedges its scripting
+    interface. Every assertion here is also a timing assertion: a refusal that
+    took long enough to have asked Mail is a refusal that asked Mail.
+
+    None of these create a draft or open a window, so they are safe to run
+    unattended alongside the read guards.
+    """
+
+    def test_forward_without_recipients_costs_no_apple_event(self):
+        code, _, err, elapsed = run("forward", "whatever@example.invalid", "--body", "x")
+        self.assertNotEqual(code, 0)
+        self.assertIn("recipients", err.lower())
+        self.assertRefusedFast(elapsed)
+        self.assertDidNotLaunchMail()
+
+    def test_unknown_message_id_is_decided_off_the_index(self):
+        code, _, err, elapsed = run(
+            "reply", "definitely-not-a-real-id@example.invalid", "--body", "x")
+        self.assertNotEqual(code, 0)
+        self.assertIn("no message", err.lower())
+        self.assertRefusedFast(elapsed)
+        self.assertDidNotLaunchMail()
+
+    def test_a_missing_body_is_refused_before_anything_opens(self):
+        code, _, err, elapsed = run("compose", "--to", "a@b.com", "--subject", "x")
+        self.assertNotEqual(code, 0)
+        self.assertIn("body", err.lower())
+        self.assertRefusedFast(elapsed)
+        self.assertDidNotLaunchMail()
+
+    def test_compose_without_recipients_is_refused(self):
+        code, _, err, elapsed = run("compose", "--subject", "x", "--body", "y")
+        self.assertNotEqual(code, 0)
+        self.assertRefusedFast(elapsed)
+        self.assertDidNotLaunchMail()
+
+    def test_markdown_and_html_together_are_refused(self):
+        code, _, err, elapsed = run(
+            "compose", "--to", "a@b.com", "--subject", "x", "--body", "y",
+            "--markdown", "--html")
+        self.assertNotEqual(code, 0)
+        self.assertIn("mutually exclusive", err.lower())
+        self.assertRefusedFast(elapsed)
+
+    def test_reply_to_a_draft_is_refused_off_the_index(self):
+        """🛑 A draft has no sender, and handing one to Mail's reply verb wedged
+        Mail during development. The refusal has to happen before the Apple
+        Event, which means it has to come from the index.
+
+        Skips when Drafts is empty rather than creating one: this suite creates
+        nothing.
+        """
+        code, out, _, _ = run("search", "", "--mailbox", "drafts", "--limit", "1", "--json")
+        if code != 0:
+            self.skipTest("could not list drafts")
+        drafts = json.loads(out)
+        if not drafts:
+            self.skipTest("no draft to point at; this suite never creates one")
+
+        code, _, err, elapsed = run("reply", drafts[0]["id"], "--body", "x")
+        self.assertNotEqual(code, 0)
+        self.assertIn("draft", err.lower())
+        self.assertRefusedFast(elapsed)
+        self.assertDidNotLaunchMail()

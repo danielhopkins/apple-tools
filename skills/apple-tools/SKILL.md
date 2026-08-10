@@ -18,7 +18,7 @@ these tools is that the edge cases are already handled.
 | Tool | Reads | Writes |
 |------|-------|--------|
 | `apple notes` | titles, folders, note bodies as Markdown | **yes**, once shortcuts are installed |
-| `apple mail` | accounts, message search, message bodies, attachments | no — see below |
+| `apple mail` | accounts, message search, message bodies, attachments | **opens a compose window**; you paste the body |
 | `apple messages` | conversations, message search, attachments | no |
 | `apple phone` | call history with names, blocked list, stats | **`dial` only** (you confirm in Phone.app) |
 | `apple reminders` | lists, items, due dates | **yes** |
@@ -66,6 +66,8 @@ apple mail search "budget review" --field content --json # full text of bodies
 apple mail export <message-id>
 apple mail attachments <message-id>                      # list what it carries
 apple mail attachments <message-id> --save ~/Downloads   # get the files
+apple mail compose --to a@b.com --subject "Q3" --body "…"  # opens window; user pastes
+apple mail reply <message-id> --body "…"                 # Mail builds the threading
 
 # Messages — reads chat.db; works with Messages.app closed. Read-only.
 apple messages chats --json                      # conversations, recent first
@@ -205,18 +207,33 @@ both words anywhere, in any order. Double-quote to require adjacency:
 `"budget review"`. So prefer two or three distinctive words over one, and do not
 paste a whole sentence — every word has to appear.
 
-🛑 **You cannot send or draft email. Do not try.** `apple mail` has no `draft`,
-`reply`, `forward` or `send` — they were removed in 26.810.0. Mail re-wraps any
-body written by a script in `<blockquote type="cite">` the moment the draft is
-opened, so every message the tool composed reached the recipient rendered as a
-quotation, while looking perfectly normal to the sender. There is no workaround
-from the CLI; the full investigation is in `docs/apple-mail-drafts.md`.
+**Writing email stops one keystroke short, by design.** `apple mail compose`,
+`reply` and `forward` open a Mail window with recipients, subject, threading, the
+quoted original and any carried-over attachments already filled in, put your text
+on the clipboard, and stop. The user presses ⌘V and ⌘S.
 
-When the user asks you to write an email: **draft the text for them in your
-reply** and tell them to paste it into Mail.app. Do not offer to send it, do not
-reach for AppleScript or `osascript` to do it yourself, and do not suggest some
-other tool will manage it. Writing the words is the useful part; putting them in
-Mail is one paste.
+```bash
+apple mail compose --to a@b.com --subject "Q3" --body "text"
+apple mail reply <message-id> --all --markdown --body-file -
+apple mail forward <message-id> --to a@b.com --body "FYI"
+```
+
+🛑 **The tool never writes the body, and you must not try to.** A body set through
+AppleScript is wrapped in `<blockquote type="cite">` and reaches recipients
+rendered as a quotation while looking normal to the sender. Do not reach for
+`osascript` to "finish the job" — that is the bug. See `docs/apple-mail-drafts.md`.
+
+**Report it as waiting, not as done.** The JSON says `status: "awaiting_paste"`
+and there is no `message_id`, because nothing was saved. Tell the user to press
+⌘V then ⌘S. Never say the mail was sent or the draft saved.
+
+**`--markdown` gives real formatting** — bold, italic, links, bullets. A plain
+`--body` is literal, so `*` and `_` in prose survive.
+
+⚠️ **There is no `send`.** When the user wants mail sent, use `compose` and let
+them press send themselves.
+
+🛑 **You cannot reply to a draft** — it has no sender. The tool refuses.
 
 `apple mail delete-draft <message-id>` still exists — it only moves a draft to
 trash, and only ever looks in Drafts, so it cannot touch sent or received mail.

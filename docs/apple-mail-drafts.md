@@ -1,14 +1,24 @@
-# Why `apple-mail` does not compose
+# Why `apple-mail` never writes a message body
 
-`apple mail` reads. It has no `draft`, `reply`, `forward` or `send`, and the
-`draft` it used to have was removed in **26.810.0**.
+`apple mail` has `compose`, `reply` and `forward` — and **none of them write the
+body**. They open a Mail compose window with everything else filled in, put the
+body on the pasteboard, and stop. You press ⌘V.
 
 The reason, in one line: **Mail wraps any body a script writes in
-`<blockquote type="cite">`, and there is no way to make that stick fixed.** A
-draft the tool wrote looked right on disk, looked right in macOS Mail, and
-reached the recipient rendered as a quotation. Every route to fixing it has been
-tried and measured; the one that works is behind an entitlement no third-party
-binary can hold.
+`<blockquote type="cite">`, and no amount of fixing the file afterwards makes
+that stick.** A draft the tool wrote looked right on disk, looked right in macOS
+Mail, and reached the recipient rendered as a quotation.
+
+The history matters, because the obvious fix looks like it works:
+
+- **26.810.0** removed `draft`, `reply`, `forward` and `send` outright, after the
+  `.emlx` rewrite they depended on was measured and found not to survive the
+  draft being opened.
+- **26.810.1** brought `compose`/`reply`/`forward` back in the shape below, once
+  pasting into the native editor was measured and *did* survive.
+
+`send` did not come back and will not: it composes without a window, so there is
+nowhere to paste. Send from Mail.app.
 
 Verified on **macOS 27, Mail 16.0 (3897.100.8.1.1)**.
 
@@ -235,7 +245,67 @@ It exits **0 if something became reachable** and 1 if nothing changed, so it can
 be run from a cron or a release check. Pair it with `util/appintents-dump` for
 the parameter schema of anything that opens up.
 
-## The alternative that might still work: paste
+## What was built instead: the pasteboard handoff
+
+Measured on 2026-08-10, by hand, in matched pairs — the method described above.
+
+**The design.** Everything Mail is good at is left to Mail; the one thing it gets
+wrong is left to a keystroke:
+
+| Piece | Who does it |
+|---|---|
+| recipients, subject, sending account | AppleScript on the outgoing message |
+| threading (`In-Reply-To`, `References`) | Mail's `reply` verb |
+| the quoted original | Mail's `reply`/`forward` verb |
+| attachments carried from the original | Mail's `forward` verb |
+| **the body** | **⌘V, by the user** |
+
+The old design fought exactly one of those and lost. Cut it out and the rest was
+never in question.
+
+**Verified end to end.** A scripted-open reply, body pasted, saved, then reopened
+and hand-edited: no wrapper, `In-Reply-To`/`References` intact, the caller's text
+above the quotation, Markdown rendered as real `<b>`, `<i>`, a live `<a href>` and
+bullets. A scripted forward of a message with an attachment came out 184 KB with
+`filename=image.jpeg` intact — the case the old rebuild path had to refuse.
+
+**The pasteboard carries RTF, deliberately one rich flavour.** HTML on the
+pasteboard makes Mail insert the body **twice** — found by
+`patrickfreyer/apple-mail-mcp` in v3.1.8/v3.2.0, fixed there the same way. Our own
+first spike used `public.html` and would have shipped the double insertion. A
+plain-text flavour is written alongside, which is what any native app does; Mail
+takes the richest offered.
+
+🛑 **Markdown needs rebuilding, not just parsing.** `AttributedString(markdown:)`
+is the right parser, but its output cannot go straight to `.rtf(from:)`:
+
+- **The parsed string contains no line breaks at all.** Block structure lives in
+  `presentationIntent` runs, so `"first para\n\nsecond para"` comes back as
+  `"first parasecond para"` and every paragraph runs together.
+- **Emphasis is semantic, not visual.** Bold arrives as
+  `inlinePresentationIntent == .stronglyEmphasized`, never as a font trait, and
+  RTF has nowhere to put an intent — so a `**bold**` body converts with no bold
+  in it.
+
+`ComposeBody.markdownAttributed` walks the runs, inserts a real break at each
+block change, prefixes list items, and converts each inline intent to an actual
+font. Both failures are pinned by tests.
+
+⚠️ **Assert on the font, not on the RTF text.** Grepping RTF for `\b` also matches
+`\brdrhair` and friends, so the obvious test passes whether or not the bold is
+really there. That test was written, passed, and was wrong.
+
+**What the tool still refuses, off the index, before any Apple Event:** a
+Message-ID it cannot find, a forward with no recipients, a body it was not given,
+`--markdown` together with `--html`, and 🛑 **replying to a draft** — a draft has
+no sender, and handing one to Mail's `reply` verb wedged Mail during development.
+Each refuses in under 0.25s.
+
+⚠️ **`send` is deliberately absent.** It composed without saving, so there was
+never a file to rewrite and there is no window to paste into. Every message it
+ever sent carried the wrapper.
+
+## The spike this grew out of
 
 Answering an open question nobody in the field had run (che-apple-mail-mcp #306,
 which assumed rich text was "structurally impossible" wrapper-free): **HTML
@@ -254,17 +324,21 @@ through AppleScript, so `⌘V` is the only keystroke. Result:
 
 No wrapper, markup intact.
 
-⚠️ **It has never been tested for review durability**, which is the property that
-killed everything else — only for whether it composes clean. The provenance
-conclusion above predicts it *should* survive, since paste is the only method
-that gets content in through the native editor, but that is a prediction and not
-a measurement.
+It has since been tested for review durability too, and survives — that is what
+the shipped design rests on.
 
-Not shipped because it needs an **Accessibility** grant, steals focus, and cannot
-run unattended — and the keystroke surface is genuinely dangerous: during testing
-a stray `pri` was leaked into one body, and a paste with the wrong tab count
-landed **in the subject field**, replacing it. If it is ever shipped, guard it by
-re-reading the subject after the paste. It also leaves `text/plain` empty.
+🛑 **What is *not* shipped is pressing ⌘V for the user.** Automating the keystroke
+needs an **Accessibility** grant — the ability to drive the whole machine — steals
+focus, and cannot run unattended. The keystroke surface is genuinely dangerous:
+during testing a stray `pri` was leaked into one body, and a paste with the wrong
+focus landed **in the subject field**, replacing it. `patrickfreyer` polls
+`frontmost of process "Mail"` before every keystroke for exactly this reason. The
+user pressing their own ⌘V costs one keystroke and removes all of it.
+
+⚠️ **`text/plain` comes out empty**, and that is not a defect of this route: a
+draft *typed by hand* in Mail has an empty `text/plain` too. It is what Mail does
+for every draft however the body arrived. The claim in `prior-art.md` that pasting
+populates it is wrong — measured empty five times.
 
 ## Dead ends
 

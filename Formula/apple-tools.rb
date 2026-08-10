@@ -54,6 +54,9 @@ class AppleTools < Formula
         apple-calendar calendars   # Calendar access
         apple-contacts list        # Contacts access
 
+        apple-mail compose --help  # no grant needed, but composing needs
+                                   # Automation -> Mail on first real use
+
       reminders, apple-calendar and apple-contacts hold their own grants rather
       than borrowing the terminal's, so they work from any terminal and appear
       in System Settings under their own names. Upgrading this formula
@@ -63,12 +66,18 @@ class AppleTools < Formula
       SQLite stores directly, which requires Full Disk Access for your terminal:
       System Settings -> Privacy & Security -> Full Disk Access
 
-      For apple-mail that covers everything it does — search, export,
-      attachments and accounts all read Mail's own index and message files, so
-      they are fast and work with Mail.app closed. apple-mail does not compose:
-      draft, reply, forward and send were removed in 26.810.0 because Mail
-      re-wraps any scripted body as a quotation the moment the draft is opened.
-      Compose in Mail.app. Run `apple mail status` for the grant detail.
+      For apple-mail that covers search, export, attachments and accounts —
+      they read Mail's own index and message files, so they are fast and work
+      with Mail.app closed.
+
+      apple-mail also has compose, reply and forward. They open a Mail window
+      with recipients, subject, threading and attachments filled in, put the body
+      on your clipboard, and stop — you press Cmd-V then Cmd-S. The tool never
+      writes a body: one written by a script is wrapped in a citation blockquote
+      and reaches recipients rendered as a quotation. That needs the Automation
+      grant below. There is no send; send from Mail.app.
+
+      Run `apple mail status` for the grant detail.
 
       apple-messages is read-only and needs nothing beyond that Full Disk
       Access; it reads ~/Library/Messages/chat.db and never drives Messages.app.

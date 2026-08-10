@@ -18,6 +18,8 @@ installed via `make install`.
 | Full-text mail search | `apple mail search "budget" --field content --json` |
 | Read an email | `apple mail export <message-id>` |
 | Save an attachment | `apple mail attachments <message-id> --save ~/Downloads` |
+| Start an email (user pastes) | `apple mail compose --to a@b.com --subject "…" --body "…"` |
+| Reply to an email | `apple mail reply <message-id> --body "…"` |
 | List mail accounts | `apple mail accounts --json` |
 | List conversations | `apple messages chats --json` |
 | Search messages | `apple messages search "dinner" --json` |
@@ -182,17 +184,20 @@ so no virtualenv is involved.
 
 ### mail — `apple mail`
 
-🛑 **This tool reads. It does not compose.** `draft`, `reply`, `forward` and
-`send` were removed in **26.810.0**: Mail re-wraps any body written by a script
-in `<blockquote type="cite">` the moment the draft is opened, so every message
-the tool composed reached recipients rendered as a quotation, invisibly to the
-sender. It is not fixable from our side — the full investigation, and the one
-route that would work, is in [`docs/apple-mail-drafts.md`](docs/apple-mail-drafts.md).
-**To send mail, compose it in Mail.app.** Do not add a compose path back without
-reading that doc first.
+🛑 **This tool never writes a message body, and that is the whole design.**
+Setting a body through AppleScript wraps it in `<blockquote type="cite">` (Apple
+FB11734014) — invisible to the sender, rendered as a quotation by iOS Mail and
+Gmail. It cannot be fixed after the fact: rewriting the `.emlx` corrects the file,
+and the file is not what the composer opens, so the wrapper returns the moment the
+draft is reviewed. A whole compose surface was built on that rewrite and removed
+in 26.810.0 when it was measured.
 
-Everything else reads Mail's own SQLite index and the `.emlx` files on disk, so
-it works with Mail.app closed and returns in milliseconds.
+So `compose`, `reply` and `forward` **open a Mail window with everything filled in
+except the body**, put the body on the pasteboard, and stop. The user presses ⌘V
+and ⌘S. Full record in [`docs/apple-mail-drafts.md`](docs/apple-mail-drafts.md).
+
+Reads go to Mail's own SQLite index and the `.emlx` files on disk, so they work
+with Mail.app closed and return in milliseconds.
 
 ```
 apple mail accounts [--json]      # names, addresses, mailboxes, enabled
@@ -202,9 +207,42 @@ apple mail search QUERY [--account NAME] [--mailbox NAME] [--field subject|sende
                         [--all] [--json]
 apple mail export MESSAGE-ID [--account NAME] [--json] [--raw]
 apple mail attachments MESSAGE-ID [--save DIR] [--skip-inline] [--account NAME] [--json]
+
+apple mail compose --to ADDR [--cc ADDR] [--bcc ADDR] [--subject TEXT]
+                   [--from ACCOUNT-ADDRESS] [--body TEXT | --body-file FILE|-]
+                   [--markdown | --html] [--json]
+apple mail reply MESSAGE-ID [--all] [--body TEXT | --body-file FILE|-]
+                 [--markdown | --html] [--account NAME] [--json]
+apple mail forward MESSAGE-ID --to ADDR [<same flags as reply>]
+
 apple mail delete-draft MESSAGE-ID [--account NAME] [--json]
 apple mail status [--json]
 ```
+
+**Composing hands off to the user, and that is not a failure.** Each command
+opens the window, loads the pasteboard and prints `press ⌘V, then ⌘S`. It never
+saves a draft itself, so there is no `message_id` to report — the JSON says
+`status: "awaiting_paste"`. Tell the user to paste; do not describe the mail as
+sent or saved.
+
+**Mail does everything except the body**: recipients, subject, sending account,
+`In-Reply-To`/`References`, the quoted original, and **attachments carried over by
+a forward** — the last of which is why forwarding is left to Mail rather than
+rebuilt. Verified: a forwarded message came out 184 KB with its attachment intact.
+
+**Bodies may be `--markdown` or `--html`; both become RTF on the pasteboard.**
+Markdown gives real bold, italic, links and bullets. 🛑 RTF is deliberate: **HTML
+on the pasteboard makes Mail insert the body twice.** A plain `--body` is taken
+literally, so prose containing `*` or `_` survives as written.
+
+⚠️ **`send` does not exist and will not.** It composed without a window, so there
+is nowhere to paste, and every message it ever sent carried the wrapper. When the
+user wants mail sent, draft the text and let them send it from Mail.app.
+
+🛑 **You cannot reply to a draft** — a draft has no sender, and handing one to
+Mail's `reply` verb wedged Mail during development. Refused off the index, before
+any Apple Event, along with an unknown Message-ID, a forward with no recipients,
+and a missing body. Each refuses in under 0.25s.
 
 All three read commands take `--engine auto|filesystem|applescript`. Leave it
 alone; `auto` uses the files. `--engine filesystem` fails loudly instead of
@@ -359,8 +397,7 @@ the command. Consequence: **the file-system answer has no `enabled` key**, so
 read it as `account.get("enabled", True)`. It also lists the local "On My Mac"
 store, which the AppleScript path omits.
 
-**`delete-draft` is the one remaining write, and it only ever moves a draft to
-trash.** It enumerates Drafts alone, so it cannot touch sent or received mail
+**`delete-draft` only ever moves a draft to trash.** It enumerates Drafts alone, so it cannot touch sent or received mail
 even if handed the Message-ID of some. It re-reads the mailbox afterwards and
 fails loudly rather than trusting the move, and it is a move to **trash, not a
 purge** — same as Notes' Recently Deleted, with no API to empty it.
@@ -916,8 +953,8 @@ docs/apple-notes-shortcuts.md  driving Notes' AppIntents from the CLI —
                           the only route to checklist writes and a real append
 notes/shortcuts/          .shortcut build scripts + signed files to install
 docs/apple-mail-store.md  Envelope Index schema, .emlx layout, verified traps
-docs/apple-mail-drafts.md why apple-mail does not compose: the cite-blockquote
-                          wrapper, every route ruled out, and how to re-check
+docs/apple-mail-drafts.md why apple-mail never writes a body: the cite-blockquote
+                          wrapper, every route ruled out, the pasteboard handoff
 util/check-mail-intents   is Mail's ComposeMessageIntent reachable yet? (exit 0
                           if something changed)
 util/appintents-dump      dev-only reader for an app's App Intents schema
@@ -1026,19 +1063,18 @@ Each tool needs a one-time TCC grant, prompted on first run **from a terminal**:
 |------|-------|
 | reminders | Privacy & Security → Reminders |
 | calendar | Privacy & Security → Calendars |
-| mail | Full Disk Access to read; Automation → Mail only for the export fallback |
+| mail | Full Disk Access to read; Automation → Mail to open a compose window |
 | messages | Full Disk Access for the calling terminal (reads chat.db directly) |
 | phone | Full Disk Access for the calling terminal (reads CallHistory + AddressBook) |
 | contacts | Privacy & Security → Contacts |
 | notes | Full Disk Access for the calling terminal (reads sqlite directly) |
 
-`mail` is effectively **Full Disk Access only** now. That covers `search`,
-`export`, `attachments` and `accounts` — everything the tool is for. Automation →
-Mail is still read, because `export` can fall back to asking Mail for a body it
-has not downloaded and `delete-draft` drives Mail, but its absence no longer
-costs a headline feature. `apple mail status` reports both and counts the tool
-usable if either is present, so "mail ✓" can mean reads work and the fallback
-does not; check the detail line before concluding which half is broken.
+`mail` needs **two grants for two halves**. Full Disk Access covers `search`,
+`export`, `attachments` and `accounts`. Automation → Mail is what lets
+`compose`/`reply`/`forward` open a window and `delete-draft` move a draft.
+`apple mail status` reports both and counts the tool usable if either is present,
+so "mail ✓" can mean reads work and composing does not; check the detail line
+before concluding which half is broken.
 
 `apple status` reports all seven at once without prompting — start there rather
 than running each tool to see which one errors.
