@@ -18,7 +18,7 @@ these tools is that the edge cases are already handled.
 | Tool | Reads | Writes |
 |------|-------|--------|
 | `apple notes` | titles, folders, note bodies as Markdown | **yes**, once shortcuts are installed |
-| `apple mail` | accounts, message search, message bodies | **drafts** (send is guarded) |
+| `apple mail` | accounts, message search, message bodies, attachments | no — see below |
 | `apple messages` | conversations, message search, attachments | no |
 | `apple phone` | call history with names, blocked list, stats | **`dial` only** (you confirm in Phone.app) |
 | `apple reminders` | lists, items, due dates | **yes** |
@@ -61,15 +61,11 @@ apple notes append 261 --body "- [ ] pack charger"         # real checklist item
 
 # Mail — reads Mail's own store; fast, and works with Mail.app closed
 apple mail accounts --json
-apple mail draft --to a@b.com --subject "Re: Q3" --body-file -   # body on stdin
 apple mail search "invoice" --json                       # whole store, ~0.04s
 apple mail search "budget review" --field content --json # full text of bodies
 apple mail export <message-id>
 apple mail attachments <message-id>                      # list what it carries
 apple mail attachments <message-id> --save ~/Downloads   # get the files
-apple mail draft --to a@b.com --subject "Q3" --body "..." --json   # → message_id
-apple mail draft --to a@b.com --subject "Q3" --body "..." --replace <message-id>
-apple mail delete-draft <message-id>
 
 # Messages — reads chat.db; works with Messages.app closed. Read-only.
 apple messages chats --json                      # conversations, recent first
@@ -110,9 +106,8 @@ apple contacts containers --json               # accounts; which is default
 
 ## Writing notes
 
-`apple notes create` and `apple notes append` take a body the same way `mail
-draft` does — `--body TEXT`, `--body-file FILE`, `--body-file -`, or a bare
-pipe. Markdown becomes **native structure**: `- [ ]` and `- [x]` are real
+`apple notes create` and `apple notes append` take a body as `--body TEXT`,
+`--body-file FILE`, `--body-file -`, or a bare pipe. Markdown becomes **native structure**: `- [ ]` and `- [x]` are real
 checklists carrying their checked state, and pipe tables are real tables.
 
 `append` is a genuine append — it **preserves attachments and existing
@@ -210,38 +205,24 @@ both words anywhere, in any order. Double-quote to require adjacency:
 `"budget review"`. So prefer two or three distinctive words over one, and do not
 paste a whole sentence — every word has to appear.
 
-**Drafting email is where you are most useful.** `apple mail draft` writes to
-Drafts and never sends. Pass long bodies via `--body-file -` on stdin.
+🛑 **You cannot send or draft email. Do not try.** `apple mail` has no `draft`,
+`reply`, `forward` or `send` — they were removed in 26.810.0. Mail re-wraps any
+body written by a script in `<blockquote type="cite">` the moment the draft is
+opened, so every message the tool composed reached the recipient rendered as a
+quotation, while looking perfectly normal to the sender. There is no workaround
+from the CLI; the full investigation is in `docs/apple-mail-drafts.md`.
 
-`draft --json` reports the new draft's `message_id`. Keep it — it is how you
-revise or remove what you just wrote:
+When the user asks you to write an email: **draft the text for them in your
+reply** and tell them to paste it into Mail.app. Do not offer to send it, do not
+reach for AppleScript or `osascript` to do it yourself, and do not suggest some
+other tool will manage it. Writing the words is the useful part; putting them in
+Mail is one paste.
 
-```bash
-apple mail draft --to a@b.com --subject "Q3" --body "v1" --json   # → message_id
-apple mail draft --to a@b.com --subject "Q3" --body "v2" --replace <message-id>
-apple mail delete-draft <message-id>
-```
-
-`--replace` writes the new draft first and only then trashes the old one, so a
-failure leaves two drafts rather than none. Check `replaced_removed` in the JSON
-before telling the user it was replaced — if it is `false`, both are still
-there and the old one needs removing in Mail.
-
-Still prefer getting it right in one write. `--replace` is for when the user
-asks for a change, not a substitute for thinking about the wording first — each
-round trip is a visible edit in their Drafts folder.
-
-`delete-draft` only looks in Drafts, so it cannot remove sent or received mail.
-It is a move to trash, not a purge.
-
-`apple mail send` exists but refuses to run without `--confirm`. Default to
-drafting and let the user send. Only use `send` if they asked you to send in
-that same turn — it is immediate and irreversible.
-
-Two things to tell the user rather than be surprised by: the body is wrapped in
-a `<blockquote type="cite">` by Mail itself (styling neutralised, renders
-normally), and the `text/plain` alternative is empty so plain-text-only readers
-see nothing until Mail regenerates the MIME on send.
+`apple mail delete-draft <message-id>` still exists — it only moves a draft to
+trash, and only ever looks in Drafts, so it cannot touch sent or received mail.
+🛑 **Re-resolve the id first**: a draft's Message-ID changes when it is edited
+and saved, and a stale one makes `export` return an *empty file* rather than an
+error. Get the current id from `apple mail search "" --mailbox drafts --json`.
 
 **Mail search is fast now — search widely.** It reads Mail's own index and
 message files rather than driving Mail.app, so a whole-store subject search is

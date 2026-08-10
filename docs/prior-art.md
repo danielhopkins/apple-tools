@@ -245,7 +245,7 @@ and it's the most careful Notes write path in the field. Verified by reading
     if self.body != body:
         self._run_script("noteSetBody", body)
     ```
-    That is the same discipline we already apply to mail drafts and contacts
+    That is the same discipline we already apply to contacts
     group removal — worth applying to notes writes too.
   - *NSPredicate filtering.* `plaintext contains[cd] %@` gets **full-text body
     search** for free, in one Apple Event. We say "search is title-only". We
@@ -705,7 +705,8 @@ for r in supermemoryai/apple-mcp more-io/claude-apple-bridges \
          PsychQuant/che-apple-mail-mcp BastianZim/apple-mail-mcp \
          fledgeling-co/sift-apple-mail-mcp joargp/amcli \
          macos-cli-tools/apple-mail-cli zenghao-stat/apple-mail-cli \
-         smarzola/apple-mail-mcp; do
+         smarzola/apple-mail-mcp jayvee6/apple-mail-mcp \
+         abhinavag-svg/apple-ecosystem-mcp fatbobman/mail-mcp-bridge; do
   gh api "repos/$r" --jq '"\(.full_name)\t★\(.stargazers_count)\tpushed \(.pushed_at[0:10])\tarchived=\(.archived)"'
 done
 ```
@@ -728,3 +729,209 @@ gh api "repos/OWNER/REPO/git/trees/HEAD?recursive=1" --jq '.tree[]|select(.type=
 Read the source before concluding anything from a name. Several claims in this
 file were wrong on the first pass precisely because they were inferred from
 filenames and shebangs rather than checked.
+
+## Mail specifically — the compose side
+
+Gathered 2026-08-06; **revised the same day** — the `.emlx` section below is a
+retraction, and one table row was scored wrong. The search-side notes above say
+nothing about composing, and that turned out to hide the single worst defect in
+the field: **Mail wraps every scripted body in `<blockquote type="cite">`**
+(Apple FB11734014). Full detail in [`apple-mail-drafts.md`](apple-mail-drafts.md).
+
+Of ~25 projects surveyed on the search side, **exactly one was recorded as
+relevant here, and its relevance was mis-scoped.** The two projects that engaged
+hardest with the wrapper were absent.
+
+| Project | Compose route | Engages with the wrapper? |
+|---|---|---|
+| [s-morgan-jeffries/apple-mail-fast-mcp](https://github.com/s-morgan-jeffries/apple-mail-fast-mcp) | **IMAP APPEND** to `\Drafts` | **best writeup in the field**, shipped v0.9.0 |
+| [PsychQuant/che-apple-mail-mcp](https://github.com/PsychQuant/che-apple-mail-mcp) | `mailto:` + GUI ⌘S; clipboard paste for reply/forward | **deepest engagement**; A/B/C/D disproof matrix |
+| [patrickfreyer/apple-mail-mcp](https://github.com/patrickfreyer/apple-mail-mcp) (189★) | **clipboard paste** — `NSAttributedString` → RTF, ⌘V into the composer | **yes, five releases of it** — see below |
+| [sweetrb/apple-mail-mcp](https://github.com/sweetrb/apple-mail-mcp) | SMTP direct (a *send* path, not a draft path) | yes, [#12](https://github.com/sweetrb/apple-mail-mcp/issues/12) — the wrapper in **sent** mail |
+| [kcrt/dotfiles](https://github.com/kcrt/dotfiles) | loads the clipboard, **lets the human press ⌘V** | yes, and the most conservative about it |
+| [parasxos/email-mcp](https://github.com/parasxos/email-mcp) | abandoned local Mail for Microsoft Graph | yes — probed it and gave up |
+| [omarshahine/apple-pim](https://github.com/omarshahine/apple-pim) | `make new outgoing message` | **no** |
+| [abhinavag-svg/apple-ecosystem-mcp](https://github.com/abhinavag-svg/apple-ecosystem-mcp) | `make new outgoing message` with `content:` (`tools/mail.py:947`) | **no** — no `blockquote`/`rtf`/`pasteboard` anywhere in the tree |
+| [jayvee6/apple-mail-mcp](https://github.com/jayvee6/apple-mail-mcp) | `reply m` then `set content of` — 🛑 **destroys Mail's quotation** | **no** |
+| [fatbobman/mail-mcp-bridge](https://github.com/fatbobman/mail-mcp-bridge) | read-only, no compose path at all | n/a |
+| [Macuse](https://macuse.app/) (closed source) | undocumented | **unscoreable** — see below |
+
+**The field has converged, and it converged on the clipboard.** Of the nine
+projects with a compose path: **three set `content:` and ship the wrapper**
+(omarshahine, abhinavag-svg, jayvee6), **three paste into Mail's own editor**
+(che, kcrt, patrickfreyer), one uses IMAP APPEND, one SMTP, and one left local
+Mail for Microsoft Graph. Setting `content:` is still the most popular single
+answer, but it is the answer of the projects that never noticed the bug. **The
+clipboard is the only route anyone has iterated on** rather than adopted and
+abandoned — and **nobody except us rewrites the `.emlx`**.
+
+Corrections to the search-side notes above, on these grounds:
+
+- The dismissal of sweetrb's IMAP/SMTP as "not a direction for this repo" was
+  written about *search*. It is also their **wrapper fix**, and that half deserved
+  judging on its own merits. (It still loses — see the drafts doc — but for
+  different reasons.)
+- che is listed as "index, no body search", true of its read side. Its **compose**
+  side is the most thorough treatment of this bug anywhere.
+- ⚠️ **patrickfreyer was scored "no — ships the wrapper, zero engagement", and
+  that is wrong.** It was written against an older release and used here as
+  evidence that the field ignores this. By v3.2.0 it is one of the most
+  engaged projects in the table. **Re-read release notes, not just `HEAD`, before
+  scoring a moving project** — the star count made it the one row worth
+  double-checking and it was the one row taken on trust.
+
+### 🛑 The `.emlx` rewrite: che was right and we were wrong
+
+**Revised 2026-08-06, the same day it was written, after watching it fail in the
+user's hands.** The claim below is what this section said, and it is retracted:
+
+> Editing the `.emlx` works — for a new draft, and only for a new draft. For a
+> draft from `make new outgoing message` che are **wrong**; the draft survives
+> being opened in the composer with its Message-ID and body intact. For a draft
+> from Mail's `reply`/`forward` verb they are **right**.
+
+That split decision does not exist. **There is one mechanism, and it applies to
+every draft Mail composed:**
+
+🛑 **Mail keeps its own copy of the message it composed, and that copy wins
+whenever Mail re-saves the draft.** The rewrite lives only in the file. Opening
+the draft can trigger a re-save; a re-save re-emits Mail's copy, discards the
+file, and mints a new Message-ID. Proven by content, not inference — a rebuilt
+reply that had been reviewed came back holding
+`Apple-Mail-URLShareUserContentTopClass`, `Apple-Mail-URLShareWrapperClass`,
+`blockquote type="cite"`, `<br>` line breaks and `Apple-converted-space` spans:
+not a degraded rewrite but **Mail's pre-rewrite composition, verbatim**.
+
+What that copy contains is the only thing the route changes, so each route loses
+something different:
+
+| Route | Mail's cached copy holds | A re-save costs |
+|---|---|---|
+| rewrite Mail's native `reply` draft (che's test, route 1) | quote + threading, **no body** | your text |
+| rebuild via the new-draft path (route 2) | your text, wrapped | the quote, `In-Reply-To`/`References`, `text/plain` |
+| plain `draft` | your text, wrapped | the wrapper returns; text survives |
+| `draft --attach` | the attachment `<object>`, **empty body** | your text |
+
+⚠️ **And it is nondeterministic, which is how it passed review.** The same
+scripted open-and-close test reported `ok` at 14:43 and `FAIL` at 14:51 with no
+code change between them. "Survives being opened" was **one observation of a coin
+flip, generalised to a property** and then written into three documents. The
+lesson is not about Mail: a live-system test that passes once is not a pinned
+property, and a claim that a write survives an interaction needs the interaction
+repeated, not passed.
+
+So `reply`'s rebuild through the new-draft path is not the fix it was documented
+as. It changes the failure mode from "loses your text" to "loses the quote and
+the threading". See [`apple-mail-drafts.md`](apple-mail-drafts.md).
+
+#### Superseded 2026-08-10 — the mechanism above is wrong, and compose is gone
+
+The retraction was right that there is one mechanism and it applies to every
+draft Mail composed. **The explanation was still wrong**, and the corrected one
+is what ended the feature.
+
+"Mail keeps its own copy and that copy wins" does not survive measurement:
+
+- **Mail's stored copy is clean.** The `.emlx` on disk and Mail's own `source of`
+  both hold the rewritten body — before *and* after a Mail restart,
+  byte-identical bar a trailing newline. There is no stale copy lurking.
+- **A cold compose cache changes nothing.** Quit Mail, confirm `outgoing messages
+  = 0`, reopen, open the draft: still wrapped.
+- **It is not nondeterministic.** Driven *by hand* rather than by `osascript`, it
+  reproduced every time across four matched pairs — every tool-written draft
+  wrapped, every hand-typed control stayed clean. The 14:43-`ok` / 14:51-`FAIL`
+  coin flip was an artefact of scripting the composer, which is itself a scripted
+  insertion and which wedges Mail besides.
+
+What actually happens: Mail **re-imports** the stored body as foreign content
+when the composer loads it, building a fresh native document and dropping ours
+inside the Share-Sheet template — which is why a hand edit lands *outside* the
+blockquote, as a sibling.
+
+🛑 **And the discriminator is provenance, not bytes.** A draft Siri composed
+through Mail's App Intents is clean, and stays clean through the same hand
+open/edit/save — while being equivalent to ours in every byte-level respect we
+control (both `7bit`, both with an empty `text/plain`, both carrying the same
+`<html aria-label="message body">` / `<body dir="auto" style="…">` shell, neither
+carrying `X-Apple-Mail-Signature`). Mail tracks how the message was created,
+outside the `.emlx`, and no rewrite can reach it.
+
+So the `.emlx` rewrite is not fixable, and `draft`/`reply`/`forward`/`send` were
+**removed in 26.810.0**. This also retires the comparison table above as a
+buyer's guide: the routes that lose are not losing for the reasons recorded
+there. See [`apple-mail-drafts.md`](apple-mail-drafts.md) for the full record and
+`util/check-mail-intents` for re-checking whether Apple has opened the one route
+that works.
+
+### One thing we established that nobody in the field had
+
+- **Rich HTML pastes wrapper-free.** che [#306](https://github.com/PsychQuant/che-apple-mail-mcp/issues/306)
+  is an explicitly unrun spike; their "rich text is structurally impossible" rule
+  was inherited from `mailto:`'s plain-text limit. Tested here: `<p>`, `<b>`,
+  `<i>`, `<a href>`, `<ul><li>` all survive a `public.html` paste into the native
+  editor. ⚠️ But see patrickfreyer below — **`public.html` is the wrong flavour**,
+  and they found that before we did.
+
+### What patrickfreyer already solved, that we would have paid for twice
+
+Their release notes are the most useful document in the field for anyone building
+the paste route. Both of these are failures we had already hit or would have:
+
+- **v3.1.5 — poll `frontmost of process "Mail"` before the keystroke**, in *both*
+  the reply and new-message paths. This is exactly the hazard recorded in
+  [`apple-mail-drafts.md`](apple-mail-drafts.md): during testing here a paste with
+  the wrong focus **landed in the subject field and replaced it**. The fix is a
+  wait, not cleverness.
+- **v3.1.8 / v3.2.0 — put RTF on the pasteboard, not HTML.** *"HTML
+  replies/compositions no longer paste the body twice… the body is now converted
+  to an `NSAttributedString` and written back as RTF (a single unambiguous
+  rich-text flavor) plus a rendered plain-text fallback."* Our verified paste used
+  `public.html`, so we would have shipped the double-insertion bug.
+
+⚠️ **Also worth crediting: pasting is the only route where Mail generates the
+`multipart/alternative` itself**, so `text/plain` comes out populated. That is one
+of the things our `.emlx` rewrite exists to hand-fix.
+
+### Notes on the rest
+
+- 🛑 **jayvee6's `reply.applescript` is the naive reply, and it loses the
+  quotation silently.** `set replyMsg to reply m` then `set content of replyMsg to
+  msgBody` — `content` is a full replace, so Mail's quoted original is discarded
+  and the new body is wrapped. It also resolves the target with `first message of
+  targetMbox whose message id = targetId`, **a whole-mailbox predicate**, which is
+  the pattern that wedges Mail's scripting interface on a large mailbox; and it
+  passes whatever it finds to `reply`, with no guard against replying to a draft
+  (which wedged Mail here). Its skill blocks LLM-generated *sends* and requires
+  manual dispatch from Mail — the same discipline as our `--confirm`.
+- **abhinavag-svg's `docs/plans/mail-rework-plan.md` is a plan to build what we
+  already ship**, from the same symptoms: AppleScript reads are slow, time out,
+  and cannot answer chronological queries; the recommendation is a hybrid of local
+  index for reads and AppleScript for actions. Independent confirmation of the
+  architecture. The compose problem is not on their roadmap.
+- ⚠️ **They read the Envelope Index by *snapshotting* it, and got the hard part
+  right: `mail_store.py:138` copies `-wal` and `-shm` alongside the main file.**
+  A copy without the write-ahead log is stale in both directions — the same trap
+  as AddressBook `immutable=1` in [`apple-phone-store.md`](apple-phone-store.md).
+  The cost they accept instead is a 900s snapshot TTL, so "any new mail?" can be
+  fifteen minutes out of date. We read live in 0.04s and need neither.
+- **fatbobman/mail-mcp-bridge is read-only and arrived at our read architecture
+  independently**: Envelope Index → `ROWID` → locate the `.emlx` → parse. No
+  compose path, so nothing on the wrapper.
+- **Macuse is a signed, closed-source MCP app and cannot be scored.** It
+  advertises "read, compose, send emails" and "reply to emails" over Full Disk
+  Access, and publishes no mechanism — no tool names, no parameters, nothing on
+  HTML or rich text. Being a signed app does not unlock a route we lack: the
+  entitlement that would matter is MailKit's, and Apple documents that as unable
+  to change a message body. To score it, install it and read the drafts it
+  produces.
+
+### And one dead end that looks promising and is not
+
+🛑 **Shortcuts / App Intents is in nobody's candidate list, and should stay that
+way.** Mail exposes `ComposeMessageIntent`, `SaveDraftIntent`, `SendDraftIntent`
+and `DeleteDraftIntent` — which would have been strictly better than every
+workaround above (clean body *plus* attachments *plus* account selection, no
+credentials, no keystrokes). They are unreachable: absent from the Shortcuts
+action picker, unsignable (`Tools.visibilityFlags & 4` is unset), and unsigned
+import is refused. Apple Intelligence is **not** the gate. Do not spend the
+afternoon we spent on it.

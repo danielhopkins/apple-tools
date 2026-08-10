@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""Report whether Mail's compose App Intents have become reachable.
+
+`apple-mail` cannot compose (see docs/apple-mail-drafts.md). The one route that
+produces a clean, review-durable draft is Mail's App Intents — and every way in
+is gated. This checks the gate, so a future macOS 27 beta opening it up is a
+one-command discovery rather than a re-investigation.
+
+What it reads
+-------------
+`~/Library/Shortcuts/ToolKit/Tools-active`, the Shortcuts action database.
+Its `Tools.visibilityFlags` column is the gate: **an action can be signed into a
+shortcut iff `flags & 4`**. Every Mail compose action is currently `3`, which is
+why `shortcuts sign` refuses them and they are absent from the action picker.
+
+⚠️ Signability is necessary, not sufficient. Even with the bit set, the action
+still has to appear in the picker (or be hand-serialisable) and survive
+`shortcuts run`. Treat a positive result as "worth re-testing", not "it works".
+
+⚠️ This reads only. It never writes the database. Flipping the bit by hand is
+possible — the file is user-owned and unprotected — but it is a rebuilt cache, so
+the change is expected to revert on reindex or OS update, and nothing shippable
+can depend on it.
+
+Exit status
+-----------
+    0   something is signable — the situation changed, go look
+    1   nothing changed; all compose actions still gated
+    2   could not read the database
+
+Usage
+-----
+    ./util/check-mail-intents
+    ./util/check-mail-intents --json
+    ./util/check-mail-intents --all      # every Mail-related tool, not just compose
+"""
+
+import glob
+import json
+import os
+import sqlite3
+import sys
+
+SIGNABLE_BIT = 4
+
+TOOLKIT = os.path.expanduser("~/Library/Shortcuts/ToolKit")
+
+# The actions that would let this tool write a message. Anything here becoming
+# signable is the event worth knowing about.
+COMPOSE_IDS = {
+    "com.apple.mail.ComposeMessageIntent",
+    "com.apple.mail.SaveDraftIntent",
+    "com.apple.mail.SendDraftIntent",
+    "com.apple.mail.UpdateDraftIntent",
+    "com.apple.mail.ReplyMessageIntent",
+    "com.apple.mail.ForwardMessageIntent",
+    "com.apple.mail.SendMail",
+}
+
+# Siri's own Mail tools, which is what actually produced a clean draft when Siri
+# was asked to write one. Matched by substring since the ids carry a suffix.
+COMPOSE_SUBSTRINGS = ("SiriMailFlowTools",)
+
+
+def database_path():
+    active = os.path.join(TOOLKIT, "Tools-active")
+    if os.path.exists(active):
+        return os.path.realpath(active)
+    candidates = sorted(glob.glob(os.path.join(TOOLKIT, "Tools-prod.*.sqlite")))
+    return candidates[-1] if candidates else None
+
+
+def is_compose(tool_id):
+    return tool_id in COMPOSE_IDS or any(s in tool_id for s in COMPOSE_SUBSTRINGS)
+
+
+def read_tools(path, everything):
+    # Read-only, and never immutable=1: Contacts taught us that an immutable
+    # open skips the write-ahead log and reports stale rows in both directions.
+    uri = "file:" + path.replace("?", "%3f").replace("#", "%23") + "?mode=ro"
+    with sqlite3.connect(uri, uri=True) as conn:
+        rows = conn.execute(
+            "SELECT id, flags, visibilityFlags FROM Tools "
+            "WHERE id LIKE '%mail%' OR id LIKE '%Mail%' ORDER BY id"
+        ).fetchall()
+    out = []
+    for tool_id, flags, visibility in rows:
+        compose = is_compose(tool_id)
+        if not everything and not compose:
+            continue
+        out.append(
+            {
+                "id": tool_id,
+                "flags": flags,
+                "visibility_flags": visibility,
+                "compose": compose,
+                "signable": bool(visibility & SIGNABLE_BIT),
+            }
+        )
+    return out
+
+
+def main():
+    args = sys.argv[1:]
+    as_json = "--json" in args
+    everything = "--all" in args
+
+    path = database_path()
+    if not path or not os.path.exists(path):
+        message = f"no Shortcuts ToolKit database under {TOOLKIT}"
+        print(json.dumps({"error": message}) if as_json else f"error: {message}",
+              file=sys.stderr)
+        return 2
+
+    try:
+        tools = read_tools(path, everything)
+    except sqlite3.Error as exc:
+        message = f"could not read {path}: {exc}"
+        print(json.dumps({"error": message}) if as_json else f"error: {message}",
+              file=sys.stderr)
+        return 2
+
+    reachable = [t for t in tools if t["compose"] and t["signable"]]
+
+    if as_json:
+        print(json.dumps(
+            {"database": path, "signable_bit": SIGNABLE_BIT,
+             "changed": bool(reachable), "reachable": reachable, "tools": tools},
+            indent=2))
+        return 0 if reachable else 1
+
+    print(f"database: {path}\n")
+    width = max((len(t["id"]) for t in tools), default=0)
+    for tool in tools:
+        mark = "SIGNABLE" if tool["signable"] else "gated"
+        tag = "compose" if tool["compose"] else "       "
+        print(f"  {tool['id']:<{width}}  visibility={tool['visibility_flags']:<3} "
+              f"{tag}  {mark}")
+
+    print()
+    if reachable:
+        print("CHANGED — a Mail compose action is now signable:")
+        for tool in reachable:
+            print(f"  {tool['id']} (visibilityFlags={tool['visibility_flags']})")
+        print("\nRe-test the route: build a shortcut around it, `shortcuts sign`, then")
+        print("`shortcuts run`. See docs/apple-mail-drafts.md before trusting it —")
+        print("signability is necessary, not sufficient.")
+        return 0
+
+    print("unchanged — every Mail compose action is still gated "
+          f"(needs visibilityFlags & {SIGNABLE_BIT}).")
+    print("apple-mail still cannot compose. See docs/apple-mail-drafts.md.")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

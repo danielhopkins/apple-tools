@@ -307,11 +307,39 @@ class TestPreflightWithMailUp(MailGuardTest):
         if not self.mail_was_running:
             self.skipTest("these need Mail running; the probe has nothing to ask otherwise")
 
+    def test_status_always_answers_and_answers_quickly(self):
+        """🛑 `status` is the command that answers "is Mail wedged?", and it used
+        to hang forever on exactly that condition.
+
+        `AEDeterminePermissionToAutomateTarget` — the side-effect-free way to read
+        the Automation grant — **blocks for minutes against a wedged Mail and then
+        answers wrongly**. Measured: `AECreateDesc` returned in 0.000013s, the
+        permission call returned -600 (`procNotFound`) after **502 seconds**, with
+        Mail running at a known pid throughout. It runs before any of the deadline
+        machinery, so `APPLE_MAIL_PROBE_TIMEOUT` did not help. It is bounded now,
+        and a timeout is reported as `automation: "unknown"` — not as
+        `mailNotRunning`, which is what the API's own eventual answer would have
+        produced.
+
+        This asserts the bound, not the wedge — there is no safe way to wedge Mail
+        on purpose. A healthy Mail answers in well under a second; the ceiling here
+        catches the unbounded call coming back.
+        """
+        code, out, err, elapsed = run("status", "--json")
+        self.assertEqual(code, 0, err)
+        self.assertLess(elapsed, 20, "status took too long; is the permission check bounded?")
+        payload = json.loads(out)
+        # It must always produce an answer for both halves, whatever Mail is doing.
+        self.assertIn("automation", payload)
+        self.assertIn("readable", payload["filesystem"])
+
     def test_status_reports_mail_responsive(self):
         code, out, err, _ = run("status", "--json")
         self.assertEqual(code, 0, err)
         payload = json.loads(out)
         self.assertTrue(payload["mail_app"]["running"])
+        if payload["automation"] == "unknown":
+            self.skipTest("Mail is wedged — quit and reopen Mail.app, then re-run")
         if payload["automation"] != "authorized":
             self.skipTest("Automation → Mail not granted, so status must not probe")
         # A healthy Mail answers; if this fails Mail really is wedged and the
@@ -397,3 +425,4 @@ class TestFastPathStillWorks(MailGuardTest):
         payload = json.loads(out)
         self.assertIn("mail_app", payload)
         self.assertIsInstance(payload["mail_app"]["running"], bool)
+

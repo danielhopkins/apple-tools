@@ -17,6 +17,7 @@ installed via `make install`.
 | Search mail | `apple mail search "invoice" --json` |
 | Full-text mail search | `apple mail search "budget" --field content --json` |
 | Read an email | `apple mail export <message-id>` |
+| Save an attachment | `apple mail attachments <message-id> --save ~/Downloads` |
 | List mail accounts | `apple mail accounts --json` |
 | List conversations | `apple messages chats --json` |
 | Search messages | `apple messages search "dinner" --json` |
@@ -94,8 +95,7 @@ apple notes status [--json]                      # access + write-path state
 ```
 
 **Writes go through Shortcuts, and the CLI hides that.** `create` and `append`
-take a body the same way `mail draft` does — `--body`, `--body-file FILE`,
-`--body-file -`, or a bare pipe — and the tool picks the payload shape and file
+take a body as `--body`, `--body-file FILE`, `--body-file -`, or a bare pipe — and the tool picks the payload shape and file
 extension the underlying shortcut needs. Markdown becomes native structure:
 `- [ ]` and `- [x]` are real checklists with their checked state, pipe tables
 are real tables.
@@ -182,10 +182,17 @@ so no virtualenv is involved.
 
 ### mail — `apple mail`
 
-**Reads go to the files, writes go through AppleScript.** `search`, `export` and
-`accounts` read Mail's own SQLite index and the `.emlx` files on disk, so they
-work with Mail.app closed and return in milliseconds. `draft` and `send` still
-drive Mail.app.
+🛑 **This tool reads. It does not compose.** `draft`, `reply`, `forward` and
+`send` were removed in **26.810.0**: Mail re-wraps any body written by a script
+in `<blockquote type="cite">` the moment the draft is opened, so every message
+the tool composed reached recipients rendered as a quotation, invisibly to the
+sender. It is not fixable from our side — the full investigation, and the one
+route that would work, is in [`docs/apple-mail-drafts.md`](docs/apple-mail-drafts.md).
+**To send mail, compose it in Mail.app.** Do not add a compose path back without
+reading that doc first.
+
+Everything else reads Mail's own SQLite index and the `.emlx` files on disk, so
+it works with Mail.app closed and returns in milliseconds.
 
 ```
 apple mail accounts [--json]      # names, addresses, mailboxes, enabled
@@ -195,13 +202,8 @@ apple mail search QUERY [--account NAME] [--mailbox NAME] [--field subject|sende
                         [--all] [--json]
 apple mail export MESSAGE-ID [--account NAME] [--json] [--raw]
 apple mail attachments MESSAGE-ID [--save DIR] [--skip-inline] [--account NAME] [--json]
-
-apple mail draft --to ADDR [--to ...] [--cc ADDR] [--bcc ADDR]
-                 --subject TEXT [--body TEXT | --body-file FILE|-]
-                 [--from ACCOUNT-ADDRESS] [--html] [--attach FILE]...
-                 [--replace MESSAGE-ID] [--json]
 apple mail delete-draft MESSAGE-ID [--account NAME] [--json]
-apple mail send  <same flags> --confirm
+apple mail status [--json]
 ```
 
 All three read commands take `--engine auto|filesystem|applescript`. Leave it
@@ -232,8 +234,6 @@ every client on the machine. So:
   abandons the Apple Event and exits on its own with a clean -1712 instead of
   being SIGKILLed mid-request. `APPLE_MAIL_PROBE_TIMEOUT` /
   `APPLE_MAIL_SCRIPT_TIMEOUT` override the outer one and the inner one follows.
-  Composing has *no* deadline on purpose: killing a save half-written is worse
-  than waiting.
 - ⚠️ **A timeout is never swallowed into a short result.** The search script
   wraps its walk in `try` so that a missing mailbox — not every account has an
   `Archive` — is skipped rather than fatal. That handler re-raises -1712 and
@@ -252,13 +252,29 @@ way to un-wedge Mail. Only restarting Mail.app does that.
 **`apple mail status` answers "is Mail wedged?"** — `mail_app.running` and
 `mail_app.responsive` in the JSON. `responsive` is only present when Automation
 is already authorized and Mail is up, because probing otherwise would trigger
-the consent dialog `status` exists to avoid. `responsive: false` means drafting
-and sending will not work until Mail is restarted.
+the consent dialog `status` exists to avoid. `responsive: false` means the
+AppleScript export fallback will not work until Mail is restarted.
 
-**Searching is now cheap — search widely.** No `--limit`/`--since` discipline is
+🛑 **`AEDeterminePermissionToAutomateTarget` blocks for minutes against a wedged
+Mail, then answers wrongly** — and it is how the Automation grant is read without
+side effects. Measured: `AECreateDesc` returned in 0.000013s, the permission call
+returned **-600 (`procNotFound`) after 502 seconds**, with Mail running at a known
+pid throughout. `askUserIfNeeded: false` stops it *prompting*, not *blocking*, and
+it runs before any of the deadline machinery, so `APPLE_MAIL_PROBE_TIMEOUT` never
+reached it.
+
+It is bounded now (3s, on a detached queue, since the call cannot be cancelled)
+and reports **`automation: "unknown"` with `responsive: false`** — a permission
+check that will not answer is itself proof Mail is not servicing Apple Events, and
+a more accurate answer than the one the API eventually gives. Read `automation:
+"unknown"` as "Mail is wedged", not as a grant problem.
+⚠️ `apple-messages status` makes the same call for Messages.app and is not
+bounded yet; it has never been observed hanging, because nothing scripts
+Messages.
+
+**Searching is cheap — search widely.** No `--limit`/`--since` discipline is
 required, and there is no timeout to trip. The default covers every mailbox
-except trash and junk (`--all` adds those), not the handful the AppleScript path
-managed.
+except trash and junk (`--all` adds those).
 
 **`--field content` is real full-text search** over decoded message bodies, and
 is the one mode that opens files. It finds text inside base64 and
@@ -319,8 +335,7 @@ the MIME part with an empty body and an `X-Apple-Content-Length` header, and
 writes the file *already decoded* to
 `Data/<digits>/Attachments/<rowid>/<mime-part>/<filename>`. Parsing the message
 alone yields zero-byte attachments — the command reads the directory and falls
-back to embedded bytes only for messages that really carry them (anything Mail
-composed locally).
+back to embedded bytes only for messages that really carry them.
 
 **What counts as an attachment is Mail's rule: a part with a filename.**
 Verified against its index — a message with two nameless tracking pixels
@@ -335,106 +350,59 @@ else is refused.
 See [`docs/apple-mail-store.md`](docs/apple-mail-store.md) for the schema, the
 `.emlx` layout, and the traps in reading them.
 
-**Picking the account.** `accounts` reports each account's `addresses` as well
-as its name — those addresses are exactly what `--from` accepts. `--from` also
-takes an account *name*, which matters here because the names are emoji and are
-not themselves valid senders. Run `accounts --json` rather than guessing.
-
 ⚠️ **`accounts` is the one read command that still prefers Mail.app**, because
-only Mail knows whether an account is `enabled`, and its account names are what
-`--from` matches. It asks Mail when Mail is already running and reads the store
-when it is not — rather than launching Mail just to list accounts, which is
-what it used to do. It also reads the store when Mail is running but *not
+only Mail knows whether an account is `enabled`. It asks Mail when Mail is
+already running and reads the store when it is not — rather than launching Mail
+just to list accounts. It also reads the store when Mail is running but *not
 answering*, so a wedged Mail costs you the `enabled` field rather than hanging
-the command. Consequence: **the file-system answer has no `enabled`
-key**, so read it as `account.get("enabled", True)`. It also lists the local
-"On My Mac" store, which the AppleScript path omits.
+the command. Consequence: **the file-system answer has no `enabled` key**, so
+read it as `account.get("enabled", True)`. It also lists the local "On My Mac"
+store, which the AppleScript path omits.
 
-**Drafting.** `draft` writes to the Drafts mailbox of whichever account matches
-`--from` (your default account otherwise) and never sends. `--body-file -`
-reads the body from stdin, which is the easiest way to pass long or generated
-text. Attachments are validated before anything is composed.
+**`delete-draft` is the one remaining write, and it only ever moves a draft to
+trash.** It enumerates Drafts alone, so it cannot touch sent or received mail
+even if handed the Message-ID of some. It re-reads the mailbox afterwards and
+fails loudly rather than trusting the move, and it is a move to **trash, not a
+purge** — same as Notes' Recently Deleted, with no API to empty it.
 
-`draft --json` reports the new draft's `message_id`; that is what `delete-draft`
-and `--replace` take. It is omitted rather than guessed when the save could not
-be identified unambiguously.
+- **Only one route removes a draft**, and `delete-draft` implements it. `delete`
+  silently does nothing, `move` errors, and `set deleted status` fails with
+  "Connection is invalid". Reassigning `mailbox of <message>` to the account's
+  trash **does** work. The trash mailbox is named differently per account type
+  (`Deleted Messages`, `Trash`, `Deleted Items`), so it tries each.
+- 🛑 **Re-resolve the Message-ID before calling it.** A draft's Message-ID
+  **changes when the draft is edited and saved**, and has been observed changing
+  with no edit at all on IMAP sync. A stale id fails with exit 64, and an
+  `export` of one silently produces an *empty file* rather than an error. Look
+  the draft up by subject first: `apple mail search "" --mailbox drafts --json`
+  and use the `id` field.
 
-**Revising a draft.** There is no in-place edit — Mail will not allow one (the
-sender freezes on save, and reading recipients back is broken). `--replace
-MESSAGE-ID` does the next best thing: it writes the new draft first, *then*
-trashes the old one, so a failure leaves two drafts rather than none. It checks
-the target exists before composing, so a bad id writes nothing at all. If the
-removal fails it says so on stderr and sets `replaced_removed: false` — do not
-report a replacement as clean without checking that.
+⚠️ **A mailbox move is copy-then-expunge**, so the Drafts copy survives until
+the server expunges it (~2 min on IMAP). `delete-draft` says so on stderr; a
+re-listing before then still shows the draft, and that is not a failure.
 
-`delete-draft` only ever enumerates Drafts, so it cannot delete sent or
-received mail even if handed the Message-ID of some. It re-reads the mailbox
-afterwards and fails loudly rather than trusting the move, and it is a move to
-**trash, not a purge** — same as Notes' Recently Deleted, with no API to empty
-it.
-
-`send` refuses to run without `--confirm`, because sending is immediate and
-irreversible. **Prefer `draft` and let the user send it themselves** — only use
-`send` when they have explicitly asked you to send, in that turn.
-
-⚠️ Mail's compose surface is unusually buggy. These are all verified on
-macOS 27 and pinned by `tests/test_mail_draft.py`:
-
-- **Only one route removes a draft**, and `delete-draft` implements it so you
-  do not have to. `delete` silently does nothing, `move` errors, and `set
-  deleted status` fails with "Connection is invalid". Reassigning `mailbox of
-  <message>` to the account's trash **does** work. The trash mailbox is named
-  differently per account type (`Deleted Messages`, `Trash`, `Deleted Items`),
-  so try each. Two traps: the Drafts enumeration is stale within a single
-  script run, so collect message ids first and move each once rather than
-  re-scanning after every move; and a move occasionally reports success without
-  taking effect, so re-check and retry.
-- **An outgoing message has no `message id`.** Asking for one errors with
-  "Can't make «class meid» of «class bcke»" — Mail assigns it only once the
-  message lands in Drafts. `draft` therefore learns the id by diffing the
-  Drafts Message-IDs across the save, in a *separate* `osascript` run, because
-  the Drafts enumeration is stale within the run that saved.
-- **Reading recipients back is broken.** `to recipients`, `cc recipients` and
-  `bcc recipients` on a saved draft all return the last-added recipient. The
-  RFC822 `source` is the only trustworthy read. The headers written are correct.
-- **The body is always wrapped in `<blockquote type="cite">`.** Mail does this
-  to any programmatically set body — `content`, `html content` and visible
-  compose windows alike. The quote styling is neutralised inline, so it renders
-  normally, but the markup is there and some clients may treat it as quoted.
-- **The `text/plain` alternative is empty.** The body lives only in the
-  `text/html` part, so a plain-text-only reader sees nothing. Mail may
-  regenerate the MIME on send; this is what the stored draft contains.
-- **A draft's sender is frozen once saved.** `set sender` works only on an
-  outgoing message before `save`; afterwards it errors. Moving a draft to
-  another account's Drafts *does* work, but the sender does not follow, leaving
-  a message filed under one account that would send from another. So choose the
-  account with `--from` at creation time; there is no correct after-the-fact
-  move short of rebuilding the message.
-- **Text comes back NFD.** Mail decomposes unicode, so `ü` sent as one
-  codepoint returns as `u` + combining diaeresis. Normalise before comparing.
-
-`--field` defaults to `subject`; use `--field all` or `--field content` when the
-user describes content rather than a subject line. `--all` widens the search to
-trash and junk, which are excluded by default — except when `--mailbox trash`
-asks for them by name, which is honoured. Account names can contain emoji and
-spaces — get exact strings from `apple mail accounts` rather than guessing.
-
-⚠️ **The timeout trap applied only to `--engine applescript`, and is now an
-error rather than a silent one.** AppleScript's event timeout is ~120s, and the
-script swallowed it, so `search` printed `[]` and exited 0 — indistinguishable
-from "no matches". A timeout now fails loudly instead, whether it is Mail's
--1712 or our own deadline, including one that hits partway through a multi-account
-walk (a short list from a half-finished search is a wrong answer, not a small one).
-The file-system engine never had this mode: it either answers or errors.
-
-⚠️ **Mailbox names are not unique** — three accounts can each have an `Archive`.
-Every result carries both `account` and `mailbox`; use the pair.
+**Mailbox names are not unique** — three accounts can each have an `Archive`.
+Every result carries both `account` and `mailbox`; use the pair. Account names
+can contain emoji and spaces — get exact strings from `apple mail accounts`
+rather than guessing.
 
 ⚠️ **A message can be in the index but not on disk** when Mail hasn't downloaded
 the body. `export` says so explicitly rather than reporting the message missing,
 and `auto` falls back to AppleScript, which can still fetch it — provided Mail is
 already running and answering. With Mail closed it reports that instead of
 launching it.
+
+⚠️ **The timeout trap applies only to `--engine applescript`, and is an error
+rather than a silent one.** AppleScript's event timeout is ~120s, and the script
+used to swallow it, so `search` printed `[]` and exited 0 — indistinguishable
+from "no matches". A timeout now fails loudly, whether it is Mail's -1712 or our
+own deadline, including one that hits partway through a multi-account walk. The
+file-system engine never had this mode: it either answers or errors.
+
+`--field` defaults to `subject`; use `--field all` or `--field content` when the
+user describes content rather than a subject line. `--all` widens the search to
+trash and junk, which are excluded by default — except when `--mailbox trash`
+asks for them by name, which is honoured.
 
 **`APPLE_MAIL_INDEX_PATH`** points the index reader at a specific file, or at a
 path that doesn't exist to see what a command does without Full Disk Access. The
@@ -555,8 +523,8 @@ an inbox. There is nothing to list and nothing to mark read.
 
 **`dial` hands a `tel:` URL to Phone.app and Phone.app always asks you to
 confirm** — skipping the prompt needs `com.apple.FaceTime.NoPrompt`, an
-Apple-internal entitlement. That prompt is the gate, so unlike `mail send` there
-is no `--confirm` flag; and the tool will never click the panel for you. Use
+Apple-internal entitlement. That prompt is the gate, so there is no `--confirm`
+flag; and the tool will never click the panel for you. Use
 `--dry-run` to see the URL without placing anything. `TARGET` may be a number, an
 Apple ID, or a contact name — a name resolves against the address book, prefers
 the number that person most recently used, and an ambiguous name is an error
@@ -948,6 +916,11 @@ docs/apple-notes-shortcuts.md  driving Notes' AppIntents from the CLI —
                           the only route to checklist writes and a real append
 notes/shortcuts/          .shortcut build scripts + signed files to install
 docs/apple-mail-store.md  Envelope Index schema, .emlx layout, verified traps
+docs/apple-mail-drafts.md why apple-mail does not compose: the cite-blockquote
+                          wrapper, every route ruled out, and how to re-check
+util/check-mail-intents   is Mail's ComposeMessageIntent reachable yet? (exit 0
+                          if something changed)
+util/appintents-dump      dev-only reader for an app's App Intents schema
 docs/apple-messages-store.md  chat.db schema, the typedstream body, verified traps
 docs/apple-phone-store.md  CallHistory schema, the entitlement walls, verified traps
 docs/prior-art.md         other projects solving this; check before building
@@ -1001,10 +974,20 @@ The `tests/` suites drive the real binaries against real data, each behind its
 own flag:
 
 ```
-./tests/run-tests              # calendar writes (25) + mail wedge guards (21)
-./tests/run-tests --mail       # + mail drafts (19)
+./tests/run-tests              # calendar writes (25) + mail wedge guards (22)
 ./tests/run-tests --contacts   # + contacts writes (60)
 ```
+
+There is no `--mail` flag any more. `apple-mail` composes nothing as of
+26.810.0, so the draft suite went with it; what is left of the mail tests is
+read-only and always on.
+
+🛑 **Never verify Mail behaviour by scripting its composer.** `open <message>`
+then `close <window> saving yes` wedges Mail's scripting interface — reproduced
+twice during development, each costing a restart. When a question genuinely needs
+the composer, drive it **by hand** and measure the `.emlx`, in a matched pair
+against a hand-typed control. That is how the compose removal was settled; see
+[`docs/apple-mail-drafts.md`](docs/apple-mail-drafts.md).
 
 `test_mail_wedge.py` is the exception to the flag rule: it is read-only — it
 creates nothing and sweeps nothing — so it always runs. It pins the guards that
@@ -1043,18 +1026,19 @@ Each tool needs a one-time TCC grant, prompted on first run **from a terminal**:
 |------|-------|
 | reminders | Privacy & Security → Reminders |
 | calendar | Privacy & Security → Calendars |
-| mail | Full Disk Access to read; Automation → Mail to draft/send |
+| mail | Full Disk Access to read; Automation → Mail only for the export fallback |
 | messages | Full Disk Access for the calling terminal (reads chat.db directly) |
 | phone | Full Disk Access for the calling terminal (reads CallHistory + AddressBook) |
 | contacts | Privacy & Security → Contacts |
 | notes | Full Disk Access for the calling terminal (reads sqlite directly) |
 
-`mail` needs **two different grants for two different halves**. Full Disk Access
-lets it read the index and message files — that covers `search`, `export` and
-`accounts`. Automation → Mail is only for `draft` and `send`. `apple mail
-status` reports both and counts the tool usable if either is present, so "mail
-✓" can mean reads work and sending does not. Check the detail line before
-concluding which half is broken.
+`mail` is effectively **Full Disk Access only** now. That covers `search`,
+`export`, `attachments` and `accounts` — everything the tool is for. Automation →
+Mail is still read, because `export` can fall back to asking Mail for a body it
+has not downloaded and `delete-draft` drives Mail, but its absence no longer
+costs a headline feature. `apple mail status` reports both and counts the tool
+usable if either is present, so "mail ✓" can mean reads work and the fallback
+does not; check the detail line before concluding which half is broken.
 
 `apple status` reports all seven at once without prompting — start there rather
 than running each tool to see which one errors.

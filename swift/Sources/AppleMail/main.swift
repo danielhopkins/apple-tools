@@ -114,17 +114,78 @@ struct AppleMail: AsyncParsableCommand {
     commandName: "apple-mail",
     abstract: "Search and export Apple Mail messages",
     discussion: """
+      Reading only. Composing was removed in 26.810.0 — Mail re-wraps any body
+      written by a script in <blockquote type="cite"> the moment the draft is
+      opened, so every draft this tool wrote reached recipients as a quotation.
+      See docs/apple-mail-drafts.md. Compose in Mail.app.
+
       Examples:
-        apple-mail accounts --json                        # addresses for --from
+        apple-mail accounts --json                        # accounts and mailboxes
         apple-mail search "invoice" --since 30 --json     # bounded search
-        apple-mail draft --to a@b.com --subject "Hi" --body "text"
+        apple-mail export <message-id> --json             # one message
       """,
     version: appleToolsVersion,
     subcommands: [
-      Search.self, Export.self, Attachments.self, Accounts.self, Draft.self, DeleteDraft.self,
-      Send.self, Status.self,
+      Search.self, Export.self, Attachments.self, Accounts.self, DeleteDraft.self, Status.self,
     ]
   )
+}
+
+// MARK: - Automation permission
+
+/// Somewhere for the detached permission thread to leave its answer.
+private final class PermissionBox: @unchecked Sendable {
+  private let lock = NSLock()
+  private var stored: OSStatus?
+  var value: OSStatus? {
+    get { lock.lock(); defer { lock.unlock() }; return stored }
+    set { lock.lock(); defer { lock.unlock() }; stored = newValue }
+  }
+}
+
+/// Ask TCC whether we may automate Mail, under a wall-clock bound. `nil` means it
+/// did not answer in time.
+///
+/// 🛑 **`AEDeterminePermissionToAutomateTarget` blocks for minutes when Mail's
+/// scripting interface is wedged, and then answers wrongly.** Measured against a
+/// wedged Mail: `AECreateDesc` returned in 0.000013s, and this call returned
+/// **-600 (`procNotFound`) after 502 seconds** — with Mail running the whole time
+/// at a known pid. `askUserIfNeeded: false` stops it *prompting*; it does not
+/// stop it *blocking*.
+///
+/// Both halves of that are bugs for us. It is the first thing `status` does, so
+/// the one command whose job is to answer "is Mail wedged?" without hanging sat
+/// there for eight minutes — `APPLE_MAIL_PROBE_TIMEOUT` included, because that
+/// bounds the osascript probe further down and this never got there. And when it
+/// finally answered, `procNotFound` would have been reported as `mailNotRunning`
+/// with "Open Mail.app, then check again", which is the wrong instruction for a
+/// Mail that is already open and wedged.
+///
+/// The call cannot be cancelled, so it runs on a detached queue and the answer is
+/// abandoned if it does not arrive. The work leaks until it returns; this is a
+/// short-lived CLI that is about to exit, and a leaked thread is a far smaller
+/// problem than a command that never finishes.
+func automationPermission(timeout: TimeInterval = 3) -> OSStatus? {
+  let box = PermissionBox()
+  let done = DispatchSemaphore(value: 0)
+  DispatchQueue.global().async {
+    var target = AEAddressDesc()
+    let bundleID = "com.apple.mail"
+    let created = bundleID.withCString { pointer in
+      AECreateDesc(typeApplicationBundleID, pointer, strlen(pointer), &target)
+    }
+    // AECreateDesc returns OSErr (Int16), the permission call OSStatus (Int32).
+    var code = OSStatus(created)
+    if created == noErr {
+      code = AEDeterminePermissionToAutomateTarget(
+        &target, typeWildCard, typeWildCard, false)
+      AEDisposeDesc(&target)
+    }
+    box.value = code
+    done.signal()
+  }
+  guard done.wait(timeout: .now() + timeout) == .success else { return nil }
+  return box.value
 }
 
 // MARK: - Accounts
@@ -144,23 +205,20 @@ struct Status: AsyncParsableCommand {
     // state without side effects: askUserIfNeeded = false means it reports
     // rather than prompts. Sending a real Apple Event to find out would trigger
     // the very dialog a status command must not trigger.
-    var target = AEAddressDesc()
-    let bundleID = "com.apple.mail"
-    let created = bundleID.withCString { pointer in
-      AECreateDesc(
-        typeApplicationBundleID, pointer, strlen(pointer), &target)
-    }
-
-    // AECreateDesc returns OSErr (Int16), the permission call OSStatus (Int32).
-    var code = OSStatus(created)
-    if created == noErr {
-      code = AEDeterminePermissionToAutomateTarget(
-        &target, typeWildCard, typeWildCard, false)
-      AEDisposeDesc(&target)
-    }
+    //
+    // 🛑 It is bounded, because it never returns against a wedged Mail. See
+    // `automationPermission`.
+    let code = automationPermission()
 
     let (automation, automationOK, automationAdvice): (String, Bool, String?) = {
       switch code {
+      case nil:
+        // The permission call itself blocked. That is not a grant problem — it is
+        // Mail not servicing Apple Events, which is exactly what this command is
+        // here to tell the user.
+        return ("unknown", false,
+                "The Automation permission check did not answer, which means Mail is not "
+                  + "servicing Apple Events. Its grant is unknown until Mail is restarted.")
       case noErr:
         return ("authorized", true, nil)
       case OSStatus(errAEEventNotPermitted):
@@ -173,7 +231,7 @@ struct Status: AsyncParsableCommand {
         // running; this says nothing about whether the grant exists.
         return ("mailNotRunning", false, "Open Mail.app, then check again.")
       default:
-        return ("unknown(\(code))", false, nil)
+        return ("unknown(\(code!))", false, nil)
       }
     }()
 
@@ -200,7 +258,13 @@ struct Status: AsyncParsableCommand {
     // authorized: on `notDetermined` the probe *is* the consent dialog this
     // command exists to avoid triggering.
     let mailRunning = isMailRunning()
-    let responsive: Bool? = (automationOK && mailRunning) ? MailPreflight.isResponsive() : nil
+    // A permission check that did not answer is itself proof Mail is not
+    // answering, so say so rather than reporting `responsive` as unknown — and
+    // do not then send a probe to a target we already know is not replying.
+    let responsive: Bool? =
+      code == nil
+      ? (mailRunning ? false : nil)
+      : ((automationOK && mailRunning) ? MailPreflight.isResponsive() : nil)
 
     let usable = fileSystemOK || automationOK
     let advice: String? = {
@@ -1189,304 +1253,6 @@ enum AppleMailDate {
   }
 }
 
-// MARK: - Compose
-
-/// Creating a message is the least reliable corner of Mail's AppleScript
-/// interface. What follows is what actually works, established empirically:
-///
-///  * `save` on an outgoing message reliably produces a draft, filed in the
-///    Drafts mailbox of whichever account matches `sender`.
-///  * Values must be passed as argv. Interpolating them into the script breaks
-///    on quotes and backslashes, and would let message text run as AppleScript.
-///  * File paths must be coerced to aliases OUTSIDE the `tell application
-///    "Mail"` block. Inside it, `POSIX file` resolves in Mail's own context and
-///    fails with -1728.
-///  * Attachments go into `content of msg` `at after the last paragraph`, and
-///    only after the body is set.
-///  * Reading `to recipients` / `cc recipients` / `bcc recipients` back off a
-///    saved draft is BROKEN — all three return the last-added recipient. The
-///    RFC822 `source` is the only trustworthy read. Nothing here relies on the
-///    property read; the tests parse `source`.
-///  * Mail wraps any programmatically set body in
-///    `<blockquote type="cite">`, with the quote styling neutralised inline.
-///    This happens for `content`, for `html content` and for visible compose
-///    windows alike — there is no way to avoid it from AppleScript.
-private let composeScript = """
-  on run argv
-    set theSubject to item 1 of argv
-    set theBody to item 2 of argv
-    set theSender to item 3 of argv
-    set bodyIsHTML to (item 4 of argv is "1")
-    set theAction to item 5 of argv
-
-    set i to 6
-    set toList to {}
-    set n to (item i of argv) as integer
-    set i to i + 1
-    repeat n times
-      set end of toList to item i of argv
-      set i to i + 1
-    end repeat
-
-    set ccList to {}
-    set n to (item i of argv) as integer
-    set i to i + 1
-    repeat n times
-      set end of ccList to item i of argv
-      set i to i + 1
-    end repeat
-
-    set bccList to {}
-    set n to (item i of argv) as integer
-    set i to i + 1
-    repeat n times
-      set end of bccList to item i of argv
-      set i to i + 1
-    end repeat
-
-    -- Resolve attachments to aliases here, outside the Mail tell block.
-    set fileList to {}
-    set n to (item i of argv) as integer
-    set i to i + 1
-    repeat n times
-      set end of fileList to ((POSIX file (item i of argv)) as alias)
-      set i to i + 1
-    end repeat
-
-    tell application "Mail"
-      if bodyIsHTML then
-        set msg to make new outgoing message with properties {subject:theSubject, visible:false}
-        set html content of msg to theBody
-      else
-        set msg to make new outgoing message with properties {subject:theSubject, content:theBody, visible:false}
-      end if
-
-      -- --from accepts an account name as well as an address, because the
-      -- names people see can be emoji and are not valid senders.
-      -- `item 1 of (email addresses of acct)` yields nothing, the same way
-      -- iterating that list does. Coercing the list to text is the form that
-      -- works, so take the first comma-separated item off that.
-      if theSender is not "" and theSender does not contain "@" then
-        set AppleScript's text item delimiters to ","
-        repeat with acct in every account
-          if (name of acct) is theSender then
-            try
-              set theSender to text item 1 of ((email addresses of acct) as string)
-            end try
-          end if
-        end repeat
-      end if
-
-      tell msg
-        if theSender is not "" then set sender to theSender
-        repeat with a in toList
-          make new to recipient at end of to recipients with properties {address:a}
-        end repeat
-        repeat with a in ccList
-          make new cc recipient at end of cc recipients with properties {address:a}
-        end repeat
-        repeat with a in bccList
-          make new bcc recipient at end of bcc recipients with properties {address:a}
-        end repeat
-      end tell
-
-      repeat with f in fileList
-        tell content of msg
-          make new attachment with properties {file name:f} at after the last paragraph
-        end tell
-        delay 0.4
-      end repeat
-
-      if theAction is "send" then
-        send msg
-        return "sent"
-      else
-        save msg
-        return "saved|" & (subject of msg) & "|" & (sender of msg)
-      end if
-    end tell
-  end run
-  """
-
-struct ComposeOptions: ParsableArguments {
-  @Option(name: .long, help: "Recipient address. Repeat for several.")
-  var to: [String] = []
-
-  @Option(name: .long, help: "Cc address. Repeat for several.")
-  var cc: [String] = []
-
-  @Option(name: .long, help: "Bcc address. Repeat for several.")
-  var bcc: [String] = []
-
-  @Option(name: .long, help: "Subject line")
-  var subject: String = ""
-
-  @Option(name: .long, help: "Message body")
-  var body: String?
-
-  @Option(name: .long, help: "Read the body from a file, or '-' for stdin")
-  var bodyFile: String?
-
-  @Flag(name: .long, help: "Treat the body as HTML")
-  var html = false
-
-  @Option(name: .long, help: "Send from this account address; defaults to your default account")
-  var from: String?
-
-  @Option(name: .long, help: "File to attach. Repeat for several.")
-  var attach: [String] = []
-
-  /// Resolves --body / --body-file, validates attachments, and returns the
-  /// argv vector the compose script expects.
-  func arguments(action: String) throws -> [String] {
-    if body != nil && bodyFile != nil {
-      throw ValidationError("pass either --body or --body-file, not both")
-    }
-
-    var text = body ?? ""
-    if let bodyFile {
-      if bodyFile == "-" {
-        let data = FileHandle.standardInput.readDataToEndOfFile()
-        text = String(data: data, encoding: .utf8) ?? ""
-      } else {
-        guard let contents = try? String(contentsOfFile: bodyFile, encoding: .utf8) else {
-          throw ValidationError("could not read --body-file '\(bodyFile)'")
-        }
-        text = contents
-      }
-    }
-
-    guard !to.isEmpty || !cc.isEmpty || !bcc.isEmpty else {
-      throw ValidationError("no recipients; pass at least one --to, --cc or --bcc")
-    }
-
-    // Validate attachments up front. A path that fails inside the script aborts
-    // it midway and leaves an orphan draft behind.
-    var paths: [String] = []
-    for path in attach {
-      let expanded = (path as NSString).expandingTildeInPath
-      var isDirectory: ObjCBool = false
-      guard FileManager.default.fileExists(atPath: expanded, isDirectory: &isDirectory),
-            !isDirectory.boolValue else {
-        throw ValidationError("attachment not found (or is a directory): \(path)")
-      }
-      paths.append(URL(fileURLWithPath: expanded).standardizedFileURL.path)
-    }
-
-    var argv = [subject, text, from ?? "", html ? "1" : "0", action]
-    argv.append(String(to.count));  argv.append(contentsOf: to)
-    argv.append(String(cc.count));  argv.append(contentsOf: cc)
-    argv.append(String(bcc.count)); argv.append(contentsOf: bcc)
-    argv.append(String(paths.count)); argv.append(contentsOf: paths)
-    return argv
-  }
-}
-
-struct Draft: AsyncParsableCommand {
-  static let configuration = CommandConfiguration(
-    abstract: "Create a draft message (does not send)",
-    discussion: """
-      Writes to the Drafts mailbox of the account matching --from. Never sends.
-      Get the addresses --from accepts from `apple-mail accounts`; an account
-      name works too.
-
-      Examples:
-        apple-mail draft --to a@b.com --subject "Q3" --body "Here it is."
-        apple-mail draft --to a@b.com --cc c@d.com --bcc e@f.com --subject "Hi" \\
-                         --body "text" --attach ~/report.pdf
-        apple-mail draft --to a@b.com --from "dan@theinevitable.co" \\
-                         --subject "Re: budget" --body-file -   # body on stdin
-        apple-mail draft --to a@b.com --subject "Hi" --html --body "<p>Hi</p>"
-      """)
-
-  @OptionGroup var compose: ComposeOptions
-
-  @Option(
-    name: .long,
-    help: "Message-ID of a draft to replace: write this one, then trash that one")
-  var replace: String?
-
-  @Flag(name: .long, help: "Output as JSON")
-  var json = false
-
-  func run() async throws {
-    // Mail cannot edit a saved draft in place — `set sender` errors once saved,
-    // and reading recipients back returns the last-added one for every list. So
-    // "replace" is write-then-remove, in that order: if the removal fails the
-    // user has two drafts, which is recoverable, whereas removing first and
-    // failing to write loses the content outright.
-    let target = replace.map { strippingAngleBrackets($0.trimmingCharacters(in: .whitespaces)) }
-    if let target {
-      guard try countDrafts(messageID: target) > 0 else {
-        throw ValidationError(
-          "No draft with Message-ID '\(target)' to replace. Nothing was written. "
-            + "Check with: apple mail search \"\" --mailbox drafts --json")
-      }
-    }
-
-    // Learning the Message-ID costs two full enumerations of Drafts, and Mail
-    // degrades badly under Apple Event volume — its scripting interface stops
-    // answering entirely if pushed. So only pay for it when the caller can
-    // actually use the answer.
-    let wantsMessageID = json || replace != nil
-    let idsBefore = wantsMessageID ? ((try? draftMessageIDs()) ?? []) : []
-
-    let argv = try compose.arguments(action: "save")
-    let result = try runAppleScript(composeScript, arguments: argv)
-
-    let parts = result.split(separator: "|", maxSplits: 2).map(String.init)
-    let subject = parts.count > 1 ? parts[1] : compose.subject
-    let sender = parts.count > 2 ? parts[2] : ""
-
-    // Exactly one new id means we know which draft is ours. Zero or several
-    // (a concurrent save, or Mail not having settled) leaves it unreported
-    // rather than guessed at.
-    var messageID = ""
-    if wantsMessageID {
-      let appeared = ((try? draftMessageIDs()) ?? []).subtracting(idsBefore)
-      if appeared.count == 1 { messageID = appeared.first! }
-    }
-
-    var removal: DraftRemoval?
-    if let target {
-      removal = try removeDraft(messageID: target, account: nil)
-      if removal == .failed {
-        warn(
-          "warning: the new draft was saved, but Mail would not move the old one (\(target)) "
-            + "out of Drafts. You now have both — remove the old one in Mail.app.")
-      }
-    }
-
-    if json {
-      var payload: [String: Any] = [
-        "status": "saved", "subject": subject, "sender": sender,
-        "to": compose.to, "cc": compose.cc, "bcc": compose.bcc,
-        "attachments": compose.attach.count,
-      ]
-      if !messageID.isEmpty { payload["message_id"] = messageID }
-      if let target {
-        payload["replaced"] = target
-        // "removed" means Mail performed the move — the old draft is on its
-        // way to trash. "confirmed" means Drafts no longer lists it, which can
-        // lag by seconds on IMAP and is not something to block on.
-        payload["replaced_removed"] = removal != .failed
-        payload["replaced_confirmed"] = removal == .confirmed
-      }
-      let data = try JSONSerialization.data(
-        withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
-      print(String(data: data, encoding: .utf8) ?? "{}")
-    } else {
-      print("Draft saved: \(subject.isEmpty ? "(no subject)" : subject)")
-      if !sender.isEmpty { print("  from: \(sender)") }
-      let recipients = compose.to + compose.cc.map { "cc:" + $0 } + compose.bcc.map { "bcc:" + $0 }
-      print("  to:   \(recipients.joined(separator: ", "))")
-      if !messageID.isEmpty { print("  id:   \(messageID)") }
-      if let target, removal != .failed { print("Replaced \(target) — the old draft is in trash.") }
-      print("It is in your Drafts mailbox — review it in Mail before sending.")
-    }
-  }
-}
-
 // MARK: - Attachments
 
 struct Attachments: AsyncParsableCommand {
@@ -1728,49 +1494,6 @@ func countDrafts(messageID: String) throws -> Int {
   return Int(try runAppleScript(countDraftScript, arguments: [messageID])) ?? 0
 }
 
-/// Every Message-ID currently in Drafts.
-///
-/// Used to learn the Message-ID of a draft that was just written, by diffing
-/// across the save. An outgoing message has no `message id` at all — asking
-/// for it errors with "Can't make «class meid» of «class bcke»" — and Mail
-/// only assigns one once the message lands in Drafts. Matching on the subject
-/// instead would pick the wrong draft whenever two share one.
-///
-/// Deliberately a separate `osascript` run from the save: the Drafts
-/// enumeration is stale *within* a single script run, so a re-scan after
-/// saving in the same script would not see the new message.
-private let draftIDsScript = """
-  on run argv
-    set out to ""
-    tell application "Mail"
-      repeat with acct in every account
-        try
-          repeat with m in messages of (mailbox "Drafts" of acct)
-            try
-              set out to out & ((message id of m) as string) & linefeed
-            end try
-          end repeat
-        end try
-      end repeat
-    end tell
-    return out
-  end run
-  """
-
-func draftMessageIDs() throws -> Set<String> {
-  if let rows = draftsFromIndex() {
-    return Set(
-      rows.compactMap { $0["message_id"] as? String }
-        .map(strippingAngleBrackets)
-        .filter { !$0.isEmpty })
-  }
-  return Set(
-    try runAppleScript(draftIDsScript)
-      .split(separator: "\n").map(String.init)
-      .map(strippingAngleBrackets)
-      .filter { !$0.isEmpty })
-}
-
 enum DraftRemoval {
   /// A copy is in a trash mailbox — the removal demonstrably happened.
   case confirmed
@@ -1886,28 +1609,6 @@ struct DeleteDraft: AsyncParsableCommand {
   }
 }
 
-struct Send: AsyncParsableCommand {
-  static let configuration = CommandConfiguration(
-    abstract: "Send a message immediately (requires --confirm)")
-
-  @OptionGroup var compose: ComposeOptions
-
-  @Flag(name: .long, help: "Required. Sending cannot be undone.")
-  var confirm = false
-
-  func run() async throws {
-    guard confirm else {
-      throw ValidationError("""
-        refusing to send without --confirm. Sending is immediate and irreversible.
-        Prefer `apple mail draft` with the same flags, review it in Mail, and send by hand.
-        """)
-    }
-    let argv = try compose.arguments(action: "send")
-    _ = try runAppleScript(composeScript, arguments: argv)
-    print("Sent to: \(compose.to.joined(separator: ", "))")
-  }
-}
-
 // MARK: - AppleScript Helper
 
 /// Wall-clock budgets for the scripts that drive Mail. These bound *this
@@ -1941,6 +1642,15 @@ enum MailDeadline {
   /// `osascript` with the message half-written, and a partly-saved draft is
   /// worse than a slow one.
   static let compose: TimeInterval? = nil
+
+  /// A reply or forward, which composes *and* looks the original up first.
+  ///
+  /// Unlike `compose` this is bounded, because the lookup is the part that
+  /// hangs: addressing a message wedged Mail here and the CLI then sat with no
+  /// output at all. Generous, because the lookup legitimately takes ~6s on a
+  /// 37,000-message mailbox. The `save` itself is left *outside* the in-script
+  /// timeout for the same reason `compose` has none.
+  static var reply: TimeInterval { env("APPLE_MAIL_SCRIPT_TIMEOUT") ?? 180 }
 
   /// The budget to hand AppleScript *inside* the script, sized to expire a few
   /// seconds before the process deadline above so the interpreter abandons the

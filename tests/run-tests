@@ -10,9 +10,12 @@
 #
 # Usage:
 #   ./tests/run-tests                        # calendar writes + mail read guards
-#   ./tests/run-tests --mail                 # + the mail draft suite
 #   ./tests/run-tests --contacts             # + the contacts write suite
 #   ./tests/run-tests test_calendar_write    # one module
+#
+# There is no --mail flag any more. apple-mail composes nothing as of 26.810.0,
+# so the draft suite went with it; what is left of the mail tests is read-only
+# and always on.
 #
 # test_mail_wedge is read-only and always on. Some of it only applies with
 # Mail.app closed and some only with it open, so run it both ways to cover
@@ -26,10 +29,9 @@
 
 set -euo pipefail
 
-# The mail and contacts suites are opt-in on top of the calendar one. Mail
-# creates real drafts and sweeps them to trash, where they stay until you empty
-# it. Contacts creates real contacts and groups, which sync to every device on
-# the account and have no undo — hence a separate flag and a stricter sweep.
+# The contacts suite is opt-in on top of the calendar one: it creates real
+# contacts and groups, which sync to every device on the account and have no
+# undo — hence a separate flag and a stricter sweep.
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 PY="$(command -v python3)"
@@ -42,13 +44,6 @@ export RUN_LIVE_CALENDAR_TESTS=1
 export RUN_LIVE_MAIL_READ_TESTS=1
 while [ "$#" -gt 0 ]; do
   case "${1:-}" in
-    --mail)
-      export RUN_LIVE_MAIL_TESTS=1
-      shift
-      echo "Mail draft tests ENABLED — creates ~15 drafts prefixed"
-      echo "__claude_mail_test__ and moves them to trash afterwards. Cleanup is"
-      echo "best-effort; if any survive, delete them by hand in Mail.app."
-      ;;
     --contacts)
       export RUN_LIVE_CONTACTS_TESTS=1
       shift

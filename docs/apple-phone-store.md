@@ -315,7 +315,8 @@ is `com.apple.FaceTime.NoPrompt`, which Phone.app holds and which is
 platform application.
 
 That is treated as a feature. Every other irreversible write in this repo needs
-an explicit `--confirm`; dialing gets a human gate from the OS that `mail send`
+an explicit `--confirm`; dialing gets a human gate from the OS that scripted
+sending never
 never had, so the CLI adds no second one. What it must never do is *click* that
 panel — auto-confirming would turn one command into a real, billable, outward
 phone call with no human in the loop. `--dry-run` prints the URL instead.

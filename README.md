@@ -155,7 +155,7 @@ isn't guaranteed; JSON is.
 | Tool | Backed by | Capability |
 |------|-----------|------------|
 | `notes` | `NoteStore.sqlite` + protobuf | Search titles, list folders, export notes as Markdown, deep links. Read-only. |
-| `mail` | `Envelope Index` + `.emlx` (reads), AppleScript (writes) | Search by subject, sender, or full body text with date and flag filters; export a message; draft and send. |
+| `mail` | `Envelope Index` + `.emlx` | Search by subject, sender, or full body text with date and flag filters; export a message; save its attachments. **Read-only** — composing was removed in 26.810.0, see [`docs/apple-mail-drafts.md`](docs/apple-mail-drafts.md). |
 | `messages` | `chat.db` | Search and export iMessage/SMS/RCS history, list conversations, save attachments. Read-only. |
 | `phone` | `CallHistory.storedata` + AddressBook | Recent calls with callers resolved to names, missed/unknown filters, talk-time stats, blocked list. Read-only apart from `dial`, which hands a `tel:` URL to Phone.app for you to confirm. |
 | `reminders` | EventKit | Full CRUD: add, edit, complete, delete, lists, priorities, recurrence, natural-language dates. |
@@ -227,9 +227,10 @@ binary. `apple-notes`, `apple-messages` and `apple-phone` need Full Disk Access 
 they read `NoteStore.sqlite`, `chat.db` and `CallHistory.storedata` directly.
 `apple-phone` in particular *cannot* be made to disclaim: doing so would make it
 its own responsible process and lose the terminal's Full Disk Access, which is
-the grant it depends on. `apple-mail` needs Full Disk Access
-to read (search, export, accounts) and Automation → Mail to write (draft, send)
-— two grants for two halves, and `apple mail status` reports them separately.
+the grant it depends on. `apple-mail` needs Full Disk Access for everything it does — search, export,
+attachments, accounts. Automation → Mail is still read, since `export` can fall
+back to asking Mail for a body it has not downloaded, but nothing headline
+depends on it; `apple mail status` reports both separately.
 
 ## Layout
 
@@ -240,7 +241,7 @@ swift/           one Swift package → reminders, apple-mail, apple-messages, ap
 notes/           Python: apple-notes, notestore.py decoder, live Notes.app tests
 skills/          Claude skills (apple-tools, daily-brief, meeting-prep, inbox-triage)
 completions/     zsh completions
-tests/           live write-path suites: calendar, mail drafts, contacts (gated)
+tests/           live suites: calendar and contacts writes (gated), mail read guards
 docs/            Notes API and Mail store references, behavior notes, prior art
 Formula/         Homebrew formula, mirrored into the tap on release
 VERSION          single source of truth, stamped into every tool
@@ -274,8 +275,7 @@ The live suites drive real data and are gated behind their own runners, each
 opting in to one more surface:
 
 ```
-./tests/run-tests              # calendar write paths       (25 tests)
-./tests/run-tests --mail       # + mail drafts              (19)
+./tests/run-tests              # calendar writes (25) + mail read guards (22)
 ./tests/run-tests --contacts   # + contacts writes          (60)
 ./notes/run-tests              # live Notes.app
 ```

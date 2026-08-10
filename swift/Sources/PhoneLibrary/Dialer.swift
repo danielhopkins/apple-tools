@@ -12,7 +12,7 @@ import Foundation
 ///
 /// That is treated as a feature rather than worked around. Every other
 /// irreversible write in this repo needs an explicit `--confirm`; dialing gets a
-/// human gate from the OS that `mail send` never had, so the CLI does not add a
+/// human gate from the OS that scripted sending never had, so the CLI does not add a
 /// second one. What it must not do is *click* that panel — auto-confirming would
 /// turn one command into a real, billable, outward-facing phone call with no
 /// human in the loop.

@@ -212,7 +212,7 @@ a listing readable; falling back to `chat_identifier` gives `chat761561030201699
   parameter `text|file`, `to` a `participant` or `chat`) and essentially nothing
   else — no read access to history worth having. Sending is not implemented yet;
   when it is, it needs Automation → Messages and the same `--confirm` discipline
-  as `apple mail send`.
+  as the removed `apple mail send` did.
 - **Deleted messages.** `chat.db` has `deleted_messages` and
   `chat_recoverable_message_join` tables backing Recently Deleted. Not read
   today; a user asking for their history probably does not mean those.
