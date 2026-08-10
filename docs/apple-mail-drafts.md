@@ -241,9 +241,55 @@ Mail compose intent has become signable:
 ./util/check-mail-intents --json   # machine-readable
 ```
 
-It exits **0 if something became reachable** and 1 if nothing changed, so it can
-be run from a cron or a release check. Pair it with `util/appintents-dump` for
-the parameter schema of anything that opens up.
+It exits **0 if something became reachable**, 1 if nothing changed, and 3 if the
+database is present but not yet populated — so it can be run from a cron or a
+release check. Pair it with `util/appintents-dump` for the parameter schema of
+anything that opens up.
+
+🛑 **An OS upgrade wipes this database, and the empty state reads as "still
+gated".** Checked on **macOS 27.0 (26A5406e)**: the upgrade bumped the schema
+version in the filename (`v78-<UUID>` → `v79-<UUID>`) and left **every table at
+zero rows** — so the first run after upgrading reported "unchanged" from an index
+that had no Mail actions in it to gate. That is the exact moment you would run
+this check, and it is a false negative. `check-mail-intents` now reads
+`count(*)` and exits **3** rather than 1 in that state. Repopulate with
+`open -g -j -a Shortcuts`, wait ~1 min, then re-run.
+
+⚠️ **Pair the live file with its `-wal` and you get zero rows too**, for a
+different reason: the indexer is writing concurrently, and a copied
+`db`+`wal`(+stale `shm`) triple replays to an earlier empty state. Copy the main
+database *alone* when snapshotting it, or read it in place.
+
+**Filed as FB24254597** (2026-08-10, Shortcuts / Suggestion): asks for Mail's
+draft-composition intents to be made Shortcuts-visible, on the evidence below —
+that Mail declares them discoverable and the withholding is applied system-side.
+Distinct from **FB11734014**, the AppleScript cite-blockquote bug; that one is
+why this route matters, this one is the route. If either is ever answered, the
+pasteboard handoff can be revisited.
+
+### Result: macOS 27.0 (26A5406e), 2026-08-10 — no change
+
+Index repopulated (2248 tools). Every compose route still gated; nothing has the
+`& 4` bit:
+
+| Action | visibilityFlags |
+|---|---|
+| `ComposeMessageIntent`, `ReplyMessageIntent`, `ForwardMessageIntent` | 3 |
+| `SaveDraftIntent`, `SendDraftIntent`, `SendMail`, `DeleteDraftIntent` | 3 |
+| `UpdateDraftIntent`, `OpenDraftComposerIntent` | 0 |
+| all five `SiriMailFlowTools` (`Create`/`Reply`/`Forward`/`Update`/`SendDraftMailTool`) | 2 |
+
+Mail's bundle metadata is unchanged too — still **23 actions**, with
+`ComposeMessageIntent` still taking `body` as an `AttributedString`
+(`Metadata.appintents` rebuilt at toolsVersion `27A200c`). The only signable Mail
+entries are `MailMessageEntity` and `MailFocusConfigurationAction` (7), which
+carry no body.
+
+⚠️ **Unexplored: `is.workflow.actions.sendemail` is signable (`visibilityFlags=15`).**
+That is the *legacy* Shortcuts "Send Email" action, not an App Intent, and it is
+not covered by the dead-ends list above. Whether its body survives review
+un-blockquoted is unmeasured — it would need the by-hand matched-pair method,
+since it is a different code path from both AppleScript and App Intents.
 
 ## What was built instead: the pasteboard handoff
 
@@ -354,6 +400,30 @@ populates it is wrong — measured empty five times.
     has a proper title and is also absent. The only reliable oracle is the
     picker, or the `visibilityFlags` bit. Apple Intelligence is **not** the gate:
     every one of the 23 has `requiredCapabilities: []`.
+  - ✅ **What the gate actually is: conformance to an assistant schema.** The
+    ToolKit index carries a `SystemToolProtocols` table, and joining it against
+    `Tools` explains the split that `visibilityMetadata` could not:
+
+    | Action | vf | protocols |
+    |---|---|---|
+    | `ComposeMessageIntent` | 3 | `appIntent, assistantInvocable, sideEffect, appIntentSchema.mail.CreateDraftIntent` |
+    | `SaveDraftIntent` | 3 | `appIntent, assistantInvocable, appIntentSchema.mail.SaveDraftIntent` |
+    | `SendMail` | 3 | `appIntent, sendMail, batchable` |
+    | `MailFocusConfigurationAction` | **7** | `appIntent, focusConfiguration, batchable` |
+
+    Actions marked `assistantInvocable` are signable in **38 of 386** cases
+    (~10%) against **756 of 2248** (~34%) overall, and within Mail the *only*
+    signable action is the one action that conforms to no assistant schema.
+    `SendMail` is gated by a second, separate rule — it carries no
+    `assistantInvocable` but its own `sendMail` system protocol.
+
+    ⚠️ **This is applied system-side at index time, not declared by Mail.** Every
+    gated action reports `visibilityMetadata: {assistantOnly: false,
+    isDiscoverable: true}` in its own bundle metadata — the app is not asking to
+    be hidden. And ordinary third-party App Intents get the bit routinely
+    (forScore 84/86, BetterDisplay 40/40, Ghostty 13/13, Tailscale 12/12), so it
+    is not a first-party privilege wall either. **It is policy, and therefore
+    reversible by Apple without any change to the intents themselves.**
 - 🛑 **IMAP APPEND.** Byte-exact and shipped by `apple-mail-fast-mcp`, but needs
   per-account credentials (an OAuth2 Gmail account cannot provide one), the draft
   does not appear in Mail's Drafts pane for minutes, it cannot create drafts in

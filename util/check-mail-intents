@@ -6,6 +6,9 @@ produces a clean, review-durable draft is Mail's App Intents — and every way i
 is gated. This checks the gate, so a future macOS 27 beta opening it up is a
 one-command discovery rather than a re-investigation.
 
+Filed with Apple as **FB24254597** (2026-08-10). A `0` exit here is what it
+looks like if that is ever acted on.
+
 What it reads
 -------------
 `~/Library/Shortcuts/ToolKit/Tools-active`, the Shortcuts action database.
@@ -22,11 +25,19 @@ possible — the file is user-owned and unprotected — but it is a rebuilt cach
 the change is expected to revert on reindex or OS update, and nothing shippable
 can depend on it.
 
+⚠️ An OS upgrade **wipes and rebuilds this database**, and the rebuild is not
+instant — the schema version in the filename bumps (v78 → v79 on macOS 27.0
+26A5406e) and every table is empty until Shortcuts or `siriappintentsd`
+repopulates it. An empty table is *not* "all gated", so it is reported as
+`indexEmpty` (exit 3) rather than silently reading as no-change. Launching
+Shortcuts once (`open -g -j -a Shortcuts`) repopulates it.
+
 Exit status
 -----------
     0   something is signable — the situation changed, go look
     1   nothing changed; all compose actions still gated
     2   could not read the database
+    3   the database is present but not populated — verdict unknown, retry later
 
 Usage
 -----
@@ -79,6 +90,10 @@ def read_tools(path, everything):
     # open skips the write-ahead log and reports stale rows in both directions.
     uri = "file:" + path.replace("?", "%3f").replace("#", "%23") + "?mode=ro"
     with sqlite3.connect(uri, uri=True) as conn:
+        # Read the total too: a rebuilt-but-unpopulated database answers every
+        # query with zero rows, which is indistinguishable from "all gated"
+        # unless the total is checked. See the exit-status note above.
+        total = conn.execute("SELECT count(*) FROM Tools").fetchone()[0]
         rows = conn.execute(
             "SELECT id, flags, visibilityFlags FROM Tools "
             "WHERE id LIKE '%mail%' OR id LIKE '%Mail%' ORDER BY id"
@@ -97,7 +112,7 @@ def read_tools(path, everything):
                 "signable": bool(visibility & SIGNABLE_BIT),
             }
         )
-    return out
+    return out, total
 
 
 def main():
@@ -113,7 +128,7 @@ def main():
         return 2
 
     try:
-        tools = read_tools(path, everything)
+        tools, total = read_tools(path, everything)
     except sqlite3.Error as exc:
         message = f"could not read {path}: {exc}"
         print(json.dumps({"error": message}) if as_json else f"error: {message}",
@@ -122,12 +137,27 @@ def main():
 
     reachable = [t for t in tools if t["compose"] and t["signable"]]
 
+    # An OS upgrade truncates this database and the rebuild takes minutes. Zero
+    # rows means "no answer yet", never "still gated" — reporting the latter
+    # here is how an upgrade that *did* open things up would be missed.
+    empty = total == 0 or not tools
+
     if as_json:
         print(json.dumps(
             {"database": path, "signable_bit": SIGNABLE_BIT,
+             "total_tools": total, "index_populated": not empty,
              "changed": bool(reachable), "reachable": reachable, "tools": tools},
             indent=2))
-        return 0 if reachable else 1
+        return 3 if empty else (0 if reachable else 1)
+
+    if empty:
+        print(f"database: {path}\n")
+        print(f"index not populated ({total} tools indexed, no Mail actions) — "
+              "verdict unknown.")
+        print("An OS upgrade wipes this cache and the rebuild is not instant.")
+        print("Repopulate it with `open -g -j -a Shortcuts`, wait a minute, "
+              "then re-run.")
+        return 3
 
     print(f"database: {path}\n")
     width = max((len(t["id"]) for t in tools), default=0)
