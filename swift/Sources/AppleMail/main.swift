@@ -128,7 +128,7 @@ struct AppleMail: AsyncParsableCommand {
     version: appleToolsVersion,
     subcommands: [
       Search.self, Export.self, Attachments.self, Accounts.self,
-      Compose.self, Reply.self, Forward.self, DeleteDraft.self, Status.self,
+      Compose.self, Reply.self, Forward.self, Move.self, DeleteDraft.self, Status.self,
     ]
   )
 }
@@ -1653,6 +1653,18 @@ enum MailDeadline {
   /// 37,000-message mailbox. The `save` itself is left *outside* the in-script
   /// timeout for the same reason `compose` has none.
   static var reply: TimeInterval { env("APPLE_MAIL_SCRIPT_TIMEOUT") ?? 180 }
+
+  /// A batch of moves, budgeted per message rather than as one flat number so
+  /// a large sweep is not killed for being large.
+  ///
+  /// Each message costs one targeted `whose id is` lookup plus the move —
+  /// measured at 0.9s on a 37,000-message mailbox, and flat in mailbox size,
+  /// since Mail resolves that predicate against an index rather than by
+  /// walking. 5s each is therefore several times the observed cost, and the
+  /// floor covers resolving the account and both mailboxes once.
+  static func move(count: Int) -> TimeInterval {
+    env("APPLE_MAIL_SCRIPT_TIMEOUT") ?? (30 + 5 * Double(count))
+  }
 
   /// The budget to hand AppleScript *inside* the script, sized to expire a few
   /// seconds before the process deadline above so the interpreter abandons the

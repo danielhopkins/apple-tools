@@ -104,6 +104,55 @@ Messages` (IMAP), `Deleted Items` (Exchange), `[Gmail]/Trash`, and `Junk` /
 `Junk Email` / `Spam`. Excluding "trash" by one spelling silently leaves the
 other two in the results.
 
+🛑 **A nested mailbox must be handed to AppleScript by its full path.** Mail
+accepts `mailbox "[Gmail]/All Mail" of acct` and refuses the leaf with **-1728,
+"Can't get mailbox …"**. Since `accounts` prints the leaf, a name that came out
+of this tool is not necessarily one Mail will take — resolve leaf → path against
+the `mailboxes` table before building a script. `resolveMailbox` in
+`MailboxMoves.swift` does exactly this (path match, then leaf, then the alias
+table).
+
+### `messages.ROWID` is Mail's AppleScript message `id`
+
+🛑 **This is the join that lets a write command address one message without
+enumerating a mailbox**, and it is the difference between a move that costs 0.9s
+and one that wedges Mail.
+
+```applescript
+set m to first message of (mailbox "Archive" of acct) whose id is 109463
+```
+
+Verified against a live 37,220-message Archive: the `message id` header Mail
+returned matched `message_global_data.message_id_header` for that ROWID every
+time.
+
+The measurement that matters is that **it is flat in mailbox size**. The newest
+message in that mailbox and the oldest (ROWID 77) both resolved in **0.9s**, so
+Mail answers the predicate from an index rather than by walking. Compare the
+AppleScript *search* engine at 154s over the same store, which is a walk and is
+how Mail's scripting interface has been wedged twice during development.
+
+⚠️ **`whose id is` is safe; `repeat with m in messages of <mailbox>` is not.**
+They look equally innocent at the call site. `delete-draft` gets away with the
+walk only because Drafts holds a handful of messages.
+
+### Custom IMAP keywords are not stored locally
+
+🛑 **Mail discards them on sync, so no local reader can expose them.** Looked for
+in every place they could be:
+
+| Where | What is there |
+|---|---|
+| `messages` columns | `flags`, `read`, `flagged`, `deleted` — no keyword column |
+| `labels`, `server_labels` | Gmail labels as mailbox references (3 rows here) |
+| `.emlx` trailer plist | `flags` bitfield, `conversation-id`, `remote-id` only |
+| `grep -ril <keyword> ~/Library/Mail` | **zero hits** |
+
+The keyword tested was one an external filter (imapfilter) sets server-side and
+that is demonstrably present over IMAP. Anything keying off an IMAP keyword —
+"which of these did my rules file, and which did I file by hand?" — has to run
+server-side; it is not a gap in this reader.
+
 ### Account display names
 
 The mailbox URL gives an account UUID; the names users recognise (here: emoji)

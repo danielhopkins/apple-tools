@@ -498,3 +498,152 @@ class TestComposeRefusalsAreFree(MailGuardTest):
         self.assertIn("draft", err.lower())
         self.assertRefusedFast(elapsed)
         self.assertDidNotLaunchMail()
+
+
+def a_junk_message():
+    """One real Message-ID sitting in a junk mailbox, or None.
+
+    Junk because these tests only ever *plan* a move, never perform one, and a
+    plan that resolves has to point at something real. Nothing here creates
+    mail; an empty junk mailbox skips the test.
+    """
+    code, out, _, _ = run(
+        "search", "", "--mailbox", "junk", "--limit", "1", "--json"
+    )
+    if code != 0:
+        return None
+    try:
+        rows = json.loads(out)
+    except ValueError:
+        return None
+    return rows[0] if rows else None
+
+
+class TestMoveIsDecidedOffTheIndex(MailGuardTest):
+    """`move` writes to real mail, so everything it can refuse, it refuses first.
+
+    🛑 The reason this command is safe at all is that it never enumerates a
+    mailbox. It resolves every message against the index and hands Mail a
+    targeted `whose id is <rowid>` — measured at 0.9s on a 37,220-message
+    mailbox, and the same for the newest and oldest message in it, so Mail
+    answers it from an index rather than by walking. A rewrite that loops over
+    `messages of <mailbox>` would be the whole-mailbox walk that wedges Mail,
+    and these timings are what would catch it.
+
+    Nothing here moves anything: every case either refuses or is a --dry-run.
+    """
+
+    def test_dry_run_costs_no_apple_event(self):
+        """--dry-run is the flag users are told to reach for first, so it has to
+        be genuinely free — resolution only, no Mail, no launch."""
+        if not index_readable():
+            self.skipTest("no readable Envelope Index (Full Disk Access)")
+        message = a_junk_message()
+        if message is None:
+            self.skipTest("no junk mail to plan a move for; this suite creates none")
+
+        code, out, err, elapsed = run(
+            "move", message["id"], "--to", "trash", "--dry-run", "--json"
+        )
+        self.assertEqual(code, 0, err)
+        payload = json.loads(out)
+        self.assertTrue(payload["dry_run"])
+        self.assertEqual(payload["moved"], 0)
+        self.assertEqual(payload["would_move"], 1)
+        self.assertRefusedFast(elapsed)
+        self.assertDidNotLaunchMail()
+
+    def test_unknown_destination_is_refused_before_mail(self):
+        if not index_readable():
+            self.skipTest("no readable Envelope Index (Full Disk Access)")
+        message = a_junk_message()
+        if message is None:
+            self.skipTest("no junk mail to plan a move for; this suite creates none")
+
+        code, _, err, elapsed = run(
+            "move", message["id"], "--to", "NoSuchMailbox-apple-tools-test"
+        )
+        self.assertEqual(code, EXIT_VALIDATION)
+        self.assertIn("No mailbox", err)
+        # A refusal that does not say what does exist just gets retried blind.
+        self.assertIn("Available:", err)
+        self.assertRefusedFast(elapsed)
+        self.assertDidNotLaunchMail()
+
+    def test_unknown_account_is_refused_before_mail(self):
+        if not index_readable():
+            self.skipTest("no readable Envelope Index (Full Disk Access)")
+        code, _, err, elapsed = run(
+            "move", "whatever@example.invalid", "--to", "trash",
+            "--account", "no-such-account-apple-tools-test",
+        )
+        self.assertEqual(code, EXIT_VALIDATION)
+        self.assertIn("No account matching", err)
+        self.assertRefusedFast(elapsed)
+        self.assertDidNotLaunchMail()
+
+    def test_unknown_message_id_never_reaches_mail(self):
+        """An id that resolves to nothing leaves no targets, so there is nothing
+        to ask Mail — the command must not preflight, launch, or hang."""
+        if not index_readable():
+            self.skipTest("no readable Envelope Index (Full Disk Access)")
+        code, out, _, elapsed = run(
+            "move", "definitely-not-a-real-id@example.invalid", "--to", "trash", "--json"
+        )
+        self.assertEqual(code, 1)
+        payload = json.loads(out)
+        self.assertEqual(payload["moved"], 0)
+        self.assertEqual(payload["failed"], 1)
+        self.assertRefusedFast(elapsed)
+        self.assertDidNotLaunchMail()
+
+    def test_no_message_ids_at_all_is_refused(self):
+        code, _, err, elapsed = run("move", "--to", "trash")
+        self.assertEqual(code, EXIT_VALIDATION)
+        self.assertIn("No Message-IDs", err)
+        self.assertRefusedFast(elapsed)
+        self.assertDidNotLaunchMail()
+
+    def test_an_unreadable_index_names_full_disk_access(self):
+        """Without the index there is no way to resolve a message, and the
+        fallback must not be 'ask Mail to find it' — that is the enumeration
+        this command exists to avoid."""
+        code, _, err, elapsed = run(
+            "move", "whatever@example.invalid", "--to", "trash",
+            env={"APPLE_MAIL_INDEX_PATH": NO_INDEX},
+        )
+        self.assertNotEqual(code, 0)
+        self.assertIn("APPLE_MAIL_INDEX_PATH", err)
+        self.assertRefusedFast(elapsed)
+        self.assertDidNotLaunchMail()
+
+
+class TestMoveRefusesToLaunchMail(MailGuardTest):
+    """With Mail down, a move that would otherwise proceed must stop.
+
+    Same guard, and the same stakes, as the read commands: `tell application
+    "Mail"` starts Mail, and a cold Mail handed work is how it gets wedged.
+    Reaching the guard needs a plan with something in it, so this points at real
+    junk mail — if the guard were gone the cost would be one spam message moved
+    to trash, which `move` itself undoes. Every other preflight test in this
+    file carries the same shape of risk.
+    """
+
+    def setUp(self):
+        super().setUp()
+        if self.mail_was_running:
+            self.skipTest("this asserts what happens when Mail is NOT running")
+
+    def test_move_refuses_to_launch_mail(self):
+        if not index_readable():
+            self.skipTest("no readable Envelope Index (Full Disk Access)")
+        message = a_junk_message()
+        if message is None:
+            self.skipTest("no junk mail to plan a move for; this suite creates none")
+
+        code, _, err, elapsed = run("move", message["id"], "--to", "trash")
+        self.assertNotEqual(code, 0)
+        self.assertIn("not running", err)
+        self.assertIn("Refusing to launch", err)
+        self.assertRefusedFast(elapsed)
+        self.assertDidNotLaunchMail()

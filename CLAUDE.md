@@ -19,6 +19,7 @@ installed via `make install`.
 | Read an email | `apple mail export <message-id>` |
 | Save an attachment | `apple mail attachments <message-id> --save ~/Downloads` |
 | Start an email (user pastes) | `apple mail compose --to a@b.com --subject "…" --body "…"` |
+| File mail into a mailbox | `apple mail move <message-id>… --to Receipts --dry-run` |
 | Reply to an email | `apple mail reply <message-id> --body "…"` |
 | List mail accounts | `apple mail accounts --json` |
 | List conversations | `apple messages chats --json` |
@@ -67,7 +68,9 @@ also answers `status` on its own.
    or deletes touches the user's real data — confirm with them first unless they
    clearly asked for the write. Contacts writes sync to every device and there is
    no undo. `phone dial` places a real, billable call: Phone.app will ask the
-   user to confirm, and that panel is theirs to click, never yours.
+   user to confirm, and that panel is theirs to click, never yours. `mail move`
+   refiles real mail and syncs everywhere — show the user `--dry-run` output
+   before running it for real.
 3. **Never edit a note that has attachments.** See the Notes section; one body
    write destroys every attachment on the note. This is unrecoverable.
 4. **IDs are per-tool and not interchangeable.** Notes use integer PKs, Mail uses
@@ -214,6 +217,9 @@ apple mail compose --to ADDR [--cc ADDR] [--bcc ADDR] [--subject TEXT]
 apple mail reply MESSAGE-ID [--all] [--body TEXT | --body-file FILE|-]
                  [--markdown | --html] [--account NAME] [--json]
 apple mail forward MESSAGE-ID --to ADDR [<same flags as reply>]
+
+apple mail move MESSAGE-ID... --to MAILBOX [--from MAILBOX] [--account NAME]
+                [--dry-run] [--mark-read] [--json]     # `-` reads ids from stdin
 
 apple mail delete-draft MESSAGE-ID [--account NAME] [--json]
 apple mail status [--json]
@@ -397,15 +403,80 @@ the command. Consequence: **the file-system answer has no `enabled` key**, so
 read it as `account.get("enabled", True)`. It also lists the local "On My Mac"
 store, which the AppleScript path omits.
 
+**`move` files received mail into another mailbox, and it is the one write path
+here that touches real mail.** Built for sweeps: filing what arrived before a
+filter rule existed, or rescuing what was filed wrongly. It takes many
+Message-IDs at once, and `-` reads them from stdin, so it is the tail of a
+pipeline:
+
+```
+apple mail search "receipt" --mailbox inbox --json | jq -r '.[].id' \
+  | apple mail move - --to Receipts --dry-run
+```
+
+🛑 **`whose id is <rowid>` is why this command is allowed to exist, and it must
+stay that way.** Every message is resolved against the index first, and Mail is
+handed an exact id in a named mailbox — never a walk over `messages of
+<mailbox>`, which is the pattern that wedges its scripting interface. Measured
+on the 37,220-message Archive here: **0.9s, and identical for the newest and the
+oldest message in the mailbox**, so Mail resolves it from an index rather than by
+scanning. The AppleScript *search* engine takes 154s over the same store. A
+batch of 8 moved in 0.9s end to end.
+
+🛑 **Mail's AppleScript `id of message` *is* the Envelope Index ROWID.** Verified
+against a live store — `first message of <mailbox> whose id is <rowid>` returned
+the matching `message id` header every time, including for the oldest message in
+a 37k mailbox. This is the join that makes an index-resolved move possible; the
+Message-ID header would work as a predicate too, but nothing else gives Mail an
+indexed integer to look up.
+
+- **`--dry-run` sends Mail nothing at all.** It resolves and prints the plan off
+  the index alone. Run it first; these moves sync to every device.
+- **Partial failure never aborts the batch.** Each message reports `{id, moved,
+  confirmed, error}`; the exit code is 1 if any failed. A whole chunk lost to a
+  timeout is charged to every message in it, because Mail may have moved some
+  before it stopped answering.
+- **Every move is confirmed against the index**, by the copy *appearing in the
+  destination* — not by it leaving the source, which takes minutes (see
+  copy-then-expunge below). `confirmed: false` with `moved: true` means Mail
+  reported success the index could not corroborate.
+- **`--mark-read` marks each message read as it moves**, matching what a
+  server-side filter rule does when it files something. Set before the move,
+  while the reference is still valid.
+- **Drafts are refused** — a draft's Message-ID changes when it is edited, so a
+  sweep would act on the wrong message. Use `delete-draft`.
+- A Message-ID with copies in several mailboxes moves **all** of them, each
+  reported separately. Narrow with `--from` or `--account`.
+- Destinations are per-account and **nothing is created**. `--to trash` resolves
+  to `Deleted Messages` on IMAP, `Deleted Items` on Exchange and `[Gmail]/Trash`
+  on Gmail, so one command works across accounts.
+
+🛑 **A nested mailbox must be named by its full path, and `accounts` prints the
+leaf.** Mail rejects `mailbox "All Mail"` outright (**-1728**) and accepts
+`mailbox "[Gmail]/All Mail"`. `move` resolves a leaf name to the full path for
+you — path match first, then leaf, then the alias table — but anything else
+driving Mail has to know. Ambiguous leaves are refused rather than guessed, and
+both errors quote paths.
+
+🛑 **Custom IMAP keywords are not on this Mac, so no tool here can expose them.**
+Searched for exhaustively: the `messages` table carries only `flags`/`read`/
+`flagged`/`deleted`, the `labels` and `server_labels` tables are Gmail
+labels-as-mailboxes (3 rows on this store), and the `.emlx` trailer plist holds
+only Mail's own flag bitfield. A `grep -ril` for a keyword known to be set
+server-side across all of `~/Library/Mail` returned **zero hits**. Mail discards
+them on sync — this is not a gap in the reader. Anything keying off an IMAP
+keyword has to run server-side.
+
 **`delete-draft` only ever moves a draft to trash.** It enumerates Drafts alone, so it cannot touch sent or received mail
 even if handed the Message-ID of some. It re-reads the mailbox afterwards and
 fails loudly rather than trusting the move, and it is a move to **trash, not a
 purge** — same as Notes' Recently Deleted, with no API to empty it.
 
-- **Only one route removes a draft**, and `delete-draft` implements it. `delete`
-  silently does nothing, `move` errors, and `set deleted status` fails with
-  "Connection is invalid". Reassigning `mailbox of <message>` to the account's
-  trash **does** work. The trash mailbox is named differently per account type
+- **Only one route removes a draft**, and `delete-draft` implements it. Mail's
+  `delete` verb silently does nothing, its `move` verb errors, and `set deleted
+  status` fails with "Connection is invalid". Reassigning `mailbox of <message>`
+  to the account's trash **does** work — which is also what `apple mail move`
+  uses for received mail. The trash mailbox is named differently per account type
   (`Deleted Messages`, `Trash`, `Deleted Items`), so it tries each.
 - 🛑 **Re-resolve the Message-ID before calling it.** A draft's Message-ID
   **changes when the draft is edited and saved**, and has been observed changing
@@ -414,9 +485,11 @@ purge** — same as Notes' Recently Deleted, with no API to empty it.
   the draft up by subject first: `apple mail search "" --mailbox drafts --json`
   and use the `id` field.
 
-⚠️ **A mailbox move is copy-then-expunge**, so the Drafts copy survives until
-the server expunges it (~2 min on IMAP). `delete-draft` says so on stderr; a
-re-listing before then still shows the draft, and that is not a failure.
+⚠️ **A mailbox move is copy-then-expunge**, so the source copy survives until
+the server expunges it (~2 min on IMAP). `delete-draft` and `move` both say so
+on stderr; a re-listing before then still shows the message in its old mailbox,
+and that is not a failure. It is also why both judge success on the copy
+*arriving* rather than on the original leaving.
 
 **Mailbox names are not unique** — three accounts can each have an `Archive`.
 Every result carries both `account` and `mailbox`; use the pair. Account names
@@ -940,7 +1013,8 @@ has no reverse lookup and it would mean scanning every group per contact.
 bin/apple                 dispatcher — routes to the tools below
 swift/                    one Swift package, six binaries
   Sources/reminders/      + RemindersLibrary/
-  Sources/AppleMail/      + MailLibrary/ (Envelope Index reader, .emlx/MIME)
+  Sources/AppleMail/      + MailLibrary/ (Envelope Index reader, .emlx/MIME,
+                          mailbox-name resolution for move)
   Sources/AppleMessages/  + MessagesLibrary/ (chat.db reader, typedstream decoder)
   Sources/ApplePhone/     + PhoneLibrary/ (CallHistory reader, AddressBook resolver)
   Sources/AppleCalendar/
@@ -1071,7 +1145,10 @@ Each tool needs a one-time TCC grant, prompted on first run **from a terminal**:
 
 `mail` needs **two grants for two halves**. Full Disk Access covers `search`,
 `export`, `attachments` and `accounts`. Automation → Mail is what lets
-`compose`/`reply`/`forward` open a window and `delete-draft` move a draft.
+`compose`/`reply`/`forward` open a window, and `delete-draft`/`move` refile a
+message. ⚠️ **`move` needs both**: Full Disk Access to resolve each message
+against the index, then Automation → Mail to move it — so it can fail for two
+quite different reasons, and the error says which.
 `apple mail status` reports both and counts the tool usable if either is present,
 so "mail ✓" can mean reads work and composing does not; check the detail line
 before concluding which half is broken.

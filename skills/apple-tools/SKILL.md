@@ -18,7 +18,7 @@ these tools is that the edge cases are already handled.
 | Tool | Reads | Writes |
 |------|-------|--------|
 | `apple notes` | titles, folders, note bodies as Markdown | **yes**, once shortcuts are installed |
-| `apple mail` | accounts, message search, message bodies, attachments | **opens a compose window**; you paste the body |
+| `apple mail` | accounts, message search, message bodies, attachments | **opens a compose window** (you paste the body); **`move` refiles messages** |
 | `apple messages` | conversations, message search, attachments | no |
 | `apple phone` | call history with names, blocked list, stats | **`dial` only** (you confirm in Phone.app) |
 | `apple reminders` | lists, items, due dates | **yes** |
@@ -31,10 +31,11 @@ these tools is that the edge cases are already handled.
    humans and its layout is not stable. (`contacts` is JSON by default; pass
    `--plain` there for human output.)
 2. **Confirm before writing.** `reminders add/edit/complete/delete`,
-   `calendar add/edit/delete`, `contacts add/edit/delete`, and
-   `reminders new-list` all touch real data that syncs to the user's other
+   `calendar add/edit/delete`, `contacts add/edit/delete`, `reminders new-list`
+   and `mail move` all touch real data that syncs to the user's other
    devices. If the user did not clearly ask for the write, describe what you are
-   about to do and wait. Contact deletion in particular has no undo.
+   about to do and wait. Contact deletion in particular has no undo; `mail move`
+   has `--dry-run`, so show that first.
 3. **Never guess an identifier.** Run the corresponding `show`/`search`/`events`
    command first and use what it returns.
 4. **Report empty results as empty.** "No events today" is a real answer. Do not
@@ -240,6 +241,40 @@ trash, and only ever looks in Drafts, so it cannot touch sent or received mail.
 🛑 **Re-resolve the id first**: a draft's Message-ID changes when it is edited
 and saved, and a stale one makes `export` return an *empty file* rather than an
 error. Get the current id from `apple mail search "" --mailbox drafts --json`.
+
+**`apple mail move` refiles received mail, and it is the one mail command that
+changes the user's mailboxes.** Use it for sweeps: filing mail that arrived
+before a filter rule existed, or rescuing something filed wrongly.
+
+```bash
+apple mail search "receipt" --mailbox inbox --json | jq -r '.[].id' \
+  | apple mail move - --to Receipts --dry-run
+apple mail move <id> <id> --to Receipts --mark-read --json
+```
+
+🛑 **Always run `--dry-run` first and show the user the result before moving
+anything.** These moves sync to every device. `--dry-run` resolves entirely from
+Mail's index and sends Mail nothing, so it is free — there is no reason to skip
+it. Treat the plan as something the user approves, not something you act on.
+
+- Takes many ids at once; `-` reads them from stdin, one per line.
+- **Read `moved` and `confirmed` per message, not the exit code.** Each result is
+  `{id, subject, account, from_mailbox, to_mailbox, moved, confirmed, error}`.
+  One bad id does not abort the batch, so a sweep can be part success.
+- Destinations are per-account and **nothing is created** — a name that does not
+  exist is an error listing what does. `--to trash` works across account types.
+- `--mark-read` marks each message read as it moves, matching what a server-side
+  filter rule does.
+- A Message-ID with copies in several mailboxes moves **all** of them. Narrow
+  with `--from` or `--account` when that is not what you want.
+- Drafts are refused; use `delete-draft`.
+
+⚠️ **The source copy lingers for ~2 minutes on IMAP** (a move is
+copy-then-expunge), so re-listing the old mailbox and still seeing the message is
+normal, not a failed move. The tool says so on stderr. Judge by `confirmed`.
+
+**Undo is just another move**, back to the original mailbox — `from_mailbox` in
+the result tells you where each one came from.
 
 **Mail search is fast now — search widely.** It reads Mail's own index and
 message files rather than driving Mail.app, so a whole-store subject search is
