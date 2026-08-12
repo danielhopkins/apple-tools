@@ -808,6 +808,20 @@ saw — EventKit resolves it to the first occurrence, often years earlier. So:
 - `--future` applies a change to this occurrence and all later ones; without it
   only the single occurrence changes. It is redundant with `--series`.
 
+**Backends are meant to be indistinguishable, and are tested that way.**
+`calendars --json` reports a `type` per calendar — `exchange`, `calDAV`,
+`local`, `subscribed`, `birthdays` — and `./tests/run-tests --backends` runs one
+shared set of assertions against a writable calendar from **every** backend
+present, naming the backend when one fails. What genuinely differs is what the
+*server* does afterwards, not the tool: Google rewrites an attendee's role and
+status where Exchange leaves both `unknown`, and the two format invitation mail
+differently.
+
+⚠️ **The matrix writes to one real calendar per backend and cannot tell which
+are shared** — nothing in EventKit exposes that — so it prints its choices
+before writing and takes `APPLE_CALENDAR_TEST_CALENDARS="A,B,C"` to pin them.
+It writes **no invitees**, so it never mails anyone.
+
 🛑 **Every calendar write is read back from the store before it is reported.**
 `EKEventStore.save` returning true is not evidence the change persisted — a
 `--occurrence` move was observed returning exit 0 with JSON describing the moved
@@ -1259,6 +1273,7 @@ own flag:
 
 ```
 ./tests/run-tests              # calendar writes (54) + mail wedge guards (40)
+./tests/run-tests --backends   # + the same calendar assertions on every backend (7×N)
 ./tests/run-tests --contacts   # + contacts writes (60)
 ```
 

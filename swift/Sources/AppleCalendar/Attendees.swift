@@ -157,6 +157,23 @@ struct AttendeeInfo: Encodable {
   }
 }
 
+extension EKSourceType {
+  /// Behaviour genuinely differs between backends — what the server rewrites,
+  /// whether invitations are sent, how spans are honoured — so anything testing
+  /// or reporting on a calendar needs to know which one it is.
+  var label: String {
+    switch self {
+    case .local: return "local"
+    case .exchange: return "exchange"
+    case .calDAV: return "calDAV"
+    case .mobileMe: return "mobileMe"
+    case .subscribed: return "subscribed"
+    case .birthdays: return "birthdays"
+    @unknown default: return "unknown"
+    }
+  }
+}
+
 extension EKParticipantStatus {
   var label: String {
     switch self {

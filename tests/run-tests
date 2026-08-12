@@ -44,6 +44,27 @@ export RUN_LIVE_CALENDAR_TESTS=1
 export RUN_LIVE_MAIL_READ_TESTS=1
 while [ "$#" -gt 0 ]; do
   case "${1:-}" in
+    --backends)
+      export RUN_LIVE_CALENDAR_BACKEND_TESTS=1
+      shift
+      echo "Backend matrix ENABLED — runs the same calendar assertions against"
+      echo "EVERY writable calendar (Exchange, calDAV/Google, calDAV/iCloud, …),"
+      echo "not just the default one. Creates and sweeps __claude_calendar_test__"
+      echo "events on each. It writes NO invitees, so nothing is mailed."
+      echo
+      # Nothing in EventKit says whether a calendar is shared, so the automatic
+      # pick can land on a team calendar. Show it before writing anything.
+      "$PY" - <<'PYEOF'
+import sys
+sys.path.insert(0, ".")
+from harness import writable_backends
+print("Backend fixtures will be written to:")
+for label, title in writable_backends():
+    print(f"    {label:24} -> {title}")
+print("Pin these with APPLE_CALENDAR_TEST_CALENDARS=\"A,B,C\" if any is shared.")
+print()
+PYEOF
+      ;;
     --contacts)
       export RUN_LIVE_CONTACTS_TESTS=1
       shift

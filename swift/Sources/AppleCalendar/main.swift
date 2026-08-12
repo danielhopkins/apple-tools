@@ -140,6 +140,11 @@ struct CalendarInfo: Encodable {
     let identifier: String
     let allowsModification: Bool
     let source: String
+    /// The backend behind this calendar: exchange, calDAV, local, subscribed,
+    /// birthdays. Behaviour genuinely differs between them — recurrence spans,
+    /// what the server rewrites, whether invitations are sent — so anything
+    /// testing or reporting on a calendar needs to know which one it is.
+    let type: String
 }
 
 struct EventInfo: Encodable {
@@ -470,7 +475,8 @@ struct Calendars: ParsableCommand {
                     title: $0.title,
                     identifier: $0.calendarIdentifier,
                     allowsModification: $0.allowsContentModifications,
-                    source: $0.source?.title ?? "<unknown>"
+                    source: $0.source?.title ?? "<unknown>",
+                    type: $0.source?.sourceType.label ?? "unknown"
                 )
             })
         } else {
@@ -1174,7 +1180,13 @@ struct Invite: ParsableCommand {
             AttendeeAPI.remove(participant, from: match)
         }
 
-        try store.save(match, span: future ? .futureEvents : .thisEvent, commit: true)
+        // 🛑 Same rule as edit and delete: --series is never .thisEvent. With it,
+        // saving an invitee change on the master detaches the first occurrence
+        // and invites people to that alone, leaving the rest of the series
+        // uninvited — while reporting success. Missed when edit and delete were
+        // fixed in 26.812.3; found by a field report on a live committee series.
+        try store.save(
+            match, span: (series || future) ? .futureEvents : .thisEvent, commit: true)
 
         // Confirm against what was persisted. The private calls report nothing,
         // and a save that reports success without taking effect is exactly the

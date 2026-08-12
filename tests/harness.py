@@ -222,3 +222,58 @@ class LiveCalendarTest(unittest.TestCase):
 
     def exists(self, event_id):
         return any(e["id"] == event_id for e in find_test_events(self.calendar))
+
+# One writable calendar per distinct backend, so the same assertions can be run
+# against each. Behaviour is *supposed* to be identical through the abstraction;
+# these exist because it has not always been (see BACKENDS below).
+BACKENDS_ENV = "RUN_LIVE_CALENDAR_BACKEND_TESTS"
+
+
+BACKEND_CALENDARS_ENV = "APPLE_CALENDAR_TEST_CALENDARS"
+
+
+def writable_backends():
+    """[(label, calendar_title)] — one calendar per (source, type) pair.
+
+    Deduped so the suite writes to as few real calendars as possible, and
+    preferring a calendar whose title nothing else claims, since --calendar
+    resolves by name.
+
+    ⚠️ **The automatic pick can land on a shared calendar.** Nothing in EventKit
+    says whether a calendar is shared with other people, so "first writable one
+    per backend" can choose a team calendar whose members would briefly see the
+    fixtures. Set APPLE_CALENDAR_TEST_CALENDARS to a comma-separated list to pin
+    the choice, and note that ./tests/run-tests --backends prints what it picked
+    before it writes anything.
+    """
+    override = os.environ.get(BACKEND_CALENDARS_ENV)
+    if override:
+        wanted = [name.strip() for name in override.split(",") if name.strip()]
+        everything = {c["title"]: c for c in run_json("calendars")}
+        chosen = []
+        for name in wanted:
+            calendar = everything.get(name)
+            if calendar is None:
+                raise RuntimeError(
+                    f"{BACKEND_CALENDARS_ENV} names '{name}', which is not a calendar")
+            if not calendar["allowsModification"]:
+                raise RuntimeError(f"'{name}' is read-only")
+            chosen.append(
+                (f"{calendar.get('source','?')}/{calendar.get('type','?')}", name))
+        return chosen
+
+    everything = run_json("calendars")
+    titles = [c["title"].lower() for c in everything]
+    chosen = {}
+    for calendar in everything:
+        if not calendar["allowsModification"]:
+            continue
+        key = (calendar.get("source", "?"), calendar.get("type", "?"))
+        unique = titles.count(calendar["title"].lower()) == 1
+        # First unique-titled calendar wins; fall back to any.
+        if key not in chosen or (unique and not chosen[key][1]):
+            chosen[key] = (calendar["title"], unique)
+    return [
+        (f"{source}/{kind}", title)
+        for (source, kind), (title, _) in sorted(chosen.items())
+    ]
