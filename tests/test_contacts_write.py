@@ -825,6 +825,194 @@ class NoteBearingContacts(GroupFixtures):
         self.assertFalse(removed["member"])
         self.assertTrue(removed["changed"])
 
+    def test_a_note_bearing_contact_cannot_be_moved_and_says_why(self):
+        """The one thing the note wall genuinely blocks rather than routes around.
+
+        `importPeople:intoAccount:createNewUIDs:` copies the note, copying it
+        faults it, and Core Data *raises* there rather than returning an error —
+        an uncaught NSException that kills the process mid-import, which is how a
+        contact ends up existing twice. So a note is checked for first and the
+        move refused before anything is written.
+        """
+        containers = run_json("containers", "--json")
+        others = [c for c in containers if not c["default"]]
+        if not others:
+            self.skipTest("only one container on this machine")
+
+        created = self.noted("NoteMove")
+        before = self.get(created["id"])["container"]
+
+        code, out, err = run("move", created["id"], "--to", others[0]["id"], check=False)
+        self.assertNotEqual(code, 0, "a note-bearing contact must not move")
+        self.assertIn("note", err)
+        self.assertIn("Contacts.app", err)
+        # A runtime refusal, not an argument error: no usage block, exit 1.
+        self.assertNotIn("Usage:", err + out)
+        self.assertEqual(code, 1)
+
+        # Nothing was written, and the note is still there.
+        self.assertEqual(self.get(created["id"])["container"], before)
+        self.assertEqual(note_of(created["id"]), self.NOTE)
+
+
+class MoveBetweenContainers(GroupFixtures):
+    """Moving a contact between accounts, which the public API cannot do.
+
+    🛑 `CNSaveRequest` has no move: a contact's container is fixed at
+    `add(_:toContainerWithIdentifier:)` and `update(_:)` cannot change it. The
+    obvious workaround — copy into the target, delete the original — mints a
+    **new identifier**, breaking every stored reference, and drops the note. So
+    this goes through the legacy AddressBook framework's
+    `importPeople:intoAccount:createNewUIDs:` with `createNewUIDs: false`, which
+    keeps the id, followed by an account-scoped removal of the original.
+
+    The identifier surviving is the assertion that matters; without it this
+    would be `add` + `delete` wearing the word "move".
+    """
+
+    def containers(self):
+        return run_json("containers", "--json")
+
+    def two_containers(self):
+        """(default, other) or skip — a move needs somewhere to go."""
+        containers = self.containers()
+        default = [c for c in containers if c["default"]]
+        others = [c for c in containers if not c["default"]]
+        if not default or not others:
+            self.skipTest("need two containers to test a move")
+        return default[0], others[0]
+
+    def test_the_identifier_survives_the_move(self):
+        source, target = self.two_containers()
+        created = self.add("Ident")
+        self.assertEqual(created["container"], source["id"])
+
+        result = run_json("move", created["id"], "--to", target["id"], "--json")
+        self.assertTrue(result["moved"])
+        self.assertTrue(result["changed"])
+        self.assertEqual(
+            result["contact_id"], created["id"],
+            "a move that renames the contact is a copy, not a move")
+
+        fetched = self.get(created["id"])
+        self.assertEqual(fetched["container"], target["id"])
+        self.assertEqual(fetched["id"], created["id"])
+
+    def test_every_field_survives_the_move(self):
+        """A different framework carries the record across, so sweep the lot."""
+        source, target = self.two_containers()
+        created = self.add(
+            "Fields",
+            "--company", "Acme", "--job-title", "Engineer", "--nickname", "Nick",
+            "--email", "work:move@example.invalid",
+            "--phone", "mobile:+15555550199",
+            "--url", "LinkedIn:https://example.invalid/in/x",
+            "--relation", "father:Robert Test",
+            "--birthday", "1980-04-12")
+        self.assertEqual(created["container"], source["id"])
+
+        run("move", created["id"], "--to", target["id"], "--json")
+        fetched = self.get(created["id"])
+
+        self.assertEqual(fetched["container"], target["id"])
+        self.assertEqual(fetched["company"], "Acme")
+        self.assertEqual(fetched["job_title"], "Engineer")
+        self.assertEqual(fetched["nickname"], "Nick")
+        self.assertEqual(fetched["birthday"], "1980-04-12")
+        self.assertEqual(
+            self.labelled(fetched["emails"], "address"), {"work": "move@example.invalid"})
+        self.assertEqual(
+            self.labelled(fetched["phones"], "number"), {"mobile": "+15555550199"})
+        self.assertEqual(
+            self.labelled(fetched["urls"], "url"), {"LinkedIn": "https://example.invalid/in/x"})
+        self.assertEqual(
+            self.labelled(fetched["relations"], "name"), {"father": "Robert Test"})
+
+    def test_dry_run_writes_nothing(self):
+        source, target = self.two_containers()
+        created = self.add("Dry")
+
+        result = run_json("move", created["id"], "--to", target["id"], "--dry-run", "--json")
+        self.assertTrue(result["dry_run"])
+        self.assertFalse(result["moved"])
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["from"], source["id"])
+        self.assertEqual(result["to"], target["id"])
+
+        self.assertEqual(
+            self.get(created["id"])["container"], source["id"],
+            "--dry-run must not move anything")
+
+    def test_it_reports_the_groups_the_move_will_empty(self):
+        """The one real cost, surfaced before the write rather than discovered.
+
+        A group belongs to one account, so moving a contact drops it out of
+        every group in the account it left. Silently emptying a group is exactly
+        the kind of quiet damage this tool refuses to do.
+        """
+        source, target = self.two_containers()
+        group = self.create_group("MoveLeaves")  # default container = source
+        contact = self.add("Leaver")
+        run("groups", "add", group["id"], contact["id"])
+
+        planned = run_json(
+            "move", contact["id"], "--to", target["id"], "--dry-run", "--json")
+        self.assertIn(group["name"], planned["groups_left"])
+
+        result = run_json("move", contact["id"], "--to", target["id"], "--json")
+        self.assertIn(group["name"], result["groups_left"])
+        self.assertEqual(
+            run_json("groups", "members", group["id"]), [],
+            "the move really does empty the contact out of its old group")
+
+    def test_moving_where_it_already_is_is_a_reported_no_op(self):
+        source, _ = self.two_containers()
+        created = self.add("Already")
+
+        result = run_json("move", created["id"], "--to", source["id"], "--json")
+        self.assertTrue(result["moved"], "it is in the requested account")
+        self.assertFalse(result["changed"], "but this call did not put it there")
+        self.assertEqual(self.get(created["id"])["container"], source["id"])
+
+    def test_an_unknown_destination_is_rejected_and_names_the_valid_ones(self):
+        source, _ = self.two_containers()
+        created = self.add("BadTarget")
+
+        code, _, err = run(
+            "move", created["id"], "--to", "___no_such_container___", check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("no container", err)
+        for entry in self.containers():
+            self.assertIn(entry["id"], err)
+        self.assertEqual(self.get(created["id"])["container"], source["id"])
+
+    def test_a_move_unblocks_a_cross_account_group_add(self):
+        """The reason this command exists.
+
+        A contact in the wrong account cannot join a group, `CNSaveRequest`
+        cannot span two containers, and there was previously no way out of that
+        from the CLI at all.
+        """
+        source, target = self.two_containers()
+        group = self.create_group("Destination")  # default container = source
+        contact = run_json(
+            "add", "--first", TEST_PREFIX, "--last", "Stranded",
+            "--container", target["id"], "--json")
+
+        code, _, err = run("groups", "add", group["id"], contact["id"], check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("different accounts", err)
+        # The refusal must name the command that fixes it, or it is still a
+        # dead end for whoever reads it.
+        self.assertIn("apple contacts move", err)
+
+        run("move", contact["id"], "--to", source["id"], "--json")
+        added = run_json("groups", "add", group["id"], contact["id"], "--json")
+        self.assertTrue(added["member"])
+        self.assertTrue(added["changed"])
+        self.assertIn(
+            contact["id"], [m["id"] for m in run_json("groups", "members", group["id"])])
+
 
 if __name__ == "__main__":
     unittest.main()

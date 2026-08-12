@@ -42,6 +42,7 @@ installed via `make install`.
 | Move one occurrence | `apple calendar edit <id> --occurrence 2026-09-21 --start "2026-09-21 14:00"` |
 | Find a person | `apple contacts search "smith" --json` |
 | Update a contact | `apple contacts edit <id> --company "New Co"` |
+| Move a contact between accounts | `apple contacts move <id> --to "iCloud" --dry-run` |
 | Export contacts | `apple contacts export --group "Family" -o family.vcf` |
 | List contact accounts | `apple contacts containers --json` |
 
@@ -709,8 +710,10 @@ iPhone that keeps years. Say "recents", never "all calls".
   handle count also moved 1367 → 1365 once the log was replayed, because it
   carries deletions too: the immutable snapshot was stale in *both* directions.
   Plain read-only open first, `immutable=1` only as a fallback. (`NoteStore` in
-  `AppleContacts` still uses `immutable=1` for the same files — fine for notes
-  today, but the same latent staleness.)
+  `AppleContacts` did the same thing until 26.812.8, and the latency was not
+  theoretical: it could not see a note written seconds earlier, so `contacts
+  move`'s "this contact has a note" refusal never fired. Fixed the same way,
+  which also means `get --json` now reports a fresher note.)
 - 🛑 **Opening a SQLite file validates nothing.** `sqlite3_open_v2` never reads
   the header, and sqlite treats a **0- or 1-byte file as a valid empty
   database** — so a truncated address book looks like "opened, no contacts" and
@@ -1002,6 +1005,7 @@ apple contacts get ID [--plain]
 apple contacts list [--limit N] [--plain]          # default limit 100
 apple contacts add [FIELDS] [--container NAME] [--json]
 apple contacts edit ID [FIELDS] [--json]
+apple contacts move ID --to CONTAINER [--dry-run] [--json]
 apple contacts delete ID
 apple contacts export ID... [--group GROUP] [-o FILE]   # vCard 3.0
 apple contacts containers [--json]                 # accounts, and which is default
@@ -1107,15 +1111,54 @@ Error: cannot add 'Kyle Zehner' to 'Recruiters': they are in different accounts,
 and one save cannot span two.
   contact: On My Mac (local)
   group:   🌈 (cardDAV)
+Move the contact into the group's account, then retry:
+  apple contacts move <id> --to "_local:ABAccount" --dry-run
 ```
 
-**There is no move.** `CNSaveRequest`'s entire mutation surface is add / update /
-delete for contacts and groups plus add / remove member — the container is fixed
-at `addContact:toContainerWithIdentifier:` and `updateContact:` cannot change it.
-Copying into the target container and deleting the original would mint a **new
-identifier** (breaking every stored reference and its group memberships) and
-**drop the note**, since notes are unwritable here. So the fix is to create the
-contact in the right account, or move the card in Contacts.app.
+**`move` is the way out of that, and it keeps the identifier.** There is no
+public move — `CNSaveRequest`'s entire mutation surface is add / update / delete
+for contacts and groups plus add / remove member, the container is fixed at
+`addContact:toContainerWithIdentifier:`, and `updateContact:` cannot change it.
+Copy-then-delete would mint a **new identifier** and **drop the note**, so it was
+not shipped. The legacy AddressBook framework's
+`importPeople:intoAccount:createNewUIDs:` with `createNewUIDs: false` copies the
+record **keeping its unique id**, and `recordForUniqueId:inAccount:` then names
+the original precisely enough to remove it.
+
+```
+apple contacts move ID --to CONTAINER [--dry-run] [--json]
+```
+
+- 🛑 **`ABRecord.nts_MoveIntoAddressBook:account:error:` is the obvious call and
+  it lies.** It returned `YES`, `save` returned `YES`, and the record was still
+  in the source store on disk. Third API in this repo to report success for a
+  write that never happened. So `move` re-reads the container from a fresh store
+  and exits non-zero on a mismatch.
+- 🛑 **Between the import and the removal the contact exists twice under one
+  id.** The removal is therefore resolved *by account* and the record's own
+  account re-checked immediately before deleting — a lookup that fell through to
+  the new copy would destroy the contact while reporting a successful move.
+- ⚠️ **A move always drops every group membership in the account it leaves**, and
+  that is inherent: a group belongs to one account. `--dry-run` lists the groups
+  it will empty before anything is written, and the result carries `groups_left`
+  either way.
+- 🛑 **A contact that carries a note cannot be moved.** `importPeople:` copies the
+  note, copying it faults it, and Core Data **raises** an uncaught
+  `NSInternalInconsistencyException` there rather than returning — which in a
+  two-step import-then-delete is how a contact ends up existing twice. Refused up
+  front, and the private calls are additionally wrapped in an ObjC exception
+  guard (`Sources/ObjCExceptions`) so an unforeseen raise is a clean refusal
+  rather than a crash. Move those in Contacts.app.
+- **Everything else survives**: the identifier, and every field (swept by a test,
+  since a different framework carries the record across).
+- If the removal fails, the import is **rolled back**. If the rollback cannot
+  name the copy precisely, nothing is deleted and the duplicate is reported —
+  two copies are recoverable in Contacts.app, zero are not.
+- ⚠️ Only `local` ↔ `cardDAV` has been exercised; Exchange should behave the same
+  way, but that is an expectation, not a measurement. The **"me" card** is not
+  treated specially and moving it is untested.
+
+Full record in [`docs/apple-contacts-move.md`](docs/apple-contacts-move.md).
 
 ⚠️ **`apple contacts containers` is how you find a valid `--container`**, and
 `get`, `groups` and `add` all report a `container` now. `add` prints where it
@@ -1252,7 +1295,10 @@ swift/                    one Swift package, six binaries
   Sources/AppleMessages/  + MessagesLibrary/ (chat.db reader, typedstream decoder)
   Sources/ApplePhone/     + PhoneLibrary/ (CallHistory reader, AddressBook resolver)
   Sources/AppleCalendar/    + Attendees.swift (the private invitee write path)
-  Sources/AppleContacts/  + Notes.swift (SQLite note reader)
+  Sources/AppleContacts/  + Notes.swift (SQLite note reader),
+                          Move.swift (the private cross-account move)
+  Sources/ObjCExceptions/ @try/@catch for Swift — the move raises rather
+                          than returning when it hits the note wall
   Tests/RemindersTests/ MailTests/ MessagesTests/
 notes/                    Python; apple-notes, notestore.py, notestore.proto,
                           tests/ (live Notes.app suite)
@@ -1264,6 +1310,9 @@ docs/apple-mail-store.md  Envelope Index schema, .emlx layout, verified traps
 docs/apple-mail-drafts.md why apple-mail never writes a body: the cite-blockquote
                           wrapper, every route ruled out, the pasteboard handoff,
                           and why --attach is the one exception
+docs/apple-contacts-move.md  no public API changes a contact's container; the
+                          private call that lies, the one that works, and what
+                          a move costs
 docs/apple-calendar-invitees.md  reading invitees is public API, writing them is
                           not; what the server rewrites, and what it mails
 util/check-mail-intents   is Mail's ComposeMessageIntent reachable yet? (exit 0

@@ -133,6 +133,7 @@ apple phone recents --missed --since 7                 # who called while I was 
 apple reminders show-all --due-date today --include-overdue
 apple calendar add "Dentist" --start "tomorrow 2pm" --duration 45
 apple contacts search "smith"
+apple contacts move <id> --to "iCloud" --dry-run       # between accounts, keeps the id
 apple contacts export --group "Family" -o family.vcf
 ```
 
@@ -176,7 +177,7 @@ isn't guaranteed; JSON is.
 | ☎️ `phone` | `CallHistory.storedata` + AddressBook | Recent calls with callers resolved to names, missed/unknown filters, talk-time stats, blocked list. Read-only apart from `dial`, which hands a `tel:` URL to Phone.app for you to confirm. |
 | ✅ `reminders` | EventKit | Full CRUD: add, edit, complete, delete, lists, priorities, recurrence, natural-language dates. |
 | 📅 `calendar` | EventKit, plus private `EKAttendee` for invitee writes | List and search events, create, edit, delete; full recurrence (`--repeat`, plus `--on-the "4th monday"`); recurring-event spans. Reads invitees with their RSVP status, and can invite or uninvite people — which sends real mail, so `invite --dry-run` first. See [`docs/apple-calendar-invitees.md`](docs/apple-calendar-invitees.md). |
-| 👤 `contacts` | Contacts framework, with a legacy `AddressBook` fallback | Search by name, company, email, or phone; create, edit, delete. Notes are read-only, and a contact that has one can only be written through the fallback. |
+| 👤 `contacts` | Contacts framework, with a legacy `AddressBook` fallback | Search by name, company, email, or phone; create, edit, delete. `move` relocates a contact between accounts **keeping its identifier** — there is no public API for that at all, see [`docs/apple-contacts-move.md`](docs/apple-contacts-move.md). Notes are read-only, and a contact that has one can only be written through the fallback. |
 
 The Notes reader decodes Apple's gzipped-protobuf note bodies directly rather
 than going through AppleScript, so it preserves highlights, headings, lists, and
@@ -257,7 +258,8 @@ notes/           Python: apple-notes, notestore.py decoder, live Notes.app tests
 skills/          Claude skills (apple-tools, daily-brief, meeting-prep, inbox-triage)
 completions/     zsh completions
 tests/           live suites: calendar and contacts writes (gated), mail read guards
-docs/            Notes API, Mail store and Calendar invitee references, prior art
+docs/            Notes API, Mail store, Calendar invitee and Contacts move
+                 references, prior art
 Formula/         Homebrew formula, mirrored into the tap on release
 VERSION          single source of truth, stamped into every tool
 CLAUDE.md        the same surface, written for an agent
@@ -292,7 +294,7 @@ opting in to one more surface:
 ```
 ./tests/run-tests              # calendar writes (58) + mail read guards (40)
 ./tests/run-tests --backends   # + every backend: Exchange, calDAV (Google, iCloud)
-./tests/run-tests --contacts   # + contacts writes          (60)
+./tests/run-tests --contacts   # + contacts writes          (68)
 ./notes/run-tests              # live Notes.app
 ```
 

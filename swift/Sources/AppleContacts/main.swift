@@ -204,7 +204,7 @@ private func info(
         container: container)
 }
 
-private func printJSON<T: Encodable>(_ value: T) {
+func printJSON<T: Encodable>(_ value: T) {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
     guard let data = try? encoder.encode(value),
@@ -298,7 +298,7 @@ private func contact(withId id: String) throws -> CNContact {
 /// `unifyResults = false` is the whole point: it returns the one record whose
 /// identifier was asked for. Falls back to the unified fetch when nothing
 /// matches, so a caller is never worse off than before.
-private func containerContact(withId id: String) throws -> CNContact {
+func containerContact(withId id: String) throws -> CNContact {
     let request = CNContactFetchRequest(keysToFetch: readKeys)
     request.predicate = CNContact.predicateForContacts(withIdentifiers: [id])
     request.unifyResults = false
@@ -373,7 +373,7 @@ private func containerInfos() -> [ContainerInfo] {
 /// resolves to. A unified identifier appears in no container's own enumeration —
 /// only its backing records do — so comparing the caller's id alone reported
 /// `container: null` for exactly the linked contacts that need it most.
-private func containerId(forContact id: String) -> String? {
+func containerId(forContact id: String) -> String? {
     var wanted: Set<String> = [id]
     if let backing = try? containerContact(withId: id) {
         wanted.insert(backing.identifier)
@@ -417,7 +417,7 @@ private func containerId(forGroup id: String) -> String? {
 /// `--container "___probe___"` reported success and put the contact somewhere
 /// else entirely — which is exactly the kind of quiet wrong answer that makes a
 /// later cross-container failure impossible to explain.
-private func resolveContainer(_ reference: String) throws -> String {
+func resolveContainer(_ reference: String) throws -> String {
     let containers = containerInfos()
     if let exact = containers.first(where: { $0.id == reference }) { return exact.id }
 
@@ -434,7 +434,7 @@ private func resolveContainer(_ reference: String) throws -> String {
 }
 
 /// Human-readable "name (type)" for a container id, for error messages.
-private func describeContainer(_ id: String?) -> String {
+func describeContainer(_ id: String?) -> String {
     guard let id else { return "unknown" }
     guard let match = containerInfos().first(where: { $0.id == id }) else { return id }
     return "\(match.name) (\(match.type))"
@@ -621,7 +621,7 @@ private func membershipViaAddressBook(
 /// and a raw `CoreData: error: Unhandled error occurred during faulting` on
 /// stderr, naming neither the contact nor the note. 52 of 669 contacts here
 /// carry one, so this was ~8% of a real address book the tool could not edit.
-private let notePropertyFaultCode = 134092
+let notePropertyFaultCode = 134092
 
 /// Is this the note wall, at any depth?
 ///
@@ -811,12 +811,13 @@ struct AppleContacts: ParsableCommand {
             apple-contacts edit <id> --birthday 1980-04-12 --date "death:2020-05-01"
             apple-contacts groups                          # groups + counts
             apple-contacts groups add "Family" <contact-id>
+            apple-contacts move <id> --to "iCloud" --dry-run
             apple-contacts export <id> -o card.vcf         # vCard
             apple-contacts export --group "Family" -o family.vcf
           """,
         version: appleToolsVersion,
-        subcommands: [Search.self, Get.self, List.self, Add.self, Edit.self, Delete.self,
-                      Export.self, Groups.self, Containers.self, Status.self],
+        subcommands: [Search.self, Get.self, List.self, Add.self, Edit.self, Move.self,
+                      Delete.self, Export.self, Groups.self, Containers.self, Status.self],
         defaultSubcommand: Search.self)
 
     static func plainText(_ contacts: [ContactInfo]) -> String { plain(contacts) }
@@ -1565,7 +1566,7 @@ struct Delete: ParsableCommand {
 
 /// Group names a contact belongs to. Contacts has no reverse lookup, so this
 /// asks each group for its members — fine for one contact, avoid it in a loop.
-private func groupNames(for contactId: String) -> [String] {
+func groupNames(for contactId: String) -> [String] {
     guard let groups = try? store.groups(matching: nil) else { return [] }
     var names: [String] = []
     for group in groups {
@@ -1832,11 +1833,11 @@ struct GroupAdd: ParsableCommand {
         // indistinguishable from any other save failure.
         //
         // This is permanent, not a sync race: the contact is simply in the wrong
-        // store and no amount of waiting changes that. Nor is it fixable here.
-        // There is no move API, and copying into the target container would mint
-        // a new identifier and orphan every reference to the old one — too
-        // destructive to do behind the caller's back. So the mismatch is detected
-        // and named, which is the one thing that turns a dead end into a fix.
+        // store and no amount of waiting changes that. It is no longer a dead
+        // end, though — `apple contacts move` relocates the record between
+        // accounts keeping its id, which is what this message points at. It is
+        // deliberately not done automatically: a move drops every group
+        // membership in the account being left, and that is the caller's call.
         let memberContainer = containerId(forContact: member.identifier)
         let groupContainer = containerId(forGroup: target.identifier)
         if let memberContainer, let groupContainer, memberContainer != groupContainer {
@@ -1846,9 +1847,11 @@ struct GroupAdd: ParsableCommand {
                 accounts, and one save cannot span two.
                   contact: \(describeContainer(memberContainer))
                   group:   \(describeContainer(groupContainer))
-                Create the contact in the group's account instead:
-                  apple contacts add --container "\(groupContainer)" …
-                or move it in Contacts.app, then retry.
+                Move the contact into the group's account, then retry:
+                  apple contacts move \(member.identifier) --to "\(groupContainer)" --dry-run
+                ⚠️ a move drops every group membership in the account it leaves, so run the \
+                dry-run first. Alternatively create the contact in the right account to begin \
+                with: apple contacts add --container "\(groupContainer)" …
                 """)
         }
 
@@ -1975,7 +1978,7 @@ struct GroupRemove: ParsableCommand {
     }
 }
 
-private func displayName(_ contact: CNContact) -> String {
+func displayName(_ contact: CNContact) -> String {
     let name = [contact.givenName, contact.familyName]
         .filter { !$0.isEmpty }
         .joined(separator: " ")

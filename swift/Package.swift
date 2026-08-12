@@ -20,6 +20,10 @@ let package = Package(
     targets: [
         .target(name: "AppleToolsVersion"),
         .target(name: "TCCResponsibility"),
+        // Swift cannot catch an NSException, and the private AddressBook call
+        // that moves a contact between accounts raises one rather than
+        // returning an error. See Sources/ObjCExceptions/include.
+        .target(name: "ObjCExceptions"),
         // Query parsing shared by mail and messages, so the two cannot drift on
         // what `budget review` means.
         .target(name: "AppleToolsSearch"),
@@ -93,6 +97,7 @@ let package = Package(
                 "AppleToolsVersion",
                 "AppleToolsStyle",
                 "TCCResponsibility",
+                "ObjCExceptions",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "Sources/AppleContacts",

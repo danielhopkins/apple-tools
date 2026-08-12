@@ -31,7 +31,7 @@ these tools is that the edge cases are already handled.
    humans and its layout is not stable. (`contacts` is JSON by default; pass
    `--plain` there for human output.)
 2. **Confirm before writing.** `reminders add/edit/complete/delete`,
-   `calendar add/edit/delete`, `contacts add/edit/delete`, `reminders new-list`
+   `calendar add/edit/delete`, `contacts add/edit/delete/move`, `reminders new-list`
    and `mail move` all touch real data that syncs to the user's other
    devices. If the user did not clearly ask for the write, describe what you are
    about to do and wait. Contact deletion in particular has no undo; `mail move`
@@ -117,6 +117,7 @@ apple contacts edit <id> --relation "daughter:Margot Hopkins"
 apple contacts edit <id> --birthday 1980-04-12 --date "death:2020-05-01"
 apple contacts groups                          # list groups with counts
 apple contacts groups add "Family" <contact-id>
+apple contacts move <id> --to "iCloud" --dry-run  # between accounts; keeps the id
 apple contacts containers --json               # accounts; which is default
 ```
 
@@ -380,11 +381,19 @@ the same person. Match on the id a single command gave you, or re-read with `get
 
 🛑 **A contact can only join a group in its own account.** If `groups add` fails
 saying the two are in different accounts, the contact is in the wrong container
-and no retry will help — **there is no move API**. Create it in the group's
-account instead (`apple contacts add --container "<id from containers>"`), or
-tell the user to drag the card between accounts in Contacts.app. `add` reports
-which container it used, and `get`/`groups` report theirs, so you can check
-before writing rather than after failing.
+and no retry will help. `apple contacts move <id> --to <container>` fixes it,
+keeping the contact's id. `add` reports which container it used, and
+`get`/`groups` report theirs, so you can check before writing rather than after
+failing.
+
+⚠️ **A move drops every group membership in the account it leaves** — a group
+belongs to one account. Run `move --dry-run` first: it lists the groups the move
+will empty and writes nothing. Say what those are before doing it for real.
+
+🛑 **A contact carrying a note cannot be moved** and the command refuses, because
+copying the record reads the note and that needs an entitlement no CLI can hold.
+Tell the user to drag that card between accounts in Contacts.app instead —
+don't try another route.
 
 **Contact notes cannot be written.** They are readable, but writing needs an
 Apple-granted entitlement no CLI can hold, so `--note` is rejected. Tell the user
