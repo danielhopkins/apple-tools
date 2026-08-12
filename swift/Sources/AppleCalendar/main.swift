@@ -1125,6 +1125,10 @@ private func refuseIfSeriesWriteWouldResetExceptions(
 
         Either \(verb) each occurrence separately with --occurrence, or pass \
         --reset-exceptions to accept that \(returns).
+
+        Note: per-occurrence detaches every occurrence you touch, so a series handled \
+        that way ends up as all exceptions and every later --series operation lands here \
+        again.
         """)
 }
 

@@ -962,6 +962,12 @@ and the series save. `edit --series` and `invite --series` now refuse when the
 series has detached occurrences, name each one, and require `--reset-exceptions`
 to proceed.
 
+⚠️ **Per-occurrence work converts a clean series into all exceptions.** Every
+occurrence you touch detaches, so a nine-meeting series invited that way ends up
+with nine exceptions and no un-detached instance — and every later `--series`
+operation on it hits the guard. Correct, but a one-way door worth knowing before
+you start.
+
 **The safe way to change a series that has exceptions is per-occurrence.**
 `invite ID --occurrence DATE --add …` never touches the master, so nothing can be
 rebuilt. Verified: it changed only that occurrence and left a pre-existing

@@ -353,3 +353,43 @@ already existed is where every reversion was seen. If that holds, creating an
 event with its invitee list is the safer construction on Exchange, and the
 workaround for a series whose invitations will not stick is to recreate it with
 `--invitee` rather than to keep retrying `invite`.
+
+### The per-occurrence path converts a clean series into all exceptions
+
+Worth knowing before choosing it. Inviting occurrence-by-occurrence detaches
+every occurrence it touches, so a nine-meeting series handled that way ends up
+with **nine exceptions and no un-detached instance left**. Every later `--series`
+operation on it then hits the exception guard above.
+
+That is correct behaviour rather than damage — the guard is protecting real
+moved occurrences — but it is a one-way door in practice, and it surprises
+people. `edit --series --title …` on such a series will refuse until someone
+passes `--reset-exceptions`, which would flatten the very moves the
+per-occurrence path was chosen to protect.
+
+### Exception invitations are well-formed (verified)
+
+Confirmed against the `.ics` copies filed in Sent Items for a real series with
+two moved occurrences:
+
+```
+RECURRENCE-ID=20261125T173000  ->  DTSTART=20261118T173000
+RECURRENCE-ID=20261223T173000  ->  DTSTART=20261216T173000
+```
+
+`RECURRENCE-ID` names the original slot the exception replaces and `DTSTART`
+carries the moved time — correct iCalendar, and recipients see the moved dates.
+A wrong date in front of the invitees was the plausible failure here, and it does
+not occur.
+
+### What is still unproven
+
+A live nine-occurrence series was completed successfully on 26.812.6, one
+occurrence at a time with roughly 60s of quiet between writes. **That is not
+evidence the reversion is fixed.** No reversion occurred, so the settle check
+never fired — it would have *caught* a failure, not prevented one. The clean run
+is equally consistent with Exchange simply behaving that hour, or with the
+spacing helping despite contention having been ruled out as the cause.
+
+The settle path remains untested against a real reversion outside a deliberate
+local reproduction.
