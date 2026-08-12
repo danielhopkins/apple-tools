@@ -37,6 +37,7 @@ installed via `make install`.
 | Add an event | `apple calendar add "Dentist" --start "tomorrow 2pm" --duration 45` |
 | Recurring meeting | `apple calendar add "Board" --start … --repeat monthly --on-the "4th monday"` |
 | See who is invited | `apple calendar events --days 7 --json` → `attendees`, `organizer`, `my_status` |
+| See the guest list (read-only) | `apple calendar invitees <id>` |
 | Invite someone (sends mail) | `apple calendar invite <id> --add a@b.com --dry-run` |
 | Move one occurrence | `apple calendar edit <id> --occurrence 2026-09-21 --start "2026-09-21 14:00"` |
 | Find a person | `apple contacts search "smith" --json` |
@@ -770,6 +771,7 @@ apple calendar add "TITLE" --start DATE [--end DATE | --duration MINUTES]
                           [--notes TEXT] [--url URL] [--invitee ADDR]... [--json]
 apple calendar edit ID [--title T] [--start DATE] [--end DATE] [--location L]
                        [--notes N] [--occurrence DATE | --series] [--future] [--json]
+apple calendar invitees ID [--occurrence DATE | --series] [--json]   # read-only
 apple calendar invite ID [--add ADDR]... [--remove ADDR]...
                        [--occurrence DATE | --series] [--future] [--dry-run] [--json]
 apple calendar delete ID [--occurrence DATE | --series] [--future]
@@ -888,6 +890,18 @@ different day, and leaves the rest of the series untouched.
   asserting on occurrences must use near-future dates — which is why the test
   suite sweeps a second, near-future window as well as its fixture year.
 
+**`apple calendar invitees ID` is the read path, and `invite` is the write
+path.** 🛑 Reading the guest list must never require changing it — before this
+command existed the only place the roster appeared was the `Invitees now:`
+block a *live* `invite` prints, so you had to mail somebody to find out who was
+already invited.
+
+⚠️ **It reports "no invitees" as an answer, not as a missing field.** `events
+--json` omits `attendees` entirely when an event has none, and a careful reader
+concluded from that omission that the field had been dropped from the build.
+`invitees --json` always carries `attendees` (`[]` when empty) and `count`, so
+emptiness is never inferred from an absent key.
+
 **Invitees.** `events --json` reports `attendees` (objects, with `name`,
 `email`, `status`, `role`, `type`, `organizer`, `is_me`), a separate
 `organizer`, and `my_status` — the user's own response, which is what "have I
@@ -923,6 +937,23 @@ is read-only in the sdef — so writes go through private
 resolved at runtime. If a future macOS drops them the command refuses cleanly
 and reading still works. Full record in
 [`docs/apple-calendar-invitees.md`](docs/apple-calendar-invitees.md).
+
+🛑 **A `--series` write destroys detached occurrences, so it refuses.** `--series`
+saves with `EKSpan.futureEvents` and EventKit rebuilds the series from the rule,
+so an occurrence someone had moved is reverted to its original slot — silently,
+no error. Measured on Exchange: a series with its November instance moved a week
+early to clear a holiday came back with that instance on its original date and
+nothing detached. ⚠️ **It is not deterministic** — a second run with more elapsed
+time preserved the exception, which looks like a race between the detach syncing
+and the series save. `edit --series` and `invite --series` now refuse when the
+series has detached occurrences, name each one, and require `--reset-exceptions`
+to proceed.
+
+**The safe way to change a series that has exceptions is per-occurrence.**
+`invite ID --occurrence DATE --add …` never touches the master, so nothing can be
+rebuilt. Verified: it changed only that occurrence and left a pre-existing
+exception intact. The cost is one invitation per occurrence, and each one you
+touch becomes detached.
 
 - 🛑 **Only the organizer can change who is invited.** On someone else's event a
   local change *appears to succeed* and is then reverted by the server, so
@@ -1272,7 +1303,7 @@ The `tests/` suites drive the real binaries against real data, each behind its
 own flag:
 
 ```
-./tests/run-tests              # calendar writes (54) + mail wedge guards (40)
+./tests/run-tests              # calendar writes (58) + mail wedge guards (40)
 ./tests/run-tests --backends   # + the same calendar assertions on every backend (7×N)
 ./tests/run-tests --contacts   # + contacts writes (60)
 ```

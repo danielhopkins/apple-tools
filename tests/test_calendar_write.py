@@ -756,3 +756,49 @@ class TestSeriesMeansTheWholeSeries(LiveCalendarTest):
         self.assertEqual(
             self.instances("series-delete"), [],
             "--series left occurrences behind; it deleted only the first")
+
+
+class TestInviteesIsReadOnly(LiveCalendarTest):
+    """Reading the guest list must never require changing it.
+
+    🛑 Before this command existed, the only way to see the current roster was
+    the `Invitees now:` block a *live* `invite` prints — i.e. you had to mail
+    somebody to find out who was already invited. A field report hit exactly
+    that.
+
+    It also reports emptiness positively. `events --json` omits `attendees`
+    when an event has none, and a competent reader concluded from that omission
+    that the field had been dropped entirely — so absent-means-empty is its own
+    trap, and this command never leaves it to inference.
+    """
+
+    def test_no_invitees_is_stated_not_implied(self):
+        event = self.add("invitees-empty", "--start", f"{BASE:%Y-%m}-04 09:00")
+        code, out, _ = run("invitees", event["id"])
+        self.assertEqual(code, 0)
+        self.assertIn("No invitees", out)
+
+    def test_json_always_carries_attendees_and_count(self):
+        event = self.add("invitees-json", "--start", f"{BASE:%Y-%m}-04 09:00")
+        payload = run_json("invitees", event["id"])
+        # Present and empty, never absent — the whole point of the command.
+        self.assertIn("attendees", payload)
+        self.assertEqual(payload["attendees"], [])
+        self.assertEqual(payload["count"], 0)
+        self.assertEqual(payload["id"], event["id"])
+
+    def test_it_writes_nothing(self):
+        event = self.add(
+            "invitees-readonly", "--start", f"{BASE:%Y-%m}-04 09:00",
+            "--location", "unchanged")
+        before = self.get(event["id"])
+        run("invitees", event["id"])
+        run("invitees", event["id"], "--json")
+        after = self.get(event["id"])
+        self.assertEqual(before, after, "a read command changed the event")
+
+    def test_invite_with_nothing_to_do_points_at_the_read_command(self):
+        event = self.add("invitees-pointer", "--start", f"{BASE:%Y-%m}-04 09:00")
+        code, _, err = run("invite", event["id"], check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("invitees", err)

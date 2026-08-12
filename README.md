@@ -290,7 +290,7 @@ The live suites drive real data and are gated behind their own runners, each
 opting in to one more surface:
 
 ```
-./tests/run-tests              # calendar writes (54) + mail read guards (40)
+./tests/run-tests              # calendar writes (58) + mail read guards (40)
 ./tests/run-tests --backends   # + every backend: Exchange, calDAV (Google, iCloud)
 ./tests/run-tests --contacts   # + contacts writes          (60)
 ./notes/run-tests              # live Notes.app

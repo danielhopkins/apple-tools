@@ -246,3 +246,66 @@ exact-match filter stops finding the instance the caller just moved, because the
 detached instance's id carries a suffix the series id does not — so
 `--occurrence <the new date>` failed with "no occurrence on that day" for an
 event plainly listed in `events`. Fixed, and pinned by a test.
+
+## 🛑 A `--series` write destroys detached occurrences (26.812.5)
+
+The worst-consequence behaviour in this surface, found by a field report on a
+live committee series.
+
+`--series` saves with `EKSpan.futureEvents`, and EventKit rebuilds the series
+from its recurrence rule. An occurrence that had been **moved** — detached, with
+a `/RID=` identifier — is therefore rebuilt back into the pattern, reverting the
+move. Silently: exit 0, no error, and the only sign is the date.
+
+Measured on Exchange, reproducing a real setup: a monthly 4th-Wednesday series
+with its November instance moved a week early to clear a holiday.
+
+```
+before   … Oct 28 · Nov 18 (detached) · Dec 23 …
+invite --series --add …
+after    … Oct 28 · Nov 25            · Dec 23 …      ← the move is gone
+```
+
+⚠️ **It is not deterministic.** A second run, with more elapsed time between the
+move and the invite, preserved the exception. That looks like a race between the
+detach reaching the server and the series save rebuilding from the rule — which
+makes it worse, not better: it cannot be steered around by timing, and it will
+pass a casual test.
+
+`edit --series` and `invite --series` now refuse when the series has detached
+occurrences, naming each one and its date, and require `--reset-exceptions` to
+proceed.
+
+**The safe path is per-occurrence**, which never touches the master:
+
+```
+apple calendar invite <id> --occurrence 2026-08-26 --add a@b.com
+```
+
+Verified: it changed only that occurrence, left a pre-existing exception intact,
+and left every other occurrence alone. Costs one invitation per occurrence, and
+each occurrence you touch becomes detached.
+
+## 🛑 `invite` reported a roster for a save that never happened
+
+Same defect class as the `edit` bug in 26.812.3, and more damaging. The
+confirmation looked right but had a precise hole:
+
+```swift
+let persisted = freshStore().event(withIdentifier: match.eventIdentifier ?? id)
+let confirmed = changes.map { change in
+    guard change.changed, persisted != nil else { return change }   // ← nil → confirmed stays nil
+    …
+}
+report(event: persisted ?? match, …)                                 // ← falls back to in-memory
+```
+
+When the event could not be re-read, every change kept `confirmed: nil`, the
+exit check (`contains { $0.confirmed == false }`) read that as "nothing failed",
+and the report fell back to `match` — the in-memory object holding the *request*.
+So a rejected save printed a full `Invitees now:` block with eight names and
+exited 0. A real committee was reported invited and the server held nobody.
+
+It now fails loudly when the event cannot be read back, and never reports from
+the in-memory object. **A lost calendar edit is recoverable; a caller who
+believes people were invited stops telling them any other way.**

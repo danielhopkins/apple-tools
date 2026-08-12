@@ -106,6 +106,7 @@ apple calendar add "Dentist" --start "tomorrow 2pm" --duration 45
 apple calendar add "Board" --start "2026-09-28 10:00" \
     --repeat monthly --on-the "4th monday"   # same --repeat flags as reminders
 apple calendar edit <id> --series --repeat weekly    # rule changes need --series
+apple calendar invitees <id>                        # read-only: who is invited
 apple calendar invite <id> --add a@b.com --dry-run   # ALWAYS dry-run first
 apple calendar invite <id> --add "Dana White <d@x.com>"   # sends real mail
 

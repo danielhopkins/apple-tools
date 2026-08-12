@@ -405,8 +405,8 @@ struct AppleCalendar: ParsableCommand {
             apple-calendar edit <id> --occurrence <occurrence> --start "3pm"
           """,
         version: appleToolsVersion,
-        subcommands: [Calendars.self, Events.self, Show.self, Add.self, Edit.self, Invite.self,
-                      Delete.self, Status.self],
+        subcommands: [Calendars.self, Events.self, Show.self, Add.self, Edit.self,
+                      Invitees.self, Invite.self, Delete.self, Status.self],
         defaultSubcommand: Events.self
     )
 }
@@ -794,6 +794,11 @@ struct Edit: ParsableCommand {
 
     @OptionGroup var recurrence: RecurrenceOptions
 
+    @Flag(
+        name: .long,
+        help: "Allow a --series change that returns moved occurrences to their original slots")
+    var resetExceptions = false
+
     @Flag(name: .long, help: "Output the updated event as JSON")
     var json = false
 
@@ -817,6 +822,11 @@ struct Edit: ParsableCommand {
 
         let match = try resolveForWrite(
             id: id, occurrence: occurrence, series: series, verb: "edit")
+
+        if series {
+            try refuseIfSeriesWriteWouldResetExceptions(
+                match, resetExceptions: resetExceptions, verb: "edit")
+        }
 
         guard title != nil || start != nil || end != nil || location != nil || notes != nil
             || recurrence.wasSpecified else {
@@ -1055,6 +1065,182 @@ struct InviteeChange: Encodable {
     let confirmed: Bool?
 }
 
+/// Occurrences that have been moved or otherwise detached from `master`'s
+/// series. Scans two years forward, which covers any series worth editing.
+private func detachedInstances(of master: EKEvent) -> [EKEvent] {
+    guard master.hasRecurrenceRules, let start = master.startDate else { return [] }
+    let calendar = Foundation.Calendar.current
+    guard let end = calendar.date(byAdding: .year, value: 2, to: start) else { return [] }
+
+    let base = (master.eventIdentifier ?? "").components(separatedBy: "/RID=").first ?? ""
+    guard !base.isEmpty else { return [] }
+
+    let fresh = freshStore()
+    return fresh.events(matching: fresh.predicateForEvents(
+        withStart: start, end: end, calendars: master.calendar.map { [$0] }))
+        .filter { instance in
+            guard let identifier = instance.eventIdentifier else { return false }
+            return identifier.hasPrefix(base) && identifier.contains("/RID=")
+        }
+        .sorted { ($0.startDate ?? .distantPast) < ($1.startDate ?? .distantPast) }
+}
+
+/// 🛑 **A `--series` write destroys every detached occurrence in the series.**
+///
+/// `--series` saves with `EKSpan.futureEvents`, and EventKit re-generates the
+/// series from the rule — so an occurrence someone had moved is *reverted to
+/// its original slot*, silently and with no error.
+///
+/// Measured: a monthly series with its November instance moved a week early to
+/// clear a holiday. After `invite --series`, the November instance was back on
+/// its original date and nothing was detached any more. The move was simply
+/// gone, and the only sign was the date.
+///
+/// This is the worst-consequence bug in the whole surface — the exceptions are
+/// deliberate human decisions ("move it off Thanksgiving week"), and reverting
+/// them is invisible until someone fails to show up. So it refuses, names every
+/// occurrence at risk, and makes the caller opt in.
+private func refuseIfSeriesWriteWouldResetExceptions(
+    _ master: EKEvent, resetExceptions: Bool, verb: String
+) throws {
+    guard !resetExceptions else { return }
+    let detached = detachedInstances(of: master)
+    guard !detached.isEmpty else { return }
+
+    let lines = detached.map { instance -> String in
+        "  \(instance.startDate.map { humanFormatter.string(from: $0) } ?? "?")"
+    }
+    let one = detached.count == 1
+    let noun = one ? "occurrence that was" : "occurrences that were"
+    let pronoun = one ? "it" : "them"
+    let returns = one
+        ? "this moved occurrence returns to its original slot"
+        : "these moved occurrences return to their original slots"
+
+    throw ValidationError("""
+        '\(master.title ?? "this event")' has \(detached.count) \(noun) moved out of the series:
+        \(lines.joined(separator: "\n"))
+        A --series \(verb) rebuilds the series from its recurrence rule, which would move \
+        \(pronoun) back and lose that change — silently, with no error.
+
+        Either \(verb) each occurrence separately with --occurrence, or pass \
+        --reset-exceptions to accept that \(returns).
+        """)
+}
+
+struct Invitees: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "invitees",
+        abstract: "Show who is invited to an event. Read-only — sends nothing.",
+        discussion: """
+          Reading the guest list must never require changing it. `invite` is the
+          write path and always mails somebody; this is the read path.
+
+          🛑 It reports "no invitees" as a positive answer, not as a missing
+          field. `events --json` omits `attendees` entirely when an event has
+          none, which reads as "this build does not report invitees" and has
+          already been misdiagnosed that way.
+
+          Examples:
+            apple-calendar invitees <id>
+            apple-calendar invitees <id> --occurrence 2026-08-26 --json
+          """)
+
+    @Argument(help: "Event identifier, from `events --json`")
+    var id: String
+
+    @Option(name: .long, help: "Which occurrence of a recurring event")
+    var occurrence: DateArg?
+
+    @Flag(name: .long, help: "Report the series master rather than an occurrence")
+    var series = false
+
+    @Flag(name: .long, help: "Output as JSON")
+    var json = false
+
+    struct Payload: Encodable {
+        let id: String
+        let title: String
+        let calendar: String
+        let start: String
+        /// Always present, `[]` when there are none — never omitted, so a
+        /// caller never has to infer emptiness from an absent key.
+        let attendees: [AttendeeInfo]
+        let count: Int
+        let organizer: AttendeeInfo?
+        let myStatus: String?
+        let recurring: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case id, title, calendar, start, attendees, count, organizer, recurring
+            case myStatus = "my_status"
+        }
+    }
+
+    func run() throws {
+        try requireCalendarAccess()
+
+        // A read, so resolve leniently: --series is honoured, but an ambiguous
+        // recurring id shows the master with a note rather than refusing.
+        let target: EKEvent
+        if series {
+            let base = id.components(separatedBy: "/RID=").first ?? id
+            if let master = try? event(withId: base) {
+                target = master
+            } else {
+                target = try event(withId: id)
+            }
+        } else {
+            target = try event(withId: id, occurrence: occurrence?.date)
+        }
+
+        if target.hasRecurrenceRules && occurrence == nil && !series {
+            FileHandle.standardError.write(Data("""
+                note: this is a recurring series; showing its first occurrence. \
+                Pass --occurrence for a specific instance.
+
+                """.utf8))
+        }
+
+        let list = Attendees.list(target) ?? []
+
+        if json {
+            printJSON(Payload(
+                id: target.eventIdentifier ?? id,
+                title: target.title ?? "<untitled>",
+                calendar: target.calendar?.title ?? "<unknown>",
+                start: target.startDate.map { iso8601.string(from: $0) } ?? "",
+                attendees: list,
+                count: list.count,
+                organizer: Attendees.organizer(target),
+                myStatus: Attendees.myStatus(target),
+                recurring: target.hasRecurrenceRules))
+            return
+        }
+
+        print(describe(target))
+        guard !list.isEmpty else {
+            // Stated, not implied. "No invitees" and "invitees not reported" are
+            // different answers and only one of them is true here.
+            print(Style.dim("No invitees — this event has an empty attendee list."))
+            if let organizer = Attendees.organizer(target) {
+                print("Organizer: \(Attendees.describe(organizer).trimmingCharacters(in: .whitespaces))")
+            }
+            return
+        }
+        print("Invitees (\(list.count)):")
+        for attendee in list { print(Attendees.describe(attendee)) }
+        if let organizer = Attendees.organizer(target),
+           !list.contains(where: { $0.isOrganizer }) {
+            // The organizer is usually not in the attendee list.
+            print("Organizer: \(Attendees.describe(organizer).trimmingCharacters(in: .whitespaces))")
+        }
+        if let mine = Attendees.myStatus(target) {
+            print("Your status: \(mine)")
+        }
+    }
+}
+
 struct Invite: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "invite",
@@ -1095,6 +1281,11 @@ struct Invite: ParsableCommand {
     @Flag(name: .long, help: "Show what would change without sending anything")
     var dryRun = false
 
+    @Flag(
+        name: .long,
+        help: "Allow a --series change that returns moved occurrences to their original slots")
+    var resetExceptions = false
+
     @Flag(name: .long, help: "Output as JSON")
     var json = false
 
@@ -1102,7 +1293,9 @@ struct Invite: ParsableCommand {
         try requireCalendarAccess()
 
         guard !add.isEmpty || !remove.isEmpty else {
-            throw ValidationError("nothing to do; pass --add and/or --remove")
+            throw ValidationError(
+                "nothing to do; pass --add and/or --remove. To *see* who is invited without "
+                + "changing anything, use `apple-calendar invitees \(id)`.")
         }
         guard AttendeeAPI.isAvailable else {
             throw ValidationError(AttendeeAPI.unavailableMessage)
@@ -1131,6 +1324,10 @@ struct Invite: ParsableCommand {
 
         if let refusal = Attendees.modificationRefusal(match) {
             throw ValidationError(refusal)
+        }
+        if series {
+            try refuseIfSeriesWriteWouldResetExceptions(
+                match, resetExceptions: resetExceptions, verb: "invite")
         }
 
         let existing = match.attendees ?? []
@@ -1188,13 +1385,32 @@ struct Invite: ParsableCommand {
         try store.save(
             match, span: (series || future) ? .futureEvents : .thisEvent, commit: true)
 
-        // Confirm against what was persisted. The private calls report nothing,
-        // and a save that reports success without taking effect is exactly the
-        // failure this needs to catch.
-        let persisted = freshStore().event(withIdentifier: match.eventIdentifier ?? id)
-        let after = persisted?.attendees ?? []
+        // 🛑 Confirm against the store, and treat "cannot re-read it" as failure.
+        //
+        // This block previously fell back to reporting `match` — the in-memory
+        // object — whenever the event could not be located, and left every
+        // change's `confirmed` as nil, which the exit check reads as "not
+        // failed". A rejected save therefore printed a full `Invitees now:`
+        // roster and exited 0. That happened to a real committee: eight names
+        // were reported invited and the server held none.
+        //
+        // A lost calendar edit is recoverable. A caller who believes people were
+        // invited stops telling them any other way, so this fails loudly.
+        guard let persisted = WriteConfirmation.locate(
+            identifier: match.eventIdentifier ?? id, fallbackID: id,
+            near: match.startDate, allowDetachedScan: occurrence != nil && !series,
+            in: freshStore())
+        else {
+            throw ValidationError("""
+                the invitee change reported success but the event could not be read back, \
+                so nothing here can be trusted as sent. Check the event in your calendar \
+                app before assuming anyone was invited.
+                """)
+        }
+
+        let after = persisted.attendees ?? []
         let confirmed = changes.map { change -> InviteeChange in
-            guard change.changed, persisted != nil else { return change }
+            guard change.changed else { return change }
             let present = after.contains { AttendeeAddress.matches($0, change.email) }
             let wanted = change.action == "add"
             return .init(
@@ -1202,7 +1418,7 @@ struct Invite: ParsableCommand {
                 confirmed: present == wanted)
         }
 
-        report(event: persisted ?? match, changes: confirmed, dryRun: false)
+        report(event: persisted, changes: confirmed, dryRun: false)
 
         if confirmed.contains(where: { $0.confirmed == false }) {
             throw ExitCode(1)
