@@ -156,14 +156,23 @@ struct EventInfo: Encodable {
     /// Only set for recurring events: the value to pass back as --occurrence so
     /// show/edit/delete act on this instance rather than the series master.
     let occurrence: String?
-    let attendees: [String]?
+    /// ⚠️ Objects, not bare names, since 26.812.0 — each carries `email`,
+    /// `status`, `role`, `organizer` and `is_me`. Reading `.attendees[]` as a
+    /// string used to work and no longer does; read `.attendees[].name`.
+    let attendees: [AttendeeInfo]?
+    let organizer: AttendeeInfo?
+    /// The current user's own response, when they are an invitee.
+    let myStatus: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, calendar, start, end, allDay, location, notes, url
+        case recurring, occurrence, attendees, organizer
+        case myStatus = "my_status"
+    }
 }
 
 private func info(_ event: EKEvent) -> EventInfo {
-    let attendees = event.attendees?.compactMap { attendee -> String? in
-        attendee.name ?? attendee.url.absoluteString
-    }
-    return EventInfo(
+    EventInfo(
         id: event.eventIdentifier ?? "",
         title: event.title ?? "<untitled>",
         calendar: event.calendar?.title ?? "<unknown>",
@@ -177,7 +186,9 @@ private func info(_ event: EKEvent) -> EventInfo {
         occurrence: event.hasRecurrenceRules
             ? event.startDate.map { iso8601.string(from: $0) }
             : nil,
-        attendees: (attendees?.isEmpty ?? true) ? nil : attendees
+        attendees: Attendees.list(event),
+        organizer: Attendees.organizer(event),
+        myStatus: Attendees.myStatus(event)
     )
 }
 
@@ -368,8 +379,8 @@ struct AppleCalendar: ParsableCommand {
             apple-calendar edit <id> --occurrence <occurrence> --start "3pm"
           """,
         version: appleToolsVersion,
-        subcommands: [Calendars.self, Events.self, Show.self, Add.self, Edit.self, Delete.self,
-                      Status.self],
+        subcommands: [Calendars.self, Events.self, Show.self, Add.self, Edit.self, Invite.self,
+                      Delete.self, Status.self],
         defaultSubcommand: Events.self
     )
 }
@@ -562,6 +573,10 @@ struct Show: ParsableCommand {
             printJSON(info(match))
         } else {
             print(describe(match))
+            if let list = Attendees.list(match) {
+                print("Invitees:")
+                for attendee in list { print(Attendees.describe(attendee)) }
+            }
             if let notes = match.notes, !notes.isEmpty {
                 print("\n\(notes)")
             }
@@ -612,6 +627,11 @@ struct Add: ParsableCommand {
     @Option(name: .long, help: "URL to attach")
     var url: String?
 
+    @Option(
+        name: .long,
+        help: "Invite someone: 'a@b.com' or 'Name <a@b.com>'. Repeatable. Sends a real invitation.")
+    var invitee: [String] = []
+
     @Flag(name: .long, help: "Output the created event as JSON")
     var json = false
 
@@ -623,6 +643,19 @@ struct Add: ParsableCommand {
         }
         if end != nil && duration != nil {
             throw ValidationError("pass either --end or --duration, not both")
+        }
+
+        // Parse and check the invitees before creating anything, so a typo
+        // cannot leave a half-built event behind that then has to be cleaned up.
+        let guests = try invitee.map { spec -> (name: String?, email: String) in
+            guard let parsed = AttendeeAddress.parse(spec) else {
+                throw ValidationError(
+                    "'\(spec)' is not an address. Use 'a@b.com' or 'Name <a@b.com>'.")
+            }
+            return parsed
+        }
+        if !guests.isEmpty && !AttendeeAPI.isAvailable {
+            throw ValidationError(AttendeeAPI.unavailableMessage)
         }
 
         let event = EKEvent(eventStore: store)
@@ -649,12 +682,28 @@ struct Add: ParsableCommand {
             event.url = URL(string: url)
         }
 
+        for guest in guests {
+            guard let attendee = AttendeeAPI.make(name: guest.name, email: guest.email) else {
+                throw ValidationError(
+                    "could not build an invitee for '\(guest.email)'. \(AttendeeAPI.unavailableMessage)")
+            }
+            AttendeeAPI.add(attendee, to: event)
+        }
+
         try store.save(event, span: .thisEvent, commit: true)
 
         if json {
             printJSON(info(event))
         } else {
             print("Created '\(name)' — \(describe(event))")
+            // EventKit adds the organizer and a self-attendee of its own accord
+            // on the first save of an event that has invitees, so report what
+            // the event ended up with rather than what was asked for.
+            if let list = Attendees.list(event) {
+                print("Invitees:")
+                for attendee in list { print(Attendees.describe(attendee)) }
+                print(Style.warning("Invitations are sent by the server — this is not undoable."))
+            }
         }
     }
 }
@@ -717,6 +766,224 @@ struct Edit: ParsableCommand {
             printJSON(info(match))
         } else {
             print("Updated '\(match.title ?? "<untitled>")' — \(describe(match))")
+        }
+    }
+}
+
+/// A fresh store, so a write can be confirmed against what was persisted rather
+/// than against the object we just mutated in memory.
+private func freshStore() -> EKEventStore {
+    let fresh = EKEventStore()
+    let semaphore = DispatchSemaphore(value: 0)
+    fresh.requestFullAccessToEvents { _, _ in semaphore.signal() }
+    semaphore.wait()
+    return fresh
+}
+
+struct InviteeChange: Encodable {
+    let email: String
+    let action: String
+    let changed: Bool
+    let confirmed: Bool?
+}
+
+struct Invite: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "invite",
+        abstract: "Add or remove invitees on an existing event",
+        discussion: """
+          🛑 Saving an invitee change makes the server send a real invitation, and
+          removing one sends a cancellation. Neither is undoable. Run --dry-run
+          first.
+
+          Only the organizer can change who is invited. For an event someone else
+          created this refuses, because a local change would be silently reverted
+          by the server.
+
+          Examples:
+            apple-calendar invite <id> --add a@b.com --dry-run
+            apple-calendar invite <id> --add "Dana White <d@x.com>" --add b@c.com
+            apple-calendar invite <id> --remove a@b.com --occurrence 2026-08-20
+          """)
+
+    @Argument(help: "Event identifier, from `events --json`")
+    var id: String
+
+    @Option(name: .long, help: "Invite this address: 'a@b.com' or 'Name <a@b.com>'. Repeatable.")
+    var add: [String] = []
+
+    @Option(name: .long, help: "Uninvite this address. Repeatable.")
+    var remove: [String] = []
+
+    @Option(name: .long, help: "Which occurrence to change (its \"occurrence\" field from `events --json`)")
+    var occurrence: DateArg?
+
+    @Flag(name: .long, help: "Target the recurring series itself rather than one occurrence")
+    var series = false
+
+    @Flag(name: .long, help: "Apply to this and all future occurrences of a recurring event")
+    var future = false
+
+    @Flag(name: .long, help: "Show what would change without sending anything")
+    var dryRun = false
+
+    @Flag(name: .long, help: "Output as JSON")
+    var json = false
+
+    func run() throws {
+        try requireCalendarAccess()
+
+        guard !add.isEmpty || !remove.isEmpty else {
+            throw ValidationError("nothing to do; pass --add and/or --remove")
+        }
+        guard AttendeeAPI.isAvailable else {
+            throw ValidationError(AttendeeAPI.unavailableMessage)
+        }
+
+        func parse(_ specs: [String], flag: String) throws -> [(name: String?, email: String)] {
+            try specs.map { spec in
+                guard let parsed = AttendeeAddress.parse(spec) else {
+                    throw ValidationError(
+                        "\(flag) '\(spec)' is not an address. Use 'a@b.com' or 'Name <a@b.com>'.")
+                }
+                return parsed
+            }
+        }
+        let additions = try parse(add, flag: "--add")
+        let removals = try parse(remove, flag: "--remove")
+
+        if let clash = additions.first(where: { addition in
+            removals.contains { $0.email.compare(addition.email, options: .caseInsensitive) == .orderedSame }
+        }) {
+            throw ValidationError("'\(clash.email)' is in both --add and --remove.")
+        }
+
+        let match = try resolveForWrite(
+            id: id, occurrence: occurrence, series: series, verb: "change invitees on")
+
+        if let refusal = Attendees.modificationRefusal(match) {
+            throw ValidationError(refusal)
+        }
+
+        let existing = match.attendees ?? []
+        var changes: [InviteeChange] = []
+        var pendingAdds: [(name: String?, email: String)] = []
+        var pendingRemovals: [EKParticipant] = []
+
+        for addition in additions {
+            if existing.contains(where: { AttendeeAddress.matches($0, addition.email) }) {
+                changes.append(.init(
+                    email: addition.email, action: "already-invited", changed: false, confirmed: nil))
+            } else {
+                pendingAdds.append(addition)
+                changes.append(.init(
+                    email: addition.email, action: "add", changed: true, confirmed: nil))
+            }
+        }
+        for removal in removals {
+            if let found = existing.first(where: { AttendeeAddress.matches($0, removal.email) }) {
+                pendingRemovals.append(found)
+                changes.append(.init(
+                    email: removal.email, action: "remove", changed: true, confirmed: nil))
+            } else {
+                changes.append(.init(
+                    email: removal.email, action: "not-invited", changed: false, confirmed: nil))
+            }
+        }
+
+        if dryRun {
+            report(event: match, changes: changes, dryRun: true)
+            return
+        }
+
+        guard !pendingAdds.isEmpty || !pendingRemovals.isEmpty else {
+            report(event: match, changes: changes, dryRun: false)
+            return
+        }
+
+        for addition in pendingAdds {
+            guard let attendee = AttendeeAPI.make(name: addition.name, email: addition.email) else {
+                throw ValidationError(
+                    "could not build an invitee for '\(addition.email)'. \(AttendeeAPI.unavailableMessage)")
+            }
+            AttendeeAPI.add(attendee, to: match)
+        }
+        for participant in pendingRemovals {
+            AttendeeAPI.remove(participant, from: match)
+        }
+
+        try store.save(match, span: future ? .futureEvents : .thisEvent, commit: true)
+
+        // Confirm against what was persisted. The private calls report nothing,
+        // and a save that reports success without taking effect is exactly the
+        // failure this needs to catch.
+        let persisted = freshStore().event(withIdentifier: match.eventIdentifier ?? id)
+        let after = persisted?.attendees ?? []
+        let confirmed = changes.map { change -> InviteeChange in
+            guard change.changed, persisted != nil else { return change }
+            let present = after.contains { AttendeeAddress.matches($0, change.email) }
+            let wanted = change.action == "add"
+            return .init(
+                email: change.email, action: change.action, changed: change.changed,
+                confirmed: present == wanted)
+        }
+
+        report(event: persisted ?? match, changes: confirmed, dryRun: false)
+
+        if confirmed.contains(where: { $0.confirmed == false }) {
+            throw ExitCode(1)
+        }
+    }
+
+    private func report(event: EKEvent, changes: [InviteeChange], dryRun: Bool) {
+        if json {
+            struct Payload: Encodable {
+                let id: String
+                let title: String
+                let dryRun: Bool
+                let changes: [InviteeChange]
+                let attendees: [AttendeeInfo]?
+                enum CodingKeys: String, CodingKey {
+                    case id, title, changes, attendees
+                    case dryRun = "dry_run"
+                }
+            }
+            printJSON(Payload(
+                id: event.eventIdentifier ?? id,
+                title: event.title ?? "<untitled>",
+                dryRun: dryRun,
+                changes: changes,
+                attendees: Attendees.list(event)))
+            return
+        }
+
+        print(describe(event))
+        for change in changes {
+            let verb: String
+            switch (change.action, dryRun) {
+            case ("add", true):     verb = "would invite"
+            case ("add", false):    verb = change.confirmed == false ? "FAILED to invite" : "invited"
+            case ("remove", true):  verb = "would uninvite"
+            case ("remove", false): verb = change.confirmed == false ? "FAILED to uninvite" : "uninvited"
+            case ("already-invited", _): verb = "already invited, unchanged"
+            default:                verb = "was not invited, unchanged"
+            }
+            let line = "  \(verb): \(change.email)"
+            print(change.confirmed == false ? Style.warning(line) : line)
+        }
+
+        if let list = Attendees.list(event) {
+            print("\nInvitees now:")
+            for attendee in list { print(Attendees.describe(attendee)) }
+        }
+
+        if dryRun {
+            print("")
+            print(Style.warning("--dry-run: nothing was sent. Re-run without it to apply."))
+        } else if changes.contains(where: { $0.changed }) {
+            print("")
+            print(Style.warning(
+                "The server sends the invitations and cancellations. This is not undoable."))
         }
     }
 }

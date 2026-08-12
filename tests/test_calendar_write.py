@@ -4,7 +4,13 @@ Every event created here is prefixed and swept; see harness.py for the safety
 model. Run with ./tests/run-tests.
 """
 
-from harness import TEST_YEAR, LiveCalendarTest, run, run_json
+from harness import (
+    TEST_YEAR,
+    LiveCalendarTest,
+    find_test_events,
+    run,
+    run_json,
+)
 
 
 class TestAdd(LiveCalendarTest):
@@ -250,3 +256,116 @@ class TestRecurringSafety(LiveCalendarTest):
         # The master is the first occurrence, so it starts no later than the
         # instance we found.
         self.assertLessEqual(master["start"], event["start"])
+
+
+class TestInvitees(LiveCalendarTest):
+    """The invitee surface, exercised without sending a single invitation.
+
+    🛑 **Nothing here saves an attendee change, deliberately.** Saving one makes
+    the CalDAV server mail a real person, and removing one mails them a
+    cancellation — neither is undoable and neither belongs in a suite that runs
+    unattended. So everything below is either a refusal or a --dry-run.
+
+    The send path was verified by hand instead, against a live Google account:
+    the attendee survived `save`, synced, and Google delivered an
+    "Invitation: …" mail to the invitee 40s later. See
+    docs/apple-calendar-invitees.md for that measurement and for why the write
+    needs private API at all.
+    """
+
+    def test_reading_attendees_yields_objects_not_names(self):
+        # The shape changed in 26.812.0: attendees used to be bare strings.
+        # Anything parsing them as strings breaks, so pin the new shape.
+        event = self.add("no-invitees", "--start", f"{TEST_YEAR}-04-01 09:00")
+        fetched = self.get(event["id"])
+        # A fixture with no invitees reports none at all rather than [].
+        self.assertIsNone(fetched.get("attendees"))
+        self.assertIsNone(fetched.get("organizer"))
+        self.assertIsNone(fetched.get("my_status"))
+
+    def test_invite_needs_something_to_do(self):
+        event = self.add("invite-noop", "--start", f"{TEST_YEAR}-04-02 09:00")
+        code, _, err = run("invite", event["id"], check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("nothing to do", err.lower())
+
+    def test_a_malformed_address_is_refused(self):
+        event = self.add("invite-bad-address", "--start", f"{TEST_YEAR}-04-03 09:00")
+        for bad in ("not-an-address", "@nodomain.com", "spaces in@it.com", "a@b"):
+            with self.subTest(address=bad):
+                code, _, err = run(
+                    "invite", event["id"], "--add", bad, "--dry-run", check=False
+                )
+                self.assertNotEqual(code, 0, f"{bad!r} was accepted as an address")
+                self.assertIn("is not an address", err.lower())
+
+    def test_a_malformed_address_is_refused_on_add_too(self):
+        # `add --invitee` parses before creating anything, so a typo must not
+        # leave a stray event behind to be swept.
+        code, _, err = run(
+            "add", self.title("invite-parse-guard"),
+            "--calendar", self.calendar,
+            "--start", f"{TEST_YEAR}-04-04 09:00",
+            "--invitee", "nonsense",
+            check=False,
+        )
+        self.assertNotEqual(code, 0)
+        self.assertIn("is not an address", err.lower())
+        self.assertEqual(
+            [e for e in find_test_events(self.calendar)
+             if e["title"].endswith("invite-parse-guard")],
+            [],
+            "a rejected --invitee still created the event",
+        )
+
+    def test_display_name_forms_are_accepted(self):
+        event = self.add("invite-name-forms", "--start", f"{TEST_YEAR}-04-05 09:00")
+        for spec in (
+            "plain@example.com",
+            "Dana White <dana@example.com>",
+            '"White, Dana" <dana@example.com>',
+        ):
+            with self.subTest(spec=spec):
+                result = run_json(
+                    "invite", event["id"], "--add", spec, "--dry-run"
+                )
+                self.assertTrue(result["dry_run"])
+                self.assertEqual(result["changes"][0]["action"], "add")
+                self.assertEqual(result["changes"][0]["email"], "dana@example.com"
+                                 if "dana" in spec else "plain@example.com")
+
+    def test_the_same_address_in_add_and_remove_is_refused(self):
+        event = self.add("invite-clash", "--start", f"{TEST_YEAR}-04-06 09:00")
+        code, _, err = run(
+            "invite", event["id"], "--add", "a@b.com", "--remove", "A@B.COM",
+            "--dry-run", check=False,
+        )
+        self.assertNotEqual(code, 0)
+        self.assertIn("both --add and --remove", err.lower())
+
+    def test_dry_run_changes_nothing(self):
+        event = self.add("invite-dry-run", "--start", f"{TEST_YEAR}-04-07 09:00")
+        result = run_json(
+            "invite", event["id"], "--add", "someone@example.com", "--dry-run"
+        )
+        self.assertTrue(result["dry_run"])
+        self.assertEqual(len(result["changes"]), 1)
+        self.assertTrue(result["changes"][0]["changed"])
+        # Nothing was saved, so the event still has no invitees at all.
+        self.assertIsNone(self.get(event["id"]).get("attendees"))
+
+    def test_removing_someone_never_invited_is_a_no_op_not_an_error(self):
+        event = self.add("invite-absent", "--start", f"{TEST_YEAR}-04-08 09:00")
+        result = run_json(
+            "invite", event["id"], "--remove", "stranger@example.com", "--dry-run"
+        )
+        self.assertEqual(result["changes"][0]["action"], "not-invited")
+        self.assertFalse(result["changes"][0]["changed"])
+
+    def test_unknown_event_id_is_refused(self):
+        code, _, err = run(
+            "invite", "not-a-real-identifier", "--add", "a@b.com", "--dry-run",
+            check=False,
+        )
+        self.assertNotEqual(code, 0)
+        self.assertIn("no event", err.lower())
