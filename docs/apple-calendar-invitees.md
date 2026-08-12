@@ -192,3 +192,57 @@ Two interactions worth knowing, both found while wiring `--repeat` up:
 
   This is the most dangerous thing found in this whole surface, precisely
   because it is silent and because invitations amplify it.
+
+## Exchange sends invitations too (verified 26.812.2)
+
+The Google measurement above was repeated against an Exchange account on the
+same machine. **Both backends send genuine iTIP mail**; the differences are
+cosmetic except for one that matters.
+
+The Exchange invitation carries a `text/calendar; method=REQUEST` part:
+
+```
+METHOD:REQUEST
+BEGIN:VEVENT
+ORGANIZER;CN=Dan Hopkins:mailto:…@copta.org
+ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;CN=…
+SUMMARY;LANGUAGE=en-US:__claude_exchange_probe__
+DTSTART;TZID=Mountain Standard Time:20260821T150000
+```
+
+| | Google (calDAV) | Exchange |
+|---|---|---|
+| invitation subject | `Invitation: <title> @ <when>` | `<title>`, no prefix |
+| cancellation subject | yes | `Canceled: <title>` |
+| sender's copy | — | filed in **Sent Items** |
+| role after sync | rewritten to `required` | left `unknown` |
+| status after sync | rewritten to `pending` | left `unknown` |
+
+🛑 **The normalisation differs by backend**, which is the reason the "match on
+the email address, never the name or role" rule is not merely Google-specific.
+A confirmation keyed to role or status would pass on Exchange and fail on
+Google, or vice versa, for the same correct write.
+
+⚠️ **Deleting an event with invitees emails a cancellation**, on both backends —
+it is not only `invite --remove` that notifies people. On Exchange, Outlook then
+moved the original invitation into the invitee's Deleted Messages on its own.
+
+⚠️ **Reading the `.ics` back needs `apple mail attachments`, not `export --raw`.**
+Mail strips attachment bytes out of the `.emlx`, so the `text/calendar` part
+parses as empty; the `method=REQUEST` parameter is still on the Content-Type
+header, but the calendar body itself has to be read off disk.
+
+## Rescheduling one occurrence
+
+`edit ID --occurrence <date> --start <new>` moves a single instance, including
+to a different day, and leaves the rest of the series alone. The moved instance
+**detaches**: `recurring` goes false, its `occurrence` field disappears, and its
+identifier gains a `/RID=<seconds>` suffix. It is then an ordinary event —
+editable and deletable by its own id, and deleting it removes only that
+instance.
+
+🛑 **`--occurrence` must match on the *base* identifier for this to work.** An
+exact-match filter stops finding the instance the caller just moved, because the
+detached instance's id carries a suffix the series id does not — so
+`--occurrence <the new date>` failed with "no occurrence on that day" for an
+event plainly listed in `events`. Fixed, and pinned by a test.

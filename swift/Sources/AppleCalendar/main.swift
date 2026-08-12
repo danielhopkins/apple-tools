@@ -323,8 +323,14 @@ private func event(withId id: String, occurrence: Date? = nil) throws -> EKEvent
         withStart: dayStart, end: dayEnd,
         calendars: master.calendar.map { [$0] })
 
+    // Compare base identifiers, not whole ones. Moving a single occurrence
+    // *detaches* it, and a detached instance carries a "/RID=<seconds>" suffix
+    // — so an exact match stops finding the very instance the caller just
+    // moved, and `--occurrence <its new date>` fails with "no occurrence on
+    // that day" for an event plainly visible in `events`.
+    let base = id.components(separatedBy: "/RID=").first ?? id
     let instances = store.events(matching: predicate)
-        .filter { $0.eventIdentifier == id }
+        .filter { ($0.eventIdentifier?.components(separatedBy: "/RID=").first ?? "") == base }
 
     guard !instances.isEmpty else {
         throw ValidationError(

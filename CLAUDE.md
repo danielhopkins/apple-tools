@@ -38,6 +38,7 @@ installed via `make install`.
 | Recurring meeting | `apple calendar add "Board" --start … --repeat monthly --on-the "4th monday"` |
 | See who is invited | `apple calendar events --days 7 --json` → `attendees`, `organizer`, `my_status` |
 | Invite someone (sends mail) | `apple calendar invite <id> --add a@b.com --dry-run` |
+| Move one occurrence | `apple calendar edit <id> --occurrence 2026-09-21 --start "2026-09-21 14:00"` |
 | Find a person | `apple contacts search "smith" --json` |
 | Update a contact | `apple contacts edit <id> --company "New Co"` |
 | Export contacts | `apple contacts export --group "Family" -o family.vcf` |
@@ -837,6 +838,18 @@ date and later ones follow the pattern.
   `--series` strips it to reach the master. Without that, `--series --repeat`
   fails with "The repeat field cannot be changed" *while naming the right
   event*, so it reads as the event refusing rather than the id being wrong.
+**Rescheduling one occurrence** — the "this week only" case — is
+`edit ID --occurrence <date> --start <new>`. It works, including moving to a
+different day, and leaves the rest of the series untouched.
+
+- ⚠️ **A moved occurrence *detaches*.** It stops being part of the series:
+  `recurring` goes false, the `occurrence` field disappears, and its id gains a
+  `/RID=<seconds>` suffix. From then on it is an ordinary event — `edit` and
+  `delete` it by its **own** id, and deleting it removes only that instance.
+- **`--occurrence` finds it by its new date**, not its old one. Matching is on
+  the base identifier, so a detached instance is still reachable through the
+  series id plus the date it moved to; the original date correctly reports "no
+  occurrence".
 - ⚠️ **EventKit does not expand a series far into the future.** An identical
   "every 2 weeks, 3 times" series reports 3 occurrences starting in 2026 and
   **1** starting in 2099, on both Google and iCloud calendars. Anything
@@ -852,10 +865,24 @@ name strings and is now an array of objects**; read `.attendees[].name`.
 alone silently omits whoever called the meeting.
 
 🛑 **Writing invitees sends real mail, and there is no undo.** `add --invitee`
-and `invite --add` make the CalDAV server email an invitation; `invite --remove`
-emails a cancellation. Measured: a Google invitation landed in the invitee's
-inbox 40s after the save. **Run `invite --dry-run` first** — it resolves and
-prints the plan without contacting the server at all.
+and `invite --add` make the server email an invitation; `invite --remove` and
+deleting the event email a cancellation. **Run `invite --dry-run` first** — it
+resolves and prints the plan without contacting the server at all.
+
+**Verified on both backends here**, and both send genuine iTIP mail:
+
+| | Google (calDAV) | Exchange |
+|---|---|---|
+| invitation | `Invitation: <title> @ …` | `<title>` (no prefix) |
+| cancellation | yes | `Canceled: <title>` |
+| payload | real invite | `text/calendar; method=REQUEST`, with `ORGANIZER`, `ATTENDEE;RSVP=TRUE` |
+| delivery | ~40s | under a minute |
+
+⚠️ **They normalise differently**, which is another reason to match on address
+only: Google rewrote role `unknown` → `required` and status → `pending`, while
+Exchange left both `unknown`. Exchange also files its own copy in Sent Items,
+and on cancellation Outlook moved the original invitation to the invitee's
+Deleted Messages by itself.
 
 🛑 **There is no public API for this.** `EKCalendarItem.attendees` is get-only,
 `EKParticipant` has no public initializer, and Calendar.app's `attendee` class
@@ -1213,7 +1240,7 @@ The `tests/` suites drive the real binaries against real data, each behind its
 own flag:
 
 ```
-./tests/run-tests              # calendar writes (45) + mail wedge guards (40)
+./tests/run-tests              # calendar writes (49) + mail wedge guards (40)
 ./tests/run-tests --contacts   # + contacts writes (60)
 ```
 

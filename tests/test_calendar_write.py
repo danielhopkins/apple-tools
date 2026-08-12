@@ -565,3 +565,110 @@ class TestRecurrence(LiveCalendarTest):
             [e for e in find_test_events(self.calendar)
              if e["title"].endswith("recur-invalid")],
             [], "a rejected recurrence still created the event")
+
+
+class TestMovingOneOccurrence(LiveCalendarTest):
+    """Rescheduling a single instance of a series — the "this week only" case.
+
+    Moving one occurrence *detaches* it: it stops being part of the series,
+    gets its own identifier with a `/RID=<seconds>` suffix, reports
+    `recurring: false`, and loses its `occurrence` field. The rest of the
+    series is untouched.
+    """
+
+    def series(self, suffix, count=4):
+        event = self.add(
+            suffix,
+            "--start", f"{BASE:%Y-%m}-07 09:00",
+            "--repeat", "weekly", "--repeat-count", str(count),
+        )
+        return event["id"]
+
+    def starts(self, needle):
+        start, end = near_window()
+        found = run_json("events", "--from", start, "--to", end, "--search", needle)
+        return sorted(datetime.datetime.fromisoformat(e["start"]) for e in found)
+
+    def test_moving_one_occurrence_leaves_the_rest_alone(self):
+        event_id = self.series("move-one")
+        before = self.starts("move-one")
+        self.assertGreaterEqual(len(before), 3)
+        target = before[1]
+
+        run(
+            "edit", event_id,
+            "--occurrence", target.date().isoformat(),
+            "--start", f"{target.date().isoformat()} 14:00",
+            "--end", f"{target.date().isoformat()} 14:30",
+        )
+
+        after = self.starts("move-one")
+        self.assertEqual(len(after), len(before), "moving one changed the series length")
+        moved = [d for d in after if d.hour == 14]
+        self.assertEqual(len(moved), 1, "exactly one occurrence should have moved")
+        self.assertEqual(
+            [d.hour for d in after if d.hour != 14], [9] * (len(before) - 1),
+            "the other occurrences did not stay at 09:00",
+        )
+
+    def test_a_moved_occurrence_detaches(self):
+        event_id = self.series("move-detach")
+        target = self.starts("move-detach")[1]
+        new_day = (target + datetime.timedelta(days=2)).date()
+        run(
+            "edit", event_id,
+            "--occurrence", target.date().isoformat(),
+            "--start", f"{new_day.isoformat()} 11:00",
+            "--end", f"{new_day.isoformat()} 11:30",
+        )
+
+        start, end = near_window()
+        found = run_json("events", "--from", start, "--to", end, "--search", "move-detach")
+        detached = [e for e in found if e["start"].startswith(new_day.isoformat())]
+        self.assertEqual(len(detached), 1)
+        instance = detached[0]
+        self.assertFalse(instance["recurring"], "a detached instance still claims to recur")
+        self.assertIsNone(instance.get("occurrence"))
+        self.assertIn("/RID=", instance["id"])
+
+    def test_a_moved_occurrence_is_findable_by_its_new_date(self):
+        """🛑 Regression: --occurrence matched identifiers exactly, and a detached
+        instance's identifier carries a /RID= suffix the series id does not — so
+        the instance you had just moved became unreachable by date, failing with
+        "no occurrence on that day" for an event plainly listed in `events`.
+        """
+        event_id = self.series("move-refind")
+        target = self.starts("move-refind")[1]
+        new_day = (target + datetime.timedelta(days=2)).date()
+        run(
+            "edit", event_id,
+            "--occurrence", target.date().isoformat(),
+            "--start", f"{new_day.isoformat()} 11:00",
+            "--end", f"{new_day.isoformat()} 11:30",
+        )
+
+        run("edit", event_id, "--occurrence", new_day.isoformat(),
+            "--location", "found by new date")
+
+        start, end = near_window()
+        found = run_json("events", "--from", start, "--to", end, "--search", "move-refind")
+        located = [e for e in found if e["start"].startswith(new_day.isoformat())]
+        self.assertEqual(len(located), 1)
+        self.assertEqual(located[0]["location"], "found by new date")
+
+    def test_the_original_date_no_longer_resolves(self):
+        event_id = self.series("move-gone")
+        target = self.starts("move-gone")[1]
+        new_day = (target + datetime.timedelta(days=2)).date()
+        run(
+            "edit", event_id,
+            "--occurrence", target.date().isoformat(),
+            "--start", f"{new_day.isoformat()} 11:00",
+            "--end", f"{new_day.isoformat()} 11:30",
+        )
+        code, _, err = run(
+            "edit", event_id, "--occurrence", target.date().isoformat(),
+            "--location", "nope", check=False,
+        )
+        self.assertNotEqual(code, 0)
+        self.assertIn("no occurrence", err.lower())
