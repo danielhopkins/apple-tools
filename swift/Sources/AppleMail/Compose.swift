@@ -83,6 +83,73 @@ extension Int32 {
   fileprivate var boolValue: Bool { self != 0 }
 }
 
+// MARK: - Attachments
+
+/// ⚠️ **Attachments are the one part of a draft this tool does write**, and the
+/// reason it can is narrow: `make new attachment` inserts an element into the
+/// message's content without ever *assigning* to `content`, and assignment is
+/// what produces the cite-blockquote wrapper. Verified on an empty body — no
+/// need to seed `content` with a newline first, which is the usual recipe and
+/// would reintroduce the wrapper.
+struct AttachmentOptions: ParsableArguments {
+  @Option(
+    name: .long,
+    help: "File to attach. Repeat for several. Attached by Mail, unlike the body.",
+    completion: .file())
+  var attach: [String] = []
+
+  func resolved() throws -> [ComposeAttachments.Resolved] {
+    do {
+      return try ComposeAttachments.resolve(attach)
+    } catch let failure as ComposeAttachments.Failure {
+      throw ValidationError(failure.description)
+    }
+  }
+}
+
+enum AttachmentHandoff {
+  /// 🛑 **`count of mail attachments` cannot verify this** — on an *outgoing*
+  /// message it fails outright with -1728 ("Can't get every mail attachment of
+  /// outgoing message id N"), the same blindness `apple notes` hits counting
+  /// PDF attachments. So the scripts count U+FFFC (the object-replacement
+  /// character Mail leaves in `content` per attachment) before and after, and
+  /// the delta is the confirmation.
+  ///
+  /// The delta, not the absolute count: a reply or forward starts with the
+  /// quoted original already in `content`, and that can carry U+FFFC of its own
+  /// from the original's inline images.
+  static func verify(_ scriptResult: String, expected: [ComposeAttachments.Resolved]) throws {
+    guard !expected.isEmpty else { return }
+
+    let parts = scriptResult.split(separator: " ").compactMap { Int($0) }
+    guard parts.count == 2 else {
+      throw ValidationError(
+        "Mail did not report how many attachments it took (got '\(scriptResult)').")
+    }
+    let attached = parts[1] - parts[0]
+    guard attached == expected.count else {
+      throw ValidationError("""
+        Mail took \(attached) of \(expected.count) attachments. The compose window is open; \
+        add the missing files by hand before sending.
+        """)
+    }
+  }
+
+  static func report(_ files: [ComposeAttachments.Resolved]) {
+    guard !files.isEmpty else { return }
+    print("")
+    print("Attached by Mail (already in the window, not on the clipboard):")
+    for file in files {
+      print("  \(file.name)  (\(file.humanSize))")
+    }
+  }
+
+  static func warnIfOversize(_ files: [ComposeAttachments.Resolved]) {
+    guard let warning = ComposeAttachments.oversizeWarning(files) else { return }
+    FileHandle.standardError.write(Data((warning + "\n").utf8))
+  }
+}
+
 // MARK: - Putting the body on the pasteboard and telling the user
 
 enum ComposeHandoff {
@@ -94,6 +161,7 @@ enum ComposeHandoff {
     let account: String?
     let subject: String?
     let threaded: Bool?
+    var attachments: [ComposeAttachments.Resolved] = []
   }
 
   static func loadPasteboard(text: String, format: ComposeBody.Format) throws {
@@ -120,6 +188,11 @@ enum ComposeHandoff {
       payload["account"] = result.account
       payload["subject"] = result.subject
       if let threaded = result.threaded { payload["threaded"] = threaded }
+      // Attachments are already in the window, so they are reported as done
+      // rather than as something the user still has to do.
+      payload["attachments"] = result.attachments.map {
+        ["name": $0.name, "path": $0.path, "bytes": $0.bytes] as [String: Any]
+      }
       let data = try? JSONSerialization.data(
         withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
       print(data.flatMap { String(data: $0, encoding: .utf8) } ?? "{}")
@@ -136,6 +209,7 @@ enum ComposeHandoff {
     if result.threaded == true {
       print("  threading and the quoted original come from Mail")
     }
+    AttachmentHandoff.report(result.attachments)
     print("")
     print("The body (\(result.bodyCharacters) characters) is on your clipboard.")
     print("  Press ⌘V to insert it, then ⌘S to save the draft.")
@@ -181,6 +255,8 @@ struct Compose: AsyncParsableCommand {
 
   @OptionGroup var bodyOptions: ComposeBodyOptions
 
+  @OptionGroup var attachmentOptions: AttachmentOptions
+
   @Flag(name: .long, help: "Output as JSON")
   var json = false
 
@@ -189,18 +265,25 @@ struct Compose: AsyncParsableCommand {
       throw ValidationError("A message needs at least one --to, --cc or --bcc.")
     }
     let (text, format) = try bodyOptions.resolved()
+    let files = try attachmentOptions.resolved()
 
     try MailPreflight.check("Opening a compose window")
     try ComposeHandoff.loadPasteboard(text: text, format: format)
+    AttachmentHandoff.warnIfOversize(files)
 
-    var argv = [subject, from ?? "", String(to.count), String(cc.count), String(bcc.count)]
-    argv += to + cc + bcc
-    _ = try runAppleScript(composeWindowScript, arguments: argv, deadline: MailDeadline.reply)
+    var argv = [
+      subject, from ?? "", String(to.count), String(cc.count), String(bcc.count),
+      String(files.count),
+    ]
+    argv += to + cc + bcc + files.map(\.path)
+    let result = try runAppleScript(
+      composeWindowScript, arguments: argv, deadline: MailDeadline.reply)
+    try AttachmentHandoff.verify(result, expected: files)
 
     ComposeHandoff.report(
       .init(
         window: "new message", bodyCharacters: text.count, format: format,
-        account: from, subject: subject, threaded: nil),
+        account: from, subject: subject, threaded: nil, attachments: files),
       json: json)
   }
 }
@@ -214,13 +297,14 @@ private let composeWindowScript = """
     set toCount to (item 3 of argv) as integer
     set ccCount to (item 4 of argv) as integer
     set bccCount to (item 5 of argv) as integer
+    set attachCount to (item 6 of argv) as integer
 
     tell application "Mail"
       -- visible:true is the point: the window is where the user pastes.
       set msg to make new outgoing message with properties {subject:theSubject, visible:true}
       if theSender is not "" then set sender of msg to theSender
 
-      set i to 6
+      set i to 7
       repeat with n from 1 to toCount
         tell msg to make new to recipient at end of to recipients ¬
           with properties {address:(item i of argv)}
@@ -237,10 +321,37 @@ private let composeWindowScript = """
         set i to i + 1
       end repeat
 
+      set markersBefore to my markerCount(content of msg)
+      repeat with n from 1 to attachCount
+        -- No `set content` anywhere: assigning content is what wraps the body
+        -- in <blockquote type="cite">. Making an attachment element does not,
+        -- and works on an empty body without seeding it first.
+        tell msg to make new attachment with properties ¬
+          {file name:(POSIX file (item i of argv))} at after the last paragraph of content
+        set i to i + 1
+      end repeat
+      set markersAfter to my markerCount(content of msg)
+
       activate
     end tell
-    return "opened"
+    return (markersBefore as text) & " " & (markersAfter as text)
   end run
+
+  -- Counts U+FFFC, the object-replacement character Mail leaves in `content`
+  -- for each attachment. Text item delimiters rather than a character loop:
+  -- iterating a forwarded body character by character takes seconds.
+  on markerCount(theText)
+    -- 🛑 The empty-string guard is load-bearing. `count of text items of ""` is
+    -- 0, not 1, so the delimiter trick returns -1 for an empty body and every
+    -- attachment then appears to add two markers instead of one. A fresh
+    -- compose window has exactly that empty body.
+    if (length of theText) is 0 then return 0
+    set saved to AppleScript's text item delimiters
+    set AppleScript's text item delimiters to (character id 65532)
+    set n to (count of text items of theText) - 1
+    set AppleScript's text item delimiters to saved
+    return n
+  end markerCount
   """
 
 // MARK: - reply and forward
@@ -302,28 +413,33 @@ struct Reply: AsyncParsableCommand {
 
   @OptionGroup var bodyOptions: ComposeBodyOptions
 
+  @OptionGroup var attachmentOptions: AttachmentOptions
+
   @Flag(name: .long, help: "Output as JSON")
   var json = false
 
   func run() async throws {
     let (text, format) = try bodyOptions.resolved()
+    let files = try attachmentOptions.resolved()
     let original = try resolveOriginal(messageID: messageID, account: account, verb: "Replying")
 
     try MailPreflight.check("Opening a reply window")
     try ComposeHandoff.loadPasteboard(text: text, format: format)
+    AttachmentHandoff.warnIfOversize(files)
 
-    _ = try runAppleScript(
-      replyWindowScript,
-      arguments: [
-        original.account, original.mailbox, String(original.rowid), all ? "yes" : "no",
-        String(MailDeadline.inScript(under: MailDeadline.reply)),
-      ],
-      deadline: MailDeadline.reply)
+    var argv = [
+      original.account, original.mailbox, String(original.rowid), all ? "yes" : "no",
+      String(MailDeadline.inScript(under: MailDeadline.reply)), String(files.count),
+    ]
+    argv += files.map(\.path)
+    let result = try runAppleScript(
+      replyWindowScript, arguments: argv, deadline: MailDeadline.reply)
+    try AttachmentHandoff.verify(result, expected: files)
 
     ComposeHandoff.report(
       .init(
         window: all ? "reply-all" : "reply", bodyCharacters: text.count, format: format,
-        account: original.account, subject: original.subject, threaded: true),
+        account: original.account, subject: original.subject, threaded: true, attachments: files),
       json: json)
   }
 }
@@ -357,6 +473,8 @@ struct Forward: AsyncParsableCommand {
 
   @OptionGroup var bodyOptions: ComposeBodyOptions
 
+  @OptionGroup var attachmentOptions: AttachmentOptions
+
   @Flag(name: .long, help: "Output as JSON")
   var json = false
 
@@ -365,23 +483,27 @@ struct Forward: AsyncParsableCommand {
       throw ValidationError("A forward has no recipients of its own: pass at least one --to.")
     }
     let (text, format) = try bodyOptions.resolved()
+    let files = try attachmentOptions.resolved()
     let original = try resolveOriginal(messageID: messageID, account: account, verb: "Forwarding")
 
     try MailPreflight.check("Opening a forward window")
     try ComposeHandoff.loadPasteboard(text: text, format: format)
+    AttachmentHandoff.warnIfOversize(files)
 
     var argv = [
       original.account, original.mailbox, String(original.rowid),
       String(MailDeadline.inScript(under: MailDeadline.reply)),
-      String(to.count), String(cc.count),
+      String(to.count), String(cc.count), String(files.count),
     ]
-    argv += to + cc
-    _ = try runAppleScript(forwardWindowScript, arguments: argv, deadline: MailDeadline.reply)
+    argv += to + cc + files.map(\.path)
+    let result = try runAppleScript(
+      forwardWindowScript, arguments: argv, deadline: MailDeadline.reply)
+    try AttachmentHandoff.verify(result, expected: files)
 
     ComposeHandoff.report(
       .init(
         window: "forward", bodyCharacters: text.count, format: format,
-        account: original.account, subject: original.subject, threaded: false),
+        account: original.account, subject: original.subject, threaded: false, attachments: files),
       json: json)
   }
 }
@@ -396,20 +518,50 @@ private let replyWindowScript = """
     set theID to (item 3 of argv) as integer
     set replyAll to (item 4 of argv) is "yes"
     set budget to (item 5 of argv) as integer
+    set attachCount to (item 6 of argv) as integer
 
     tell application "Mail"
       with timeout of budget seconds
         set m to first message of mailbox box of account acct whose id is theID
         if replyAll then
-          reply m with opening window and reply to all
+          set r to reply m with opening window and reply to all
         else
-          reply m with opening window without reply to all
+          set r to reply m with opening window without reply to all
         end if
+
+        set markersBefore to 0
+        set markersAfter to 0
+        if attachCount > 0 then
+          -- The quoted original is already in `content` and may carry U+FFFC of
+          -- its own from inline images, so the delta is what counts.
+          set markersBefore to my markerCount(content of r)
+          set i to 7
+          repeat with n from 1 to attachCount
+            tell r to make new attachment with properties ¬
+              {file name:(POSIX file (item i of argv))} at after the last paragraph of content
+            set i to i + 1
+          end repeat
+          set markersAfter to my markerCount(content of r)
+        end if
+
         activate
       end timeout
     end tell
-    return "opened"
+    return (markersBefore as text) & " " & (markersAfter as text)
   end run
+
+  on markerCount(theText)
+    -- 🛑 The empty-string guard is load-bearing. `count of text items of ""` is
+    -- 0, not 1, so the delimiter trick returns -1 for an empty body and every
+    -- attachment then appears to add two markers instead of one. A fresh
+    -- compose window has exactly that empty body.
+    if (length of theText) is 0 then return 0
+    set saved to AppleScript's text item delimiters
+    set AppleScript's text item delimiters to (character id 65532)
+    set n to (count of text items of theText) - 1
+    set AppleScript's text item delimiters to saved
+    return n
+  end markerCount
   """
 
 private let forwardWindowScript = """
@@ -420,13 +572,14 @@ private let forwardWindowScript = """
     set budget to (item 4 of argv) as integer
     set toCount to (item 5 of argv) as integer
     set ccCount to (item 6 of argv) as integer
+    set attachCount to (item 7 of argv) as integer
 
     tell application "Mail"
       with timeout of budget seconds
         set m to first message of mailbox box of account acct whose id is theID
         set f to forward m with opening window
 
-        set i to 7
+        set i to 8
         repeat with n from 1 to toCount
           tell f to make new to recipient at end of to recipients ¬
             with properties {address:(item i of argv)}
@@ -438,9 +591,37 @@ private let forwardWindowScript = """
           set i to i + 1
         end repeat
 
+        set markersBefore to 0
+        set markersAfter to 0
+        if attachCount > 0 then
+          -- ⚠️ A forward already carries the original's own attachments, which
+          -- show up here as U+FFFC too. Counting the delta rather than the
+          -- total is what keeps them from reading as ours.
+          set markersBefore to my markerCount(content of f)
+          repeat with n from 1 to attachCount
+            tell f to make new attachment with properties ¬
+              {file name:(POSIX file (item i of argv))} at after the last paragraph of content
+            set i to i + 1
+          end repeat
+          set markersAfter to my markerCount(content of f)
+        end if
+
         activate
       end timeout
     end tell
-    return "opened"
+    return (markersBefore as text) & " " & (markersAfter as text)
   end run
+
+  on markerCount(theText)
+    -- 🛑 The empty-string guard is load-bearing. `count of text items of ""` is
+    -- 0, not 1, so the delimiter trick returns -1 for an empty body and every
+    -- attachment then appears to add two markers instead of one. A fresh
+    -- compose window has exactly that empty body.
+    if (length of theText) is 0 then return 0
+    set saved to AppleScript's text item delimiters
+    set AppleScript's text item delimiters to (character id 65532)
+    set n to (count of text items of theText) - 1
+    set AppleScript's text item delimiters to saved
+    return n
+  end markerCount
   """

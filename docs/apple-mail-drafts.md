@@ -351,6 +351,176 @@ Each refuses in under 0.25s.
 never a file to rewrite and there is no window to paste into. Every message it
 ever sent carried the wrapper.
 
+## Attachments: the one part of a draft the tool does write
+
+Added 26.812.0. `--attach FILE` on `compose`, `reply` and `forward`.
+
+**Why this is allowed when the body is not.** The wrapper comes from
+*assignment* — `set content` / `set html content`. `make new attachment … at
+after the last paragraph of content` creates an element inside the content
+without ever assigning to it, so it never touches the code path that wraps.
+
+🛑 **No need to seed `content` first, and seeding it is the trap.** Every recipe
+on the web sets the body to a string before attaching:
+
+```applescript
+set content to "text here" & return & return   -- ← this is the wrapper
+tell content
+    make new attachment with properties {file name: theFile} at after the last paragraph
+end tell
+```
+
+That first line is exactly what this tool exists to avoid. Verified instead
+against a **brand-new outgoing message with an empty body**: `make new
+attachment` succeeds on it directly, and `content` afterwards is a single
+U+FFFC. No seeding required.
+
+### Verifying the attachment landed
+
+🛑 **`count of mail attachments` cannot do it.** On an *outgoing* message it does
+not return zero — it fails outright:
+
+```
+-1728: Mail got an error: Can't get every mail attachment of outgoing message id 17.
+```
+
+Same shape as `apple notes`' blindness to PDF attachments, and the same lesson:
+never treat the count as evidence. `attachments of msg` is no better.
+
+**What works is counting U+FFFC in `content`** — Mail leaves one
+object-replacement character per attachment. Two files attached, two markers.
+The scripts count **before and after**, and assert the delta:
+
+```applescript
+on markerCount(theText)
+    if (length of theText) is 0 then return 0
+    set saved to AppleScript's text item delimiters
+    set AppleScript's text item delimiters to (character id 65532)
+    set n to (count of text items of theText) - 1
+    set AppleScript's text item delimiters to saved
+    return n
+end markerCount
+```
+
+Three things in that handler are load-bearing:
+
+- 🛑 **The empty-string guard.** `count of text items of ""` is **0, not 1**, so
+  without it the handler returns `-1` for an empty body and every attachment
+  appears to add two markers. That is exactly a fresh compose window, and it
+  produced `Mail took 3 of 2 attachments` on the first run — a *counting* bug
+  that looked precisely like Notes' `make new attachment` double-insert bug.
+  The delta check is what surfaced it.
+- ⚠️ **The delta, not the absolute count.** A reply or forward starts with the
+  quoted original already in `content`, and a forward carries the original's own
+  attachments — all of which are U+FFFC too. Only the difference is ours.
+- ⚠️ **Text item delimiters, not a character loop.** Iterating `characters of` a
+  forwarded body takes seconds; the delimiter split is instant.
+
+### The refusals
+
+Every path is checked **before any Apple Event**, because a window that opened
+and then failed part-way through attaching leaves a half-built draft with no way
+to tell which files made it in. Missing file, directory, unreadable file, and
+the same file given twice each refuse with exit 64.
+
+⚠️ **Attachments are resolved before the body reaches the pasteboard**, so a bad
+`--attach` cannot silently replace whatever the user had copied. Pinned by a
+test.
+
+**What the user still does:** paste and save. Attachments are already in the
+window when it opens, so the JSON reports them as done (`attachments: [{name,
+path, bytes}]`) rather than as pending work, while `status` stays
+`awaiting_paste` for the body.
+
+### The hand verification (2026-08-12)
+
+Measured the way this document insists on: **a matched pair, driven by hand.**
+Two compose windows, the same body, one clipboard load serving both — one window
+opened with `--attach report.txt`, the other with nothing attached. Both pasted
+with ⌘V and saved with ⌘S, then the two `.emlx` files compared.
+
+| | with `--attach` | control |
+|---|---|---|
+| `To:` | `Dan Hopkins <dan@boulderhopkins.com>` | same |
+| body | `Bold check: <b>pasted</b> and <i>italic</i>.` | **identical** |
+| bullets | `•&nbsp;bullet two` in `<p>` | **identical** |
+| `blockquote type="cite"` **around the body** | **0** | 0 |
+| attachment part | `report.txt`, 18 bytes | — |
+
+**The conclusion: `--attach` neither wraps the body nor degrades the pasted
+formatting.** Markdown came through as real `<b>` and `<i>` in *both*, so
+attaching first does not put Mail's editor into a plain-text paste mode.
+
+⚠️ **Mail does wrap the attachment placeholder in a cite blockquote, and that is
+not FB11734014.** The saved HTML contains exactly one:
+
+```html
+<div class="Apple-Mail-URLShareWrapperClass" style="position: relative !important;">
+  <blockquote type="cite" style="border-left-style: none; color: inherit; padding: inherit; margin: inherit;">
+    <span class="Apple-string-attachment">
+      <object type="application/x-apple-msg-attachment" width="66" data="cid:…"></object>
+    </span>
+  </blockquote>
+</div>
+```
+
+Three things separate it from the wrapper this whole document is about: it
+contains **only the attachment placeholder** — the body text sits entirely above
+it and outside it; its styles are **explicitly neutralised**
+(`border-left-style: none`, everything else `inherit`), where FB11734014's
+wrapper carries none; and `application/x-apple-msg-attachment` is Apple
+proprietary, so non-Apple clients ignore the object entirely. It is Mail's own
+layout structure for a positioned attachment, not a quotation.
+
+🛑 **Still unverified at the receiving end.** Nothing here measured how a
+*recipient* renders that blockquote, because sending is not something this tool
+does. If it ever matters, send one to yourself and read it in Gmail's web UI.
+
+### 🛑 The compose window steals focus, and it will corrupt your test
+
+The first hand test produced two anomalies — a saved draft whose body was plain
+text (literal `**pasted**`) and whose header read `To: dop`. Neither reproduced
+in the matched pair, and reading the recipient straight back off a fresh compose
+gives `dan@boulderhopkins.com|Dan Hopkins` with and without an attachment.
+
+**The cause was focus theft, not Mail.** `compose` ends in `activate`, which
+pulls Mail to the front — and the user was mid-keystroke in another app, so
+`dop` was *their* typing, captured by a To field that had just appeared under
+the cursor.
+
+This is a property of every command here that opens a window, and it cuts both
+ways: it corrupts whatever the user was doing, and it plants evidence that looks
+exactly like a tool bug. Time was spent proving the recipient path correct
+before the real explanation surfaced. So:
+
+- **Warn before a window appears**, and batch window-opening into as few moments
+  as possible.
+- **Use `visible:false` for any probe that does not need a window.** Only the
+  window someone is actually asked to type into needs to be on screen.
+- **Suspect focus theft first** when a hand test shows stray or truncated text in
+  an input field.
+- **One hand test is a data point, not a result.** The matched pair is what
+  separated a real finding (the neutralised blockquote, which recurred) from an
+  artefact (`To: dop`, which did not).
+
+### 🛑 A scripted attachment reads back as *inline*, and the counts disagree
+
+Consequence of attaching at a content position: Mail references the part from
+the HTML by `cid:`, so every reader here classifies it as an inline attachment.
+On a saved draft carrying one real `report.txt`:
+
+| Reader | Reports |
+|---|---|
+| `apple mail attachments` | **1** — `report.txt  text/plain, 18 bytes (inline)` |
+| `apple mail export --json` | `[]` |
+| the Envelope Index (`search`) | `attachments: 0` |
+
+The file is genuinely there — a `report.txt` MIME part with the right 18 bytes.
+This is a classification difference, not a lost attachment, and it means the
+older claim that `attachments` and `export --json` *always* agree does not hold
+for a draft built this way. Use `apple mail attachments` when the question is
+"did the file make it".
+
 ## The spike this grew out of
 
 Answering an open question nobody in the field had run (che-apple-mail-mcp #306,

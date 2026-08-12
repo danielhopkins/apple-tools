@@ -34,6 +34,7 @@ is meaningful either way and complete over both.
 import json
 import os
 import subprocess
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -469,6 +470,67 @@ class TestComposeRefusalsAreFree(MailGuardTest):
         self.assertNotEqual(code, 0)
         self.assertRefusedFast(elapsed)
         self.assertDidNotLaunchMail()
+
+    def test_a_missing_attachment_is_refused_before_the_window_opens(self):
+        code, _, err, elapsed = run(
+            "compose", "--to", "a@b.com", "--subject", "x", "--body", "y",
+            "--attach", "/definitely/not/here.pdf")
+        self.assertNotEqual(code, 0)
+        self.assertIn("no such file", err.lower())
+        self.assertRefusedFast(elapsed)
+        self.assertDidNotLaunchMail()
+
+    def test_a_directory_attachment_is_refused(self):
+        code, _, err, elapsed = run(
+            "compose", "--to", "a@b.com", "--subject", "x", "--body", "y",
+            "--attach", "/tmp")
+        self.assertNotEqual(code, 0)
+        self.assertIn("directory", err.lower())
+        self.assertRefusedFast(elapsed)
+        self.assertDidNotLaunchMail()
+
+    def test_the_same_attachment_twice_is_refused(self):
+        code, _, err, elapsed = run(
+            "compose", "--to", "a@b.com", "--subject", "x", "--body", "y",
+            "--attach", "/etc/hosts", "--attach", "/etc/hosts")
+        self.assertNotEqual(code, 0)
+        self.assertIn("twice", err.lower())
+        self.assertRefusedFast(elapsed)
+        self.assertDidNotLaunchMail()
+
+    def test_an_unreadable_attachment_is_refused(self):
+        # 🛑 Checked before the window opens, not after. A compose window that
+        # opened and then failed part-way through attaching leaves a half-built
+        # draft with no way to tell which files made it in.
+        with tempfile.NamedTemporaryFile(delete=False) as handle:
+            handle.write(b"secret")
+            path = handle.name
+        try:
+            os.chmod(path, 0o000)
+            if os.access(path, os.R_OK):
+                self.skipTest("running as a user that can read a 000-mode file")
+            code, _, err, elapsed = run(
+                "compose", "--to", "a@b.com", "--subject", "x", "--body", "y",
+                "--attach", path)
+            self.assertNotEqual(code, 0)
+            self.assertIn("not readable", err.lower())
+            self.assertRefusedFast(elapsed)
+            self.assertDidNotLaunchMail()
+        finally:
+            os.chmod(path, 0o600)
+            os.unlink(path)
+
+    def test_attachment_paths_are_checked_before_the_body_reaches_the_pasteboard(self):
+        # Ordering guard: a bad --attach must not leave the body sitting on the
+        # user's clipboard, having silently replaced whatever they had copied.
+        marker = f"__attach_order_probe__{os.getpid()}"
+        code, _, _, _ = run(
+            "compose", "--to", "a@b.com", "--subject", "x", "--body", marker,
+            "--attach", "/definitely/not/here.pdf")
+        self.assertNotEqual(code, 0)
+        pasteboard = subprocess.run(
+            ["pbpaste"], capture_output=True, text=True).stdout
+        self.assertNotIn(marker, pasteboard)
 
     def test_markdown_and_html_together_are_refused(self):
         code, _, err, elapsed = run(
