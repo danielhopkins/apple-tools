@@ -217,7 +217,7 @@ apple mail export MESSAGE-ID [--account NAME] [--json] [--raw]
 apple mail attachments MESSAGE-ID [--save DIR] [--skip-inline] [--account NAME] [--json]
 
 apple mail compose --to ADDR [--cc ADDR] [--bcc ADDR] [--subject TEXT]
-                   [--from ACCOUNT-ADDRESS] [--body TEXT | --body-file FILE|-]
+                   [--from|--account ACCOUNT-ADDRESS] [--body TEXT | --body-file FILE|-]
                    [--markdown | --html] [--attach FILE]... [--json]
 apple mail reply MESSAGE-ID [--all] [--body TEXT | --body-file FILE|-]
                  [--markdown | --html] [--attach FILE]... [--account NAME] [--json]
@@ -798,10 +798,28 @@ saw — EventKit resolves it to the first occurrence, often years earlier. So:
 - `edit` and `delete` **refuse to run** on a recurring event unless you pass
   either `--occurrence DATE` or `--series`. They will not guess.
 - `show` without `--occurrence` returns the series master and says so on stderr.
-- `--series` targets the master deliberately; combined with `--future` that
-  rewrites the whole series.
-- `--future` applies a change to this and all later occurrences; without it only
-  the single occurrence changes.
+- **`--series` means the whole series** — every occurrence, and it never
+  detaches one. 🛑 It used to save with `EKSpan.thisEvent`, which *detached the
+  first occurrence*, applied the change to that alone and left the rest
+  untouched, while reporting success. Measured: `edit --series --location X`
+  produced one detached instance carrying X and five unchanged occurrences.
+  Fixed in 26.812.3; `delete --series` had the same bug and removed only the
+  first occurrence.
+- `--future` applies a change to this occurrence and all later ones; without it
+  only the single occurrence changes. It is redundant with `--series`.
+
+🛑 **Every calendar write is read back from the store before it is reported.**
+`EKEventStore.save` returning true is not evidence the change persisted — a
+`--occurrence` move was observed returning exit 0 with JSON describing the moved
+occurrence while the store still held the original date, and an identical retry
+then worked. So `edit` re-reads a fresh store, compares each field it was asked
+to change, **retries once** if nothing landed, and **exits non-zero naming the
+mismatch** rather than reporting the request back as if it were the result.
+
+- ⚠️ **The JSON from `edit` is what the store holds, not what you asked for.**
+  If they differ, the command fails instead of printing either.
+- `APPLE_CALENDAR_SIMULATE_LOST_WRITE=1` makes the save a no-op so that path can
+  be tested; the real failure is intermittent and cannot be provoked.
 
 **Recurrence.** `add` and `edit` take the same four flags as `apple reminders`
 — `--repeat none|daily|weekly|monthly|yearly` (`-r`), `--repeat-interval N`,
@@ -1240,7 +1258,7 @@ The `tests/` suites drive the real binaries against real data, each behind its
 own flag:
 
 ```
-./tests/run-tests              # calendar writes (49) + mail wedge guards (40)
+./tests/run-tests              # calendar writes (54) + mail wedge guards (40)
 ./tests/run-tests --contacts   # + contacts writes (60)
 ```
 

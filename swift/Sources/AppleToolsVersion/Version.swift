@@ -1,3 +1,3 @@
 // Generated from the repo-root VERSION file by `make set-version`.
 // Do not edit by hand.
-public let appleToolsVersion = "26.812.2"
+public let appleToolsVersion = "26.812.3"

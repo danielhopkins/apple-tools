@@ -63,12 +63,21 @@ def calendar_bin():
     return CALENDAR
 
 
-def run(*args, check=True):
-    """Invoke apple-calendar and return (returncode, stdout, stderr)."""
+def run(*args, check=True, env=None):
+    """Invoke apple-calendar and return (returncode, stdout, stderr).
+
+    `env` adds variables on top of the inherited environment — used only to set
+    APPLE_CALENDAR_SIMULATE_LOST_WRITE, the seam that stands in for a save that
+    reports success and changes nothing.
+    """
+    environment = None
+    if env:
+        environment = {**os.environ, **env}
     proc = subprocess.run(
         [calendar_bin(), *args],
         capture_output=True,
         text=True,
+        env=environment,
     )
     if check and proc.returncode != 0:
         raise AssertionError(
@@ -165,11 +174,10 @@ def sweep(calendar=None):
             )
         args = ["delete", event["id"]]
         if event.get("recurring"):
-            # --series alone targets the master, which for a recurring event is
-            # just its first occurrence; --future is what removes the series.
-            # Without it the sweep deletes one occurrence per pass and leaves
-            # the rest behind.
-            args += ["--series", "--future"]
+            # --series removes the whole series. It used to need --future too,
+            # because --series saved with EKSpan.thisEvent and deleted only the
+            # first occurrence — fixed in 26.812.3.
+            args.append("--series")
         code, _, err = run(*args, check=False)
         if code != 0:
             print(f"warning: could not delete {event['title']!r}: {err}", file=sys.stderr)

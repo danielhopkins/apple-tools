@@ -672,3 +672,87 @@ class TestMovingOneOccurrence(LiveCalendarTest):
         )
         self.assertNotEqual(code, 0)
         self.assertIn("no occurrence", err.lower())
+
+
+class TestWritesAreReadBack(LiveCalendarTest):
+    """🛑 A write is only reported as done if the store confirms it.
+
+    Reported from a real session: `edit --occurrence` returned exit 0 and a JSON
+    body describing the moved occurrence, while a re-read still showed the
+    original date. The return value was built from the in-memory object — the
+    one holding the *request* — so it could never fail. An identical retry then
+    worked, making it intermittent and invisible.
+
+    The failure cannot be provoked on demand, so APPLE_CALENDAR_SIMULATE_LOST_WRITE
+    stands in for it: it makes the save a no-op and nothing else.
+    """
+
+    def test_a_lost_write_is_reported_as_a_failure(self):
+        event = self.add("readback-lost", "--start", f"{BASE:%Y-%m}-04 09:00")
+        code, out, err = run(
+            "edit", event["id"], "--location", "should not persist",
+            check=False, env={"APPLE_CALENDAR_SIMULATE_LOST_WRITE": "1"},
+        )
+        self.assertNotEqual(code, 0, "a save that changed nothing reported success")
+        self.assertIn("does not hold the change", err)
+        self.assertIn("location", err)
+        self.assertEqual(out.strip(), "", "a failed write still printed a result")
+        # And the store really is untouched.
+        self.assertIsNone(self.get(event["id"]).get("location"))
+
+    def test_a_successful_write_reports_what_the_store_holds(self):
+        event = self.add("readback-ok", "--start", f"{BASE:%Y-%m}-04 09:00")
+        updated = run_json("edit", event["id"], "--location", "persisted")
+        self.assertEqual(updated["location"], "persisted")
+        self.assertEqual(self.get(event["id"])["location"], "persisted")
+
+
+class TestSeriesMeansTheWholeSeries(LiveCalendarTest):
+    """🛑 --series must not touch a single occurrence.
+
+    Saving with EKSpan.thisEvent under --series *detached the first occurrence*,
+    applied the change to that alone, left the other occurrences untouched, and
+    reported success. Measured: one detached instance carrying the new location
+    and five unchanged occurrences.
+    """
+
+    def series(self, suffix):
+        return self.add(
+            suffix,
+            "--start", f"{BASE:%Y-%m}-07 09:00",
+            "--repeat", "weekly", "--repeat-count", "4",
+        )["id"]
+
+    def instances(self, needle):
+        start, end = near_window()
+        return run_json("events", "--from", start, "--to", end, "--search", needle)
+
+    def test_series_edit_applies_to_every_occurrence(self):
+        event_id = self.series("series-wide")
+        run("edit", event_id, "--series", "--location", "series wide")
+
+        found = self.instances("series-wide")
+        self.assertGreaterEqual(len(found), 3)
+        for instance in found:
+            self.assertEqual(
+                instance["location"], "series wide",
+                f"{instance['start']} did not get the series-wide change")
+            self.assertTrue(
+                instance["recurring"],
+                f"{instance['start']} was detached from the series by a --series edit")
+
+    def test_series_edit_does_not_detach_anything(self):
+        event_id = self.series("series-nodetach")
+        run("edit", event_id, "--series", "--title", self.title("series-nodetach renamed"))
+        for instance in self.instances("series-nodetach"):
+            self.assertNotIn(
+                "/RID=", instance["id"],
+                "a --series edit detached an occurrence")
+
+    def test_series_delete_removes_the_whole_series(self):
+        event_id = self.series("series-delete")
+        self.assertGreaterEqual(len(self.instances("series-delete")), 3)
+        run("delete", event_id, "--series")
+        self.assertEqual(
+            self.instances("series-delete"), [],
+            "--series left occurrences behind; it deleted only the first")

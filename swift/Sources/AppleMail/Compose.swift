@@ -250,7 +250,11 @@ struct Compose: AsyncParsableCommand {
   @Option(name: .long, help: "Subject line")
   var subject: String = ""
 
-  @Option(name: .long, help: "Send from this account address; defaults to your default account")
+  /// `--account` is accepted as a synonym because every other command here
+  /// spells this `--account`, and reaching for it first is the obvious mistake.
+  @Option(
+    name: [.customLong("from"), .customLong("account")],
+    help: "Send from this account address; defaults to your default account")
   var from: String?
 
   @OptionGroup var bodyOptions: ComposeBodyOptions

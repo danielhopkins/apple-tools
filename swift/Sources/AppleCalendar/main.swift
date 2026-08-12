@@ -818,25 +818,28 @@ struct Edit: ParsableCommand {
                 "nothing to change; pass at least one of --title/--start/--end/--location/--notes/--repeat")
         }
 
-        if let title { match.title = title }
-        if let start { match.startDate = start.date }
-        if let end { match.endDate = end.date }
-        if let location { match.location = location }
-        if let notes { match.notes = notes }
+        // Applied to the retry target too, so both attempts are identical.
+        func apply(to event: EKEvent, warn: Bool) {
+            if let title { event.title = title }
+            if let start { event.startDate = start.date }
+            if let end { event.endDate = end.date }
+            if let location { event.location = location }
+            if let notes { event.notes = notes }
 
-        if recurrence.wasSpecified {
+            guard recurrence.wasSpecified else { return }
             if let rule = recurrence.rule() {
-                match.recurrenceRules = [rule]
-                let effectiveStart = start?.date ?? match.startDate
-                if let effectiveStart,
+                event.recurrenceRules = [rule]
+                let effectiveStart = start?.date ?? event.startDate
+                if warn, let effectiveStart,
                    let warning = recurrence.startDateWarning(start: effectiveStart) {
                     FileHandle.standardError.write(Data((warning + "\n").utf8))
                 }
             } else {
                 // --repeat none: collapse the series to a single event.
-                match.recurrenceRules = nil
+                event.recurrenceRules = nil
             }
         }
+        apply(to: match, warn: true)
 
         if let startDate = match.startDate, let endDate = match.endDate, endDate < startDate {
             throw ValidationError("end time must be at or after the start time")
@@ -849,30 +852,184 @@ struct Edit: ParsableCommand {
         // 4 occurrences a year into 365. .futureEvents round-trips correctly.
         // Since a rule change already requires --series, the master is the
         // first occurrence and .futureEvents means exactly "the whole series".
-        let span: EKSpan = (future || recurrence.wasSpecified) ? .futureEvents : .thisEvent
-        try store.save(match, span: span, commit: true)
+        // 🛑 --series means the whole series, and that requires .futureEvents.
+        // With .thisEvent it *detached the first occurrence*, applied the change
+        // to that alone and left the series untouched — while reporting success.
+        // Measured: `edit --series --location X` produced one detached instance
+        // carrying X and five unchanged occurrences. Same root cause as the
+        // recurrence-rule corruption above; --series is simply never .thisEvent.
+        let span: EKSpan = (series || future || recurrence.wasSpecified)
+            ? .futureEvents : .thisEvent
+        if !simulatingLostWrite {
+            try store.save(match, span: span, commit: true)
+        }
 
-        // Confirm the rule that landed, rather than the one that was asked for.
-        if recurrence.wasSpecified {
-            let persisted = freshStore().event(withIdentifier: match.eventIdentifier ?? id)
-            let saved = RecurrenceInfo(persisted?.recurrenceRules?.first)
-            if recurrence.isRecurring && saved == nil {
-                throw ValidationError(
-                    "the recurrence change reported success but no rule is on the event.")
+        // 🛑 Everything below exists because `save` reporting success is not
+        // evidence the change persisted. Reporting `match` here — the object we
+        // just mutated — describes the *request*, so it can never fail. The
+        // answer has to come from the store.
+        let want = IntendedChange(
+            start: start?.date, end: end?.date, title: title,
+            location: location, notes: notes,
+            recurs: recurrence.wasSpecified ? recurrence.isRecurring : nil)
+        let intendedStart = start?.date ?? match.startDate
+
+        func readBack() -> EKEvent? {
+            WriteConfirmation.locate(
+                identifier: match.eventIdentifier ?? id, fallbackID: id,
+                near: intendedStart, allowDetachedScan: occurrence != nil && !series,
+                in: freshStore())
+        }
+
+        var persisted = readBack()
+        var problems = WriteConfirmation.mismatches(persisted, want: want)
+
+        // Observed intermittently on a recurring series: the first save takes
+        // no effect at all and an identical retry works. Retrying is safe only
+        // because nothing landed — a partial write re-resolves to a different
+        // occurrence and is reported rather than retried.
+        if !problems.isEmpty, !want.isEmpty {
+            store.refreshSourcesIfNecessary()
+            if let retry = try? resolveForWrite(
+                id: id, occurrence: occurrence, series: series, verb: "edit") {
+                apply(to: retry, warn: false)
+                if simulatingLostWrite || (try? store.save(retry, span: span, commit: true)) != nil {
+                    persisted = WriteConfirmation.locate(
+                        identifier: retry.eventIdentifier ?? id, fallbackID: id,
+                        near: intendedStart, allowDetachedScan: occurrence != nil && !series,
+                        in: freshStore())
+                    let after = WriteConfirmation.mismatches(persisted, want: want)
+                    if after.isEmpty {
+                        FileHandle.standardError.write(Data(
+                            "note: the first save did not take and was retried.\n".utf8))
+                    }
+                    problems = after
+                }
             }
         }
 
+        guard problems.isEmpty, let saved = persisted else {
+            throw ValidationError("""
+                the save reported success but the store does not hold the change:
+                  \(problems.joined(separator: "\n  "))
+                Nothing here is reported as done unless it was read back.
+                """)
+        }
+
         if json {
-            printJSON(info(match))
+            printJSON(info(saved))
         } else {
-            print("Updated '\(match.title ?? "<untitled>")' — \(describe(match))")
-            if let pattern = RecurrenceInfo(match.recurrenceRules?.first) {
+            print("Updated '\(saved.title ?? "<untitled>")' — \(describe(saved))")
+            if let pattern = RecurrenceInfo(saved.recurrenceRules?.first) {
                 print("Repeats: \(pattern.describe)")
             } else if recurrence.wasSpecified {
                 print("Repeats: no longer repeats")
             }
         }
     }
+}
+
+// MARK: - Confirming a write actually landed
+
+/// What an `edit` asked for, so it can be checked against what the store holds.
+struct IntendedChange {
+    var start: Date?
+    var end: Date?
+    var title: String?
+    var location: String?
+    var notes: String?
+    /// True when a recurrence rule should exist afterwards, false when it
+    /// should not, nil when recurrence was not part of the request.
+    var recurs: Bool?
+
+    var isEmpty: Bool {
+        start == nil && end == nil && title == nil && location == nil && notes == nil
+            && recurs == nil
+    }
+}
+
+/// 🛑 **`EKEventStore.save` returning true does not mean the change persisted.**
+/// Measured in the field: moving one occurrence of a monthly series returned
+/// exit 0 and a JSON body describing the moved, detached occurrence, while a
+/// re-read still showed the *original* date and an intact series. An identical
+/// retry then worked. So the value a write command reports must come from the
+/// store, never from the in-memory object it just mutated — that object always
+/// reflects the request and is therefore always "successful".
+///
+/// Finding the event again is the fiddly part: moving an occurrence **detaches**
+/// it, which mints a new identifier ending in `/RID=<seconds>`. So this looks up
+/// by identifier first, then falls back to scanning the day around the intended
+/// start for anything sharing the same base identifier.
+enum WriteConfirmation {
+    /// `allowDetachedScan` must be false for a whole-series write. A series edit
+    /// that wrongly detached one occurrence leaves that instance carrying the
+    /// change, so scanning the day would *find* it and report success for
+    /// precisely the bug worth catching.
+    static func locate(
+        identifier: String, fallbackID: String, near date: Date?,
+        allowDetachedScan: Bool, in store: EKEventStore
+    ) -> EKEvent? {
+        if let direct = store.event(withIdentifier: identifier) { return direct }
+        if identifier != fallbackID, let direct = store.event(withIdentifier: fallbackID) {
+            return direct
+        }
+        guard allowDetachedScan, let date else { return nil }
+
+        let base = identifier.components(separatedBy: "/RID=").first ?? identifier
+        let calendar = Foundation.Calendar.current
+        let dayStart = calendar.startOfDay(for: date)
+        guard let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart) else { return nil }
+        return store.events(matching: store.predicateForEvents(
+            withStart: dayStart, end: dayEnd, calendars: nil))
+            .first { ($0.eventIdentifier?.components(separatedBy: "/RID=").first ?? "") == base }
+    }
+
+    /// Field-by-field, naming everything that did not take.
+    static func mismatches(_ event: EKEvent?, want: IntendedChange) -> [String] {
+        guard let event else { return ["the event could not be found after the save"] }
+        var problems: [String] = []
+
+        func compare(_ label: String, _ actual: Date?, _ expected: Date?) {
+            guard let expected else { return }
+            // Second granularity: stores round sub-second components.
+            guard let actual, abs(actual.timeIntervalSince(expected)) < 1 else {
+                problems.append(
+                    "\(label) is \(actual.map { iso8601.string(from: $0) } ?? "unset"), "
+                    + "expected \(iso8601.string(from: expected))")
+                return
+            }
+        }
+        compare("start", event.startDate, want.start)
+        compare("end", event.endDate, want.end)
+
+        func compareText(_ label: String, _ actual: String?, _ expected: String?) {
+            guard let expected, (actual ?? "") != expected else { return }
+            problems.append("\(label) is \(actual.map { "'\($0)'" } ?? "unset"), expected '\(expected)'")
+        }
+        compareText("title", event.title, want.title)
+        compareText("location", event.location, want.location)
+        compareText("notes", event.notes, want.notes)
+
+        if let recurs = want.recurs, recurs != event.hasRecurrenceRules {
+            problems.append(
+                recurs
+                    ? "the event has no recurrence rule, but one was set"
+                    : "the event still repeats, but recurrence was removed")
+        }
+        return problems
+    }
+}
+
+/// Test seam: makes every `save` in `edit` a no-op, so the confirmation path
+/// can be exercised deliberately.
+///
+/// The failure it stands in for is real but **intermittent** — a save that
+/// reports success and changes nothing — and there is no way to provoke it on
+/// demand. Without this the read-back logic would only ever be tested on the
+/// happy path, which is exactly how it came to be missing. It can only turn a
+/// silent no-op into a loud one, never the reverse.
+private var simulatingLostWrite: Bool {
+    ProcessInfo.processInfo.environment["APPLE_CALENDAR_SIMULATE_LOST_WRITE"] == "1"
 }
 
 /// A fresh store, so a write can be confirmed against what was persisted rather
@@ -1113,7 +1270,11 @@ struct Delete: ParsableCommand {
         let match = try resolveForWrite(
             id: id, occurrence: occurrence, series: series, verb: "delete")
         let title = match.title ?? "<untitled>"
-        try store.remove(match, span: future ? .futureEvents : .thisEvent, commit: true)
+        // Same rule as edit: --series is the whole series, never one occurrence.
+        // With .thisEvent, `delete --series` removed only the first occurrence
+        // and reported the series deleted.
+        try store.remove(
+            match, span: (series || future) ? .futureEvents : .thisEvent, commit: true)
         print("Deleted '\(title)'")
     }
 }
