@@ -910,6 +910,19 @@ name strings and is now an array of objects**; read `.attendees[].name`.
 ⚠️ **The organizer is usually *not* in the attendee list**, so listing attendees
 alone silently omits whoever called the meeting.
 
+🛑 **On Exchange an invitee change can be discarded after it is confirmed.**
+`invite` saves, a fresh-store read confirms it, and the server then throws the
+change away seconds later. Intermittent: five of nine per-occurrence invites on
+one real series survived and three reverted. So `invite` now waits
+`APPLE_CALENDAR_INVITE_SETTLE` seconds (default 12), re-reads, and **fails
+naming the addresses that did not survive**.
+
+⚠️ **Local attendees and delivered mail disagree in both directions** — a
+reverted change still mailed people, and an event that kept its attendees never
+mailed anyone. "invitees: 8" is not evidence anyone was invited, and an empty
+list is not evidence nobody was. The server is the only authority; check OWA or
+the web UI when it matters.
+
 🛑 **Writing invitees sends real mail, and there is no undo.** `add --invitee`
 and `invite --add` make the server email an invitation; `invite --remove` and
 deleting the event email a cancellation. **Run `invite --dry-run` first** — it

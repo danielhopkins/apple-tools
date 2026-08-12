@@ -1128,6 +1128,54 @@ private func refuseIfSeriesWriteWouldResetExceptions(
         """)
 }
 
+/// How long to wait before re-checking that an invitee change survived.
+///
+/// The reversion is a server round trip, so it lands seconds after the local
+/// save. 12s caught it in testing; `APPLE_CALENDAR_INVITE_SETTLE=0` skips the
+/// wait for tests and for callers who will verify themselves.
+private var inviteSettleSeconds: TimeInterval {
+    if let raw = ProcessInfo.processInfo.environment["APPLE_CALENDAR_INVITE_SETTLE"],
+       let seconds = Double(raw) {
+        return max(0, seconds)
+    }
+    return 12
+}
+
+/// Waits for the server round trip, then checks the change is still there.
+private func settleAndRecheck(
+    identifier: String, fallbackID: String, expecting changes: [InviteeChange],
+    near date: Date?, allowDetachedScan: Bool
+) -> (event: EKEvent?, changes: [InviteeChange], revertedAddresses: [String]?) {
+    let wait = inviteSettleSeconds
+    guard wait > 0, changes.contains(where: { $0.changed }) else {
+        return (nil, changes, nil)
+    }
+
+    FileHandle.standardError.write(Data(
+        "note: waiting \(Int(wait))s to confirm the server kept the change…\n".utf8))
+    Thread.sleep(forTimeInterval: wait)
+
+    guard let after = WriteConfirmation.locate(
+        identifier: identifier, fallbackID: fallbackID, near: date,
+        allowDetachedScan: allowDetachedScan, in: freshStore())
+    else {
+        return (nil, changes, ["the event could not be re-read"])
+    }
+
+    let present = after.attendees ?? []
+    var reverted: [String] = []
+    let rechecked = changes.map { change -> InviteeChange in
+        guard change.changed else { return change }
+        let here = present.contains { AttendeeAddress.matches($0, change.email) }
+        let wanted = change.action == "add"
+        if here != wanted { reverted.append(change.email) }
+        return .init(
+            email: change.email, action: change.action, changed: change.changed,
+            confirmed: here == wanted)
+    }
+    return (after, rechecked, reverted.isEmpty ? nil : reverted)
+}
+
 struct Invitees: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "invitees",
@@ -1418,7 +1466,36 @@ struct Invite: ParsableCommand {
                 confirmed: present == wanted)
         }
 
-        report(event: persisted, changes: confirmed, dryRun: false)
+        // 🛑 An immediate read-back is not enough for an invitee change.
+        //
+        // Measured on Exchange: `invite` saves, a fresh-store read confirms the
+        // attendees are there, and the server then **discards the change** —
+        // the attendees vanish tens of seconds later. The confirmation above is
+        // reading state that is locally committed but not yet server-accepted,
+        // and those are different things for the one operation whose entire
+        // purpose is server-side mail.
+        //
+        // It is intermittent: of nine per-occurrence invites on one series,
+        // five survived and three reverted; in isolated pairs here one reverted
+        // and one held. So a single check at any instant can be wrong — the
+        // only honest thing is to let it settle and look again.
+        let settled = settleAndRecheck(
+            identifier: persisted.eventIdentifier ?? id, fallbackID: id,
+            expecting: confirmed, near: persisted.startDate,
+            allowDetachedScan: occurrence != nil && !series)
+
+        report(event: settled.event ?? persisted, changes: settled.changes, dryRun: false)
+
+        if let reverted = settled.revertedAddresses, !reverted.isEmpty {
+            throw ValidationError("""
+                the server discarded this change after accepting it locally. \
+                \(reverted.joined(separator: ", ")) \(reverted.count == 1 ? "is" : "are") no longer \
+                on the event.
+                ⚠️ Invitation mail may still have gone out — the two are independent, so do not \
+                assume nobody was notified. Check the event in your calendar app, and re-run this \
+                command if it really is missing.
+                """)
+        }
 
         if confirmed.contains(where: { $0.confirmed == false }) {
             throw ExitCode(1)

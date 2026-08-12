@@ -309,3 +309,47 @@ exited 0. A real committee was reported invited and the server held nobody.
 It now fails loudly when the event cannot be read back, and never reports from
 the in-memory object. **A lost calendar edit is recoverable; a caller who
 believes people were invited stops telling them any other way.**
+
+## 🛑 On Exchange, an invitee change can be discarded *after* it is confirmed
+
+The most important thing measured in this whole surface, and it defeats the
+obvious guard.
+
+`invite` saves, a fresh-store read confirms the attendees are on the event, and
+the server then **discards the change** — the attendees disappear tens of
+seconds later. The confirmation is reading state that is locally committed but
+not yet server-accepted, and for the one operation whose entire purpose is
+server-side mail those are different things.
+
+**It is intermittent.** Of nine per-occurrence invites issued against one real
+series, five survived and three reverted. In isolated pairs here, one reverted
+and one held at 60s. So a single check at any instant can be wrong.
+
+⚠️ **Local state and delivered mail disagree in both directions.**
+
+| Observed | Local attendees | Invitation mailed |
+|---|---|---|
+| the common case | kept | yes |
+| reverted | **lost** | **yes, still sent** |
+| the other way | **kept** | **never sent** |
+
+So "invitees: 8" is not evidence anyone was invited, and an empty list is not
+evidence nobody was. Both were seen on the same series within one minute.
+
+`invite` therefore waits `APPLE_CALENDAR_INVITE_SETTLE` seconds (default 12)
+after the immediate confirmation, re-reads, and **fails naming the addresses
+that did not survive** — while saying explicitly that mail may have gone out
+anyway, because it may have.
+
+⚠️ **What this does not fix:** the tool still cannot verify delivery, and a
+change that reverts after the settle window is still missed. The only
+authoritative store is the server; OWA is the check that settles an argument.
+
+### Create-with-invitees looks more reliable than invite-after-the-fact
+
+Not proven, but worth knowing. `add --invitee` persisted through sync every time
+it was tried (four events, Exchange and Google). `invite` on an event that
+already existed is where every reversion was seen. If that holds, creating an
+event with its invitee list is the safer construction on Exchange, and the
+workaround for a series whose invitations will not stick is to recreate it with
+`--invitee` rather than to keep retrying `invite`.
