@@ -4,7 +4,12 @@ Every event created here is prefixed and swept; see harness.py for the safety
 model. Run with ./tests/run-tests.
 """
 
+import calendar as calendar_module
+import datetime
+
 from harness import (
+    near_future,
+    near_window,
     TEST_YEAR,
     LiveCalendarTest,
     find_test_events,
@@ -369,3 +374,194 @@ class TestInvitees(LiveCalendarTest):
         )
         self.assertNotEqual(code, 0)
         self.assertIn("no event", err.lower())
+
+
+def _nth_weekday(year, month, weekday, nth):
+    """Date of the nth `weekday` (0=Mon) of a month; nth=-1 means the last."""
+    days = [
+        datetime.date(year, month, d)
+        for d in range(1, calendar_module.monthrange(year, month)[1] + 1)
+    ]
+    matching = [d for d in days if d.weekday() == weekday]
+    return matching[nth if nth == -1 else nth - 1]
+
+
+BASE = near_future(month_offset=2)
+
+
+class TestRecurrence(LiveCalendarTest):
+    """Creating and changing recurring events.
+
+    The flag surface mirrors `apple reminders` on purpose — --repeat,
+    --repeat-interval, --repeat-until, --repeat-count, same validation wording —
+    with --on-the added for the one thing reminders cannot express.
+    """
+
+    def occurrences(self, needle):
+        start, end = near_window()
+        found = run_json("events", "--from", start, "--to", end, "--search", needle)
+        return sorted(datetime.datetime.fromisoformat(e["start"]) for e in found)
+
+    # -- reminders-parity flags ------------------------------------------- #
+
+    def test_weekly_with_interval_and_count(self):
+        event = self.add(
+            "recur-weekly",
+            "--start", f"{BASE:%Y-%m}-04 09:00",
+            "--repeat", "weekly", "--repeat-interval", "2", "--repeat-count", "3",
+        )
+        self.assertTrue(event["recurring"])
+        self.assertEqual(event["recurrence"]["frequency"], "weekly")
+        self.assertEqual(event["recurrence"]["interval"], 2)
+        self.assertEqual(event["recurrence"]["count"], 3)
+
+        starts = self.occurrences("recur-weekly")
+        self.assertEqual(len(starts), 3, "--repeat-count did not bound the series")
+        self.assertEqual((starts[1] - starts[0]).days, 14)
+
+    def test_repeat_until_bounds_the_series(self):
+        event = self.add(
+            "recur-until",
+            "--start", f"{BASE:%Y-%m}-04 09:00",
+            "--repeat", "daily", "--repeat-until", f"{BASE:%Y-%m}-08",
+        )
+        self.assertIsNotNone(event["recurrence"]["until"])
+        for start in self.occurrences("recur-until"):
+            self.assertLessEqual(start.date(), datetime.date(BASE.year, BASE.month, 8))
+
+    def test_a_one_off_reports_no_recurrence(self):
+        event = self.add("recur-none", "--start", f"{BASE:%Y-%m}-04 09:00")
+        self.assertFalse(event["recurring"])
+        self.assertIsNone(event.get("recurrence"))
+
+    # -- the positional monthly case -------------------------------------- #
+
+    def test_fourth_monday_of_each_month(self):
+        start = _nth_weekday(BASE.year, BASE.month, weekday=0, nth=4)
+        event = self.add(
+            "recur-4th-mon",
+            "--start", f"{start.isoformat()} 10:00",
+            "--repeat", "monthly", "--on-the", "4th monday",
+        )
+        self.assertEqual(event["recurrence"]["on_the"], "the 4th Monday")
+
+        starts = self.occurrences("recur-4th-mon")
+        self.assertGreater(len(starts), 3, "series did not project forward")
+        for moment in starts:
+            self.assertEqual(moment.weekday(), 0, f"{moment} is not a Monday")
+            self.assertEqual(
+                (moment.day - 1) // 7 + 1, 4, f"{moment} is not the 4th Monday"
+            )
+
+    def test_last_friday_of_each_month(self):
+        start = _nth_weekday(BASE.year, BASE.month, weekday=4, nth=-1)
+        self.add(
+            "recur-last-fri",
+            "--start", f"{start.isoformat()} 10:00",
+            "--repeat", "monthly", "--on-the", "last friday",
+        )
+        for moment in self.occurrences("recur-last-fri"):
+            self.assertEqual(moment.weekday(), 4)
+            last = calendar_module.monthrange(moment.year, moment.month)[1]
+            self.assertGreater(moment.day, last - 7, f"{moment} is not the last Friday")
+
+    def test_day_of_month(self):
+        event = self.add(
+            "recur-day-15",
+            "--start", f"{BASE:%Y-%m}-15 10:00",
+            "--repeat", "monthly", "--on-the", "15",
+        )
+        self.assertEqual(event["recurrence"]["on_the"], "day 15")
+        for moment in self.occurrences("recur-day-15"):
+            self.assertEqual(moment.day, 15)
+
+    def test_a_start_date_off_the_pattern_warns(self):
+        # Sunday cannot be the 4th Monday; the tool must say so rather than
+        # silently produce a series whose first occurrence is the odd one out.
+        start = _nth_weekday(BASE.year, BASE.month, weekday=6, nth=1)
+        code, _, err = run(
+            "add", self.title("recur-mismatch"),
+            "--calendar", self.calendar,
+            "--start", f"{start.isoformat()} 10:00",
+            "--repeat", "monthly", "--on-the", "4th monday",
+        )
+        self.assertEqual(code, 0, "the mismatch should warn, not fail")
+        self.assertIn("not the 4th Monday", err)
+
+    # -- editing ----------------------------------------------------------- #
+
+    def test_changing_recurrence_requires_series(self):
+        start = _nth_weekday(BASE.year, BASE.month, weekday=0, nth=4)
+        event = self.add(
+            "recur-edit-guard",
+            "--start", f"{start.isoformat()} 10:00",
+            "--repeat", "monthly", "--on-the", "4th monday",
+        )
+        code, _, err = run("edit", event["id"], "--repeat", "weekly", check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("--series", err)
+
+    def test_editing_a_rule_does_not_silently_become_daily(self):
+        """🛑 Regression: saving a changed rule with EKSpan.thisEvent rewrites it
+        to FREQ=DAILY;INTERVAL=1 — no error, `save` reports success, and a
+        4-times-a-year series quietly becomes 365. The fix is .futureEvents;
+        this test is the thing standing between that bug and a user's calendar.
+        """
+        start = _nth_weekday(BASE.year, BASE.month, weekday=0, nth=4)
+        event = self.add(
+            "recur-span",
+            "--start", f"{start.isoformat()} 10:00",
+            "--repeat", "monthly", "--on-the", "4th monday",
+        )
+        updated = run_json(
+            "edit", event["id"], "--series",
+            "--repeat", "monthly", "--on-the", "2nd tuesday",
+        )
+        self.assertEqual(updated["recurrence"]["frequency"], "monthly")
+        self.assertEqual(updated["recurrence"]["on_the"], "the 2nd Tuesday")
+
+        # The count is the tell: daily over two years is hundreds.
+        starts = self.occurrences("recur-span")
+        self.assertLess(
+            len(starts), 40,
+            f"{len(starts)} occurrences — the rule collapsed to daily",
+        )
+        # Every occurrence after the anchor follows the new pattern.
+        for moment in starts[1:]:
+            self.assertEqual(moment.weekday(), 1, f"{moment} is not a Tuesday")
+
+    def test_repeat_none_removes_the_series(self):
+        event = self.add(
+            "recur-remove",
+            "--start", f"{BASE:%Y-%m}-04 09:00",
+            "--repeat", "weekly",
+        )
+        self.assertTrue(event["recurring"])
+        updated = run_json("edit", event["id"], "--series", "--repeat", "none")
+        self.assertFalse(updated["recurring"])
+        self.assertIsNone(updated.get("recurrence"))
+
+    # -- validation, matching the reminders wording ------------------------ #
+
+    def test_recurrence_flag_validation(self):
+        base = ["add", self.title("recur-invalid"), "--calendar", self.calendar,
+                "--start", f"{BASE:%Y-%m}-04 09:00"]
+        cases = [
+            (["--repeat-interval", "2"], "require --repeat"),
+            (["--repeat-until", f"{BASE:%Y-%m}-28"], "require --repeat"),
+            (["--repeat", "weekly", "--repeat-until", f"{BASE:%Y-%m}-28",
+              "--repeat-count", "3"], "mutually exclusive"),
+            (["--repeat", "weekly", "--repeat-interval", "0"], "must be >= 1"),
+            (["--repeat", "weekly", "--repeat-count", "0"], "must be >= 1"),
+            (["--repeat", "weekly", "--on-the", "4th monday"], "needs --repeat monthly"),
+            (["--repeat", "monthly", "--on-the", "banana"], "is not a day of the month"),
+        ]
+        for extra, expected in cases:
+            with self.subTest(flags=" ".join(extra)):
+                code, _, err = run(*base, *extra, check=False)
+                self.assertNotEqual(code, 0, f"{extra} was accepted")
+                self.assertIn(expected, err)
+        self.assertEqual(
+            [e for e in find_test_events(self.calendar)
+             if e["title"].endswith("recur-invalid")],
+            [], "a rejected recurrence still created the event")

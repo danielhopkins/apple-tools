@@ -175,7 +175,7 @@ isn't guaranteed; JSON is.
 | 💬 `messages` | `chat.db` | Search and export iMessage/SMS/RCS history, list conversations, save attachments. Read-only. |
 | ☎️ `phone` | `CallHistory.storedata` + AddressBook | Recent calls with callers resolved to names, missed/unknown filters, talk-time stats, blocked list. Read-only apart from `dial`, which hands a `tel:` URL to Phone.app for you to confirm. |
 | ✅ `reminders` | EventKit | Full CRUD: add, edit, complete, delete, lists, priorities, recurrence, natural-language dates. |
-| 📅 `calendar` | EventKit, plus private `EKAttendee` for invitee writes | List and search events, create, edit, delete; recurring-event spans. Reads invitees with their RSVP status, and can invite or uninvite people — which sends real mail, so `invite --dry-run` first. See [`docs/apple-calendar-invitees.md`](docs/apple-calendar-invitees.md). |
+| 📅 `calendar` | EventKit, plus private `EKAttendee` for invitee writes | List and search events, create, edit, delete; full recurrence (`--repeat`, plus `--on-the "4th monday"`); recurring-event spans. Reads invitees with their RSVP status, and can invite or uninvite people — which sends real mail, so `invite --dry-run` first. See [`docs/apple-calendar-invitees.md`](docs/apple-calendar-invitees.md). |
 | 👤 `contacts` | Contacts framework, with a legacy `AddressBook` fallback | Search by name, company, email, or phone; create, edit, delete. Notes are read-only, and a contact that has one can only be written through the fallback. |
 
 The Notes reader decodes Apple's gzipped-protobuf note bodies directly rather
@@ -290,7 +290,7 @@ The live suites drive real data and are gated behind their own runners, each
 opting in to one more surface:
 
 ```
-./tests/run-tests              # calendar writes (34) + mail read guards (40)
+./tests/run-tests              # calendar writes (45) + mail read guards (40)
 ./tests/run-tests --contacts   # + contacts writes          (60)
 ./notes/run-tests              # live Notes.app
 ```

@@ -170,3 +170,25 @@ The suite in `tests/test_calendar_write.py::TestInvitees` covers parsing, every
 refusal, and `--dry-run` — and **saves nothing**, because a test that ran
 unattended would mail real people. The send path is verified by hand, which is
 what this document records.
+
+## Recurrence, added 26.812.1
+
+Two interactions worth knowing, both found while wiring `--repeat` up:
+
+- **Inviting someone to a recurring event invites them to the whole series.**
+  There is no per-occurrence invitation here — the invitee list lives on the
+  event, and for a series that means every occurrence. `add --repeat` with
+  `--invitee` says so on stderr rather than letting it be a surprise.
+- 🛑 **A recurrence-rule change must be saved with `EKSpan.futureEvents`.**
+  Saving a changed rule on the series master with `.thisEvent` silently rewrites
+  it to `FREQ=DAILY;INTERVAL=1`. No error, `save` reports success, and a meeting
+  that happened four times a year now happens 365 times — with an invitation
+  already sent to everyone on it. Measured both ways:
+
+  | span | resulting rule |
+  |---|---|
+  | `.thisEvent` | `FREQ=DAILY;INTERVAL=1` |
+  | `.futureEvents` | `FREQ=MONTHLY;INTERVAL=1;BYDAY=2TU` |
+
+  This is the most dangerous thing found in this whole surface, precisely
+  because it is silent and because invitations amplify it.

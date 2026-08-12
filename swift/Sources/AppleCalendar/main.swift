@@ -156,6 +156,8 @@ struct EventInfo: Encodable {
     /// Only set for recurring events: the value to pass back as --occurrence so
     /// show/edit/delete act on this instance rather than the series master.
     let occurrence: String?
+    /// How the series repeats. `recurring: true` never said *how*.
+    let recurrence: RecurrenceInfo?
     /// ⚠️ Objects, not bare names, since 26.812.0 — each carries `email`,
     /// `status`, `role`, `organizer` and `is_me`. Reading `.attendees[]` as a
     /// string used to work and no longer does; read `.attendees[].name`.
@@ -166,7 +168,7 @@ struct EventInfo: Encodable {
 
     enum CodingKeys: String, CodingKey {
         case id, title, calendar, start, end, allDay, location, notes, url
-        case recurring, occurrence, attendees, organizer
+        case recurring, occurrence, recurrence, attendees, organizer
         case myStatus = "my_status"
     }
 }
@@ -186,6 +188,7 @@ private func info(_ event: EKEvent) -> EventInfo {
         occurrence: event.hasRecurrenceRules
             ? event.startDate.map { iso8601.string(from: $0) }
             : nil,
+        recurrence: RecurrenceInfo(event.recurrenceRules?.first),
         attendees: Attendees.list(event),
         organizer: Attendees.organizer(event),
         myStatus: Attendees.myStatus(event)
@@ -341,6 +344,18 @@ private func event(withId id: String, occurrence: Date? = nil) throws -> EKEvent
 private func resolveForWrite(
     id: String, occurrence: DateArg?, series: Bool, verb: String
 ) throws -> EKEvent {
+    // 🛑 An identifier gains a "/RID=<seconds>" suffix once that occurrence has
+    // been *detached* (any single-occurrence edit does it), and it then resolves
+    // to the detached instance rather than the series master. A detached
+    // instance carries no recurrence rule of its own, so `--series --repeat`
+    // against one fails with "The repeat field cannot be changed" — while
+    // reporting the event's title, so it reads as the right event refusing.
+    // --series means the master, so ask for the master.
+    if series, let base = id.components(separatedBy: "/RID=").first, base != id,
+       let seriesMaster = try? event(withId: base) {
+        return seriesMaster
+    }
+
     let master = try event(withId: id)
 
     guard master.hasRecurrenceRules else { return master }
@@ -632,8 +647,14 @@ struct Add: ParsableCommand {
         help: "Invite someone: 'a@b.com' or 'Name <a@b.com>'. Repeatable. Sends a real invitation.")
     var invitee: [String] = []
 
+    @OptionGroup var recurrence: RecurrenceOptions
+
     @Flag(name: .long, help: "Output the created event as JSON")
     var json = false
+
+    func validate() throws {
+        try recurrence.validate()
+    }
 
     func run() throws {
         try requireCalendarAccess()
@@ -682,6 +703,22 @@ struct Add: ParsableCommand {
             event.url = URL(string: url)
         }
 
+        if let rule = recurrence.rule() {
+            event.recurrenceRules = [rule]
+            if let warning = recurrence.startDateWarning(start: start.date) {
+                FileHandle.standardError.write(Data((warning + "\n").utf8))
+            }
+            // 🛑 An invitation to a series invites the person to every
+            // occurrence, and the mail goes out on save like any other.
+            if !guests.isEmpty {
+                FileHandle.standardError.write(Data("""
+                    note: \(guests.count) invitee\(guests.count == 1 ? "" : "s") on a recurring \
+                    event — the invitation covers the whole series, not one occurrence.
+
+                    """.utf8))
+            }
+        }
+
         for guest in guests {
             guard let attendee = AttendeeAPI.make(name: guest.name, email: guest.email) else {
                 throw ValidationError(
@@ -690,12 +727,17 @@ struct Add: ParsableCommand {
             AttendeeAPI.add(attendee, to: event)
         }
 
+        // .thisEvent on a brand-new event creates the series; there is no
+        // earlier occurrence for a span to be relative to.
         try store.save(event, span: .thisEvent, commit: true)
 
         if json {
             printJSON(info(event))
         } else {
             print("Created '\(name)' — \(describe(event))")
+            if let pattern = RecurrenceInfo(event.recurrenceRules?.first) {
+                print("Repeats: \(pattern.describe)")
+            }
             // EventKit adds the organizer and a self-attendee of its own accord
             // on the first save of an event that has invitees, so report what
             // the event ended up with rather than what was asked for.
@@ -738,16 +780,36 @@ struct Edit: ParsableCommand {
     @Flag(name: .long, help: "Apply to this and all future occurrences of a recurring event")
     var future = false
 
+    @OptionGroup var recurrence: RecurrenceOptions
+
     @Flag(name: .long, help: "Output the updated event as JSON")
     var json = false
 
+    func validate() throws {
+        try recurrence.validate()
+    }
+
     func run() throws {
         try requireCalendarAccess()
+
+        // 🛑 A recurrence rule belongs to the series, never to one occurrence —
+        // there is no such thing as "this Tuesday repeats weekly". Applying it
+        // to a single instance would detach that instance and leave the series
+        // unchanged, which looks like success and does nothing.
+        if recurrence.wasSpecified && !series {
+            throw ValidationError("""
+                changing how an event repeats applies to the whole series, so it needs --series. \
+                (--occurrence targets one instance, which cannot carry a recurrence rule of its own.)
+                """)
+        }
+
         let match = try resolveForWrite(
             id: id, occurrence: occurrence, series: series, verb: "edit")
 
-        guard title != nil || start != nil || end != nil || location != nil || notes != nil else {
-            throw ValidationError("nothing to change; pass at least one of --title/--start/--end/--location/--notes")
+        guard title != nil || start != nil || end != nil || location != nil || notes != nil
+            || recurrence.wasSpecified else {
+            throw ValidationError(
+                "nothing to change; pass at least one of --title/--start/--end/--location/--notes/--repeat")
         }
 
         if let title { match.title = title }
@@ -756,16 +818,53 @@ struct Edit: ParsableCommand {
         if let location { match.location = location }
         if let notes { match.notes = notes }
 
+        if recurrence.wasSpecified {
+            if let rule = recurrence.rule() {
+                match.recurrenceRules = [rule]
+                let effectiveStart = start?.date ?? match.startDate
+                if let effectiveStart,
+                   let warning = recurrence.startDateWarning(start: effectiveStart) {
+                    FileHandle.standardError.write(Data((warning + "\n").utf8))
+                }
+            } else {
+                // --repeat none: collapse the series to a single event.
+                match.recurrenceRules = nil
+            }
+        }
+
         if let startDate = match.startDate, let endDate = match.endDate, endDate < startDate {
             throw ValidationError("end time must be at or after the start time")
         }
 
-        try store.save(match, span: future ? .futureEvents : .thisEvent, commit: true)
+        // 🛑 A recurrence-rule change MUST be saved with .futureEvents.
+        // Saving a changed rule on the series master with .thisEvent silently
+        // rewrites it to FREQ=DAILY;INTERVAL=1 — no error, and `save` reports
+        // success. Measured: a monthly BYDAY=4MO series became daily, turning
+        // 4 occurrences a year into 365. .futureEvents round-trips correctly.
+        // Since a rule change already requires --series, the master is the
+        // first occurrence and .futureEvents means exactly "the whole series".
+        let span: EKSpan = (future || recurrence.wasSpecified) ? .futureEvents : .thisEvent
+        try store.save(match, span: span, commit: true)
+
+        // Confirm the rule that landed, rather than the one that was asked for.
+        if recurrence.wasSpecified {
+            let persisted = freshStore().event(withIdentifier: match.eventIdentifier ?? id)
+            let saved = RecurrenceInfo(persisted?.recurrenceRules?.first)
+            if recurrence.isRecurring && saved == nil {
+                throw ValidationError(
+                    "the recurrence change reported success but no rule is on the event.")
+            }
+        }
 
         if json {
             printJSON(info(match))
         } else {
             print("Updated '\(match.title ?? "<untitled>")' — \(describe(match))")
+            if let pattern = RecurrenceInfo(match.recurrenceRules?.first) {
+                print("Repeats: \(pattern.describe)")
+            } else if recurrence.wasSpecified {
+                print("Repeats: no longer repeats")
+            }
         }
     }
 }

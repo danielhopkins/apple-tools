@@ -14,6 +14,7 @@ arbitrarily far into the future, so the fixture window is full of real events
 too (~600 on this machine).
 """
 
+import datetime
 import json
 import os
 import subprocess
@@ -109,14 +110,49 @@ def window():
     return [f"{TEST_YEAR}-01-01", f"{TEST_YEAR}-12-31"]
 
 
+def near_window():
+    """The near-future range recurrence fixtures have to live in.
+
+    🛑 **EventKit does not expand a recurring series 70-odd years out**, so a
+    TEST_YEAR fixture cannot be used to assert on occurrences. Measured on this
+    machine: an identical "every 2 weeks, 3 times" series reports **3**
+    occurrences starting in 2026 and **1** starting in 2099, on both a Google
+    and an iCloud calendar — the year is the only variable.
+
+    So any test that checks where occurrences actually land must use real
+    near-future dates, and those must be swept too or they leak into the user's
+    live calendar. This window is what makes that safe.
+    """
+    today = datetime.date.today()
+    return [today.isoformat(), (today + datetime.timedelta(days=800)).isoformat()]
+
+
+def near_future(month_offset=2, day=1):
+    """A date a couple of months out, for fixtures that need real expansion."""
+    today = datetime.date.today()
+    month = today.month + month_offset
+    year = today.year + (month - 1) // 12
+    return datetime.date(year, (month - 1) % 12 + 1, day)
+
+
 def find_test_events(calendar=None):
-    """Every fixture event this suite owns, in the fixture year."""
-    start, end = window()
-    args = ["events", "--from", start, "--to", end]
-    if calendar:
-        args += ["--calendar", calendar]
-    events = run_json(*args)
-    return [e for e in events if e["title"].startswith(TEST_PREFIX)]
+    """Every fixture event this suite owns.
+
+    Scans two ranges — the fixture year and the near-future window — because
+    recurrence fixtures cannot live in TEST_YEAR (see near_window). Missing the
+    second range would leave real events on a real calendar forever.
+    """
+    found = {}
+    for start, end in (window(), near_window()):
+        args = ["events", "--from", start, "--to", end]
+        if calendar:
+            args += ["--calendar", calendar]
+        for event in run_json(*args):
+            if event["title"].startswith(TEST_PREFIX):
+                # Collapse occurrences of one series to its master, so the
+                # sweep deletes the series rather than one instance at a time.
+                found.setdefault(event["id"].split("/RID=")[0], event)
+    return list(found.values())
 
 
 def sweep(calendar=None):
@@ -129,7 +165,11 @@ def sweep(calendar=None):
             )
         args = ["delete", event["id"]]
         if event.get("recurring"):
-            args.append("--series")
+            # --series alone targets the master, which for a recurring event is
+            # just its first occurrence; --future is what removes the series.
+            # Without it the sweep deletes one occurrence per pass and leaves
+            # the rest behind.
+            args += ["--series", "--future"]
         code, _, err = run(*args, check=False)
         if code != 0:
             print(f"warning: could not delete {event['title']!r}: {err}", file=sys.stderr)

@@ -35,6 +35,7 @@ installed via `make install`.
 | Add a reminder | `apple reminders add Soon "Buy milk" --due-date "tomorrow 9am"` |
 | This week's events | `apple calendar events --days 7 --json` |
 | Add an event | `apple calendar add "Dentist" --start "tomorrow 2pm" --duration 45` |
+| Recurring meeting | `apple calendar add "Board" --start … --repeat monthly --on-the "4th monday"` |
 | See who is invited | `apple calendar events --days 7 --json` → `attendees`, `organizer`, `my_status` |
 | Invite someone (sends mail) | `apple calendar invite <id> --add a@b.com --dry-run` |
 | Find a person | `apple contacts search "smith" --json` |
@@ -801,8 +802,46 @@ saw — EventKit resolves it to the first occurrence, often years earlier. So:
 - `--future` applies a change to this and all later occurrences; without it only
   the single occurrence changes.
 
-`apple calendar add` cannot create recurring events — use Reminders'
-`--repeat`, or create the series in Calendar.app.
+**Recurrence.** `add` and `edit` take the same four flags as `apple reminders`
+— `--repeat none|daily|weekly|monthly|yearly` (`-r`), `--repeat-interval N`,
+`--repeat-until DATE`, `--repeat-count N` — with identical validation and
+wording. `events --json` reports a `recurrence` object (`frequency`, `interval`,
+`until`, `count`, `on_the`) alongside `recurring`, which never said *how*.
+
+**`--on-the` is the one flag reminders has no equivalent for**, and it exists
+because `--repeat monthly` alone cannot say "the 4th Monday": a plain monthly
+rule repeats on *the start date's day number*, so a series starting Mon 28 Sep
+recurs on the 28th. The two coincide for exactly one month and then diverge
+silently.
+
+```
+apple calendar add "Board" --start "2026-09-28 10:00" \
+    --repeat monthly --on-the "4th monday"
+```
+
+Takes `4th monday`, `last friday`, a bare weekday (means the first), a day
+number like `15`, or `last`. Requires `--repeat monthly`; anything else is
+refused rather than silently dropped. ⚠️ A `--start` that does not match the
+pattern is a **warning, not an error** — the first occurrence sits on the start
+date and later ones follow the pattern.
+
+- 🛑 **A recurrence change must be saved with `EKSpan.futureEvents`.** Saving a
+  changed rule on the series master with `.thisEvent` silently rewrites it to
+  `FREQ=DAILY;INTERVAL=1` — no error, `save` reports success, and a
+  4-times-a-year series becomes 365. Measured both ways; pinned by a test.
+- **Changing how an event repeats requires `--series`**, because a rule belongs
+  to the series and a single occurrence cannot carry one. `--repeat none`
+  removes recurrence entirely.
+- 🛑 **An id gains a `/RID=<seconds>` suffix once that occurrence is detached**,
+  and then resolves to the detached instance, which has no rule of its own — so
+  `--series` strips it to reach the master. Without that, `--series --repeat`
+  fails with "The repeat field cannot be changed" *while naming the right
+  event*, so it reads as the event refusing rather than the id being wrong.
+- ⚠️ **EventKit does not expand a series far into the future.** An identical
+  "every 2 weeks, 3 times" series reports 3 occurrences starting in 2026 and
+  **1** starting in 2099, on both Google and iCloud calendars. Anything
+  asserting on occurrences must use near-future dates — which is why the test
+  suite sweeps a second, near-future window as well as its fixture year.
 
 **Invitees.** `events --json` reports `attendees` (objects, with `name`,
 `email`, `status`, `role`, `type`, `organizer`, `is_me`), a separate
@@ -1174,7 +1213,7 @@ The `tests/` suites drive the real binaries against real data, each behind its
 own flag:
 
 ```
-./tests/run-tests              # calendar writes (34) + mail wedge guards (40)
+./tests/run-tests              # calendar writes (45) + mail wedge guards (40)
 ./tests/run-tests --contacts   # + contacts writes (60)
 ```
 
