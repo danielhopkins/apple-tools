@@ -1,8 +1,8 @@
 class AppleTools < Formula
   desc "Local CLIs for Notes, Mail, Messages, Phone, Reminders, Calendar, Contacts"
   homepage "https://github.com/danielhopkins/apple-tools"
-  url "https://github.com/danielhopkins/apple-tools/releases/download/v26.812.7/apple-tools-26.812.7.tar.gz"
-  sha256 "831026a2cbbb2838381db32f9349ccff522e8bf0dd595d617a99b90c2d78b58a"
+  url "https://github.com/danielhopkins/apple-tools/releases/download/v26.812.8/apple-tools-26.812.8.tar.gz"
+  sha256 "662703bc7e0520de8d1608d997895570167545dcac133d94b71511e4d523d113"
   license "MIT"
 
   depends_on :macos
@@ -133,6 +133,12 @@ class AppleTools < Formula
     # exits 0 for any word it does not recognise, so "it ran" proves nothing.
     # Assert it appears in the subcommand list instead.
     assert_match "move", shell_output("#{bin}/apple-mail --help")
+
+    # Same for the contacts move, which relocates a record between accounts
+    # through private AddressBook API. If those symbols ever go missing the
+    # command refuses at runtime rather than disappearing, so this only checks
+    # it is registered at all.
+    assert_match "move", shell_output("#{bin}/apple-contacts --help")
 
     # The Notes write path is the signed shortcuts plus the commands that drive
     # them. `make dist` cannot know this formula's install list, so a shortcut
