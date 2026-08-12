@@ -21,6 +21,7 @@ installed via `make install`.
 | Start an email (user pastes) | `apple mail compose --to a@b.com --subject "…" --body "…"` |
 | File mail into a mailbox | `apple mail move <message-id>… --to Receipts --dry-run` |
 | Reply to an email | `apple mail reply <message-id> --body "…"` |
+| Draft with a file attached | `apple mail compose --to a@b.com --attach ~/r.pdf --body "…"` |
 | List mail accounts | `apple mail accounts --json` |
 | List conversations | `apple messages chats --json` |
 | Search messages | `apple messages search "dinner" --json` |
@@ -34,6 +35,8 @@ installed via `make install`.
 | Add a reminder | `apple reminders add Soon "Buy milk" --due-date "tomorrow 9am"` |
 | This week's events | `apple calendar events --days 7 --json` |
 | Add an event | `apple calendar add "Dentist" --start "tomorrow 2pm" --duration 45` |
+| See who is invited | `apple calendar events --days 7 --json` → `attendees`, `organizer`, `my_status` |
+| Invite someone (sends mail) | `apple calendar invite <id> --add a@b.com --dry-run` |
 | Find a person | `apple contacts search "smith" --json` |
 | Update a contact | `apple contacts edit <id> --company "New Co"` |
 | Export contacts | `apple contacts export --group "Family" -o family.vcf` |
@@ -213,9 +216,9 @@ apple mail attachments MESSAGE-ID [--save DIR] [--skip-inline] [--account NAME] 
 
 apple mail compose --to ADDR [--cc ADDR] [--bcc ADDR] [--subject TEXT]
                    [--from ACCOUNT-ADDRESS] [--body TEXT | --body-file FILE|-]
-                   [--markdown | --html] [--json]
+                   [--markdown | --html] [--attach FILE]... [--json]
 apple mail reply MESSAGE-ID [--all] [--body TEXT | --body-file FILE|-]
-                 [--markdown | --html] [--account NAME] [--json]
+                 [--markdown | --html] [--attach FILE]... [--account NAME] [--json]
 apple mail forward MESSAGE-ID --to ADDR [<same flags as reply>]
 
 apple mail move MESSAGE-ID... --to MAILBOX [--from MAILBOX] [--account NAME]
@@ -235,6 +238,41 @@ sent or saved.
 `In-Reply-To`/`References`, the quoted original, and **attachments carried over by
 a forward** — the last of which is why forwarding is left to Mail rather than
 rebuilt. Verified: a forwarded message came out 184 KB with its attachment intact.
+
+**`--attach FILE` is the one part of a draft the tool writes itself.** Repeatable,
+on all three commands. The files are **already in the window** when it opens —
+only the body is left to ⌘V — so the JSON reports them under `attachments`
+(`name`, `path`, `bytes`) while `status` stays `awaiting_paste`.
+
+It is allowed where the body is not because the cite-blockquote wrapper comes
+from *assigning* to `content`; `make new attachment` adds an element without
+assigning. 🛑 **Do not seed `content` with a newline first** — that is the usual
+recipe and it is exactly the wrapper. Attaching to an empty body works directly.
+
+- 🛑 **`count of mail attachments` cannot verify this.** On an outgoing message
+  it fails with **-1728** ("Can't get every mail attachment of outgoing message
+  id N") rather than returning 0 — same blindness `apple notes` has to PDFs.
+  What works is counting **U+FFFC** in `content`, one per attachment, and
+  asserting the **delta** across the attach — a forward already carries the
+  original's attachments, and they are U+FFFC too.
+- ⚠️ **A mismatch is a hard error naming the shortfall**, because a window is
+  already open in front of the user: "Mail took 1 of 2 attachments … add the
+  missing files by hand before sending."
+- **Every path is checked before any Apple Event** — missing file, directory,
+  unreadable, or the same file twice all exit 64 with nothing opened. They are
+  also checked *before the body reaches the pasteboard*, so a bad `--attach`
+  cannot silently replace what the user had copied.
+- Attachments totalling over 20 MB get a stderr note, not a refusal; the limit
+  belongs to the receiving server.
+
+**Verified by hand in a matched pair (26.812.0):** two windows, same body, one
+with `--attach` and one without, both pasted and saved. Identical output —
+`<b>`/`<i>` intact in both, **no cite-blockquote around the body in either**. So
+attaching first does not degrade the pasted formatting. ⚠️ Mail does wrap the
+*attachment placeholder* in a cite blockquote, but a style-neutralised one
+containing only the Apple-proprietary `<object>`, with the body entirely outside
+it — that is Mail's layout structure, not FB11734014. How a recipient renders it
+is untested, since nothing here sends.
 
 **Bodies may be `--markdown` or `--html`; both become RTF on the pasteboard.**
 Markdown gives real bold, italic, links and bullets. 🛑 RTF is deliberate: **HTML
@@ -383,8 +421,14 @@ back to embedded bytes only for messages that really carry them.
 
 **What counts as an attachment is Mail's rule: a part with a filename.**
 Verified against its index — a message with two nameless tracking pixels
-reports zero attachments, one with seven named inline images reports seven. So
-`attachments` and `export --json` always agree.
+reports zero attachments, one with seven named inline images reports seven.
+
+🛑 **`attachments` and `export --json` do *not* always agree, and a draft built
+by `--attach` is where they part.** Mail references a scripted attachment from
+the HTML by `cid:`, so it reads back as *inline*: `apple mail attachments`
+reports `1 … (inline)` while `export --json` gives `[]` and the index says `0`,
+for a draft that really does carry the file. **Use `apple mail attachments` when
+the question is "did the file make it".**
 
 `--save` never overwrites: a name that already exists gets `-2` before the
 extension. Filenames come from the sender, so they are sanitised to a bare
@@ -721,9 +765,11 @@ apple calendar events [--from DATE] [--to DATE | --days N] [--calendar NAME]
 apple calendar show ID [--occurrence DATE] [--json]
 apple calendar add "TITLE" --start DATE [--end DATE | --duration MINUTES]
                           [--calendar NAME] [--all-day] [--location TEXT]
-                          [--notes TEXT] [--url URL] [--json]
+                          [--notes TEXT] [--url URL] [--invitee ADDR]... [--json]
 apple calendar edit ID [--title T] [--start DATE] [--end DATE] [--location L]
                        [--notes N] [--occurrence DATE | --series] [--future] [--json]
+apple calendar invite ID [--add ADDR]... [--remove ADDR]...
+                       [--occurrence DATE | --series] [--future] [--dry-run] [--json]
 apple calendar delete ID [--occurrence DATE | --series] [--future]
 apple calendar status [--json]                # report permission state, never prompts
 ```
@@ -757,6 +803,46 @@ saw — EventKit resolves it to the first occurrence, often years earlier. So:
 
 `apple calendar add` cannot create recurring events — use Reminders'
 `--repeat`, or create the series in Calendar.app.
+
+**Invitees.** `events --json` reports `attendees` (objects, with `name`,
+`email`, `status`, `role`, `type`, `organizer`, `is_me`), a separate
+`organizer`, and `my_status` — the user's own response, which is what "have I
+accepted this?" actually asks. ⚠️ **`attendees` used to be an array of bare
+name strings and is now an array of objects**; read `.attendees[].name`.
+⚠️ **The organizer is usually *not* in the attendee list**, so listing attendees
+alone silently omits whoever called the meeting.
+
+🛑 **Writing invitees sends real mail, and there is no undo.** `add --invitee`
+and `invite --add` make the CalDAV server email an invitation; `invite --remove`
+emails a cancellation. Measured: a Google invitation landed in the invitee's
+inbox 40s after the save. **Run `invite --dry-run` first** — it resolves and
+prints the plan without contacting the server at all.
+
+🛑 **There is no public API for this.** `EKCalendarItem.attendees` is get-only,
+`EKParticipant` has no public initializer, and Calendar.app's `attendee` class
+is read-only in the sdef — so writes go through private
+`EKAttendee.attendeeWithName:emailAddress:` + `addAttendee:`/`removeAttendee:`,
+resolved at runtime. If a future macOS drops them the command refuses cleanly
+and reading still works. Full record in
+[`docs/apple-calendar-invitees.md`](docs/apple-calendar-invitees.md).
+
+- 🛑 **Only the organizer can change who is invited.** On someone else's event a
+  local change *appears to succeed* and is then reverted by the server, so
+  `invite` refuses up front rather than lying. Reply to the invitation in
+  Calendar.app instead.
+- 🛑 **EventKit adds the organizer and a self-attendee itself on save.** Don't
+  call `addOrganizerAndSelfAttendeeForNewInvitation`; report what the event
+  ended up with, not what was asked for.
+- 🛑 **Match invitees on the email address, never the name or role** — the
+  server rewrites both. `Dan Hopkins`/role `unknown` came back as
+  `dan@boulderhopkins.com`/role `required` after one round trip.
+- ⚠️ **Removing the last invitee empties the list entirely**, because the
+  auto-added self-attendee goes with it. That is correct, not a failure.
+- Every change is **confirmed against a fresh store** by address; `confirmed:
+  false` with a non-zero exit means the save reported success the store could
+  not corroborate.
+- Addresses take `a@b.com` or `Name <a@b.com>`. Matching is case-insensitive,
+  and re-adding someone already invited is a reported no-op, not an error.
 
 ### contacts — `apple contacts`
 
@@ -1017,7 +1103,7 @@ swift/                    one Swift package, six binaries
                           mailbox-name resolution for move)
   Sources/AppleMessages/  + MessagesLibrary/ (chat.db reader, typedstream decoder)
   Sources/ApplePhone/     + PhoneLibrary/ (CallHistory reader, AddressBook resolver)
-  Sources/AppleCalendar/
+  Sources/AppleCalendar/    + Attendees.swift (the private invitee write path)
   Sources/AppleContacts/  + Notes.swift (SQLite note reader)
   Tests/RemindersTests/ MailTests/ MessagesTests/
 notes/                    Python; apple-notes, notestore.py, notestore.proto,
@@ -1028,7 +1114,10 @@ docs/apple-notes-shortcuts.md  driving Notes' AppIntents from the CLI —
 notes/shortcuts/          .shortcut build scripts + signed files to install
 docs/apple-mail-store.md  Envelope Index schema, .emlx layout, verified traps
 docs/apple-mail-drafts.md why apple-mail never writes a body: the cite-blockquote
-                          wrapper, every route ruled out, the pasteboard handoff
+                          wrapper, every route ruled out, the pasteboard handoff,
+                          and why --attach is the one exception
+docs/apple-calendar-invitees.md  reading invitees is public API, writing them is
+                          not; what the server rewrites, and what it mails
 util/check-mail-intents   is Mail's ComposeMessageIntent reachable yet? (exit 0
                           if something changed)
 util/appintents-dump      dev-only reader for an app's App Intents schema
@@ -1085,7 +1174,7 @@ The `tests/` suites drive the real binaries against real data, each behind its
 own flag:
 
 ```
-./tests/run-tests              # calendar writes (25) + mail wedge guards (22)
+./tests/run-tests              # calendar writes (34) + mail wedge guards (40)
 ./tests/run-tests --contacts   # + contacts writes (60)
 ```
 

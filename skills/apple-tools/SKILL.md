@@ -18,11 +18,11 @@ these tools is that the edge cases are already handled.
 | Tool | Reads | Writes |
 |------|-------|--------|
 | `apple notes` | titles, folders, note bodies as Markdown | **yes**, once shortcuts are installed |
-| `apple mail` | accounts, message search, message bodies, attachments | **opens a compose window** (you paste the body); **`move` refiles messages** |
+| `apple mail` | accounts, message search, message bodies, attachments | **opens a compose window** (you paste the body; `--attach` files are already in it); **`move` refiles messages** |
 | `apple messages` | conversations, message search, attachments | no |
 | `apple phone` | call history with names, blocked list, stats | **`dial` only** (you confirm in Phone.app) |
 | `apple reminders` | lists, items, due dates | **yes** |
-| `apple calendar` | calendars, events | **yes** |
+| `apple calendar` | calendars, events, **invitees with RSVP status** | **yes** — and `invite` **emails real people** |
 | `apple contacts` | names, emails, phones, addresses, notes | **yes** (except notes) |
 
 ## Rules
@@ -36,6 +36,12 @@ these tools is that the edge cases are already handled.
    devices. If the user did not clearly ask for the write, describe what you are
    about to do and wait. Contact deletion in particular has no undo; `mail move`
    has `--dry-run`, so show that first.
+   🛑 **`calendar invite` and `calendar add --invitee` are a category worse:
+   they make the server email a real invitation to a real person, and removing
+   an invitee emails a cancellation. Neither is undoable and neither is
+   visible to the user until it has already been sent. Always show
+   `invite --dry-run` output and get an explicit yes first — and note only the
+   organizer can change invitees, so it refuses on someone else's event.**
 3. **Never guess an identifier.** Run the corresponding `show`/`search`/`events`
    command first and use what it returns.
 4. **Report empty results as empty.** "No events today" is a real answer. Do not
@@ -68,6 +74,7 @@ apple mail export <message-id>
 apple mail attachments <message-id>                      # list what it carries
 apple mail attachments <message-id> --save ~/Downloads   # get the files
 apple mail compose --to a@b.com --subject "Q3" --body "…"  # opens window; user pastes
+apple mail compose --to a@b.com --body "…" --attach ~/q3.pdf  # files go in for you
 apple mail reply <message-id> --body "…"                 # Mail builds the threading
 
 # Messages — reads chat.db; works with Messages.app closed. Read-only.
@@ -94,8 +101,10 @@ apple reminders add Inbox "Buy milk" --due-date "tomorrow 9am"
 
 # Calendar
 apple calendar calendars --writable --json
-apple calendar events --days 7 --json
+apple calendar events --days 7 --json          # attendees, organizer, my_status
 apple calendar add "Dentist" --start "tomorrow 2pm" --duration 45
+apple calendar invite <id> --add a@b.com --dry-run   # ALWAYS dry-run first
+apple calendar invite <id> --add "Dana White <d@x.com>"   # sends real mail
 
 # Contacts — JSON by default; add/edit/delete are real writes
 apple contacts search "smith"

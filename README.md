@@ -1,9 +1,15 @@
 # apple-tools
 
-Command-line access to local Apple app data — **Notes, Mail, Reminders,
-Calendar, Contacts** — built so an agent (or a shell) can work with real data
-without an intermediary service. Everything is local: no network calls, no API
-keys, no sync layer.
+[![macOS](https://img.shields.io/badge/macOS-13%2B-000000?logo=apple&logoColor=white)](https://www.apple.com/macos/)
+[![Homebrew](https://img.shields.io/badge/install-brew-FBB040?logo=homebrew&logoColor=white)](#install)
+[![Swift](https://img.shields.io/badge/Swift-5.9-F05138?logo=swift&logoColor=white)](https://swift.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Local only](https://img.shields.io/badge/network%20calls-none-2ea44f)](#)
+
+Command-line access to local Apple app data — **Notes, Mail, Messages, Phone,
+Reminders, Calendar, Contacts** — built so an agent (or a shell) can work with
+real data without an intermediary service. Everything is local: no network
+calls, no API keys, no sync layer.
 
 ```
 $ apple calendar events --days 3
@@ -42,15 +48,24 @@ permission prompt — an agent can't click through those dialogs:
 reminders show-lists      # → Reminders access
 apple-calendar calendars  # → Calendar access
 apple-contacts list       # → Contacts access
-apple-mail accounts       # → Automation access for Mail
-apple-notes search        # → needs Full Disk Access for your terminal
+apple-mail accounts       # → Full Disk Access; Automation → Mail to write
+apple-messages chats      # → Full Disk Access for your terminal
+apple-phone recents       # → Full Disk Access for your terminal
+apple-notes search        # → Full Disk Access for your terminal
 ```
 
-The grants belong to **the tools themselves**, not to your terminal, so they
-work the same from Terminal, iTerm, Ghostty, VS Code, or a multiplexer. That
-takes a deliberate trick — see [Permissions](#permissions) — and it is why
-`reminders`, `apple-calendar` and `apple-contacts` appear by name in System
-Settings.
+`apple status` reports all seven at once without prompting, so start there
+rather than running each tool to see which one errors.
+
+The first three grants belong to **the tools themselves**, not to your terminal,
+so `reminders`, `apple-calendar` and `apple-contacts` work the same from
+Terminal, iTerm, Ghostty, VS Code, or a multiplexer, and appear by name in
+System Settings. That takes a deliberate trick — see
+[Permissions](#permissions).
+
+`mail`, `messages`, `phone` and `notes` are different: Full Disk Access and
+Automation are attributed to **whatever terminal launched the tool**, so those
+four really do depend on where you run them.
 
 macOS only shows a prompt the first time; after that the request returns
 silently. Calendar has a third state worth knowing about — "Add Only"
@@ -97,7 +112,7 @@ They are symlinks, so edits in the repo take effect in the next Claude session.
 make install-completions
 ```
 
-Installs zsh completions for `apple` and all five tools. The dispatcher delegates
+Installs zsh completions for `apple` and all seven tools. The dispatcher delegates
 after the tool name, so `apple calendar events --<TAB>` offers exactly what
 `apple-calendar events --<TAB>` does. `reminders show <TAB>` completes list
 names and `apple calendar --calendar <TAB>` completes calendar names, both live
@@ -132,13 +147,14 @@ out which grant is missing:
 
 ```
 $ apple status
-TOOL       PERMISSION             OK
-notes      Full Disk Access       ✓
-mail       Automation → Mail      ✓
-messages   Full Disk Access       ✓
-reminders  Reminders              ✓
-calendar   Calendars              ✓
-contacts   Contacts               ✓
+TOOL       PERMISSION                     OK
+notes      Full Disk Access               ✓
+mail       Full Disk Access + Automation  ✓
+messages   Full Disk Access               ✓
+phone      Full Disk Access               ✓
+reminders  Reminders                      ✓
+calendar   Calendars                      ✓
+contacts   Contacts                       ✓
 
 All tools have the access they need.
 ```
@@ -154,13 +170,13 @@ isn't guaranteed; JSON is.
 
 | Tool | Backed by | Capability |
 |------|-----------|------------|
-| `notes` | `NoteStore.sqlite` + protobuf | Search titles, list folders, export notes as Markdown, deep links. Read-only. |
-| `mail` | `Envelope Index` + `.emlx` (reads), AppleScript + pasteboard (compose) | Search by subject, sender, or full body text with date and flag filters; export a message; save its attachments. `compose`/`reply`/`forward` open a Mail window with everything but the body and put that on the clipboard — **the tool never writes a body**, see [`docs/apple-mail-drafts.md`](docs/apple-mail-drafts.md). |
-| `messages` | `chat.db` | Search and export iMessage/SMS/RCS history, list conversations, save attachments. Read-only. |
-| `phone` | `CallHistory.storedata` + AddressBook | Recent calls with callers resolved to names, missed/unknown filters, talk-time stats, blocked list. Read-only apart from `dial`, which hands a `tel:` URL to Phone.app for you to confirm. |
-| `reminders` | EventKit | Full CRUD: add, edit, complete, delete, lists, priorities, recurrence, natural-language dates. |
-| `calendar` | EventKit | List and search events, create, edit, delete; recurring-event spans. |
-| `contacts` | Contacts framework, with a legacy `AddressBook` fallback | Search by name, company, email, or phone; create, edit, delete. Notes are read-only, and a contact that has one can only be written through the fallback. |
+| 📝 `notes` | `NoteStore.sqlite` + protobuf (reads), Shortcuts (writes) | Search titles, list folders, export notes as Markdown, deep links. `create` and `append` write through Shortcuts, which turns Markdown into native structure and preserves attachments and checklist state — see [`docs/apple-notes-shortcuts.md`](docs/apple-notes-shortcuts.md). |
+| ✉️ `mail` | `Envelope Index` + `.emlx` (reads), AppleScript + pasteboard (compose) | Search by subject, sender, or full body text with date and flag filters; export a message; save its attachments. `compose`/`reply`/`forward` open a Mail window with everything but the body — including any `--attach` files — and put the body on the clipboard. **The tool never writes a body**, see [`docs/apple-mail-drafts.md`](docs/apple-mail-drafts.md). |
+| 💬 `messages` | `chat.db` | Search and export iMessage/SMS/RCS history, list conversations, save attachments. Read-only. |
+| ☎️ `phone` | `CallHistory.storedata` + AddressBook | Recent calls with callers resolved to names, missed/unknown filters, talk-time stats, blocked list. Read-only apart from `dial`, which hands a `tel:` URL to Phone.app for you to confirm. |
+| ✅ `reminders` | EventKit | Full CRUD: add, edit, complete, delete, lists, priorities, recurrence, natural-language dates. |
+| 📅 `calendar` | EventKit, plus private `EKAttendee` for invitee writes | List and search events, create, edit, delete; recurring-event spans. Reads invitees with their RSVP status, and can invite or uninvite people — which sends real mail, so `invite --dry-run` first. See [`docs/apple-calendar-invitees.md`](docs/apple-calendar-invitees.md). |
+| 👤 `contacts` | Contacts framework, with a legacy `AddressBook` fallback | Search by name, company, email, or phone; create, edit, delete. Notes are read-only, and a contact that has one can only be written through the fallback. |
 
 The Notes reader decodes Apple's gzipped-protobuf note bodies directly rather
 than going through AppleScript, so it preserves highlights, headings, lists, and
@@ -241,7 +257,7 @@ notes/           Python: apple-notes, notestore.py decoder, live Notes.app tests
 skills/          Claude skills (apple-tools, daily-brief, meeting-prep, inbox-triage)
 completions/     zsh completions
 tests/           live suites: calendar and contacts writes (gated), mail read guards
-docs/            Notes API and Mail store references, behavior notes, prior art
+docs/            Notes API, Mail store and Calendar invitee references, prior art
 Formula/         Homebrew formula, mirrored into the tap on release
 VERSION          single source of truth, stamped into every tool
 CLAUDE.md        the same surface, written for an agent
@@ -274,7 +290,7 @@ The live suites drive real data and are gated behind their own runners, each
 opting in to one more surface:
 
 ```
-./tests/run-tests              # calendar writes (25) + mail read guards (22)
+./tests/run-tests              # calendar writes (34) + mail read guards (40)
 ./tests/run-tests --contacts   # + contacts writes          (60)
 ./notes/run-tests              # live Notes.app
 ```
