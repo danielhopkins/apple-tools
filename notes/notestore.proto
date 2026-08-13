@@ -66,8 +66,16 @@ message Dictionary {
 }
 
 // ObjectIDs are used to identify objects within the protobuf
+//
+// 🛑 double_value (3) is absent from the published schemas this file came from,
+// because tables never use it. It is where every call-recording timestamp
+// lives, so omitting it yields a transcript whose segments cannot be ordered.
+//
+// ⚠️ object_index is 0-BASED, as are the key/type/uuid tables it indexes into.
+// A 1-based reading makes the root ICTTAudioRecording reference itself.
 message ObjectID {
   required uint64 unsigned_integer_value = 2;
+  required double double_value = 3;
   required string string_value = 4;
   required int32 object_index = 6;
 }
@@ -179,3 +187,33 @@ message OrderedSetOrderingArrayAttachment {
   required int32 index = 1;
   required bytes uuid = 2;
 }
+
+//
+// Audio recordings — call recordings and imported/recorded audio.
+//
+// These reuse the mergeable-data machinery above rather than adding new
+// messages: each object is a MergeableDataObjectEntry.custom_map whose `type`
+// indexes the type table, and whose map entries index the key table. So there
+// is nothing here to generate bindings for — the shapes below are what
+// mergeable.py reconstructs, recorded for reference.
+//
+//   com.apple.notes.ICTTAudioRecording
+//     topLineSummary            the line Notes.app shows as "Preview"
+//     summary                   longer summary; frequently absent
+//     callLocalSpeakerHandle    your number      (call recordings only)
+//     callRemoteSpeakerHandle   the other party  (call recordings only)
+//     callRecordingStartTime    🛑 UNIX epoch, not Apple epoch
+//     fragments                 -> ICTTAudioRecording.Fragment
+//
+//   com.apple.notes.ICTTAudioRecording.Fragment
+//     transcript                -> a CRDT text object whose Note body is one
+//                                  U+FFFC per segment and holds no words
+//
+//   com.apple.notes.ICTTTranscriptSegment    ⚠️ ONE PER WORD
+//     speaker                   handle, or absent for non-call audio
+//     text                      the word
+//     timestamp                 seconds from the start of the recording
+//     duration                  seconds
+//
+// ⚠️ Segments are stored in CRDT insertion order, which is not reading order.
+// Sort on timestamp.

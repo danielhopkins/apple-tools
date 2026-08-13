@@ -250,7 +250,10 @@ struct ApplePhone: ParsableCommand {
       The store is a mirror of the iPhone's recent calls, not its whole history.
       """,
     version: appleToolsVersion,
-    subcommands: [Recents.self, Search.self, Blocked.self, Stats.self, Dial.self, Status.self],
+    subcommands: [
+      Recents.self, Search.self, Blocked.self, Stats.self, Recordings.self, Dial.self,
+      Status.self,
+    ],
     defaultSubcommand: Recents.self
   )
 }
@@ -401,6 +404,57 @@ struct Blocked: ParsableCommand {
       footer += ", last changed \(Output.compactDate.string(from: date))"
     }
     print(Style.dim(footer))
+  }
+}
+
+/// A signpost, not a feature. Call recordings are genuinely not in this store,
+/// and the question "where are my call recordings?" naturally lands here — so
+/// this answers it rather than leaving the reader to conclude the tool is
+/// missing something. It deliberately does NOT shell out to `apple-notes`:
+/// proxying would couple this binary to the Python tool at runtime, and would
+/// invite reporting a call and a recording as one object when they do not join.
+struct Recordings: ParsableCommand {
+  static let configuration = CommandConfiguration(
+    commandName: "recordings",
+    abstract: "Where call recordings live (they are not in call history)",
+    discussion: """
+      An iPhone call recording syncs to the Mac as a NOTE, not as call history.
+      Its audio, transcript and Apple's summary are all held in that note's
+      attachment, so nothing in the call history store references one and no
+      command here can list them.
+
+      They also do not correspond one-to-one with calls. Recording is started by
+      hand, partway through, so a recording is shorter than its call and starts
+      later — neither the timestamp nor the duration matches. Dialling the same
+      number repeatedly makes even an interval match ambiguous.
+      """,
+    // `transcripts` is what people reach for when the transcript is the thing
+    // they want; the command name matches `apple notes recordings`.
+    aliases: ["transcripts"]
+  )
+
+  @Flag(name: .long, help: "Output as JSON")
+  var json = false
+
+  func run() throws {
+    if json {
+      try Output.json([
+        "in_call_history": false,
+        "tool": "apple notes",
+        "command": "apple notes recordings --calls-only",
+        "note": "Call recordings are stored as Notes attachments, not in call "
+          + "history, and do not join 1:1 to calls.",
+      ])
+      return
+    }
+    print("Call recordings are stored in Notes, not call history.")
+    print("")
+    print("  \(Style.title("apple notes recordings --calls-only"))")
+    print("  \(Style.title("apple notes transcript <note-id>"))")
+    print("  \(Style.title("apple notes summary <note-id>"))")
+    print("")
+    print(Style.dim("They do not correspond 1:1 to calls: recording starts by"))
+    print(Style.dim("hand, mid-call, so it is shorter and later than the call."))
   }
 }
 

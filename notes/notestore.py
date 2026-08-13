@@ -105,6 +105,14 @@ class Message:
             return default
         return struct.unpack("<f", value)[0]
 
+    def float64(self, number, default=None):
+        """FIXED64 read as a double. ObjectID.double_value uses this, and it is
+        where every call-recording timestamp lives — see mergeable.py."""
+        value = self._first(number)
+        if value is None or len(value) != 8:
+            return default
+        return struct.unpack("<d", value)[0]
+
     def message(self, number):
         """Sub-message, or None when the field is absent."""
         value = self._first(number)

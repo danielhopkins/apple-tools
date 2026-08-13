@@ -11,10 +11,14 @@ Usage:
     apple-notes folders [FOLDER NAME]  # List notes in a folder
     apple-notes export [ID]            # Export note to markdown
     apple-notes get-url [ID]           # Get applenotes:// URL for a note
+    apple-notes recordings             # List call recordings and voice memos
+    apple-notes transcript [ID]        # Transcript of an audio recording
+    apple-notes summary [ID]           # Apple's summary of a recording
     apple-notes --help
 """
 
 import sqlite3
+import datetime
 import gzip
 import json
 import os
@@ -35,6 +39,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 from notestore import Color, parse_note_store
+from mergeable import all_recordings, recordings_for_note
 
 
 class Style:
@@ -971,6 +976,255 @@ def cmd_get_url(args):
         print(url)
 
 
+# --------------------------------------------------------------------------- #
+# Call recordings and voice memos.
+#
+# The audio, its transcript and Apple's summary are NOT in the note body — the
+# body holds only an attachment placeholder, so `export` shows nothing useful.
+# They live in the attachment's ZMERGEABLEDATA1 blob. See mergeable.py.
+# --------------------------------------------------------------------------- #
+
+
+def _clock(seconds):
+    """m:ss, or h:mm:ss past an hour."""
+    seconds = int(seconds)
+    if seconds >= 3600:
+        return "%d:%02d:%02d" % (seconds // 3600, (seconds % 3600) // 60, seconds % 60)
+    return "%d:%02d" % (seconds // 60, seconds % 60)
+
+
+def _load_recording(identifier):
+    """Resolve a note and return (pk, title, recording).
+
+    Exits with a message rather than a traceback for the three ways this goes
+    wrong: no such note, a note with no recording on it, and a recording whose
+    transcript has not been generated.
+    """
+    result = find_note(identifier)
+    if not result:
+        print("Note not found: %s" % identifier, file=sys.stderr)
+        sys.exit(1)
+
+    pk, title, _, _, locked = result
+    if locked:
+        print("Note %d is password-protected; its attachments cannot be read."
+              % pk, file=sys.stderr)
+        sys.exit(2)
+
+    recordings = recordings_for_note(get_db_path(), pk)
+    if not recordings:
+        print("Note %d (%s) has no audio recording attached.\n"
+              "Call recordings and voice memos live on the note as an "
+              "attachment; this note has none." % (pk, title), file=sys.stderr)
+        sys.exit(1)
+
+    if len(recordings) > 1:
+        print("note: this note carries %d recordings; using the first"
+              % len(recordings), file=sys.stderr)
+    return pk, title, recordings[0]
+
+
+def _matches(recording, term, include_transcript=False):
+    """Substring match, AND of terms — the same semantics as `mail search`."""
+    if not term:
+        return True
+    parts = [recording.note_id, recording.note_title, recording.title,
+             recording.local_handle, recording.remote_handle,
+             recording.top_line_summary, recording.summary]
+    if include_transcript:
+        parts.extend(s.text for s in recording.segments)
+    haystack = " ".join(str(v) for v in parts if v).lower()
+    return all(word in haystack for word in term.lower().split())
+
+
+def cmd_recordings(args):
+    """List every audio recording in the store."""
+    # Segments are only decoded when the search needs them: it is the bulk of
+    # the work and scales with recording length, so a plain listing skips it.
+    want_transcripts = bool(args.transcripts and args.search)
+    found = all_recordings(get_db_path(), with_segments=want_transcripts)
+
+    if args.calls_only:
+        found = [r for r in found if r.is_call]
+    found = [r for r in found if _matches(r, args.search, want_transcripts)]
+    if args.limit:
+        found = found[:args.limit]
+
+    if args.json:
+        payload = []
+        for r in found:
+            entry = {
+                "note_id": r.note_id,
+                "note_title": r.note_title,
+                "attachment_id": r.attachment_id,
+                "title": r.title,
+                "is_call": r.is_call,
+                "duration": r.audio_duration,
+                "file_size": r.file_size,
+                "local_handle": r.local_handle,
+                "remote_handle": r.remote_handle,
+                "call_type": r.call_type,
+                "top_line_summary": r.top_line_summary,
+                "summary": r.summary,
+            }
+            if r.start_time:
+                entry["start_time"] = datetime.datetime.fromtimestamp(
+                    r.start_time).isoformat()
+            payload.append(entry)
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+
+    if not found:
+        print("No recordings found." if args.search or args.calls_only
+              else "No audio recordings in this Notes store.")
+        return
+
+    header = "%5s  %-16s %7s  %-14s %-14s %s" % (
+        "ID", "WHEN", "LENGTH", "YOU", "OTHER PARTY", "SUMMARY")
+    print(Style.dim(header))
+    print(Style.dim("-" * 118))
+    for r in found:
+        when = ""
+        if r.start_time:
+            when = datetime.datetime.fromtimestamp(r.start_time).strftime(
+                "%Y-%m-%d %H:%M")
+        elif r.created:
+            when = datetime.datetime.fromtimestamp(r.created).strftime(
+                "%Y-%m-%d %H:%M")
+        length = _clock(r.audio_duration) if r.audio_duration else "-"
+        # A non-call recording has no handles at all; leave the columns empty
+        # rather than printing a placeholder that reads like a failed lookup.
+        summary = r.top_line_summary or r.summary or r.note_title or ""
+        print("%s  %-16s %7s  %-14s %-14s %s" % (
+            Style.identifier("%5d" % r.note_id),
+            when, length,
+            r.local_handle or "", r.remote_handle or "",
+            Style.title(summary[:48])))
+
+    # ⚠️ LENGTH is how long the RECORDING ran, which is not how long the call
+    # lasted: recording can be started at any point, and stops when it is
+    # stopped. Said once here so a short length is not read as a short call.
+    # stdout is flushed first — otherwise this unbuffered stderr line lands
+    # above the buffered table when either is redirected.
+    sys.stdout.flush()
+    print(Style.dim("\nLENGTH is the recorded audio, not the full call — "
+                    "recording can start mid-call."), file=sys.stderr)
+
+
+def cmd_transcript(args):
+    """Print a recording's transcript."""
+    pk, title, rec = _load_recording(args.identifier)
+
+    if not rec.segments:
+        # A recording with no segments is the normal state when Apple
+        # Intelligence never transcribed it — not a decode failure.
+        print("Recording on note %d has no transcript.\n"
+              "Transcription is generated on-device by Apple Intelligence; a "
+              "device without it, or an unsupported language, records audio "
+              "only." % pk, file=sys.stderr)
+        sys.exit(1)
+
+    turns = rec.turns()
+
+    if args.json:
+        payload = {
+            "note_id": pk,
+            "note_title": title,
+            "attachment_id": rec.attachment_id,
+            "duration": rec.audio_duration,
+            "is_call": rec.is_call,
+            "local_handle": rec.local_handle,
+            "remote_handle": rec.remote_handle,
+            "top_line_summary": rec.top_line_summary,
+            "summary": rec.summary,
+            "segment_count": len(rec.segments),
+        }
+        if rec.start_time:
+            payload["start_time"] = datetime.datetime.fromtimestamp(
+                rec.start_time).isoformat()
+        if args.words:
+            payload["segments"] = [
+                {"speaker": s.speaker, "text": s.text,
+                 "timestamp": s.timestamp, "duration": s.duration}
+                for s in rec.segments
+            ]
+        else:
+            payload["turns"] = turns
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+
+    lines = ["# %s" % (rec.title or title)]
+    if rec.start_time:
+        lines.append("")
+        lines.append(datetime.datetime.fromtimestamp(rec.start_time)
+                     .strftime("%Y-%m-%d %H:%M"))
+    if rec.top_line_summary:
+        lines.append("")
+        lines.append("**Summary:** %s" % rec.top_line_summary)
+    if rec.is_call:
+        lines.append("")
+        lines.append("- you: `%s`" % rec.local_handle)
+        lines.append("- other party: `%s`" % rec.remote_handle)
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    for turn in turns:
+        # A recording with no speakers (a voice memo, an imported file) gets
+        # no name prefix — see Recording.speaker_label.
+        stamp = "" if args.no_timestamps else "[%s] " % _clock(turn["start"])
+        if turn["label"]:
+            lines.append("**%s%s:** %s" % (stamp, turn["label"], turn["text"]))
+        elif stamp:
+            lines.append("**%s** %s" % (stamp.rstrip(), turn["text"]))
+        else:
+            lines.append(turn["text"])
+        lines.append("")
+
+    text = "\n".join(lines).rstrip() + "\n"
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        print("Wrote transcript to: %s" % args.output, file=sys.stderr)
+    else:
+        sys.stdout.write(text)
+
+
+def cmd_summary(args):
+    """Print Apple's generated summary of a recording."""
+    pk, title, rec = _load_recording(args.identifier)
+
+    if args.json:
+        payload = {
+            "note_id": pk,
+            "note_title": title,
+            "attachment_id": rec.attachment_id,
+            "top_line_summary": rec.top_line_summary,
+            "summary": rec.summary,
+            "duration": rec.audio_duration,
+            "is_call": rec.is_call,
+            "segment_count": len(rec.segments),
+        }
+        if rec.start_time:
+            payload["start_time"] = datetime.datetime.fromtimestamp(
+                rec.start_time).isoformat()
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+
+    # ⚠️ `summary` is frequently absent while `topLineSummary` is present —
+    # report which one is missing rather than printing an empty line.
+    if not rec.top_line_summary and not rec.summary:
+        print("Recording on note %d has no summary.\n"
+              "Summaries are generated on-device by Apple Intelligence."
+              % pk, file=sys.stderr)
+        sys.exit(1)
+
+    if rec.top_line_summary:
+        print(rec.top_line_summary)
+    if rec.summary and rec.summary != rec.top_line_summary:
+        print()
+        print(rec.summary)
+
 
 # --------------------------------------------------------------------------- #
 # Writes.
@@ -1187,6 +1441,10 @@ Examples:
     apple-notes export 261                 # Export note ID 261 to stdout
     apple-notes export "My Note" -o out.md # Export to file
     apple-notes get-url 261                # Get applenotes:// URL
+    apple-notes recordings                 # Table of every recording
+    apple-notes recordings verizon --transcripts   # Search inside transcripts
+    apple-notes transcript 11426           # Transcript of a call recording
+    apple-notes summary 11426              # Apple's summary of it
         """,
     )
 
@@ -1231,6 +1489,49 @@ Examples:
         "identifier", help="Note ID, title, or applenotes:// URL"
     )
     export_parser.add_argument("-o", "--output", help="Output file (default: stdout)")
+
+    # recordings command
+    recordings_parser = subparsers.add_parser(
+        "recordings", help="List call recordings and voice memos")
+    recordings_parser.add_argument(
+        "search", nargs="?", help="Filter on handles, summary, or title")
+    recordings_parser.add_argument(
+        "--calls-only", action="store_true",
+        help="Only call recordings (exclude voice memos and imported audio)")
+    recordings_parser.add_argument(
+        "--transcripts", action="store_true",
+        help="Also search transcript text (slower; decodes every recording)")
+    recordings_parser.add_argument(
+        "--limit", type=int, help="Maximum rows")
+    recordings_parser.add_argument(
+        "--json", action="store_true", help="Output as JSON")
+
+    # transcript command
+    transcript_parser = subparsers.add_parser(
+        "transcript",
+        help="Print the transcript of a call recording or voice memo",
+    )
+    transcript_parser.add_argument(
+        "identifier", help="Note ID, title, or applenotes:// URL"
+    )
+    transcript_parser.add_argument(
+        "-o", "--output", help="Output file (default: stdout)")
+    transcript_parser.add_argument(
+        "--no-timestamps", action="store_true",
+        help="Omit the [m:ss] marker on each turn")
+    transcript_parser.add_argument(
+        "--words", action="store_true",
+        help="With --json, emit per-word segments instead of speaker turns")
+    transcript_parser.add_argument(
+        "--json", action="store_true", help="Output as JSON")
+
+    # summary command
+    summary_parser = subparsers.add_parser(
+        "summary", help="Print Apple's generated summary of a recording")
+    summary_parser.add_argument(
+        "identifier", help="Note ID, title, or applenotes:// URL")
+    summary_parser.add_argument(
+        "--json", action="store_true", help="Output as JSON")
 
     # get-url command
     url_parser = subparsers.add_parser("get-url", help="Get applenotes:// URL for note")
@@ -1283,6 +1584,12 @@ Examples:
         cmd_export(args)
     elif args.command == "get-url":
         cmd_get_url(args)
+    elif args.command == "recordings":
+        cmd_recordings(args)
+    elif args.command == "transcript":
+        cmd_transcript(args)
+    elif args.command == "summary":
+        cmd_summary(args)
     elif args.command == "status":
         cmd_status(args)
     elif args.command == "install-shortcuts":

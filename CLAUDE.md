@@ -14,6 +14,10 @@ installed via `make install`.
 | Search notes | `apple notes search "budget" --json` |
 | Read a note | `apple notes export 261` |
 | List note folders | `apple notes folders --json` |
+| List call recordings | `apple notes recordings --json` |
+| Find a recording by what was said | `apple notes recordings "apple watch" --transcripts` |
+| Transcript of a call recording | `apple notes transcript 11426` |
+| Summary of a recording | `apple notes summary 11426 --json` |
 | Search mail | `apple mail search "invoice" --json` |
 | Full-text mail search | `apple mail search "budget" --field content --json` |
 | Read an email | `apple mail export <message-id>` |
@@ -100,6 +104,9 @@ apple notes search [TERM] [--limit N] [--json] [--include-locked]  # title searc
 apple notes folders [NAME] [--limit N] [--json]  # all folders, or notes in one folder
 apple notes export ID [-o out.md]                # note body as Markdown
 apple notes get-url ID [--json]                  # applenotes:// deep link
+apple notes recordings [TERM] [--calls-only] [--transcripts] [--limit N] [--json]
+apple notes transcript ID [-o FILE] [--no-timestamps] [--words] [--json]
+apple notes summary ID [--json]                  # Apple's generated summary
 apple notes create [--title T] [--body TEXT | --body-file FILE|-] [--json]
 apple notes append ID  [--body TEXT | --body-file FILE|-] [--json]
 apple notes install-shortcuts [--force]          # install the write path
@@ -120,6 +127,66 @@ matches more than one note rather than appending to all of them.
 
 **Search is title-only.** There is no full-text search over note bodies; to
 search content, export candidates and grep them.
+
+**Call recordings and voice memos have their own two commands**, because none of
+what you want is in the note body. 🛑 **`export` on a recording returns an
+attachment placeholder and nothing else** — no transcript, no summary — and the
+note's snippet and modification date never change when transcription lands, so
+polling any of them waits forever. All of it lives in the attachment's
+`ZMERGEABLEDATA1` blob.
+
+```
+apple notes recordings        # table: id, when, length, both handles, summary
+apple notes transcript ID     # speaker-attributed, timestamped turns
+apple notes summary ID        # the line Notes.app shows as "Preview"
+```
+
+**`recordings` is the discovery command** — there is no other way to find them,
+since note titles are all "Call Recording" and search is title-only. It scans
+every mergeable-data attachment and keeps the ones that decode as audio, so it
+finds voice memos and imported files too; `--calls-only` narrows to real calls.
+A bare listing **skips the per-word decode**, which is most of the cost.
+
+**Search matches handles, titles and summaries — not what was said.** Add
+`--transcripts` to search the words too (0.36s for this whole store, and it
+scales with total recorded audio). A query is an AND of substring terms, the
+same semantics as `mail search`.
+
+🛑 **LENGTH is the recording, not the call, and the gap can be large.** Recording
+is started by hand at any point. Measured here: a 29-minute outgoing call
+produced a 14m53s recording that began 14 minutes in, whose **first transcribed
+word is 1:33 into the recording** because the rest was hold. Call length,
+recording length and speech length are three different numbers.
+
+⚠️ **Hold time and IVR leave no segments at all** — not silence markers, simply
+absent. The first segment's timestamp is the only sign, and it is not zero.
+
+⚠️ **Direction is not recorded.** `callType` is reported raw (`0` on the one call
+here) and nothing infers incoming/outgoing from it. That is why the columns are
+`YOU`/`OTHER PARTY`, not `FROM`/`TO`. `apple phone recents` does know, but the
+stores do not join cleanly: the recording starts mid-call, so neither start time
+nor duration matches.
+
+- ⚠️ **Segments are per-word** (2,228 for a 15-minute call) and stored in **CRDT
+  insertion order, not reading order** — the decoder sorts on timestamp.
+  `--words --json` exposes the raw segments; the default groups them into turns.
+- **Speaker attribution is Apple's**, per word, so overlapping speech renders as
+  genuine interruption. `You` is resolved from `callLocalSpeakerHandle`.
+- ⚠️ **Only call recordings have speakers.** A voice memo or imported audio
+  transcribes with no speaker on any segment and gets no name prefix — that is
+  correct, not a failed lookup. `is_call` in the JSON says which you have.
+- ⚠️ **A recording with no transcript is normal**, not a decode failure:
+  transcription is on-device Apple Intelligence, and a device without it (or an
+  unsupported language) records audio only. Both commands say so and exit 1.
+- **`summary` is often absent while `topLineSummary` is present.** The JSON
+  carries both; the plain output prints whichever exist.
+- 🛑 **The audio bytes are not reachable through any command here.** `transcript`
+  reads the store; to get the `.m4a` itself, copy it out of
+  `~/Library/Group Containers/group.com.apple.notes/Accounts/<uuid>/Media/`.
+
+Full record — the 0-based indices, the undocumented `ObjectID` double field, the
+Unix-epoch start time, and the two incompatible word tokenizations — in
+[`docs/apple-notes-transcripts.md`](docs/apple-notes-transcripts.md).
 
 **Writes need `install-shortcuts` first.** `apple notes status` reports whether
 the write path is available and names anything missing; until then Notes is
@@ -650,6 +717,8 @@ apple phone recents [--limit N] [--since DAYS] [--before DAYS]
 apple phone search QUERY  <same filters>            # name, number, or place
 apple phone stats  <same filters> [--json]          # counts, talk time, top callers
 apple phone blocked [--json]                        # read-only
+apple phone recordings [--json]                     # signpost → `apple notes`
+                                                    #   (alias: transcripts)
 apple phone dial TARGET [--facetime-audio] [--dry-run] [--json]
 apple phone status [--json]
 ```
@@ -678,6 +747,19 @@ is `0` on every row), `vmd` does not exist on macOS, and `vmshow://` needs a UUI
 nothing local can enumerate. `voicemail-*.m4a` files under
 `~/Library/Messages/Attachments` are ones people *forwarded over iMessage*, not
 an inbox. There is nothing to list and nothing to mark read.
+
+🛑 **Call recordings are not here either — they belong to `apple notes`.**
+`apple phone recordings` (alias `transcripts`) is a **signpost that prints where
+to go and exits** — it reads nothing and proxies nothing, deliberately, so it can
+never imply a call and a recording are the same object. An
+iPhone call recording syncs as a *note*, and its audio, transcript and summary
+live in that note's attachment blob, so nothing in `CallHistory.storedata`
+references one. Use `apple notes recordings`. ⚠️ **The two stores do not join
+cleanly**: recording is started by hand partway through a call, so the recording
+is shorter than the call and starts later, and neither timestamp nor duration
+matches. A number dialled repeatedly makes even an interval match ambiguous.
+Do not report a call and a recording as the same object without saying how the
+match was made.
 
 **`dial` hands a `tel:` URL to Phone.app and Phone.app always asks you to
 confirm** — skipping the prompt needs `com.apple.FaceTime.NoPrompt`, an
@@ -1301,10 +1383,13 @@ swift/                    one Swift package, six binaries
                           than returning when it hits the note wall
   Tests/RemindersTests/ MailTests/ MessagesTests/
 notes/                    Python; apple-notes, notestore.py, notestore.proto,
-                          tests/ (live Notes.app suite)
+                          mergeable.py (ZMERGEABLEDATA1 reader — recordings,
+                          transcripts, summaries), tests/ (live Notes.app suite)
 docs/apple-notes-api.md   NoteStore schema, AppleScript API, verified bugs
 docs/apple-notes-shortcuts.md  driving Notes' AppIntents from the CLI —
                           the only route to checklist writes and a real append
+docs/apple-notes-transcripts.md  where call recordings actually store their
+                          transcript, and the four traps in decoding it
 notes/shortcuts/          .shortcut build scripts + signed files to install
 docs/apple-mail-store.md  Envelope Index schema, .emlx layout, verified traps
 docs/apple-mail-drafts.md why apple-mail never writes a body: the cite-blockquote

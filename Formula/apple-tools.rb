@@ -8,10 +8,14 @@ class AppleTools < Formula
   depends_on :macos
 
   def install
-    # apple-notes imports notestore.py as a sibling module, so the two must stay
+    # apple-notes imports its Python modules as siblings, so they must all stay
     # in the same directory. bin/apple-notes is a symlink and the script
-    # realpath()s itself, so the import still resolves.
-    libexec.install "apple-notes", "notestore.py", "notestore.proto"
+    # realpath()s itself, so the imports still resolve.
+    #
+    # Dir["*.py"], never a literal list: mergeable.py was added in v26.812.9 and
+    # a named list would have installed apple-notes without it, giving an
+    # ImportError on every invocation while the checkout worked fine.
+    libexec.install "apple-notes", "notestore.proto", *Dir["*.py"]
     bin.install_symlink libexec/"apple-notes"
 
     bin.install "apple", "apple-contacts", "apple-mail", "apple-messages",
@@ -151,5 +155,17 @@ class AppleTools < Formula
     notes_help = shell_output("#{bin}/apple-notes --help")
     assert_match "install-shortcuts", notes_help
     assert_match "append", notes_help
+
+    # Call-recording commands. These live in mergeable.py, a sibling module
+    # added after notestore.py — the one file a literal install list would have
+    # dropped. apple-notes imports it at module scope, so every assertion above
+    # would fail too; this one names what is actually missing.
+    assert_match "recordings", notes_help
+    assert_match "transcript", notes_help
+
+    # The phone-side signpost. It reads nothing, so it is safe without a grant,
+    # and it is the only cross-reference telling someone looking in call history
+    # that recordings live in Notes.
+    assert_match "recordings", shell_output("#{bin}/apple-phone --help")
   end
 end

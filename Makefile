@@ -208,7 +208,16 @@ dist: set-version completions
 	   "$$(cd $(SWIFT_DIR) && swift build $(SWIFT_UNIV) --show-bin-path)"/apple-phone \
 	   $(DIST)/
 	cp bin/apple $(DIST)/
-	cp notes/apple-notes notes/notestore.py notes/notestore.proto $(DIST)/
+	@# notes/*.py, never a literal list: apple-notes imports its modules as
+	@# siblings, so a new one (mergeable.py, v26.812.9) that is not copied
+	@# here builds and tests perfectly from the checkout and then dies with
+	@# ImportError on a brew install. Same shape as the formula's explicit
+	@# bin.install list.
+	cp notes/apple-notes notes/*.py notes/notestore.proto $(DIST)/
+	@# Prove the packaged tool can actually import what it needs — running it
+	@# out of $(DIST) is the only check that a sibling module went missing.
+	@PYTHONDONTWRITEBYTECODE=1 $(DIST)/apple-notes --version >/dev/null \
+		|| { echo "error: packaged apple-notes cannot run — a module is missing from $(DIST)"; exit 1; }
 	cp README.md CLAUDE.md LICENSE VERSION $(DIST)/
 	@# All of docs/, not one named file: CLAUDE.md links to these, and a
 	@# release that ships the link but not the target is worse than neither.
