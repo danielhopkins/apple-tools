@@ -54,6 +54,7 @@ _apple-phone() {
             'search:Find calls by name, number, or place'
             'blocked:List blocked callers (read-only)'
             'stats:Summarise call activity'
+            'recordings:Where call recordings live (they are not in call history)'
             'dial:Place a call by handing it to Phone.app'
             'status:Report permission state without requesting it'
             'help:Show subcommand help information.'
@@ -62,7 +63,7 @@ _apple-phone() {
         ;;
     arg)
         case "${words[1]}" in
-        recents|search|blocked|stats|dial|status|help)
+        recents|search|blocked|stats|recordings|dial|status|help)
             "_apple-phone_${words[1]}" && ret=0
             ;;
         esac
@@ -141,6 +142,18 @@ _apple-phone_stats() {
         '--blocked-only[Only callers on your blocked list]'
         '--kind[Restrict to phone, facetime-audio, or facetime-video]:kind:'
         '--handle[Restrict to one number or Apple ID]:handle:'
+        '--json[Output as JSON]'
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+_apple-phone_recordings() {
+    local -i ret=1
+    local -ar arg_specs=(
         '--json[Output as JSON]'
         '--version[Show the version.]'
         '(-h --help)'{-h,--help}'[Show help information.]'
