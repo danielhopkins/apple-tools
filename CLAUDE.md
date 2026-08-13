@@ -39,6 +39,8 @@ installed via `make install`.
 | Add a reminder | `apple reminders add Soon "Buy milk" --due-date "tomorrow 9am"` |
 | Tag a reminder | `apple reminders add Inbox "Bake sale" --tag PTA` |
 | Retag an existing one | `apple reminders edit Inbox 3 --add-tag PTA` |
+| Everything tagged PTA | `apple reminders show-all --tag PTA --json` |
+| What did I finish? | `apple reminders show Inbox --only-completed --json` |
 | This week's events | `apple calendar events --days 7 --json` |
 | Add an event | `apple calendar add "Dentist" --start "tomorrow 2pm" --duration 45` |
 | Recurring meeting | `apple calendar add "Board" --start … --repeat monthly --on-the "4th monday"` |
@@ -823,9 +825,11 @@ recurrence added.
 
 ```
 apple reminders show-lists [--json]
-apple reminders show LIST [--due-date DATE] [--include-overdue] [--include-completed]
+apple reminders show LIST [--due-date DATE] [--include-overdue]
+                          [--include-completed | --only-completed] [--tag TAG]...
                           [--sort none|creation-date|due-date] [--json]
-apple reminders show-all [--due-date DATE] [--include-overdue] [--json]
+apple reminders show-all [--due-date DATE] [--include-overdue]
+                         [--include-completed | --only-completed] [--tag TAG]... [--json]
 apple reminders add LIST "TEXT" [--due-date DATE] [--priority high|medium|low|none]
                                 [--notes TEXT] [--repeat daily|weekly|monthly|yearly]
                                 [--repeat-interval N] [--repeat-until DATE] [--repeat-count N]
@@ -857,6 +861,17 @@ beyond the Reminders one. Full record in
   matching how multi-value flags behave in `apple contacts`. `--add-tag` /
   `--remove-tag` change them one at a time, and combining the two styles is
   refused rather than guessed.
+- **`--tag` on `show`/`show-all` filters instead** — the same flag name means
+  "write this" on a write command and "match this" on a read one, as `--tag` has
+  no other sensible reading there. Repeating it is an **AND**
+  (`--tag PTA --tag urgent` is reminders carrying both), matching what multiple
+  terms mean in `apple mail`. Matching is case-insensitive.
+- ⚠️ **The index survives filtering.** Filtering happens *after* the index is
+  assigned, so what `show --tag PTA` prints is each reminder's position in the
+  whole list and stays valid for `edit`/`complete`/`delete`. The indices are not
+  1..n of the filtered view.
+- **There is no `search` subcommand**, and `--tag` is the only content filter.
+  To match on title text, pipe `--json` through `jq`.
 - 🛑 **A tag is invisible to EventKit and does not touch the title.** Measured: a
   tagged reminder's title comes back byte-identical, with no `#PTA` in it. So a
   `PTA: ` title prefix and a real tag are **not** interchangeable, and nothing

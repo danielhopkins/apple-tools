@@ -149,4 +149,24 @@ enum TagCache {
         guard let externalId else { return [] }
         return byExternalId[externalId] ?? []
     }
+
+    /// Keep only the reminders carrying **every** tag in `required`.
+    ///
+    /// An AND, matching what a multi-term query means in `apple mail` and
+    /// `apple messages` — `--tag PTA --tag urgent` is "both", not "either".
+    /// Comparison is case-insensitive, the same rule the store uses.
+    ///
+    /// Call after `populate`; with an empty filter this is the identity.
+    static func filter<T>(
+        _ items: [T],
+        by required: [String],
+        externalId: (T) -> String?) -> [T]
+    {
+        guard !required.isEmpty else { return items }
+        let wanted = Set(required.map { $0.lowercased() })
+        return items.filter { item in
+            let present = Set(tags(for: externalId(item)).map { $0.lowercased() })
+            return wanted.isSubset(of: present)
+        }
+    }
 }

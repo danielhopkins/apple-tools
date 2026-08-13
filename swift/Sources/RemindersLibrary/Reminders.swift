@@ -246,7 +246,7 @@ public final class Reminders {
     }
 
     func showAllReminders(dueOn dueDate: DateComponents?, includeOverdue: Bool,
-        displayOptions: DisplayOptions, outputFormat: OutputFormat
+        displayOptions: DisplayOptions, outputFormat: OutputFormat, tagFilter: [String] = []
     ) {
         let semaphore = DispatchSemaphore(value: 0)
         let calendar = Calendar.current
@@ -276,12 +276,18 @@ public final class Reminders {
 
             // One batch lookup for the whole listing; both branches read it.
             TagCache.populate(for: matchingReminders.map { $0.0 })
+            // Filtering after the index is assigned keeps the printed index the
+            // one `edit`/`complete`/`delete` take — it is a position in the
+            // whole list, not in the filtered view.
+            let visibleReminders = TagCache.filter(
+                matchingReminders, by: tagFilter,
+                externalId: { $0.0.calendarItemExternalIdentifier })
 
             switch outputFormat {
             case .json:
-                print(encodeToJson(data: matchingReminders.map { $0.0 }))
+                print(encodeToJson(data: visibleReminders.map { $0.0 }))
             case .plain:
-                for (reminder, i, listName) in matchingReminders {
+                for (reminder, i, listName) in visibleReminders {
                     print(format(reminder, at: i, listName: listName))
                 }
             }
@@ -293,7 +299,8 @@ public final class Reminders {
     }
 
     func showListItems(withName name: String, dueOn dueDate: DateComponents?, includeOverdue: Bool,
-        displayOptions: DisplayOptions, outputFormat: OutputFormat, sort: Sort, sortOrder: CustomSortOrder)
+        displayOptions: DisplayOptions, outputFormat: OutputFormat, sort: Sort, sortOrder: CustomSortOrder,
+        tagFilter: [String] = [])
     {
         let semaphore = DispatchSemaphore(value: 0)
         let calendar = Calendar.current
@@ -324,12 +331,18 @@ public final class Reminders {
 
             // One batch lookup for the whole listing; both branches read it.
             TagCache.populate(for: matchingReminders.map { $0.0 })
+            // Filtering after the index is assigned keeps the printed index the
+            // one `edit`/`complete`/`delete` take — it is a position in the
+            // whole list, not in the filtered view.
+            let visibleReminders = TagCache.filter(
+                matchingReminders, by: tagFilter,
+                externalId: { $0.0.calendarItemExternalIdentifier })
 
             switch outputFormat {
             case .json:
-                print(encodeToJson(data: matchingReminders.map { $0.0 }))
+                print(encodeToJson(data: visibleReminders.map { $0.0 }))
             case .plain:
-                for (reminder, i) in matchingReminders {
+                for (reminder, i) in visibleReminders {
                     print(format(reminder, at: i))
                 }
             }

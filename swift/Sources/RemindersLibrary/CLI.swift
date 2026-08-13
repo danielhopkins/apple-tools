@@ -87,6 +87,16 @@ private struct ShowAll: ParsableCommand {
         help: "Show only reminders due on this date")
     var dueDate: DateComponents?
 
+    @Option(
+        name: .customLong("tag"),
+        help: ArgumentHelp(
+            "Show only reminders carrying this tag, without the '#'. Repeatable.",
+            discussion: "Repeating it means AND — `--tag PTA --tag urgent` is reminders "
+                + "carrying both — matching what multiple terms mean in `apple mail`. "
+                + "Matching is case-insensitive. The index shown is still the reminder's "
+                + "position in the whole list, so it stays valid for edit/complete/delete."))
+    var tagFilter: [String] = []
+
     @OptionGroup var formatOptions: FormatOptions
 
     func validate() throws {
@@ -94,6 +104,7 @@ private struct ShowAll: ParsableCommand {
             throw ValidationError(
                 "Cannot specify both --show-completed and --only-completed")
         }
+        try validateTagFlags(tagFilter)
     }
 
     func run() {
@@ -106,7 +117,8 @@ private struct ShowAll: ParsableCommand {
 
         reminders.showAllReminders(
             dueOn: self.dueDate, includeOverdue: self.includeOverdue,
-            displayOptions: displayOptions, outputFormat: formatOptions.resolved)
+            displayOptions: displayOptions, outputFormat: formatOptions.resolved,
+            tagFilter: tagFilter)
     }
 }
 
@@ -143,6 +155,16 @@ private struct Show: ParsableCommand {
         help: "Show only reminders due on this date")
     var dueDate: DateComponents?
 
+    @Option(
+        name: .customLong("tag"),
+        help: ArgumentHelp(
+            "Show only reminders carrying this tag, without the '#'. Repeatable.",
+            discussion: "Repeating it means AND — `--tag PTA --tag urgent` is reminders "
+                + "carrying both — matching what multiple terms mean in `apple mail`. "
+                + "Matching is case-insensitive. The index shown is still the reminder's "
+                + "position in the whole list, so it stays valid for edit/complete/delete."))
+    var tagFilter: [String] = []
+
     @OptionGroup var formatOptions: FormatOptions
 
     func validate() throws {
@@ -150,6 +172,7 @@ private struct Show: ParsableCommand {
             throw ValidationError(
                 "Cannot specify both --show-completed and --only-completed")
         }
+        try validateTagFlags(tagFilter)
     }
 
     func run() {
@@ -162,7 +185,8 @@ private struct Show: ParsableCommand {
 
         reminders.showListItems(
             withName: self.listName, dueOn: self.dueDate, includeOverdue: self.includeOverdue,
-            displayOptions: displayOptions, outputFormat: formatOptions.resolved, sort: sort, sortOrder: sortOrder)
+            displayOptions: displayOptions, outputFormat: formatOptions.resolved, sort: sort, sortOrder: sortOrder,
+            tagFilter: tagFilter)
     }
 }
 

@@ -174,6 +174,48 @@ A tag is two records:
 row still present is normal and clears on the next CloudKit sync; it is not a
 failed delete.
 
+## Reading tags in bulk
+
+🛑 **Fetch reminders with the plural selector, not in a loop.** The cost of a tag
+read is the round trip to `remindd`, not the tag decode — so a loop of
+`fetchReminderWithDACalendarItemUniqueIdentifier:` pays it once per reminder,
+and that is what made a 1,191-reminder listing take **4.3s** in 26.813.0.
+
+```objc
+// returns NSDictionary: identifier → REMReminder
+[store fetchRemindersWithDACalendarItemUniqueIdentifiers:ids inList:nil error:&e];
+```
+
+Measured on the same 1,191 reminders: the batched fetch is **0.20s**, and
+walking `hashtagContext` on the already-fetched objects afterwards is **under a
+millisecond** — it is in-process, with no further XPC. End to end the listing
+went **4.3s → 0.48s**.
+
+⚠️ **It returns a dictionary, not an array.** Iterating it directly yields the
+identifier *strings*, so a loop written for an array of reminders throws
+`unrecognized selector sent to __NSCFString`.
+
+⚠️ **Identifiers that resolve to nothing are simply absent from the dictionary**,
+which is the wanted behaviour — a listing should not fail because one reminder
+was deleted mid-run.
+
+### Why not read the SQLite store directly
+
+Because `apple reminders` **cannot**. It re-executes itself *disclaimed* to own
+its TCC identity, and disclaiming makes the process its own responsible process —
+which is exactly what Full Disk Access is attributed to. So it holds the
+Reminders grant and has no FDA, and the store under
+`~/Library/Group Containers/group.com.apple.reminders/` is unreadable to it. The
+same constraint, in mirror image, is why `apple phone` may *not* disclaim.
+
+This is only a constraint on the tool. Reading the store by hand, as in the
+tables above, is fine from a terminal that has FDA.
+
+⚠️ **A `mode=ro` SQLite open does not replay the write-ahead log.** The reminders
+store keeps a multi-megabyte `-wal`, so a read-only URI open can return a stale
+snapshot — the same trap `apple contacts` hit with `immutable=1`. Open the file
+plainly, and cross-check anything surprising before believing it.
+
 ## Traps
 
 🛑 **A tag containing a space is silently rewritten, not refused.** Measured:
