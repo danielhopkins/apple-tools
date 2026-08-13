@@ -37,6 +37,8 @@ installed via `make install`.
 | Place a call | `apple phone dial "Alice"` |
 | Today's reminders | `apple reminders show-all --due-date today --include-overdue --json` |
 | Add a reminder | `apple reminders add Soon "Buy milk" --due-date "tomorrow 9am"` |
+| Tag a reminder | `apple reminders add Inbox "Bake sale" --tag PTA` |
+| Retag an existing one | `apple reminders edit Inbox 3 --add-tag PTA` |
 | This week's events | `apple calendar events --days 7 --json` |
 | Add an event | `apple calendar add "Dentist" --start "tomorrow 2pm" --duration 45` |
 | Recurring meeting | `apple calendar add "Board" --start … --repeat monthly --on-the "4th monday"` |
@@ -827,7 +829,9 @@ apple reminders show-all [--due-date DATE] [--include-overdue] [--json]
 apple reminders add LIST "TEXT" [--due-date DATE] [--priority high|medium|low|none]
                                 [--notes TEXT] [--repeat daily|weekly|monthly|yearly]
                                 [--repeat-interval N] [--repeat-until DATE] [--repeat-count N]
+                                [--tag TAG]...
 apple reminders edit LIST INDEX ["NEW TEXT"] [--due-date DATE] [--priority P] [--notes TEXT]
+                                [--tag TAG]... [--add-tag TAG]... [--remove-tag TAG]...
 apple reminders complete LIST INDEX
 apple reminders uncomplete LIST INDEX
 apple reminders delete LIST INDEX
@@ -841,6 +845,40 @@ apple reminders new-list NAME
 get added. Always `show` immediately before `complete`/`edit`/`delete`.
 
 `--format json` still works as a synonym for `--json`.
+
+**Tags — the `#PTA` chips — have no public API, and this is the one place the
+tool reaches past EventKit.** Not EventKit (every "tag" symbol there is a sync
+ETag), not AppleScript (the string appears in Reminders' sdef zero times). Writes
+go through private `ReminderKit`, resolved at runtime, needing no extra grant
+beyond the Reminders one. Full record in
+[`docs/apple-reminders-tags.md`](docs/apple-reminders-tags.md).
+
+- `--tag` on **`add`** sets the tags; on **`edit`** it **replaces** the whole set,
+  matching how multi-value flags behave in `apple contacts`. `--add-tag` /
+  `--remove-tag` change them one at a time, and combining the two styles is
+  refused rather than guessed.
+- 🛑 **A tag is invisible to EventKit and does not touch the title.** Measured: a
+  tagged reminder's title comes back byte-identical, with no `#PTA` in it. So a
+  `PTA: ` title prefix and a real tag are **not** interchangeable, and nothing
+  converts one to the other. `show`/`show-all` read tags from the private store
+  and report them as `tags` in JSON (absent when there are none) and as `#tag`
+  in plain output.
+- 🛑 **A tag containing a space is silently rewritten, not rejected.** `two words`
+  stores as `twowords`, and the save reports success. Refused up front, naming
+  the substitute. A leading `#` is refused too — it is punctuation the app adds
+  when rendering, so storing it yields `##PTA`.
+- ⚠️ **Matching is case-insensitive, display case is kept.** Reminders keys tags
+  on a lowercased `canonicalName`, so adding `pta` to something already tagged
+  `PTA` is a reported no-op.
+- ⚠️ **Tagging is a second write through a different framework.** On `add` the
+  reminder exists before tagging can fail, and the error says so — read
+  "tagging failed" as "created but untagged", not as "nothing happened".
+- Every tag write is **read back from a fresh store** and fails naming what did
+  not land, the same discipline `apple calendar` and `apple contacts` use.
+- ⚠️ If macOS ever moves the private API, tags degrade to unavailable — `--tag`
+  refuses with an explanation and everything else keeps working. The documented
+  fallback is Shortcuts' `is.workflow.actions.setters.reminders`, which works but
+  can only find a reminder **by title**.
 
 ### calendar — `apple calendar`
 
@@ -1371,7 +1409,10 @@ has no reverse lookup and it would mean scanning every group per contact.
 ```
 bin/apple                 dispatcher — routes to the tools below
 swift/                    one Swift package, six binaries
-  Sources/reminders/      + RemindersLibrary/
+  Sources/reminders/      + RemindersLibrary/ (+ Tags.swift, the tag read/write
+                          face and the per-listing tag cache)
+  Sources/ReminderKitBridge/  private ReminderKit resolved at runtime — the only
+                          route to Reminders tags, since EventKit has none
   Sources/AppleMail/      + MailLibrary/ (Envelope Index reader, .emlx/MIME,
                           mailbox-name resolution for move)
   Sources/AppleMessages/  + MessagesLibrary/ (chat.db reader, typedstream decoder)
@@ -1400,6 +1441,9 @@ docs/apple-contacts-move.md  no public API changes a contact's container; the
                           a move costs
 docs/apple-calendar-invitees.md  reading invitees is public API, writing them is
                           not; what the server rewrites, and what it mails
+docs/apple-reminders-tags.md  tags have no public API at all — what EventKit,
+                          AppleScript and App Intents each fail to do, the
+                          private call that works, and the store behind it
 util/check-mail-intents   is Mail's ComposeMessageIntent reachable yet? (exit 0
                           if something changed)
 util/appintents-dump      dev-only reader for an app's App Intents schema

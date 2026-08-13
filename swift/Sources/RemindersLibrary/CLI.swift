@@ -217,12 +217,22 @@ private struct Add: ParsableCommand {
         help: "The notes to add to the reminder")
     var notes: String?
 
+    @Option(
+        name: .customLong("tag"),
+        help: ArgumentHelp(
+            "A tag to put on the reminder, without the '#'. Repeatable.",
+            discussion: "Tags are not an EventKit concept, so they are written through "
+                + "Reminders' own store. They are invisible to any other EventKit client, "
+                + "and they sync like the reminder itself."))
+    var tags: [String] = []
+
     func validate() throws {
         try validateRecurrenceFlags(
             frequency: repeatFrequency,
             interval: repeatInterval,
             until: repeatUntil,
             count: repeatCount)
+        try validateTagFlags(tags)
     }
 
     func run() {
@@ -237,6 +247,7 @@ private struct Add: ParsableCommand {
                 interval: repeatInterval,
                 until: repeatUntil,
                 count: repeatCount),
+            tags: tags,
             outputFormat: formatOptions.resolved)
     }
 }
@@ -299,6 +310,28 @@ func listNameCompletion(_ arguments: [String]) -> [String] {
     // NOTE: A list name with ':' was separated in zsh completion, there might be more of these or
     // this might break other shells
     return reminders.getListNames().map { $0.replacingOccurrences(of: ":", with: "\\:") }
+}
+
+/// Check every tag before any of them is written, and refuse the whole command
+/// if one is unusable — a partial tagging is worse than none, since the user
+/// has no way to tell which of several `--tag` flags took.
+///
+/// Also refuses when the private API backing tags is missing, rather than
+/// accepting the flag and quietly doing nothing.
+private func validateTagFlags(_ tags: [String]) throws {
+    guard !tags.isEmpty else { return }
+    if !ReminderTags.isAvailable {
+        throw ValidationError(
+            "tags are not available on this system: Reminders' private tag API could not be "
+            + "resolved. Everything else still works; set tags in Reminders.app.")
+    }
+    for tag in tags {
+        do {
+            try ReminderTags.validate(tag)
+        } catch let error as TagError {
+            throw ValidationError(error.description)
+        }
+    }
 }
 
 private func validateRecurrenceFlags(
@@ -384,6 +417,25 @@ private struct Edit: ParsableCommand {
         help: "End the recurrence after this many occurrences")
     var repeatCount: Int?
 
+    @Option(
+        name: .customLong("tag"),
+        help: ArgumentHelp(
+            "Replace the reminder's tags with these, without the '#'. Repeatable.",
+            discussion: "Like the other multi-value flags in this repo, --tag replaces rather "
+                + "than appends: the tags you pass become the complete set. Use --add-tag and "
+                + "--remove-tag to change them one at a time."))
+    var tags: [String] = []
+
+    @Option(
+        name: .customLong("add-tag"),
+        help: "Add a tag, keeping the existing ones. Repeatable.")
+    var addTags: [String] = []
+
+    @Option(
+        name: .customLong("remove-tag"),
+        help: "Remove a tag, keeping the others. Repeatable.")
+    var removeTags: [String] = []
+
     @Argument(
         parsing: .remaining,
         help: "The new reminder contents")
@@ -398,8 +450,19 @@ private struct Edit: ParsableCommand {
             && self.repeatInterval == nil
             && self.repeatUntil == nil
             && self.repeatCount == nil
+            && self.tags.isEmpty
+            && self.addTags.isEmpty
+            && self.removeTags.isEmpty
         {
-            throw ValidationError("Must specify either new reminder content, new notes, new due date, new priority, or new recurrence")
+            throw ValidationError("Must specify either new reminder content, new notes, new due date, new priority, new recurrence, or a tag change")
+        }
+
+        // --tag is a whole-set replace, so combining it with the incremental
+        // flags describes two different intentions for the same field.
+        if !self.tags.isEmpty && !(self.addTags.isEmpty && self.removeTags.isEmpty) {
+            throw ValidationError(
+                "--tag replaces every tag, so it cannot be combined with --add-tag or "
+                + "--remove-tag. Pass the complete set to --tag, or use only the incremental flags.")
         }
 
         try validateRecurrenceFlags(
@@ -407,6 +470,7 @@ private struct Edit: ParsableCommand {
             interval: repeatInterval,
             until: repeatUntil,
             count: repeatCount)
+        try validateTagFlags(tags + addTags + removeTags)
     }
 
     func run() {
@@ -424,7 +488,10 @@ private struct Edit: ParsableCommand {
                     interval: repeatInterval,
                     until: repeatUntil,
                     count: repeatCount)
-            }
+            },
+            tagsToSet: tags.isEmpty ? nil : tags,
+            tagsToAdd: addTags,
+            tagsToRemove: removeTags
         )
     }
 }

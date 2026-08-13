@@ -24,6 +24,12 @@ let package = Package(
         // that moves a contact between accounts raises one rather than
         // returning an error. See Sources/ObjCExceptions/include.
         .target(name: "ObjCExceptions"),
+        // Reminders tags have no public API — not in EventKit, not in
+        // AppleScript — so they go through private ReminderKit, resolved at
+        // runtime. The Objective-C runtime work lives here rather than in
+        // Swift because `addHashtagWithType:name:` takes a non-object argument
+        // and objc_msgSend has to be cast to its exact signature.
+        .target(name: "ReminderKitBridge"),
         // Query parsing shared by mail and messages, so the two cannot drift on
         // what `budget review` means.
         .target(name: "AppleToolsSearch"),
@@ -50,6 +56,7 @@ let package = Package(
                 "AppleToolsVersion",
                 "AppleToolsStyle",
                 "TCCResponsibility",
+                "ReminderKitBridge",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),

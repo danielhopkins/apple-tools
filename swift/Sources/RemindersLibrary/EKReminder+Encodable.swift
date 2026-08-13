@@ -17,6 +17,7 @@ extension EKReminder: @retroactive Encodable {
         case dueDate
         case list
         case recurrence
+        case tags
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -63,6 +64,14 @@ extension EKReminder: @retroactive Encodable {
         // EventKit allows multiple recurrence rules; the CLI only writes one, so we surface the first.
         if let rule = self.recurrenceRules?.first {
             try container.encode(EncodedRecurrence(rule: rule), forKey: .recurrence)
+        }
+
+        // Tags are not an EventKit concept at all — they come from the private
+        // ReminderKit store, resolved in one batch before encoding. Omitted
+        // entirely when there are none, so `tags` present always means tagged.
+        let tags = TagCache.tags(for: self.calendarItemExternalIdentifier)
+        if !tags.isEmpty {
+            try container.encode(tags, forKey: .tags)
         }
     }
 

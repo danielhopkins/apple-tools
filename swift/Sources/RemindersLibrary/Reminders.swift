@@ -59,6 +59,12 @@ private func format(_ reminder: EKReminder, at index: Int?, listName: String? = 
     if let rule = reminder.recurrenceRules?.first {
         suffix += "  " + Style.dim("(repeats: \(humanRecurrence(rule)))")
     }
+    // Rendered the way Reminders.app writes one, so it reads as a tag rather
+    // than as another parenthesised attribute.
+    let tags = TagCache.tags(for: reminder.calendarItemExternalIdentifier)
+    if !tags.isEmpty {
+        suffix += "  " + Style.label(tags.map { "#\($0)" }.joined(separator: " "))
+    }
 
     var line = "\(listString)\(indexString)\(title)\(suffix)"
     if let notes = notesLine(reminder) {
@@ -268,6 +274,9 @@ public final class Reminders {
                 }
             }
 
+            // One batch lookup for the whole listing; both branches read it.
+            TagCache.populate(for: matchingReminders.map { $0.0 })
+
             switch outputFormat {
             case .json:
                 print(encodeToJson(data: matchingReminders.map { $0.0 }))
@@ -312,6 +321,9 @@ public final class Reminders {
                     matchingReminders.append((reminder, index))
                 }
             }
+
+            // One batch lookup for the whole listing; both branches read it.
+            TagCache.populate(for: matchingReminders.map { $0.0 })
 
             switch outputFormat {
             case .json:
@@ -369,7 +381,7 @@ public final class Reminders {
         }
     }
 
-    func edit(itemAtIndex index: String, onListNamed name: String, newText: String?, newNotes: String?, newDueDate: DateComponents?, newPriority: Priority? = nil, newRecurrence: RecurrenceConfig? = nil) {
+    func edit(itemAtIndex index: String, onListNamed name: String, newText: String?, newNotes: String?, newDueDate: DateComponents?, newPriority: Priority? = nil, newRecurrence: RecurrenceConfig? = nil, tagsToSet: [String]? = nil, tagsToAdd: [String] = [], tagsToRemove: [String] = []) {
         let calendar = self.calendar(withName: name)
         let semaphore = DispatchSemaphore(value: 0)
 
@@ -396,7 +408,35 @@ public final class Reminders {
                     }
                 }
                 try Store.save(reminder, commit: true)
-                print("Updated reminder '\(reminder.title!)'")
+
+                // Tags go through ReminderKit, not EventKit, so this is a
+                // separate write that can fail on its own after the rest of the
+                // edit has already landed.
+                if tagsToSet != nil || !tagsToAdd.isEmpty || !tagsToRemove.isEmpty {
+                    guard let externalId = reminder.calendarItemExternalIdentifier else {
+                        print("Updated reminder '\(reminder.title!)', but it has no external "
+                            + "identifier, so its tags could not be changed.")
+                        exit(1)
+                    }
+                    do {
+                        let applied = try ReminderTags.apply(
+                            externalId: externalId,
+                            add: tagsToSet ?? tagsToAdd,
+                            remove: tagsToRemove,
+                            replaceAll: tagsToSet != nil)
+                        TagCache.set(applied, for: externalId)
+                    } catch {
+                        print("Updated reminder '\(reminder.title!)', but changing its tags "
+                            + "failed: \(error.localizedDescription)")
+                        exit(1)
+                    }
+                }
+
+                let tags = TagCache.tags(for: reminder.calendarItemExternalIdentifier)
+                let tagSuffix = tags.isEmpty
+                    ? ""
+                    : " (tags: \(tags.map { "#\($0)" }.joined(separator: " ")))"
+                print("Updated reminder '\(reminder.title!)'\(tagSuffix)")
             } catch let error {
                 print("Failed to update reminder with error: \(error)")
                 exit(1)
@@ -467,6 +507,7 @@ public final class Reminders {
         dueDateComponents: DateComponents?,
         priority: Priority,
         recurrence: RecurrenceConfig?,
+        tags: [String] = [],
         outputFormat: OutputFormat)
     {
         let calendar = self.calendar(withName: name)
@@ -485,15 +526,40 @@ public final class Reminders {
 
         do {
             try Store.save(reminder, commit: true)
-            switch (outputFormat) {
-            case .json:
-                print(encodeToJson(data: reminder))
-            default:
-                print("Added '\(reminder.title!)' to '\(calendar.title)'")
-            }
         } catch let error {
             print("Failed to save reminder with error: \(error)")
             exit(1)
+        }
+
+        // Tags are a second write, through a different framework, so the
+        // reminder already exists by the time this can fail. Say so explicitly
+        // rather than letting "add failed" imply nothing was created.
+        if !tags.isEmpty {
+            let created = "Added '\(reminder.title!)' to '\(calendar.title)'"
+            guard let externalId = reminder.calendarItemExternalIdentifier else {
+                let message = "\(created), but it has no external identifier, so the tags "
+                    + "could not be applied.\n"
+                FileHandle.standardError.write(Data(message.utf8))
+                exit(1)
+            }
+            do {
+                let applied = try ReminderTags.applyToNewReminder(
+                    externalId: externalId, tags: tags)
+                TagCache.set(applied, for: externalId)
+            } catch {
+                let message = "\(created), but tagging it failed: "
+                    + "\(error.localizedDescription)\n"
+                    + "The reminder exists and is untagged; add the tags in Reminders.app.\n"
+                FileHandle.standardError.write(Data(message.utf8))
+                exit(1)
+            }
+        }
+
+        switch (outputFormat) {
+        case .json:
+            print(encodeToJson(data: reminder))
+        default:
+            print("Added '\(reminder.title!)' to '\(calendar.title)'")
         }
     }
 
