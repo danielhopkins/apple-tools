@@ -258,6 +258,7 @@ notes/           Python: apple-notes, notestore.py decoder, live Notes.app tests
 skills/          Claude skills (apple-tools, daily-brief, meeting-prep, inbox-triage)
 completions/     zsh completions
 tests/           live suites: calendar and contacts writes (gated), mail read guards
+util/            gate probes: is Mail's compose intent / CoreSpotlight reachable yet?
 docs/            Notes API, Mail store, Calendar invitee and Contacts move
                  references, prior art
 Formula/         Homebrew formula, mirrored into the tap on release
@@ -309,6 +310,86 @@ have no undo — so its fixtures must carry `__claude_contacts_test__` as their
 the build you just made may not be the approved one; point the suite at a
 granted copy with `APPLE_CONTACTS_BIN="$(command -v apple-contacts)"`. None of
 these is a casual command.
+
+## FAQ
+
+### Why not use Spotlight / CoreSpotlight instead of reading the stores?
+
+Because it returns nothing, and doesn't say so.
+[CoreSpotlight](https://developer.apple.com/documentation/corespotlight) is a
+**write** API for your *own* app's content — `CSSearchableIndex` puts your items
+in, `CSSearchQuery` reads back what your bundle put there. The index is
+per-app-bundle and there is no public route into another app's. Notes, Mail and
+Messages each index into their own; the Spotlight UI reads those privately.
+
+Measured on macOS 27 against a real store — re-check any time with
+`util/check-spotlight`:
+
+| Probe | Result |
+|---|---|
+| `CSSearchQuery` | **0 items, `err = none`** |
+| `CSUserQuery` (the macOS 13+ replacement) | **0 items, no error** |
+| `Bundle.main.bundleIdentifier` | **`nil`** — a CLI has no bundle, so no index |
+
+The empty-with-no-error part is what rules it out even more than the emptiness:
+it is indistinguishable from "no matches", so a broken search looks like a
+working one. `mdfind` doesn't fill the gap either — searching a live mail
+subject returns unrelated files and **zero messages**, though
+`/System/Library/Spotlight/Mail.mdimporter` ships with the OS. The importer
+exists; its output isn't in the index you can query. Apple confirmed as much on
+[their own forums](https://developer.apple.com/forums/thread/121187?page=2).
+
+And even if the query worked, a `CSSearchableItem` is a title, a snippet and a
+content type. These tools need the *record* — the note's decoded body with
+checklist state, the message's recipients and attachment bytes, the reminder's
+tags. Spotlight has no write path either, and about half of what's here writes.
+
+### Isn't reading Apple's private SQLite files hacky?
+
+**Yes.** Reading `NoteStore.sqlite`, `Envelope Index`, `chat.db` and
+`CallHistory.storedata` directly, ungzipping a protobuf note body, and decoding
+a NeXT typedstream are not what Apple intends. It is done anyway because the
+supported alternatives were each measured and each fails:
+
+| Supported route | What actually happens |
+|---|---|
+| Spotlight / CoreSpotlight | 0 results, no error (above) |
+| AppleScript search | 154s vs **0.04s**, and it can wedge Mail's scripting interface until you restart it |
+| AppleScript note bodies | flattens checklists, and a body write **destroys attachments** |
+| App Intents / Shortcuts (Mail) | actions exist but are unsignable and absent from the picker — filed as FB24254597 |
+| EventKit (reminder tags) | no tag API exists at all; every "tag" symbol there is a sync ETag |
+| `CNSaveRequest` (contact move) | cannot change a container; a note on the contact blocks *every* write |
+
+So the pattern throughout is: use the public API where it works, measure it where
+it merely claims to, and drop to the store or a private call only where the
+public one is absent or lies — then **read every write back from a fresh store**
+rather than trusting a return value. Four separate APIs here report success for
+something they didn't do; that discipline exists because of them.
+
+### Will a macOS update break it?
+
+Some of it, probably — that's the cost of the above, and it's why the failure
+modes are deliberate. Schema changes surface as a clear error rather than as
+silently missing rows; the private calls (`ReminderKit` tags, `EKAttendee`
+invitees, the AddressBook move) are resolved at **runtime** and degrade to a
+refusal with an explanation, leaving everything else working. Nothing here
+silently returns a wrong answer if Apple moves something.
+
+### Does anything leave the machine?
+
+No network calls, no API keys, no sync service, no telemetry. Two things reach
+outward, both only when you ask: `calendar invite` makes *your* calendar server
+send real invitation mail, and `phone dial` places a real call — which is why
+the first has `--dry-run` and the second is confirmed by Phone.app rather than
+by the tool. Writes to Reminders, Calendar, Contacts and Notes also sync to your
+own devices, because they go through the real apps' stores.
+
+### Why does it need Full Disk Access?
+
+Only `mail`, `messages`, `phone` and `notes` do — they read those store files
+directly, and macOS gates them. `reminders`, `calendar` and `contacts` use
+public frameworks and take an ordinary per-tool grant instead. `apple status`
+reports all seven at once without prompting.
 
 ## Prior art
 

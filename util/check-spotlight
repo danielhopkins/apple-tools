@@ -1,0 +1,134 @@
+#!/usr/bin/env swift
+
+// Report whether CoreSpotlight has become readable from a CLI.
+//
+// "Why not just use Spotlight?" is the most common question this repo gets, and
+// reading the stores directly *is* hacky — the supported route simply does not
+// work. This measures that, so the claim in docs/prior-art.md is reproducible
+// and a future macOS opening it up is a one-command discovery rather than a
+// re-investigation.
+//
+// What it probes
+// --------------
+//   1. Bundle.main.bundleIdentifier — nil for a CLI. CoreSpotlight's index is
+//      per-app-bundle, so no bundle means no index to query, and there is no
+//      public route into another app's.
+//   2. CSSearchQuery      — the classic API.
+//   3. CSUserQuery        — its macOS 13+ replacement.
+//
+// Both are expected to return 0 items and *no error*, which is the whole
+// problem: zero-with-no-error is indistinguishable from "no matches".
+//
+// Exit codes
+// ----------
+//   1  still a dead end (expected)
+//   0  something changed — a query returned items. Read the output, then
+//      update docs/prior-art.md.
+//
+// Usage: util/check-spotlight [term ...]      (default: a few generic words)
+
+import Foundation
+import CoreSpotlight
+
+let terms = CommandLine.arguments.count > 1
+    ? Array(CommandLine.arguments.dropFirst())
+    : ["school", "invoice", "meeting"]
+
+var found = 0
+
+func describe(_ item: CSSearchableItem) -> String {
+    let a = item.attributeSet
+    let title = a.title ?? a.displayName ?? "nil"
+    return "    domain=\(item.domainIdentifier ?? "nil") "
+         + "type=\(a.contentType ?? "nil") title=\(title)"
+}
+
+// 1. the mechanism ----------------------------------------------------------
+
+let bundleID = Bundle.main.bundleIdentifier
+print("Bundle.main.bundleIdentifier = \(bundleID ?? "nil")")
+if bundleID == nil {
+    print("  → no bundle, so no CoreSpotlight index of our own, and no public")
+    print("    route into Notes'/Mail's/Messages'.")
+}
+print("")
+
+// 2. CSSearchQuery ----------------------------------------------------------
+
+print("CSSearchQuery")
+for term in terms {
+    let sem = DispatchSemaphore(value: 0)
+    // Match any attribute, case- and diacritic-insensitive, word-prefix.
+    let query = CSSearchQuery(
+        queryString: "**== \"\(term)*\"cdw",
+        attributes: ["title", "displayName", "contentDescription",
+                     "contentType", "domainIdentifier"])
+    var count = 0
+    var samples: [String] = []
+
+    query.foundItemsHandler = { items in
+        count += items.count
+        for item in items.prefix(3) where samples.count < 3 {
+            samples.append(describe(item))
+        }
+    }
+    query.completionHandler = { error in
+        let err = error.map { String(describing: $0) } ?? "none"
+        print("  \"\(term)\": \(count) items, err=\(err)")
+        samples.forEach { print($0) }
+        sem.signal()
+    }
+    query.start()
+    if sem.wait(timeout: .now() + 15) == .timedOut {
+        print("  \"\(term)\": timed out after 15s")
+        query.cancel()
+    }
+    found += count
+}
+print("")
+
+// 3. CSUserQuery ------------------------------------------------------------
+
+print("CSUserQuery")
+for term in terms {
+    let sem = DispatchSemaphore(value: 0)
+    let context = CSUserQueryContext()
+    context.fetchAttributes = ["title", "displayName", "contentDescription",
+                              "contentType"]
+    context.maxResultCount = 20
+    let query = CSUserQuery(userQueryString: term, userQueryContext: context)
+    var count = 0
+
+    Task {
+        do {
+            for try await element in query.responses {
+                if case .item(let found) = element {
+                    count += 1
+                    if count <= 3 { print(describe(found.item)) }
+                }
+            }
+            print("  \"\(term)\": \(count) items, err=none")
+        } catch {
+            print("  \"\(term)\": \(count) items, err=\(error)")
+        }
+        sem.signal()
+    }
+    if sem.wait(timeout: .now() + 20) == .timedOut {
+        print("  \"\(term)\": timed out after 20s")
+    }
+    found += count
+}
+print("")
+
+// verdict -------------------------------------------------------------------
+
+if found > 0 {
+    print("CHANGED: \(found) items came back. CoreSpotlight is readable from a")
+    print("CLI in a way it was not on macOS 27. Update docs/prior-art.md.")
+    exit(0)
+}
+
+print("Still a dead end: 0 items, no error, from both APIs.")
+print("Zero-with-no-error is indistinguishable from \"no matches\" — which is")
+print("why this is not a search backend. See docs/prior-art.md.")
+exit(1)
