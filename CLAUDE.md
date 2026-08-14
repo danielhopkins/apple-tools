@@ -1461,6 +1461,8 @@ docs/apple-reminders-tags.md  tags have no public API at all — what EventKit,
                           private call that works, and the store behind it
 util/check-mail-intents   is Mail's ComposeMessageIntent reachable yet? (exit 0
                           if something changed)
+util/check-spotlight      is CoreSpotlight readable from a CLI yet? (exit 0 if
+                          something changed) — the answer to "why not Spotlight"
 util/appintents-dump      dev-only reader for an app's App Intents schema
 docs/apple-messages-store.md  chat.db schema, the typedstream body, verified traps
 docs/apple-phone-store.md  CallHistory schema, the entitlement walls, verified traps

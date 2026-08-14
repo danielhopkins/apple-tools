@@ -557,6 +557,11 @@ no equivalent of the preflight, the no-launch rule, or `mail_app.responsive`.
   it.** Confirmed on [Apple's own forums](https://developer.apple.com/forums/thread/121187?page=2):
   Spotlight mail search works through neither `MDQueryRef` nor `mdfind` even
   with the grant. Not a permissions problem — don't spend time on it.
+- 🛑 **[CoreSpotlight](https://developer.apple.com/documentation/corespotlight)
+  is a *write* API for your own app's content, not a read API for anyone
+  else's** — and it fails silently, which is worse. See below; this is the most
+  frequently suggested alternative to reading the stores, so it gets the full
+  measurement.
 - **IMAP instead of Mail.app.** sweetrb ships this as an opt-in fast path
   (credentials in the Keychain), and it is what [himalaya](https://github.com/pimalaya/himalaya),
   notmuch and mu do generally. It works and gives server-side search, but it
@@ -565,6 +570,74 @@ no equivalent of the preflight, the no-launch rule, or `mail_app.responsive`.
 - **`che-apple-mail-mcp`'s "millisecond search across 250K+ emails"** is
   subject/sender/recipient/date only. Its own comparison table says so two rows
   below the claim. A reminder to read the table, not the headline.
+
+### CoreSpotlight, measured
+
+*"Why not just use Spotlight?" is the most common question this repo gets, and
+the honest answer is that reading the stores directly is hacky — it is just that
+the supported route does not work. Measured on macOS 27 against a real store,
+26.813.1, so nobody has to take that on faith.*
+
+🛑 **The index is per-app-bundle, and a CLI has no bundle.** `CSSearchableIndex`
+is how an app puts *its own* items into Spotlight; `CSSearchQuery` reads back
+what the calling bundle put there. There is no public route into another app's
+index. Notes, Mail and Messages each index into their own, and the Spotlight UI
+reads those through a private path.
+
+| Probe | Result |
+|---|---|
+| `CSSearchQuery("**==\"school*\"cdw")` | **0 items, `err = none`** |
+| `CSUserQuery` (the macOS 13+ replacement) | **0 items, no error** |
+| `Bundle.main.bundleIdentifier` | **`nil`** |
+
+That last row is the mechanism, and the first two are why it costs an afternoon:
+**both APIs return an empty result and report no error.** Zero-with-no-error is
+indistinguishable from "no matches", so the failure looks like a working search
+over an empty corpus. This repo has met that shape four times now — the
+AppleScript timeout that printed `[]` and exited 0, `immutable=1` hiding a
+contact added minutes earlier, `CMFBlockListIsItemBlocked` returning `false` for
+a demonstrably blocked number, `nts_MoveIntoAddressBook` returning `YES` without
+moving anything. An API that answers "nothing" when it means "I cannot see
+anything" is disqualifying on its own.
+
+⚠️ **The file-level index does not fill the gap either**, and it looks like it
+should: `/System/Library/Spotlight/Mail.mdimporter` ships with the OS. It is
+still true that
+
+```
+$ mdfind "<a subject line sitting in the inbox right now>"
+~/…/some-unrelated-document.docx          # fuzzy file matches
+~/…/another-unrelated.pdf                 # …and zero mail messages
+$ mdfind 'kMDItemContentType == "com.apple.mail.emlx"'
+                                          # nothing at all
+```
+
+The importer exists; its output is not in the index you can query. Same for
+notes — a live note title returns spreadsheets and no notes.
+
+🛑 **Even if the query worked, it returns the wrong thing.** A
+`CSSearchableItem` carries a title, a `contentDescription` snippet, a content
+type and a domain identifier. Every tool here needs the *record*: the note's
+ungzipped protobuf with checklist state intact, the message's recipients and the
+attachment bytes on disk, the reminder's private-API tags, the calendar
+occurrence date. Spotlight would be a discovery layer bolted onto readers that
+already answer in 0.04s.
+
+🛑 **And it has no write path.** Roughly half this repo is writes — `contacts
+move`, `calendar invite`, `mail move`, `reminders add`. CoreSpotlight cannot
+touch another app's data at all, so it could not replace any of it.
+
+⚠️ **The concession worth making: an index is not a bad idea.** *A body index* is
+still listed under "Still not taken" below, because `--field content` re-reads
+and re-decodes 3.4 GB on a full scan, and both sweetrb and sift built one. The
+finding is not "indexing is wrong" — it is "**Apple's index is not readable from
+here**, so an index has to be ours."
+
+**Re-check it with `util/check-spotlight`** rather than re-investigating. It
+probes the bundle identifier and both query APIs in ~1.3s, needs no entitlement
+to demonstrate the empty result, and **exits 0 only if something came back** —
+the same shape as `util/check-mail-intents`, so a future macOS opening this up
+is a one-command discovery.
 
 ### What we took from this survey
 
