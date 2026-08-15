@@ -611,6 +611,43 @@ struct Show: ParsableCommand {
     }
 }
 
+/// A requested change to `EKEvent.url`.
+///
+/// `--url ""` clears the field, anything else sets it, and an absent flag means
+/// the URL is not part of the request at all. The three states have to stay
+/// distinct: a cleared URL and an untouched one look identical afterwards, so a
+/// write confirmation that could not tell them apart would report either as
+/// success.
+enum URLChange {
+    case set(URL)
+    case clear
+
+    /// `nil` when the flag was not passed. Throws on a string that is not a URL,
+    /// rather than storing nothing and reporting success — `URL(string:)`
+    /// returns nil for a bad value, and `add --url` used to drop it silently.
+    static func parse(_ raw: String?) throws -> URLChange? {
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty { return .clear }
+        guard let url = URL(string: trimmed), url.scheme != nil else {
+            throw ValidationError("""
+                '\(raw)' is not a URL. Pass a full one with a scheme, such as \
+                'https://example.com', or --url "" to clear the field.
+                """)
+        }
+        return .set(url)
+    }
+
+    /// What `EKEvent.url` should hold afterwards. `.clear` really is `nil`, not
+    /// an empty URL.
+    var value: URL? {
+        switch self {
+        case .set(let url): return url
+        case .clear: return nil
+        }
+    }
+}
+
 struct Add: ParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Create an event",
@@ -651,7 +688,7 @@ struct Add: ParsableCommand {
     @Option(name: .long, help: "Notes body")
     var notes: String?
 
-    @Option(name: .long, help: "URL to attach")
+    @Option(name: .long, help: "URL to attach, e.g. a meeting link")
     var url: String?
 
     @Option(
@@ -666,6 +703,7 @@ struct Add: ParsableCommand {
 
     func validate() throws {
         try recurrence.validate()
+        _ = try URLChange.parse(url)
     }
 
     func run() throws {
@@ -711,8 +749,8 @@ struct Add: ParsableCommand {
 
         event.location = location
         event.notes = notes
-        if let url {
-            event.url = URL(string: url)
+        if let change = try URLChange.parse(url) {
+            event.url = change.value
         }
 
         if let rule = recurrence.rule() {
@@ -783,6 +821,9 @@ struct Edit: ParsableCommand {
     @Option(name: .long, help: "New notes body (replaces existing notes)")
     var notes: String?
 
+    @Option(name: .long, help: "New URL, or \"\" to clear it (a stale meeting link, say)")
+    var url: String?
+
     @Option(name: .long, help: "Which occurrence to edit (its \"occurrence\" field from `events --json`)")
     var occurrence: DateArg?
 
@@ -804,10 +845,12 @@ struct Edit: ParsableCommand {
 
     func validate() throws {
         try recurrence.validate()
+        _ = try URLChange.parse(url)
     }
 
     func run() throws {
         try requireCalendarAccess()
+        let urlChange = try URLChange.parse(url)
 
         // 🛑 A recurrence rule belongs to the series, never to one occurrence —
         // there is no such thing as "this Tuesday repeats weekly". Applying it
@@ -829,9 +872,9 @@ struct Edit: ParsableCommand {
         }
 
         guard title != nil || start != nil || end != nil || location != nil || notes != nil
-            || recurrence.wasSpecified else {
+            || urlChange != nil || recurrence.wasSpecified else {
             throw ValidationError(
-                "nothing to change; pass at least one of --title/--start/--end/--location/--notes/--repeat")
+                "nothing to change; pass at least one of --title/--start/--end/--location/--notes/--url/--repeat")
         }
 
         // Applied to the retry target too, so both attempts are identical.
@@ -841,6 +884,7 @@ struct Edit: ParsableCommand {
             if let end { event.endDate = end.date }
             if let location { event.location = location }
             if let notes { event.notes = notes }
+            if let urlChange { event.url = urlChange.value }
 
             guard recurrence.wasSpecified else { return }
             if let rule = recurrence.rule() {
@@ -886,7 +930,7 @@ struct Edit: ParsableCommand {
         // answer has to come from the store.
         let want = IntendedChange(
             start: start?.date, end: end?.date, title: title,
-            location: location, notes: notes,
+            location: location, notes: notes, url: urlChange,
             recurs: recurrence.wasSpecified ? recurrence.isRecurring : nil)
         let intendedStart = start?.date ?? match.startDate
 
@@ -954,13 +998,16 @@ struct IntendedChange {
     var title: String?
     var location: String?
     var notes: String?
+    /// `.set` when a URL should be there afterwards, `.clear` when it should be
+    /// gone, nil when the URL was not part of the request.
+    var url: URLChange?
     /// True when a recurrence rule should exist afterwards, false when it
     /// should not, nil when recurrence was not part of the request.
     var recurs: Bool?
 
     var isEmpty: Bool {
         start == nil && end == nil && title == nil && location == nil && notes == nil
-            && recurs == nil
+            && url == nil && recurs == nil
     }
 }
 
@@ -1025,6 +1072,24 @@ enum WriteConfirmation {
         compareText("title", event.title, want.title)
         compareText("location", event.location, want.location)
         compareText("notes", event.notes, want.notes)
+
+        // A cleared URL has to be checked as "absent", not as "equal to an empty
+        // string": EKEvent.url is a URL?, and the whole point of --url "" is to
+        // reach nil rather than an empty URL.
+        switch want.url {
+        case .none:
+            break
+        case .some(.clear):
+            if let actual = event.url {
+                problems.append("url is '\(actual.absoluteString)', expected it to be cleared")
+            }
+        case .some(.set(let expected)):
+            if event.url?.absoluteString != expected.absoluteString {
+                problems.append(
+                    "url is \(event.url.map { "'\($0.absoluteString)'" } ?? "unset"), "
+                    + "expected '\(expected.absoluteString)'")
+            }
+        }
 
         if let recurs = want.recurs, recurs != event.hasRecurrenceRules {
             problems.append(

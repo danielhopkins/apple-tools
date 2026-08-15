@@ -44,6 +44,7 @@ installed via `make install`.
 | This week's events | `apple calendar events --days 7 --json` |
 | Add an event | `apple calendar add "Dentist" --start "tomorrow 2pm" --duration 45` |
 | Recurring meeting | `apple calendar add "Board" --start … --repeat monthly --on-the "4th monday"` |
+| Fix a stale meeting link | `apple calendar edit <id> --url ""` |
 | See who is invited | `apple calendar events --days 7 --json` → `attendees`, `organizer`, `my_status` |
 | See the guest list (read-only) | `apple calendar invitees <id>` |
 | Invite someone (sends mail) | `apple calendar invite <id> --add a@b.com --dry-run` |
@@ -908,7 +909,7 @@ apple calendar add "TITLE" --start DATE [--end DATE | --duration MINUTES]
                           [--calendar NAME] [--all-day] [--location TEXT]
                           [--notes TEXT] [--url URL] [--invitee ADDR]... [--json]
 apple calendar edit ID [--title T] [--start DATE] [--end DATE] [--location L]
-                       [--notes N] [--occurrence DATE | --series] [--future] [--json]
+                       [--notes N] [--url URL|""] [--occurrence DATE | --series] [--future] [--json]
 apple calendar invitees ID [--occurrence DATE | --series] [--json]   # read-only
 apple calendar invite ID [--add ADDR]... [--remove ADDR]...
                        [--occurrence DATE | --series] [--future] [--dry-run] [--json]
@@ -929,6 +930,26 @@ matches *every* calendar with that name when reading, and prefers a writable
 one when writing — otherwise `calendars --writable` would offer a name that
 `add` then rejected as read-only. When it matters which one you got, use the
 `calendar` field on each event rather than assuming the name is unambiguous.
+
+**`--url` is writable on `add` and `edit`, and `--url ""` clears it.** An event's
+`url` is a separate field from `location` and `notes`, and calendar clients turn
+it into the join button — so a synced event can carry a **stale** meeting link
+there while `location` holds the current one, and the stale one wins. `events
+--json` has always reported `url`; nothing here could write it before, and the
+only fallback was AppleScript against Calendar.app.
+
+- **`--url ""` reaches `nil`**, not an empty URL. The read-back check treats a
+  cleared URL as absent, so `--url ""` on an event that still holds one fails
+  rather than reporting success.
+- **A string that is not a URL is refused**, naming it. A scheme is required:
+  `example.com` is rejected, `https://example.com` and `zoommtg://…` are taken.
+  `add --url` used to drop an unparseable value silently and report success.
+- `--occurrence` / `--series` / `--future` mean the same thing here as for every
+  other field.
+- ⚠️ **The AppleScript route is a trap worth avoiding.** `set url of e to missing
+  value` fails with **-1700**; only an empty string works. And Calendar.app
+  cannot be addressed by the EventKit id that `events --json` prints, so matching
+  falls back to calendar name plus summary.
 
 **Recurring events.** An event ID identifies the *series*, not the instance you
 saw — EventKit resolves it to the first occurrence, often years earlier. So:

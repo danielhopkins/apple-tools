@@ -109,6 +109,51 @@ class TestEdit(LiveCalendarTest):
         run("edit", event["id"], "--notes", "second")
         self.assertEqual(self.get(event["id"])["notes"], "second")
 
+    def test_edit_sets_url(self):
+        event = self.add("edit-url", "--start", f"{TEST_YEAR}-04-07 09:00")
+        run("edit", event["id"], "--url", "https://example.com/join")
+        self.assertEqual(self.get(event["id"])["url"], "https://example.com/join")
+
+    def test_edit_replaces_a_stale_url(self):
+        event = self.add(
+            "edit-url-replace",
+            "--start", f"{TEST_YEAR}-04-08 09:00",
+            "--url", "https://stale.example.com/1",
+        )
+        run("edit", event["id"], "--url", "https://fresh.example.com/2")
+        self.assertEqual(self.get(event["id"])["url"], "https://fresh.example.com/2")
+
+    def test_edit_empty_url_clears_the_field(self):
+        # The reason this flag exists: a stale meeting link in `url` competes
+        # with the real one in location/notes. Clearing must reach nil, not an
+        # empty URL, so the key has to be absent from the JSON afterwards.
+        event = self.add(
+            "edit-url-clear",
+            "--start", f"{TEST_YEAR}-04-09 09:00",
+            "--url", "https://example.com/stale",
+        )
+        self.assertEqual(self.get(event["id"])["url"], "https://example.com/stale")
+        run("edit", event["id"], "--url", "")
+        self.assertIsNone(self.get(event["id"]).get("url"))
+
+    def test_edit_rejects_a_url_that_does_not_parse(self):
+        event = self.add("edit-url-bad", "--start", f"{TEST_YEAR}-04-10 09:00")
+        code, _, err = run("edit", event["id"], "--url", "example.com", check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("not a URL", err)
+        self.assertIsNone(self.get(event["id"]).get("url"))
+
+    def test_add_rejects_a_url_that_does_not_parse(self):
+        code, _, err = run(
+            "add", self.title("add-url-bad"),
+            "--start", f"{TEST_YEAR}-04-11 09:00",
+            "--calendar", self.calendar,
+            "--url", "example.com",
+            check=False,
+        )
+        self.assertNotEqual(code, 0)
+        self.assertIn("not a URL", err)
+
     def test_edit_with_no_changes_is_rejected(self):
         event = self.add("edit-noop", "--start", f"{TEST_YEAR}-04-05 09:00")
         code, _, err = run("edit", event["id"], check=False)
