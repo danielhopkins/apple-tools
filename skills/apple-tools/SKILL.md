@@ -1,6 +1,6 @@
 ---
 name: apple-tools
-description: Read and write the user's local Apple app data — Notes, Mail, Messages, Phone calls, Maps, Reminders, Calendar, Contacts — through the `apple` CLI. Use whenever the user refers to their own notes, email, texts, iMessages, phone calls, missed calls, voicemail, reminders, todos, calendar, meetings, schedule, contacts, or places they have been ("what's on my calendar", "find that email from", "what did they text me", "who called me", "call Alice", "remind me to", "look up their number", "search my notes", "where have I been", "when was I last at", "what's in my Maps guide"). Everything runs locally against real data, so writes need care.
+description: Read and write the user's local Apple app data — Notes, Mail, Messages, Phone calls, Maps, Reminders, Calendar, Contacts — through the `apple` CLI. Also turns a place name into a coordinate, for location reminders ("remind me when I get to the store") and calendar events with a real map pin. Use whenever the user refers to their own notes, email, texts, iMessages, phone calls, missed calls, voicemail, reminders, todos, calendar, meetings, schedule, contacts, or places they have been ("what's on my calendar", "find that email from", "what did they text me", "who called me", "call Alice", "remind me to", "look up their number", "search my notes", "where have I been", "when was I last at", "what's in my Maps guide"). Everything runs locally against real data, so writes need care.
 ---
 
 # apple-tools
@@ -102,11 +102,15 @@ apple maps places --search "costco" --json       # when were they last there
 apple maps visits --since 14 --json              # individual arrivals, newest first
 apple maps guides --json                         # saved guides with place counts
 apple maps guides "Boulder Playgrounds" --json   # the places in one guide
+apple maps geocode "costco" --json               # coordinate; local first, then network
+apple maps geocode "costco" --local-only         # never touch the network
 
 # Reminders
 apple reminders show-lists --json
 apple reminders show-all --due-date today --include-overdue --json
 apple reminders add Inbox "Buy milk" --due-date "tomorrow 9am"
+apple reminders add Errands "Milk" --at "costco, superior co"   # when I arrive
+apple reminders add Errands "Call" --at "39.96,-105.17" --on leave --radius 250
 
 # Calendar
 apple calendar calendars --writable --json
@@ -244,6 +248,38 @@ messages use.
 guides, playground lists — so they carry intent that visit history does not. An
 ambiguous guide name is an error listing the candidates; pass an id to resolve
 it.
+
+🛑 **Geocoding is the one thing here that touches the network.** Everything else
+runs against local stores. Three flags use it:
+
+- `apple maps geocode QUERY` — a coordinate for a place. It tries the user's own
+  visited places and guides **first**, so the common case makes no network call,
+  and the answer is better: "costco" means the branch they go to. Pass
+  `--local-only` when the user should not be sent to the network at all.
+- `apple reminders add|edit --at PLACE` — a location reminder. `--on arrive`
+  (default) or `--on leave`, `--radius` in metres.
+- `apple calendar add|edit --at PLACE` — an event with a real map pin, which is
+  what gives a client a map thumbnail and a travel-time alert.
+
+⚠️ **Four things to get right:**
+
+- **`--location` never geocodes, and that is deliberate.** Use it for text that
+  is not a place ("Zoom", a room name). Use `--at` when the user wants a pin.
+- **`reminders` cannot resolve against the user's own Maps data**, only over the
+  network, because it runs disclaimed and loses Full Disk Access. To pin a
+  reminder to a place they actually go to, compose the tools:
+
+  ```
+  AT=$(apple maps geocode costco --json | jq -r '.[0].at')
+  apple reminders add Errands "Buy milk" --at "$AT"
+  ```
+
+  The `at` field is a ready-made `"Name@lat,lon"` string. Use it rather than
+  building one, so the place keeps its name.
+- **An ambiguous place is refused, not guessed.** Branches more than 250 m apart
+  produce an error listing them. Narrow with `--near`, or pass a coordinate.
+- **Check `has_coordinate` in `apple calendar show --json`** to confirm a pin
+  landed. `location` alone reads identically with or without one.
 
 Not every row is a text: check the `kind` field, which is `message`, `tapback`,
 `systemEvent`, or `appMessage`. Group joins and renames are excluded unless you

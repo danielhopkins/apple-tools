@@ -241,6 +241,8 @@ private struct Add: ParsableCommand {
         help: "The notes to add to the reminder")
     var notes: String?
 
+    @OptionGroup var location: LocationOptions
+
     @Option(
         name: .customLong("tag"),
         help: ArgumentHelp(
@@ -257,9 +259,17 @@ private struct Add: ParsableCommand {
             until: repeatUntil,
             count: repeatCount)
         try validateTagFlags(tags)
+        try location.validate()
+        if location.clearLocation {
+            throw ValidationError("--clear-location only means something on `edit`.")
+        }
     }
 
-    func run() {
+    func run() throws {
+        // Geocoding is a network call and can fail, so it happens before the
+        // reminder is created. A reminder that exists without the location the
+        // user asked for is worse than one that was never created.
+        let locationAlarm = try location.makeAlarm()
         reminders.addReminder(
             string: self.reminder.joined(separator: " "),
             notes: self.notes,
@@ -271,8 +281,12 @@ private struct Add: ParsableCommand {
                 interval: repeatInterval,
                 until: repeatUntil,
                 count: repeatCount),
+            locationAlarm: locationAlarm,
             tags: tags,
             outputFormat: formatOptions.resolved)
+        if formatOptions.resolved != .json, let described = location.describe(locationAlarm) {
+            print(described)
+        }
     }
 }
 
@@ -450,6 +464,8 @@ private struct Edit: ParsableCommand {
                 + "--remove-tag to change them one at a time."))
     var tags: [String] = []
 
+    @OptionGroup var location: LocationOptions
+
     @Option(
         name: .customLong("add-tag"),
         help: "Add a tag, keeping the existing ones. Repeatable.")
@@ -477,8 +493,10 @@ private struct Edit: ParsableCommand {
             && self.tags.isEmpty
             && self.addTags.isEmpty
             && self.removeTags.isEmpty
+            && self.location.at == nil
+            && !self.location.clearLocation
         {
-            throw ValidationError("Must specify either new reminder content, new notes, new due date, new priority, new recurrence, or a tag change")
+            throw ValidationError("Must specify either new reminder content, new notes, new due date, new priority, new recurrence, a location change, or a tag change")
         }
 
         // --tag is a whole-set replace, so combining it with the incremental
@@ -495,9 +513,13 @@ private struct Edit: ParsableCommand {
             until: repeatUntil,
             count: repeatCount)
         try validateTagFlags(tags + addTags + removeTags)
+        try location.validate()
     }
 
-    func run() {
+    func run() throws {
+        // Resolve before touching the reminder, so a failed lookup leaves it
+        // exactly as it was rather than half-edited.
+        let locationAlarm = try location.makeAlarm()
         let newText = self.reminder.joined(separator: " ")
         reminders.edit(
             itemAtIndex: self.index,
@@ -513,10 +535,17 @@ private struct Edit: ParsableCommand {
                     until: repeatUntil,
                     count: repeatCount)
             },
+            newLocationAlarm: locationAlarm,
+            clearLocation: location.clearLocation,
             tagsToSet: tags.isEmpty ? nil : tags,
             tagsToAdd: addTags,
             tagsToRemove: removeTags
         )
+        if let described = location.describe(locationAlarm) {
+            print(described)
+        } else if location.clearLocation {
+            print("Removed the location trigger.")
+        }
     }
 }
 

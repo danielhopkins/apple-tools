@@ -34,6 +34,17 @@ let package = Package(
         // Query parsing shared by mail and messages, so the two cannot drift on
         // what `budget review` means.
         .target(name: "AppleToolsSearch"),
+        // 🛑 The only target in this package that touches the network.
+        // MKLocalSearch and CLGeocoder both query Apple's servers; nothing else
+        // here makes a network call, so this is deliberately its own target and
+        // depending on it is a decision rather than an accident.
+        //
+        // It is separate from MapsLibrary because `reminders` needs geocoding
+        // and cannot link the Maps store: reminders re-executes itself
+        // disclaimed, and a disclaimed process loses the terminal's Full Disk
+        // Access (measured — a probe read MapsSync_0.0.1 fine until it
+        // disclaimed, then got EPERM).
+        .target(name: "Geocoding"),
         .target(
             name: "AppleToolsStyle",
             dependencies: [.product(name: "ArgumentParser", package: "swift-argument-parser")]
@@ -58,6 +69,9 @@ let package = Package(
                 "AppleToolsStyle",
                 "TCCResponsibility",
                 "ReminderKitBridge",
+                // Location reminders need a coordinate, and reminders cannot
+                // read the Maps store — see the Geocoding target comment.
+                "Geocoding",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
@@ -86,6 +100,11 @@ let package = Package(
                 "AppleToolsVersion",
                 "AppleToolsStyle",
                 "TCCResponsibility",
+                // `--at` gives an event a real map pin. Nothing geocodes a
+                // location string after the fact — not EventKit, not the
+                // calDAV server, not Calendar.app — so the coordinate has to
+                // be resolved here. That is a network call.
+                "Geocoding",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "Sources/AppleCalendar",
@@ -175,7 +194,7 @@ let package = Package(
         ),
         .target(
             name: "MapsLibrary",
-            dependencies: ["AppleToolsSearch"],
+            dependencies: ["AppleToolsSearch", "Geocoding"],
             linkerSettings: [
                 // MapsSync_0.0.1 is a Core Data SQLite store, read directly the
                 // same way PhoneLibrary reads CallHistory.storedata. Maps.app
@@ -201,6 +220,10 @@ let package = Package(
         .testTarget(
             name: "MapsTests",
             dependencies: ["MapsLibrary"]
+        ),
+        .testTarget(
+            name: "GeocodingTests",
+            dependencies: ["Geocoding"]
         ),
         .testTarget(
             name: "PhoneTests",

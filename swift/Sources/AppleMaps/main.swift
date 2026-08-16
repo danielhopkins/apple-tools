@@ -1,7 +1,9 @@
 import AppleToolsStyle
 import AppleToolsVersion
 import ArgumentParser
+import CoreLocation
 import Foundation
+import Geocoding
 import MapsLibrary
 
 func warn(_ message: String) {
@@ -110,6 +112,45 @@ enum Output {
     return payload
   }
 
+  static func encode(_ result: GeocodeResult) -> [String: Any] {
+    var payload: [String: Any] = [
+      "name": result.name,
+      "latitude": result.latitude,
+      "longitude": result.longitude,
+      "source": result.source.rawValue,
+      // The one field a caller needs to know whether this answer left the
+      // machine. Never inferred from `source` by a consumer that may not know
+      // every case.
+      "network": result.source.isNetwork,
+    ]
+    if let address = result.address { payload["address"] = address }
+    if let category = result.category { payload["category"] = category }
+    if let visits = result.visitCount { payload["visits"] = visits }
+    // Ready to hand straight to `apple reminders --at` or `apple calendar --at`,
+    // which is the whole point of this command. Carrying the name means the
+    // reminder reads "Costco Wholesale" rather than "39.96,-105.17".
+    payload["at"] = result.atForm
+    return payload
+  }
+
+  static func line(_ result: GeocodeResult) {
+    print("\(Style.title(result.name))  \(Style.identifier(coordinates(result)))")
+    var detail: [String] = []
+    if let address = result.address { detail.append(Style.dim(address)) }
+    if let visits = result.visitCount, visits > 0 {
+      detail.append(Style.dim(visits == 1 ? "1 visit" : "\(visits) visits"))
+    }
+    detail.append(
+      result.source.isNetwork
+        ? Style.warning(result.source.rawValue) : Style.success(result.source.rawValue))
+    print("    \(detail.joined(separator: "  "))")
+  }
+
+  /// Six decimal places is about 0.1 m, which is finer than any source here.
+  static func coordinates(_ result: GeocodeResult) -> String {
+    String(format: "%.6f,%.6f", result.latitude, result.longitude)
+  }
+
   /// `Boulder · Swimming Lessons`, dropping whichever half is missing.
   static func context(_ place: Place) -> String? {
     let parts = [place.city, place.category].compactMap { $0 }
@@ -175,9 +216,118 @@ struct AppleMaps: ParsableCommand {
       unprivileged process can read. Do not report one as the other.
       """,
     version: appleToolsVersion,
-    subcommands: [Places.self, Visits.self, Guides.self, Status.self],
+    subcommands: [Places.self, Visits.self, Guides.self, Geocode.self, Status.self],
     defaultSubcommand: Places.self
   )
+}
+
+struct Geocode: ParsableCommand {
+  static let configuration = CommandConfiguration(
+    abstract: "Turn a place name or address into a coordinate",
+    discussion: """
+      Answers from the user's own Maps data first, and asks Apple Maps only if
+      nothing local matches. A place they have been to already carries a real
+      coordinate, so the local answer costs no network call and is usually the
+      one they mean: "costco" is the branch they actually go to, not whichever
+      branch Apple ranks first.
+
+      🛑 The network fallback is the only part of apple-tools that leaves the
+      machine. --local-only refuses it; --network-only skips the local store.
+
+      A Maps search is biased toward where the user has recently been, taken
+      from their own visit history. Nothing asks Location Services where they
+      are now. Override with --near, which takes "lat,lon" or a place name.
+      """
+  )
+
+  @Argument(help: "A place name, an address, or \"lat,lon\"")
+  var query: String
+
+  @Option(name: .long, help: "Bias the search near this place or \"lat,lon\"")
+  var near: String?
+
+  @Option(name: .long, help: "Maximum results")
+  var limit: Int = 5
+
+  @Flag(name: .long, help: "Never touch the network; only places you have been or saved")
+  var localOnly = false
+
+  @Flag(name: .long, help: "Skip your own places and ask Apple Maps")
+  var networkOnly = false
+
+  @Flag(name: .long, help: "Output as JSON")
+  var json = false
+
+  func run() throws {
+    guard !(localOnly && networkOnly) else {
+      throw ValidationError("--local-only and --network-only are opposites; pass one.")
+    }
+
+    // A literal pair is not a lookup at all, and answering it without touching
+    // the store or the network keeps `--local-only` honest for scripted input.
+    if Coordinate.looksLikeCoordinates(query) {
+      guard let parsed = Coordinate.parseLabelled(query) else {
+        throw ValidationError(
+          "'\(query)' looks like a coordinate pair but is out of range. "
+            + "Latitude is -90..90 and longitude is -180..180, in that order.")
+      }
+      let result = GeocodeResult(
+        name: parsed.label ?? query,
+        latitude: parsed.coordinate.latitude, longitude: parsed.coordinate.longitude,
+        source: .coordinate)
+      try emit([result])
+      return
+    }
+
+    var results: [GeocodeResult] = []
+    var localFailure: String?
+
+    if !networkOnly {
+      do {
+        let local = LocalGeocoder(database: try openDatabase())
+        results = try local.resolve(query, limit: limit)
+      } catch {
+        // Without Full Disk Access the local half cannot answer. That is a
+        // reason to fall through to the network, not to fail — but it must be
+        // said, or a network answer looks like a local one.
+        localFailure = error.localizedDescription
+      }
+    }
+
+    if results.isEmpty && !localOnly {
+      if let localFailure { warn("note: could not read your Maps store (\(localFailure))") }
+      results = try NetworkGeocoder().resolve(query, near: try searchBias(), limit: limit)
+    }
+
+    if results.isEmpty {
+      if let localFailure { throw GeocodeError.failed(localFailure) }
+      throw GeocodeError.noResults(
+        "Nothing in your visited places or guides matches '\(query)'. "
+          + "Drop --local-only to ask Apple Maps.")
+    }
+    try emit(results)
+  }
+
+  /// Where to centre a Maps search. An explicit `--near` wins; otherwise the
+  /// user's own recent visits provide it, and a store we cannot read simply
+  /// means no bias rather than an error.
+  private func searchBias() throws -> CLLocationCoordinate2D? {
+    if let near {
+      if let literal = Coordinate.parse(near) { return literal }
+      guard let resolved = try NetworkGeocoder().resolve(near, limit: 1).first else { return nil }
+      return resolved.coordinate
+    }
+    guard let database = try? MapsDatabase.open() else { return nil }
+    return try? LocalGeocoder(database: database).searchCentre()
+  }
+
+  private func emit(_ results: [GeocodeResult]) throws {
+    if json {
+      try Output.json(results.map(Output.encode))
+      return
+    }
+    for result in results { Output.line(result) }
+  }
 }
 
 /// Shared by `places` and `visits` so the two cannot drift on what a filter means.

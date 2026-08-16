@@ -718,8 +718,10 @@ struct Add: ParsableCommand {
     @Flag(name: .long, help: "Create as an all-day event")
     var allDay = false
 
-    @Option(name: .long, help: "Location")
+    @Option(name: .long, help: "Location text, written verbatim and never geocoded")
     var location: String?
+
+    @OptionGroup var pin: PinnedLocationOptions
 
     @Option(name: .long, help: "Notes body")
     var notes: String?
@@ -751,6 +753,11 @@ struct Add: ParsableCommand {
         if end != nil && duration != nil {
             throw ValidationError("pass either --end or --duration, not both")
         }
+
+        try pin.validate()
+        // Geocode before creating anything, for the same reason the invitees
+        // are parsed first: a failed lookup must leave nothing behind.
+        let resolvedPin = try pin.resolve()
 
         // Parse and check the invitees before creating anything, so a typo
         // cannot leave a half-built event behind that then has to be cleaned up.
@@ -784,6 +791,8 @@ struct Add: ParsableCommand {
         }
 
         event.location = location
+        // Resolved before the save, so a failed lookup creates nothing.
+        pin.apply(resolvedPin, to: event)
         event.notes = notes
         if let change = try URLChange.parse(url) {
             event.url = change.value
@@ -851,8 +860,10 @@ struct Edit: ParsableCommand {
     @Option(name: .long, help: "New end time")
     var end: DateArg?
 
-    @Option(name: .long, help: "New location")
+    @Option(name: .long, help: "New location text, written verbatim and never geocoded")
     var location: String?
+
+    @OptionGroup var pin: PinnedLocationOptions
 
     @Option(name: .long, help: "New notes body (replaces existing notes)")
     var notes: String?
@@ -908,10 +919,14 @@ struct Edit: ParsableCommand {
         }
 
         guard title != nil || start != nil || end != nil || location != nil || notes != nil
-            || urlChange != nil || recurrence.wasSpecified else {
+            || urlChange != nil || recurrence.wasSpecified || pin.wasSpecified else {
             throw ValidationError(
-                "nothing to change; pass at least one of --title/--start/--end/--location/--notes/--url/--repeat")
+                "nothing to change; pass at least one of --title/--start/--end/--location/--at/--notes/--url/--repeat")
         }
+
+        // Geocode once, before the first save attempt, so the retry below
+        // applies exactly the same change rather than asking Maps twice.
+        let resolvedPin = try pin.resolve()
 
         // Applied to the retry target too, so both attempts are identical.
         func apply(to event: EKEvent, warn: Bool) {
@@ -919,6 +934,7 @@ struct Edit: ParsableCommand {
             if let start { event.startDate = start.date }
             if let end { event.endDate = end.date }
             if let location { event.location = location }
+            pin.apply(resolvedPin, to: event)
             if let notes { event.notes = notes }
             if let urlChange { event.url = urlChange.value }
 

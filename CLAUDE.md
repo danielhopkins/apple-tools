@@ -2,7 +2,13 @@
 
 CLIs for reading and writing local Apple app data: Notes, Mail, Messages, Phone,
 Maps, Reminders, Calendar, Contacts. Everything runs locally against the user's real data — no
-network, no sync service, no API keys.
+sync service, no API keys.
+
+🛑 **One exception, and it is opt-in: geocoding.** `apple maps geocode`,
+`apple reminders --at` and `apple calendar --at` resolve a place name through
+Apple Maps, which is a network call. Nothing else in the repo makes one. It
+lives in its own `Geocoding` target so the dependency stays visible, and
+`apple maps geocode --local-only` refuses it outright.
 
 ## Quick reference
 
@@ -40,6 +46,9 @@ installed via `make install`.
 | Recent arrivals | `apple maps visits --since 14 --json` |
 | List saved guides | `apple maps guides --json` |
 | Places in one guide | `apple maps guides "Boulder Playgrounds" --json` |
+| Coordinate for a place | `apple maps geocode "costco" --json` |
+| Remind me when I get there | `apple reminders add Errands "Milk" --at "costco, superior co"` |
+| Event with a real map pin | `apple calendar add "Lunch" --start … --at "4800 Baseline Rd, Boulder"` |
 | Today's reminders | `apple reminders show-all --due-date today --include-overdue --json` |
 | Add a reminder | `apple reminders add Soon "Buy milk" --due-date "tomorrow 9am"` |
 | Tag a reminder | `apple reminders add Inbox "Bake sale" --tag PTA` |
@@ -898,10 +907,38 @@ places: `Boulder Playgrounds` with 21 named parks and street addresses,
 `categories` array and `category` for the first. `ZMAPITEMTOPLEVELCATEGORY` is a
 separate integer enum that nothing local names, so it goes through raw.
 
-**Every place carries a real coordinate**, unlike `apple calendar`, where a
-written location gets a structured location with no `geoLocation`. So `apple
-maps` is the one tool here that can hand you a latitude and longitude for a
-place the user has actually been.
+**`geocode` turns a name into a coordinate, and answers locally first.**
+
+```
+apple maps geocode "costco"                      # a place you have been: no network
+apple maps geocode "Union Station Denver"        # falls through to Apple Maps
+apple maps geocode "costco" --local-only         # refuse the network
+apple maps geocode "costco" --network-only       # skip your own places
+```
+
+- **The local answer is usually the better one**, not just the cheaper one.
+  "costco" means the branch the user goes to, not whichever branch Apple ranks
+  first. A visited place already carries a coordinate, so nothing is geocoded.
+- 🛑 **The network fallback is the only part of apple-tools that leaves the
+  machine.** It lives in its own `Geocoding` target so a dependency on it is a
+  decision. `--local-only` refuses it.
+- **A Maps search is biased to where the user has recently been**, taken from
+  the median of their own visit coordinates. Nothing asks Location Services
+  where they are. Measured: `geocode costco --network-only` returns Superior,
+  Longmont and Thornton; the same query `--near "Seattle, WA"` returns Seattle
+  and Kirkland.
+  ⚠️ The **median**, not the mean — one trip abroad drags a mean into the ocean.
+- **`--json` carries `at`**, a `"Name@lat,lon"` string ready to hand to
+  `apple reminders --at` or `apple calendar --at`. That is the composed path,
+  and it is what keeps the place's name on the reminder.
+- **`source` and `network` say where an answer came from**: `visited-place`,
+  `guide-place`, `maps-search`, `address-lookup` or `coordinate`. Read
+  `network`, never infer it from `source`.
+
+**Every place carries a real coordinate**, unlike a `--location` written by
+`apple calendar`, which gets a structured location with no `geoLocation`. So
+`apple maps` is the one tool here that can hand you a latitude and longitude for
+a place the user has actually been, without touching the network.
 
 Traps in the file itself — the Apple-epoch seconds (against `chat.db`'s
 nanoseconds), the `REAL` column that never matches a text comparison, the WAL
@@ -940,6 +977,45 @@ apple reminders new-list NAME
 
 `--due-date` takes natural language: `today`, `tomorrow 9am`, `next friday`,
 `2026-12-25`.
+
+**Location reminders — "remind me when I get there" — go on `add` and `edit`.**
+
+```
+apple reminders add Errands "Buy milk" --at "Costco, Superior CO"
+apple reminders add Errands "Call back" --at "39.96,-105.17" --on leave --radius 250
+apple reminders edit Errands 3 --clear-location
+```
+
+`--at` takes a place name, an address, a `"lat,lon"` pair, or the
+`"Name@lat,lon"` form that `apple maps geocode --json` emits as `at`. `--on` is
+`arrive` (default) or `leave`. `--radius` is metres, default 100. `--near`
+biases the Maps search.
+
+- 🛑 **A name or address means a network call**, the only one `reminders` makes.
+  A `"lat,lon"` pair touches nothing.
+- 🛑 **`reminders` cannot read the Maps store, so it cannot resolve a place from
+  the user's own history.** It re-executes itself disclaimed so the Reminders
+  grant follows the binary, and **a disclaimed process loses the terminal's Full
+  Disk Access** — measured with a probe that read `MapsSync_0.0.1` fine as a
+  plain process and got "you don't have permission" once disclaimed. To pin a
+  reminder to the branch the user actually goes to, compose the two tools:
+
+  ```
+  AT=$(apple maps geocode costco --json | jq -r '.[0].at')
+  apple reminders add Errands "Buy milk" --at "$AT"
+  ```
+
+  That resolves locally, with no network call, and carries the name through.
+- ⚠️ **A structured location with no coordinate triggers nothing**, while still
+  showing a name in Reminders.app. So a failed lookup refuses rather than
+  saving a location that looks right and never fires.
+- ⚠️ **Ambiguity is refused, not guessed.** A shop name matching branches more
+  than 250 m apart is an error listing them.
+- **The location alarm sits alongside a time alarm** rather than replacing it,
+  so "at 9am, or when I get there" is one reminder. `--clear-location` removes
+  only the location alarms and leaves any due-date alarm intact.
+- ⚠️ **`show --json` reports `locationTitle` and `location`** on a reminder that
+  has one. `location` is the coordinate pair as a string, not an address.
 
 ⚠️ `INDEX` is the position shown by `show`, and it **shifts** as items complete or
 get added. Always `show` immediately before `complete`/`edit`/`delete`.
@@ -1026,34 +1102,51 @@ one when writing — otherwise `calendars --writable` would offer a name that
 `add` then rejected as read-only. When it matters which one you got, use the
 `calendar` field on each event rather than assuming the name is unambiguous.
 
-🛑 **`--location` is text, and nothing here can give an event a map pin.**
+🛑 **`--location` is text and gets no map pin; `--at` is the flag that does.**
 EventKit keeps the coordinate on a separate `EKStructuredLocation`, and only
-that coordinate produces a map thumbnail or a travel-time alert. A location the
-tool writes gets a structured location carrying **the title and nothing else**.
+that coordinate produces a map thumbnail or a travel-time alert. A location
+written by `--location` gets a structured location carrying **the title and
+nothing else**.
+
+```
+apple calendar add "Bagels" --start "tomorrow 9am" \
+    --at "Big Daddy Bagels, 4800 Baseline Rd, Boulder, CO"
+```
+
+`--at` resolves the place through Apple Maps and sets the coordinate itself,
+then sets `location` to the resolved address. **This is a network call** — the
+only one `apple-calendar` makes. `--pin-radius` sets the geofence size,
+`--near` biases the search, `--clear-pin` removes the coordinate while leaving
+the location text alone.
+
+⚠️ **`--location` still never geocodes, deliberately.** A location that is not a
+place — "Zoom", "my desk", a room name — must not be silently turned into a
+coordinate somewhere else in the world. Ask for a pin explicitly.
 
 Measured on 2026-08-16, across 517 real events: 166 carry location text, all 166
 carry a structured location, and only **68** carry a coordinate. 64 of those 68
 are multi-line, which is Apple's picker format; three of the four single-line
 ones end in `, USA`, which is Google's.
 
-- **Nothing geocodes a string after the fact.** Not EventKit on save, not the
-  calDAV server on sync, and not Calendar.app on display — real street addresses
-  have sat in this store for months with no coordinate. A probe event re-read at
-  creation, from a fresh store, and after 150s of sync never gained one.
-- **The picker is what attaches it**, at entry time. Confirmed in a matched pair
-  on one event: `--location "Big Daddy Bagels, 4800 Baseline Rd, Boulder, CO
-  80303"` gave `has_coordinate: false`, and the same event edited through
-  Calendar.app's address picker came back as `Big Daddy Bagels\n4800 Baseline Rd,
-  Unit B101, Boulder, CO 80303, United States` with a coordinate and a 169 m
-  radius. Same event id — the picker rewrote in place.
+- **Nothing geocodes a string after the fact**, which is why `--at` has to do it
+  at write time. Not EventKit on save, not the calDAV server on sync, and not
+  Calendar.app on display — real street addresses have sat in this store for
+  months with no coordinate. A probe event re-read at creation, from a fresh
+  store, and after 150s of sync never gained one.
+- **Verified in a matched pair on 2026-08-16**, same address, two events:
+  `--location "Big Daddy Bagels, 4800 Baseline Rd, Boulder, CO 80303"` gave
+  `has_coordinate: false`; `--at` on the same address gave `has_coordinate:
+  true` at `39.9976725,-105.233365`, read back from a fresh store. Before `--at`
+  existed the only route was Calendar.app's address picker.
 - **`events`/`show --json` report `geo`** (`title`, `latitude`, `longitude`,
   `radius`, `has_coordinate`), and omit the key entirely when the event has no
   structured location. `location` alone cannot tell a geocoded address from a
-  typed one; they read identically.
-- ⚠️ **So never promise a user a pin or a travel-time alert from a write here.**
-  Giving one would mean calling `CLGeocoder` and setting
-  `EKStructuredLocation.geoLocation`, which is a network call this repo does not
-  make.
+  typed one; they read identically. **`has_coordinate` is how you check a
+  `--at` write landed.**
+- ⚠️ **Ambiguity is refused, not guessed.** A shop name matching branches more
+  than 250 m apart is an error listing them, because pinning a meeting to the
+  wrong branch is a mistake nobody notices until they drive there. Narrow it
+  with `--near`, or pass `"lat,lon"`.
 - A URL in `--location` is fine and stays verbatim. For a meeting link prefer
   `--url`, which clients turn into the join button.
 
@@ -1579,13 +1672,17 @@ swift/                    one Swift package, seven binaries
                           mailbox-name resolution for move)
   Sources/AppleMessages/  + MessagesLibrary/ (chat.db reader, typedstream decoder)
   Sources/ApplePhone/     + PhoneLibrary/ (CallHistory reader, AddressBook resolver)
-  Sources/AppleMaps/      + MapsLibrary/ (MapsSync reader — visits, places, guides)
+  Sources/AppleMaps/      + MapsLibrary/ (MapsSync reader — visits, places, guides,
+                          and the local geocoder that needs no network)
+  Sources/Geocoding/      🛑 the only target that touches the network: Apple Maps
+                          search and CLGeocoder, behind `--at` and `maps geocode`
   Sources/AppleCalendar/    + Attendees.swift (the private invitee write path)
   Sources/AppleContacts/  + Notes.swift (SQLite note reader),
                           Move.swift (the private cross-account move)
   Sources/ObjCExceptions/ @try/@catch for Swift — the move raises rather
                           than returning when it hits the note wall
   Tests/RemindersTests/ MailTests/ MessagesTests/ PhoneTests/ MapsTests/
+        GeocodingTests/
 notes/                    Python; apple-notes, notestore.py, notestore.proto,
                           mergeable.py (ZMERGEABLEDATA1 reader — recordings,
                           transcripts, summaries), tests/ (live Notes.app suite)
@@ -1616,6 +1713,8 @@ docs/apple-messages-store.md  chat.db schema, the typedstream body, verified tra
 docs/apple-phone-store.md  CallHistory schema, the entitlement walls, verified traps
 docs/apple-maps-store.md  MapsSync schema, why the location table overcounts,
                           and why nothing here writes
+docs/apple-geocoding.md   the one network call: what uses it, the local-first
+                          rule, and why reminders cannot read the Maps store
 docs/prior-art.md         other projects solving this; check before building
 docs/todo-deep-links.md   planned: a `url` on every entity, so anything we
                           name can be opened and cross-linked
@@ -1634,7 +1733,8 @@ make build      # swift build -c release → all seven binaries
 make install    # symlink dispatcher + tools into ~/bin
 make dev        # debug build, shaded ahead of the installed copy — see below
 make check      # smoke-test that every tool responds
-make test       # Swift unit tests (mail, messages, phone, maps, reminders — all offline)
+make test       # Swift unit tests (mail, messages, phone, maps, geocoding,
+                #   reminders — all offline; the network geocoder is not exercised)
 make bump       # next CalVer for today, stamped into every tool
 make dist       # universal release tarball + sha256 for the Homebrew tap
 ```

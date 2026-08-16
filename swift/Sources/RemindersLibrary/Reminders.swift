@@ -394,7 +394,7 @@ public final class Reminders {
         }
     }
 
-    func edit(itemAtIndex index: String, onListNamed name: String, newText: String?, newNotes: String?, newDueDate: DateComponents?, newPriority: Priority? = nil, newRecurrence: RecurrenceConfig? = nil, tagsToSet: [String]? = nil, tagsToAdd: [String] = [], tagsToRemove: [String] = []) {
+    func edit(itemAtIndex index: String, onListNamed name: String, newText: String?, newNotes: String?, newDueDate: DateComponents?, newPriority: Priority? = nil, newRecurrence: RecurrenceConfig? = nil, newLocationAlarm: EKAlarm? = nil, clearLocation: Bool = false, tagsToSet: [String]? = nil, tagsToAdd: [String] = [], tagsToRemove: [String] = []) {
         let calendar = self.calendar(withName: name)
         let semaphore = DispatchSemaphore(value: 0)
 
@@ -419,6 +419,16 @@ public final class Reminders {
                     } else {
                         reminder.recurrenceRules = nil
                     }
+                }
+                // Setting a new location replaces the old one. Removing only
+                // the location alarms leaves any due-date alarm intact — a
+                // blanket `alarms = nil` would silently cancel the time
+                // reminder too.
+                if clearLocation || newLocationAlarm != nil {
+                    reminder.removeLocationAlarms()
+                }
+                if let newLocationAlarm {
+                    reminder.addAlarm(newLocationAlarm)
                 }
                 try Store.save(reminder, commit: true)
 
@@ -520,6 +530,7 @@ public final class Reminders {
         dueDateComponents: DateComponents?,
         priority: Priority,
         recurrence: RecurrenceConfig?,
+        locationAlarm: EKAlarm? = nil,
         tags: [String] = [],
         outputFormat: OutputFormat)
     {
@@ -532,6 +543,12 @@ public final class Reminders {
         reminder.priority = priority.intValue
         if let dueDate = dueDateComponents?.date, dueDateComponents?.hour != nil {
             reminder.addAlarm(EKAlarm(absoluteDate: dueDate))
+        }
+        // A location alarm sits alongside a time alarm rather than replacing
+        // it: "at 9am, or when I get there, whichever comes first" is a real
+        // and useful reminder.
+        if let locationAlarm {
+            reminder.addAlarm(locationAlarm)
         }
         if let recurrence, let rule = makeRecurrenceRule(recurrence) {
             reminder.recurrenceRules = [rule]

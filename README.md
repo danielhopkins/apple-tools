@@ -8,8 +8,9 @@
 
 Command-line access to local Apple app data — **Notes, Mail, Messages, Phone,
 Maps, Reminders, Calendar, Contacts** — built so an agent (or a shell) can work with
-real data without an intermediary service. Everything is local: no network
-calls, no API keys, no sync layer.
+real data without an intermediary service. Everything is local: no API keys, no
+sync layer, and no network calls — with one opt-in exception, geocoding, which
+asks Apple Maps where a named place is. See [Geocoding](#geocoding).
 
 ```
 $ apple calendar events --days 3
@@ -132,6 +133,8 @@ apple messages search "dinner" --since 30 --json       # whole chat history
 apple phone recents --missed --since 7                 # who called while I was out
 apple maps places --min-visits 5                       # where you actually go
 apple maps guides "Boulder Playgrounds"                # the places in one guide
+apple maps geocode "costco"                            # a coordinate, local if it can
+apple reminders add Errands "Milk" --at "costco"       # remind me when I get there
 apple reminders show-all --due-date today --include-overdue
 apple calendar add "Dentist" --start "tomorrow 2pm" --duration 45
 apple contacts search "smith"
@@ -178,7 +181,7 @@ isn't guaranteed; JSON is.
 | ✉️ `mail` | `Envelope Index` + `.emlx` (reads), AppleScript + pasteboard (compose) | Search by subject, sender, or full body text with date and flag filters; export a message; save its attachments. `compose`/`reply`/`forward` open a Mail window with everything but the body — including any `--attach` files — and put the body on the clipboard. **The tool never writes a body**, see [`docs/apple-mail-drafts.md`](docs/apple-mail-drafts.md). |
 | 💬 `messages` | `chat.db` | Search and export iMessage/SMS/RCS history, list conversations, save attachments. Read-only. |
 | ☎️ `phone` | `CallHistory.storedata` + AddressBook | Recent calls with callers resolved to names, missed/unknown filters, talk-time stats, blocked list. Read-only apart from `dial`, which hands a `tel:` URL to Phone.app for you to confirm. |
-| 🗺️ `maps` | `MapsSync_0.0.1` | Places you have been, with visit counts and coordinates; individual visits; your saved guides and the places in them. Read-only by construction — CloudKit mirrors the store, and Maps.app has no scripting interface to fall back to. See [`docs/apple-maps-store.md`](docs/apple-maps-store.md). |
+| 🗺️ `maps` | `MapsSync_0.0.1`, plus Apple Maps for `geocode` | Places you have been, with visit counts and coordinates; individual visits; your saved guides and the places in them. `geocode` turns a name into a coordinate, answering from your own places first and Apple Maps only if nothing matches. The store is read-only by construction — CloudKit mirrors it, and Maps.app has no scripting interface. See [`docs/apple-maps-store.md`](docs/apple-maps-store.md). |
 | ✅ `reminders` | EventKit | Full CRUD: add, edit, complete, delete, lists, priorities, recurrence, natural-language dates. |
 | 📅 `calendar` | EventKit, plus private `EKAttendee` for invitee writes | List and search events, create, edit, delete; full recurrence (`--repeat`, plus `--on-the "4th monday"`); recurring-event spans. Reads invitees with their RSVP status, and can invite or uninvite people — which sends real mail, so `invite --dry-run` first. See [`docs/apple-calendar-invitees.md`](docs/apple-calendar-invitees.md). |
 | 👤 `contacts` | Contacts framework, with a legacy `AddressBook` fallback | Search by name, company, email, or phone; create, edit, delete. `move` relocates a contact between accounts **keeping its identifier** — there is no public API for that at all, see [`docs/apple-contacts-move.md`](docs/apple-contacts-move.md). Notes are read-only, and a contact that has one can only be written through the fallback. |
@@ -391,12 +394,57 @@ silently returns a wrong answer if Apple moves something.
 
 ### Does anything leave the machine?
 
-No network calls, no API keys, no sync service, no telemetry. Two things reach
-outward, both only when you ask: `calendar invite` makes *your* calendar server
-send real invitation mail, and `phone dial` places a real call — which is why
-the first has `--dry-run` and the second is confirmed by Phone.app rather than
-by the tool. Writes to Reminders, Calendar, Contacts and Notes also sync to your
-own devices, because they go through the real apps' stores.
+No API keys, no sync service, no telemetry, and one network call you have to ask
+for by name — see [Geocoding](#geocoding). Two other things reach outward, both
+only when you ask: `calendar invite` makes *your* calendar server send real
+invitation mail, and `phone dial` places a real call — which is why the first has
+`--dry-run` and the second is confirmed by Phone.app rather than by the tool.
+Writes to Reminders, Calendar, Contacts and Notes also sync to your own devices,
+because they go through the real apps' stores.
+
+## Geocoding
+
+Three flags resolve a place name into a coordinate, and all three ask Apple Maps.
+That is the only network call in the repo. It lives in its own `Geocoding` target
+so a dependency on it is a decision rather than an accident.
+
+```
+apple maps geocode "costco"                       # coordinate for a place
+apple reminders add Errands "Milk" --at "costco"  # remind me when I get there
+apple calendar add "Lunch" --start … --at "4800 Baseline Rd, Boulder"
+```
+
+**`apple maps geocode` answers from your own data first.** A place you have
+visited already carries a coordinate, so the common case makes no network call
+at all — and the answer is better: "costco" means the branch you actually go to,
+not whichever branch Apple ranks first. `--local-only` refuses the network
+outright; `--network-only` skips your own places.
+
+**A Maps search is biased toward where you have recently been**, taken from the
+median of your own visit coordinates. Nothing asks Location Services where you
+are. `geocode costco --network-only` returns Superior, Longmont and Thornton
+here; the same query with `--near "Seattle, WA"` returns Seattle and Kirkland.
+
+**`--at` on `reminders` and `calendar` is separate from `--location`.**
+`--location` stays a verbatim text write and never geocodes, because "Zoom" or a
+room name must not silently become a coordinate somewhere else in the world.
+
+`apple calendar --at` is what finally closes a gap this repo documented as
+unfixable: nothing geocodes an event's location string after the fact — not
+EventKit on save, not the calDAV server on sync, not Calendar.app on display — so
+before this the only way to get a map pin was Calendar.app's address picker.
+Verified in a matched pair on the same address: `--location` gave
+`has_coordinate: false`, `--at` gave `has_coordinate: true`.
+
+⚠️ `reminders` cannot resolve against your own Maps data, only over the network.
+It re-executes itself disclaimed so its grant follows the binary, and a
+disclaimed process loses the terminal's Full Disk Access. Compose the two tools
+to get a local answer:
+
+```
+AT=$(apple maps geocode costco --json | jq -r '.[0].at')
+apple reminders add Errands "Buy milk" --at "$AT"
+```
 
 ### Why does it need Full Disk Access?
 
