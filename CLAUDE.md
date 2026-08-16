@@ -931,6 +931,37 @@ one when writing — otherwise `calendars --writable` would offer a name that
 `add` then rejected as read-only. When it matters which one you got, use the
 `calendar` field on each event rather than assuming the name is unambiguous.
 
+🛑 **`--location` is text, and nothing here can give an event a map pin.**
+EventKit keeps the coordinate on a separate `EKStructuredLocation`, and only
+that coordinate produces a map thumbnail or a travel-time alert. A location the
+tool writes gets a structured location carrying **the title and nothing else**.
+
+Measured on 2026-08-16, across 517 real events: 166 carry location text, all 166
+carry a structured location, and only **68** carry a coordinate. 64 of those 68
+are multi-line, which is Apple's picker format; three of the four single-line
+ones end in `, USA`, which is Google's.
+
+- **Nothing geocodes a string after the fact.** Not EventKit on save, not the
+  calDAV server on sync, and not Calendar.app on display — real street addresses
+  have sat in this store for months with no coordinate. A probe event re-read at
+  creation, from a fresh store, and after 150s of sync never gained one.
+- **The picker is what attaches it**, at entry time. Confirmed in a matched pair
+  on one event: `--location "Big Daddy Bagels, 4800 Baseline Rd, Boulder, CO
+  80303"` gave `has_coordinate: false`, and the same event edited through
+  Calendar.app's address picker came back as `Big Daddy Bagels\n4800 Baseline Rd,
+  Unit B101, Boulder, CO 80303, United States` with a coordinate and a 169 m
+  radius. Same event id — the picker rewrote in place.
+- **`events`/`show --json` report `geo`** (`title`, `latitude`, `longitude`,
+  `radius`, `has_coordinate`), and omit the key entirely when the event has no
+  structured location. `location` alone cannot tell a geocoded address from a
+  typed one; they read identically.
+- ⚠️ **So never promise a user a pin or a travel-time alert from a write here.**
+  Giving one would mean calling `CLGeocoder` and setting
+  `EKStructuredLocation.geoLocation`, which is a network call this repo does not
+  make.
+- A URL in `--location` is fine and stays verbatim. For a meeting link prefer
+  `--url`, which clients turn into the join button.
+
 **`--url` is writable on `add` and `edit`, and `--url ""` clears it.** An event's
 `url` is a separate field from `location` and `notes`, and calendar clients turn
 it into the join button — so a synced event can carry a **stale** meeting link

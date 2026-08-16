@@ -62,6 +62,36 @@ class TestAdd(LiveCalendarTest):
         self.assertEqual(fetched["notes"], "agenda line one")
         self.assertEqual(fetched["url"], "https://example.com/meeting")
 
+    def test_a_written_location_gets_no_map_pin(self):
+        # 🛑 Measured on 2026-08-16, and the reason `geo` is reported at all.
+        # EventKit wraps a written location string in an EKStructuredLocation
+        # carrying the title and nothing else. Nothing geocodes it afterwards —
+        # not EventKit, not the calDAV server, and not Calendar.app on display.
+        # Confirmed in a matched pair: the same event, edited through
+        # Calendar.app's address picker, came back with the text rewritten to
+        # Apple's multi-line form and a real coordinate attached.
+        #
+        # So a location this tool writes is text. Nothing here can promise a map
+        # pin or a travel-time alert, and this test fails if that ever changes.
+        event = self.add(
+            "geo",
+            "--start", f"{TEST_YEAR}-03-08 09:00",
+            "--location", "Big Daddy Bagels, 4800 Baseline Rd, Boulder, CO 80303",
+        )
+        fetched = self.get(event["id"])
+        self.assertEqual(
+            fetched["location"], "Big Daddy Bagels, 4800 Baseline Rd, Boulder, CO 80303"
+        )
+        self.assertIsNotNone(fetched.get("geo"), "a written location still gets a structuredLocation")
+        self.assertFalse(fetched["geo"]["has_coordinate"])
+        self.assertIsNone(fetched["geo"].get("latitude"))
+
+    def test_an_event_without_a_location_reports_no_geo(self):
+        # Absent, not an object full of nulls: `geo` present must mean the event
+        # really carries a structured location.
+        event = self.add("geo-absent", "--start", f"{TEST_YEAR}-03-09 09:00")
+        self.assertIsNone(self.get(event["id"]).get("geo"))
+
     def test_added_event_is_listed(self):
         event = self.add("listed", "--start", f"{TEST_YEAR}-03-06 12:00")
         self.assertTrue(self.exists(event["id"]))

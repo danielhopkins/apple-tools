@@ -147,6 +147,38 @@ struct CalendarInfo: Encodable {
     let type: String
 }
 
+/// The map pin behind a location string.
+///
+/// `EKEvent.location` is plain text. The coordinate lives on a separate
+/// `EKStructuredLocation`, and only that coordinate gives a client a map pin or
+/// a travel-time alert. Reporting it is the only way to tell a geocoded
+/// location from a typed one — they read identically through `location`.
+struct GeoInfo: Encodable {
+    let title: String?
+    let latitude: Double?
+    let longitude: Double?
+    /// Metres. Non-zero on a location saved as a geofence.
+    let radius: Double?
+    /// True when a coordinate is present, so a reader never has to infer it
+    /// from two nullable numbers.
+    let hasCoordinate: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case title, latitude, longitude, radius
+        case hasCoordinate = "has_coordinate"
+    }
+
+    init?(_ event: EKEvent) {
+        guard let structured = event.structuredLocation else { return nil }
+        let coordinate = structured.geoLocation
+        title = structured.title
+        latitude = coordinate?.coordinate.latitude
+        longitude = coordinate?.coordinate.longitude
+        radius = structured.radius == 0 ? nil : structured.radius
+        hasCoordinate = coordinate != nil
+    }
+}
+
 struct EventInfo: Encodable {
     let id: String
     let title: String
@@ -155,6 +187,9 @@ struct EventInfo: Encodable {
     let end: String
     let allDay: Bool
     let location: String?
+    /// Present only when the event carries a structured location. `location`
+    /// alone cannot say whether a client has a pin to drop.
+    let geo: GeoInfo?
     let notes: String?
     let url: String?
     let recurring: Bool
@@ -172,7 +207,7 @@ struct EventInfo: Encodable {
     let myStatus: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, title, calendar, start, end, allDay, location, notes, url
+        case id, title, calendar, start, end, allDay, location, geo, notes, url
         case recurring, occurrence, recurrence, attendees, organizer
         case myStatus = "my_status"
     }
@@ -187,6 +222,7 @@ private func info(_ event: EKEvent) -> EventInfo {
         end: event.endDate.map { iso8601.string(from: $0) } ?? "",
         allDay: event.isAllDay,
         location: event.location,
+        geo: GeoInfo(event),
         notes: event.notes,
         url: event.url?.absoluteString,
         recurring: event.hasRecurrenceRules,
