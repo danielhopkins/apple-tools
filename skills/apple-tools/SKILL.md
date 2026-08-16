@@ -1,6 +1,6 @@
 ---
 name: apple-tools
-description: Read and write the user's local Apple app data — Notes, Mail, Messages, Phone calls, Reminders, Calendar, Contacts — through the `apple` CLI. Use whenever the user refers to their own notes, email, texts, iMessages, phone calls, missed calls, voicemail, reminders, todos, calendar, meetings, schedule, or contacts ("what's on my calendar", "find that email from", "what did they text me", "who called me", "call Alice", "remind me to", "look up their number", "search my notes"). Everything runs locally against real data, so writes need care.
+description: Read and write the user's local Apple app data — Notes, Mail, Messages, Phone calls, Maps, Reminders, Calendar, Contacts — through the `apple` CLI. Use whenever the user refers to their own notes, email, texts, iMessages, phone calls, missed calls, voicemail, reminders, todos, calendar, meetings, schedule, contacts, or places they have been ("what's on my calendar", "find that email from", "what did they text me", "who called me", "call Alice", "remind me to", "look up their number", "search my notes", "where have I been", "when was I last at", "what's in my Maps guide"). Everything runs locally against real data, so writes need care.
 ---
 
 # apple-tools
@@ -13,7 +13,7 @@ Check availability with `apple --version`. If the command is missing, say so
 rather than falling back to AppleScript or `osascript` by hand; the point of
 these tools is that the edge cases are already handled.
 
-## The seven tools
+## The eight tools
 
 | Tool | Reads | Writes |
 |------|-------|--------|
@@ -21,6 +21,7 @@ these tools is that the edge cases are already handled.
 | `apple mail` | accounts, message search, message bodies, attachments | **opens a compose window** (you paste the body; `--attach` files are already in it); **`move` refiles messages** |
 | `apple messages` | conversations, message search, attachments | no |
 | `apple phone` | call history with names, blocked list, stats | **`dial` only** (you confirm in Phone.app) |
+| `apple maps` | visited places with coordinates, visits, saved guides | no, and never |
 | `apple reminders` | lists, items, due dates | **yes** |
 | `apple calendar` | calendars, events, **invitees with RSVP status** | **yes** — and `invite` **emails real people** |
 | `apple contacts` | names, emails, phones, addresses, notes | **yes** (except notes) |
@@ -93,6 +94,14 @@ apple phone search "denver" --json               # by name, number, or place
 apple phone stats --since 90                     # counts, talk time, top callers
 apple phone blocked --json                       # read-only, cannot be written
 apple phone dial "Alice"                         # Phone.app asks them to confirm
+
+# Maps — reads MapsSync; works with Maps.app closed. Read-only, always.
+apple maps places --json                         # where they go, most-visited first
+apple maps places --min-visits 5 --json          # the regular places only
+apple maps places --search "costco" --json       # when were they last there
+apple maps visits --since 14 --json              # individual arrivals, newest first
+apple maps guides --json                         # saved guides with place counts
+apple maps guides "Boulder Playgrounds" --json   # the places in one guide
 
 # Reminders
 apple reminders show-lists --json
@@ -212,6 +221,29 @@ pass it to `apple contacts add`.
 is the user's to click — never try to click it for them. Only run `dial` when the
 user asked for the call in that turn, and prefer telling them the number
 otherwise. `--dry-run` shows the URL without dialing.
+
+**`maps` answers "where have I been", and `places` is usually the command.**
+`places` is one line per place with a visit count and a last-visited date;
+`visits` is one line per arrival. Both take `--search`, which is an AND of
+substring terms across name, address, city and category — the same rule mail and
+messages use.
+
+⚠️ **Four things to get right when reporting Maps data:**
+
+- **This is Maps' "Visited Places", not Significant Locations.** Significant
+  Locations belongs to `routined` and no unprivileged process can read it. Never
+  call one the other.
+- **A visit has no end time**, so the store cannot say how long the user stayed
+  anywhere. Do not report a duration.
+- **Coverage is about a year**, not all time. `apple maps status` prints the real
+  window; quote that rather than implying the history is complete.
+- **`classification` in the JSON is an undocumented number.** Two values appear
+  and nothing names them. Do not interpret it.
+
+**`guides` is the richer half.** These are lists the user built by hand — trip
+guides, playground lists — so they carry intent that visit history does not. An
+ambiguous guide name is an error listing the candidates; pass an id to resolve
+it.
 
 Not every row is a text: check the `kind` field, which is `message`, `tapback`,
 `systemEvent`, or `appMessage`. Group joins and renames are excluded unless you

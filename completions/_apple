@@ -12,6 +12,8 @@ _apple() {
         'notes:Search, export, and link Apple Notes'
         'mail:Search and export Apple Mail messages'
         'messages:Search and export iMessage/SMS history'
+        'phone:Read call history and place calls'
+        'maps:Read visited places and guides'
         'reminders:Read and write Reminders'
         'calendar:Read and write Calendar events'
         'contacts:Query Contacts'
@@ -41,6 +43,8 @@ _apple() {
                 notes)     target=apple-notes ;;
                 mail)      target=apple-mail ;;
                 messages)  target=apple-messages ;;
+                phone)     target=apple-phone ;;
+                maps)      target=apple-maps ;;
                 reminders) target=reminders ;;
                 calendar)  target=apple-calendar ;;
                 contacts)  target=apple-contacts ;;

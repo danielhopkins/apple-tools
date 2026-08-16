@@ -1,7 +1,7 @@
 # apple-tools
 
 CLIs for reading and writing local Apple app data: Notes, Mail, Messages, Phone,
-Reminders, Calendar, Contacts. Everything runs locally against the user's real data — no
+Maps, Reminders, Calendar, Contacts. Everything runs locally against the user's real data — no
 network, no sync service, no API keys.
 
 ## Quick reference
@@ -35,6 +35,11 @@ installed via `make install`.
 | Callers not in Contacts | `apple phone recents --unknown --since 30 --json` |
 | Blocked callers | `apple phone blocked --json` |
 | Place a call | `apple phone dial "Alice"` |
+| Where do I actually go | `apple maps places --min-visits 5 --json` |
+| When was I last there | `apple maps places --search "costco" --json` |
+| Recent arrivals | `apple maps visits --since 14 --json` |
+| List saved guides | `apple maps guides --json` |
+| Places in one guide | `apple maps guides "Boulder Playgrounds" --json` |
 | Today's reminders | `apple reminders show-all --due-date today --include-overdue --json` |
 | Add a reminder | `apple reminders add Soon "Buy milk" --due-date "tomorrow 9am"` |
 | Tag a reminder | `apple reminders add Inbox "Bake sale" --tag PTA` |
@@ -60,7 +65,7 @@ its shape is not stable. Use `apple --which` to see which binary each name
 resolves to.
 
 **Check permissions before diagnosing an access failure.** `apple status`
-reports all seven in one table, never prompts, and exits non-zero if anything is
+reports all eight in one table, never prompts, and exits non-zero if anything is
 unusable:
 
 ```
@@ -819,6 +824,96 @@ iPhone that keeps years. Say "recents", never "all calls".
 `location`, plus `call_type` so an unrecognised type is visible rather than
 hidden behind `kind: "unknown"`.
 
+### maps — `apple maps`
+
+Reads `MapsSync_0.0.1` directly, the same way phone reads
+`CallHistory.storedata`. Works with Maps.app closed. **Read-only, and it will
+stay that way** — see below.
+
+```
+apple maps places [--since DAYS] [--before DAYS] [--search TEXT]
+                  [--min-visits N] [--limit N] [--json]   # default subcommand
+apple maps visits [--since DAYS] [--before DAYS] [--search TEXT] [--limit N] [--json]
+apple maps guides [GUIDE] [--search TEXT] [--places] [--json]
+apple maps status [--json]
+```
+
+`places` is the default subcommand, so `apple maps` alone lists where the user
+goes, most-visited first. `visits` is the same data one arrival at a time.
+
+⚠️ **This is Maps' "Visited Places", not Significant Locations.** Significant
+Locations belongs to `routined`, under `/var/db/locationd/`, which no
+unprivileged process can read (`~/Library/Caches/com.apple.routined/` does not
+exist either). They are different features with different retention. **Never
+report one as the other.**
+
+🛑 **Nothing here writes, and nothing here should.** CloudKit mirrors this
+store — 1,936 `NSCKRecordMetadata` rows — and Core Data triggers maintain
+denormalised counters on it (`ZCOLLECTION.ZPLACESCOUNT`,
+`ZVISITEDLOCATION.ZLATESTVISITDATE`). A direct write would fight the sync
+engine. There is also no fallback to fall back *to*: Maps.app ships **no
+AppleScript dictionary at all** (`sdef` prints nothing), and its five App
+Intents only drive navigation — `StartNavigationIntent`,
+`UpdateNavigationIntent`, `MapsShowPlacesInAppIntent` and two test intents.
+Reading the file is the only route.
+
+🛑 **A place is a location row that has a visit, and the raw table overcounts
+badly.** 123 of the 314 `ZVISITEDLOCATION` rows here carry **no `ZVISIT` at
+all** — duplicates of places that already have a visited row, three of them for
+"Ocean First" alone, each with a NULL `ZLATESTVISITDATE`. Counting that table
+reports **314 places where the honest answer is 191**, a 64% overcount in the
+flattering direction. `places` joins through `ZVISIT`; `status` prints the
+orphan count so the gap is visible rather than inferred.
+
+🛑 **`ZHIDDEN` is NULL, not 0, on every row** — 440 of 440 visits and 314 of 314
+locations. So `ZHIDDEN = 0` matches **nothing** and the command returns an empty
+history, which reads exactly like "you have never been anywhere". Only
+`IS NOT 1` covers NULL and 0 together. Pinned by a test.
+
+⚠️ **A visit records a start time and nothing else.** There is no end time in
+the schema, so this store **cannot say how long the user stayed** anywhere. Do
+not report a duration from it.
+
+⚠️ **`ZVISITCLASSIFICATION` is undocumented and reported raw.** Two values
+appear — `1` on 389 visits and `3` on 51 — and the `3` visits sit at places that
+also have `1` visits, so it belongs to the arrival rather than the place.
+Nothing names it, so the JSON carries the number and no label.
+
+**Guides are the richest thing in the store.** 18 here, holding 126 saved
+places: `Boulder Playgrounds` with 21 named parks and street addresses,
+`Kings Ridge Apple trees` with 19, plus one trip guide per work trip since 2020.
+
+- 🛑 **Places come through `Z_7PLACES`, never off `ZCOLLECTIONITEM`.** 12 of the
+  126 item rows belong to no guide — the same orphan pattern the locations show
+  — so listing that table invents saved places the user cannot see in Maps.app.
+- **The join is genuinely many-to-many.** One place here sits in two guides.
+- ⚠️ **An ambiguous guide name is an error naming the candidates**, not a guess.
+  `guides "chicago"` matches three on this store. Same rule `apple messages`
+  uses for a chat reference.
+- **A renamed place keeps both names.** `ZCUSTOMNAME` is set on 122 of 126
+  items and wins; `map_item_name` appears in JSON only when the two differ.
+
+**Categories are `||`-joined, most specific first** —
+`Dining||American Cuisine||Restaurant` — and `--json` reports both the split
+`categories` array and `category` for the first. `ZMAPITEMTOPLEVELCATEGORY` is a
+separate integer enum that nothing local names, so it goes through raw.
+
+**Every place carries a real coordinate**, unlike `apple calendar`, where a
+written location gets a structured location with no `geoLocation`. So `apple
+maps` is the one tool here that can hand you a latitude and longitude for a
+place the user has actually been.
+
+Traps in the file itself — the Apple-epoch seconds (against `chat.db`'s
+nanoseconds), the `REAL` column that never matches a text comparison, the WAL
+that `immutable=1` will not replay, and the `ZMAPITEMSTORAGE` protobuf — are in
+[`docs/apple-maps-store.md`](docs/apple-maps-store.md). `APPLE_MAPS_DB_PATH`
+overrides the path, and the test suite builds its own store so it runs offline.
+
+**Six tables are read; five more hold data nothing reads yet**:
+`ZHISTORYITEM` (32 rows: searches, directions, dropped pins — and Maps prunes
+it, 189 created against 32 kept), `ZUSERROUTE` (3 custom hikes with geometry),
+`ZFAVORITEITEM` (14), `ZREVIEWEDPLACE` (56) and `ZINCIDENTREPORT` (32).
+
 ### reminders — `apple reminders`
 
 Swift + EventKit. Full CRUD. Fork of `keith/reminders-cli` with editing and
@@ -1475,7 +1570,7 @@ has no reverse lookup and it would mean scanning every group per contact.
 
 ```
 bin/apple                 dispatcher — routes to the tools below
-swift/                    one Swift package, six binaries
+swift/                    one Swift package, seven binaries
   Sources/reminders/      + RemindersLibrary/ (+ Tags.swift, the tag read/write
                           face and the per-listing tag cache)
   Sources/ReminderKitBridge/  private ReminderKit resolved at runtime — the only
@@ -1484,12 +1579,13 @@ swift/                    one Swift package, six binaries
                           mailbox-name resolution for move)
   Sources/AppleMessages/  + MessagesLibrary/ (chat.db reader, typedstream decoder)
   Sources/ApplePhone/     + PhoneLibrary/ (CallHistory reader, AddressBook resolver)
+  Sources/AppleMaps/      + MapsLibrary/ (MapsSync reader — visits, places, guides)
   Sources/AppleCalendar/    + Attendees.swift (the private invitee write path)
   Sources/AppleContacts/  + Notes.swift (SQLite note reader),
                           Move.swift (the private cross-account move)
   Sources/ObjCExceptions/ @try/@catch for Swift — the move raises rather
                           than returning when it hits the note wall
-  Tests/RemindersTests/ MailTests/ MessagesTests/
+  Tests/RemindersTests/ MailTests/ MessagesTests/ PhoneTests/ MapsTests/
 notes/                    Python; apple-notes, notestore.py, notestore.proto,
                           mergeable.py (ZMERGEABLEDATA1 reader — recordings,
                           transcripts, summaries), tests/ (live Notes.app suite)
@@ -1518,6 +1614,8 @@ util/check-spotlight      is CoreSpotlight readable from a CLI yet? (exit 0 if
 util/appintents-dump      dev-only reader for an app's App Intents schema
 docs/apple-messages-store.md  chat.db schema, the typedstream body, verified traps
 docs/apple-phone-store.md  CallHistory schema, the entitlement walls, verified traps
+docs/apple-maps-store.md  MapsSync schema, why the location table overcounts,
+                          and why nothing here writes
 docs/prior-art.md         other projects solving this; check before building
 docs/todo-deep-links.md   planned: a `url` on every entity, so anything we
                           name can be opened and cross-linked
@@ -1532,11 +1630,11 @@ VERSION                   CalVer YY.MMDD.Patch, stamped in by scripts/set-versio
 ## Building
 
 ```
-make build      # swift build -c release → all six binaries
+make build      # swift build -c release → all seven binaries
 make install    # symlink dispatcher + tools into ~/bin
 make dev        # debug build, shaded ahead of the installed copy — see below
 make check      # smoke-test that every tool responds
-make test       # Swift unit tests (mail, messages, phone, reminders — all offline)
+make test       # Swift unit tests (mail, messages, phone, maps, reminders — all offline)
 make bump       # next CalVer for today, stamped into every tool
 make dist       # universal release tarball + sha256 for the Homebrew tap
 ```
@@ -1549,11 +1647,11 @@ debug (~2s) into `.dev-bin/` and prints the line to put that dir first:
 make dev && eval "$(make -s dev-path)"
 ```
 
-It shades `apple-mail` and `apple-notes` only, and symlinks the other three to
-the installed copies. That is deliberate: reminders/calendar/contacts disclaim,
-so their TCC grant is bound to the binary's path and a debug build at a new path
-re-prompts for permission. mail and notes are attributed to the terminal, so
-shading them is free. To work on one of the others, `make dev
+It shades `apple-mail`, `apple-notes`, `apple-messages`, `apple-phone` and
+`apple-maps` only, and symlinks the other three to the installed copies. That is
+deliberate: reminders/calendar/contacts disclaim, so their TCC grant is bound to
+the binary's path and a debug build at a new path re-prompts for permission. The
+other five are attributed to the terminal, so shading them is free. To work on one of the others, `make dev
 DEV_TOOLS="apple-contacts"` and accept the re-prompt. `make dev-off` removes it.
 
 Every tool reports `--version`, and they all report the same one. If they
@@ -1625,6 +1723,7 @@ Each tool needs a one-time TCC grant, prompted on first run **from a terminal**:
 | mail | Full Disk Access to read; Automation → Mail to open a compose window |
 | messages | Full Disk Access for the calling terminal (reads chat.db directly) |
 | phone | Full Disk Access for the calling terminal (reads CallHistory + AddressBook) |
+| maps | Full Disk Access for the calling terminal (reads MapsSync) |
 | contacts | Privacy & Security → Contacts |
 | notes | Full Disk Access for the calling terminal (reads sqlite directly) |
 
@@ -1638,7 +1737,7 @@ quite different reasons, and the error says which.
 so "mail ✓" can mean reads work and composing does not; check the detail line
 before concluding which half is broken.
 
-`apple status` reports all seven at once without prompting — start there rather
+`apple status` reports all eight at once without prompting — start there rather
 than running each tool to see which one errors.
 
 If a tool reports an access error, the fix is for the **user** to run it once in
@@ -1660,9 +1759,9 @@ binary rather than to the terminal that launched it. Practical consequences:
 - An already-working grant skips the re-exec entirely, so this is invisible when
   everything is set up.
 
-`mail`, `messages`, `phone` and `notes` are *not* covered by this: Automation and
-Full Disk Access are still attributed to the calling terminal, so those four
-really do depend on which terminal is running. This now covers mail's read path
+`mail`, `messages`, `phone`, `maps` and `notes` are *not* covered by this:
+Automation and Full Disk Access are still attributed to the calling terminal, so
+those five really do depend on which terminal is running. This now covers mail's read path
 too — reading the Envelope Index needs Full Disk Access for whatever terminal
 launched the tool.
 

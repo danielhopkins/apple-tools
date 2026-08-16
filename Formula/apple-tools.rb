@@ -1,5 +1,5 @@
 class AppleTools < Formula
-  desc "Local CLIs for Notes, Mail, Messages, Phone, Reminders, Calendar, Contacts"
+  desc "Local CLIs for Notes, Mail, Messages, Phone, Maps, Reminders, Calendar, Contacts"
   homepage "https://github.com/danielhopkins/apple-tools"
   url "https://github.com/danielhopkins/apple-tools/releases/download/v26.816.0/apple-tools-26.816.0.tar.gz"
   sha256 "52ea2f840bff63c13a166fda4915c452703c311e497baaf45e8c32f9ccec386b"
@@ -19,7 +19,7 @@ class AppleTools < Formula
     bin.install_symlink libexec/"apple-notes"
 
     bin.install "apple", "apple-contacts", "apple-mail", "apple-messages",
-                "apple-phone", "apple-calendar", "reminders"
+                "apple-phone", "apple-maps", "apple-calendar", "reminders"
 
     doc.install "README.md", "CLAUDE.md", "docs"
 
@@ -66,8 +66,9 @@ class AppleTools < Formula
       in System Settings under their own names. Upgrading this formula
       occasionally asks for a grant again; that is expected, not a fault.
 
-      apple-notes, apple-mail, apple-messages and apple-phone read Apple's
-      SQLite stores directly, which requires Full Disk Access for your terminal:
+      apple-notes, apple-mail, apple-messages, apple-phone and apple-maps read
+      Apple's SQLite stores directly, which requires Full Disk Access for your
+      terminal:
       System Settings -> Privacy & Security -> Full Disk Access
 
       For apple-mail that covers search, export, attachments and accounts —
@@ -98,6 +99,12 @@ class AppleTools < Formula
       grant to give it. `apple phone dial` hands a tel: URL to Phone.app, which
       always asks you to confirm before it dials.
 
+      apple-maps is read-only and needs nothing beyond that Full Disk Access. It
+      reads Maps' visited places and guides out of MapsSync_0.0.1. Maps.app is
+      not scriptable, and the store is mirrored by CloudKit, so the tool never
+      writes. Note that visited places is not Significant Locations: that store
+      belongs to routined and no unprivileged process can read it.
+
       apple-contacts also reads that store for contact notes, which the Contacts
       framework cannot expose without an Apple-granted entitlement.
 
@@ -125,6 +132,7 @@ class AppleTools < Formula
     assert_match version.to_s, shell_output("#{bin}/apple-calendar --version")
     assert_match version.to_s, shell_output("#{bin}/apple-messages --version")
     assert_match version.to_s, shell_output("#{bin}/apple-phone --version")
+    assert_match version.to_s, shell_output("#{bin}/apple-maps --version")
 
     # The dispatcher must find each tool as a sibling in bin.
     assert_match "apple-notes", shell_output("#{bin}/apple --which")
@@ -167,5 +175,11 @@ class AppleTools < Formula
     # and it is the only cross-reference telling someone looking in call history
     # that recordings live in Notes.
     assert_match "recordings", shell_output("#{bin}/apple-phone --help")
+
+    # apple-maps is read-only by construction, so the assertion that matters is
+    # that both read commands are registered. --help needs no grant.
+    maps_help = shell_output("#{bin}/apple-maps --help")
+    assert_match "places", maps_help
+    assert_match "guides", maps_help
   end
 end

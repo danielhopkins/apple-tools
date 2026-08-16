@@ -13,6 +13,7 @@ let package = Package(
         .executable(name: "apple-contacts", targets: ["apple-contacts"]),
         .executable(name: "apple-messages", targets: ["apple-messages"]),
         .executable(name: "apple-phone", targets: ["apple-phone"]),
+        .executable(name: "apple-maps", targets: ["apple-maps"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.3.1"),
@@ -172,9 +173,34 @@ let package = Package(
             ],
             path: "Sources/ApplePhone"
         ),
+        .target(
+            name: "MapsLibrary",
+            dependencies: ["AppleToolsSearch"],
+            linkerSettings: [
+                // MapsSync_0.0.1 is a Core Data SQLite store, read directly the
+                // same way PhoneLibrary reads CallHistory.storedata. Maps.app
+                // ships no scripting dictionary at all, and its App Intents only
+                // drive navigation, so there is no fallback to read history.
+                .linkedLibrary("sqlite3"),
+            ]
+        ),
+        .executableTarget(
+            name: "apple-maps",
+            dependencies: [
+                "AppleToolsVersion",
+                "AppleToolsStyle",
+                "MapsLibrary",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "Sources/AppleMaps"
+        ),
         .testTarget(
             name: "MailTests",
             dependencies: ["MailLibrary", "AppleToolsSearch"]
+        ),
+        .testTarget(
+            name: "MapsTests",
+            dependencies: ["MapsLibrary"]
         ),
         .testTarget(
             name: "PhoneTests",

@@ -7,7 +7,7 @@
 [![Local only](https://img.shields.io/badge/network%20calls-none-2ea44f)](#)
 
 Command-line access to local Apple app data — **Notes, Mail, Messages, Phone,
-Reminders, Calendar, Contacts** — built so an agent (or a shell) can work with
+Maps, Reminders, Calendar, Contacts** — built so an agent (or a shell) can work with
 real data without an intermediary service. Everything is local: no network
 calls, no API keys, no sync layer.
 
@@ -54,7 +54,7 @@ apple-phone recents       # → Full Disk Access for your terminal
 apple-notes search        # → Full Disk Access for your terminal
 ```
 
-`apple status` reports all seven at once without prompting, so start there
+`apple status` reports all eight at once without prompting, so start there
 rather than running each tool to see which one errors.
 
 The first three grants belong to **the tools themselves**, not to your terminal,
@@ -112,7 +112,7 @@ They are symlinks, so edits in the repo take effect in the next Claude session.
 make install-completions
 ```
 
-Installs zsh completions for `apple` and all seven tools. The dispatcher delegates
+Installs zsh completions for `apple` and all eight tools. The dispatcher delegates
 after the tool name, so `apple calendar events --<TAB>` offers exactly what
 `apple-calendar events --<TAB>` does. `reminders show <TAB>` completes list
 names and `apple calendar --calendar <TAB>` completes calendar names, both live
@@ -122,7 +122,7 @@ Homebrew installs these automatically.
 
 ## Usage
 
-One dispatcher fronts all seven tools:
+One dispatcher fronts all eight tools:
 
 ```
 apple notes search "budget" --json
@@ -130,6 +130,8 @@ apple mail search "invoice" --json
 apple mail search "budget" --field content --json      # full-text over bodies
 apple messages search "dinner" --since 30 --json       # whole chat history
 apple phone recents --missed --since 7                 # who called while I was out
+apple maps places --min-visits 5                       # where you actually go
+apple maps guides "Boulder Playgrounds"                # the places in one guide
 apple reminders show-all --due-date today --include-overdue
 apple calendar add "Dentist" --start "tomorrow 2pm" --duration 45
 apple contacts search "smith"
@@ -138,7 +140,8 @@ apple contacts export --group "Family" -o family.vcf
 ```
 
 Each is also installed under its own name (`apple-notes`, `apple-mail`,
-`apple-messages`, `apple-phone`, `reminders`, `apple-calendar`, `apple-contacts`). Run
+`apple-messages`, `apple-phone`, `apple-maps`, `reminders`, `apple-calendar`,
+`apple-contacts`). Run
 `apple <tool> --help` for
 full options, or `apple --which` to see what resolves where.
 
@@ -175,6 +178,7 @@ isn't guaranteed; JSON is.
 | ✉️ `mail` | `Envelope Index` + `.emlx` (reads), AppleScript + pasteboard (compose) | Search by subject, sender, or full body text with date and flag filters; export a message; save its attachments. `compose`/`reply`/`forward` open a Mail window with everything but the body — including any `--attach` files — and put the body on the clipboard. **The tool never writes a body**, see [`docs/apple-mail-drafts.md`](docs/apple-mail-drafts.md). |
 | 💬 `messages` | `chat.db` | Search and export iMessage/SMS/RCS history, list conversations, save attachments. Read-only. |
 | ☎️ `phone` | `CallHistory.storedata` + AddressBook | Recent calls with callers resolved to names, missed/unknown filters, talk-time stats, blocked list. Read-only apart from `dial`, which hands a `tel:` URL to Phone.app for you to confirm. |
+| 🗺️ `maps` | `MapsSync_0.0.1` | Places you have been, with visit counts and coordinates; individual visits; your saved guides and the places in them. Read-only by construction — CloudKit mirrors the store, and Maps.app has no scripting interface to fall back to. See [`docs/apple-maps-store.md`](docs/apple-maps-store.md). |
 | ✅ `reminders` | EventKit | Full CRUD: add, edit, complete, delete, lists, priorities, recurrence, natural-language dates. |
 | 📅 `calendar` | EventKit, plus private `EKAttendee` for invitee writes | List and search events, create, edit, delete; full recurrence (`--repeat`, plus `--on-the "4th monday"`); recurring-event spans. Reads invitees with their RSVP status, and can invite or uninvite people — which sends real mail, so `invite --dry-run` first. See [`docs/apple-calendar-invitees.md`](docs/apple-calendar-invitees.md). |
 | 👤 `contacts` | Contacts framework, with a legacy `AddressBook` fallback | Search by name, company, email, or phone; create, edit, delete. `move` relocates a contact between accounts **keeping its identifier** — there is no public API for that at all, see [`docs/apple-contacts-move.md`](docs/apple-contacts-move.md). Notes are read-only, and a contact that has one can only be written through the fallback. |
@@ -198,6 +202,15 @@ column but in an archived `NSAttributedString` — 1,921 ordinary messages on a
 `apple-messages` decodes that NeXT typedstream format directly; the decoder is
 verified against the 99,023 rows that carry both columns, matching 99,022 of
 them. See [`docs/apple-messages-store.md`](docs/apple-messages-store.md).
+Maps is read the same way, from `MapsSync_0.0.1`. The trap there is that the
+place table cannot be counted on its own: 123 of its 314 rows on a real store
+carry no visit at all, being duplicates of places that already have a visited
+row. Counting rows reports 314 places where the honest answer is 191, so
+`apple maps places` joins through the visit table and reports the orphan count
+in `status`. Nothing here writes — CloudKit mirrors the store and Maps.app has
+no scripting interface at all. See
+[`docs/apple-maps-store.md`](docs/apple-maps-store.md).
+
 [`docs/apple-notes-api.md`](docs/apple-notes-api.md) documents the schema and the
 verified behaviors and bugs behind that, including a data-loss bug where editing
 a note's body destroys its attachments.
@@ -238,10 +251,11 @@ plist into `__TEXT,__info_plist` at link time — and `make build` re-signs
 afterwards, because macOS ignores a plist that isn't covered by the signature.
 `make dist` verifies the binding and fails the build if it is missing.
 
-`apple-mail`, `apple-messages`, `apple-phone` and `apple-notes` are the
-exceptions, and all four are attributed to the calling terminal rather than the
-binary. `apple-notes`, `apple-messages` and `apple-phone` need Full Disk Access —
-they read `NoteStore.sqlite`, `chat.db` and `CallHistory.storedata` directly.
+`apple-mail`, `apple-messages`, `apple-phone`, `apple-maps` and `apple-notes`
+are the exceptions, and all five are attributed to the calling terminal rather
+than the binary. `apple-notes`, `apple-messages`, `apple-phone` and `apple-maps`
+need Full Disk Access — they read `NoteStore.sqlite`, `chat.db`,
+`CallHistory.storedata` and `MapsSync_0.0.1` directly.
 `apple-phone` in particular *cannot* be made to disclaim: doing so would make it
 its own responsible process and lose the terminal's Full Disk Access, which is
 the grant it depends on. `apple-mail` needs Full Disk Access to read — search, export, attachments,
@@ -253,14 +267,14 @@ and `forward`. `apple mail status` reports both separately.
 ```
 bin/apple        dispatcher
 swift/           one Swift package → reminders, apple-mail, apple-messages, apple-phone,
-                 apple-calendar, apple-contacts
+                 apple-maps, apple-calendar, apple-contacts
 notes/           Python: apple-notes, notestore.py decoder, live Notes.app tests
 skills/          Claude skills (apple-tools, daily-brief, meeting-prep, inbox-triage)
 completions/     zsh completions
 tests/           live suites: calendar and contacts writes (gated), mail read guards
 util/            gate probes: is Mail's compose intent / CoreSpotlight reachable yet?
-docs/            Notes API, Mail store, Calendar invitee and Contacts move
-                 references, prior art
+docs/            Notes API, Mail, Messages, Phone and Maps stores, Calendar
+                 invitee and Contacts move references, prior art
 Formula/         Homebrew formula, mirrored into the tap on release
 VERSION          single source of truth, stamped into every tool
 CLAUDE.md        the same surface, written for an agent
@@ -389,7 +403,7 @@ own devices, because they go through the real apps' stores.
 Only `mail`, `messages`, `phone` and `notes` do — they read those store files
 directly, and macOS gates them. `reminders`, `calendar` and `contacts` use
 public frameworks and take an ordinary per-tool grant instead. `apple status`
-reports all seven at once without prompting.
+reports all eight at once without prompting.
 
 ## Prior art
 

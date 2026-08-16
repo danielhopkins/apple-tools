@@ -1,0 +1,148 @@
+#compdef apple-maps
+
+__apple-maps_complete() {
+    local -ar non_empty_completions=("${@:#(|:*)}")
+    local -ar empty_completions=("${(M)@:#(|:*)}")
+    _describe -V '' non_empty_completions -- empty_completions -P $'\'\''
+}
+
+__apple-maps_custom_complete() {
+    local -a completions
+    completions=("${(@f)"$("${command_name}" "${@}" "${command_line[@]}")"}")
+    if [[ "${#completions[@]}" -gt 1 ]]; then
+        __apple-maps_complete "${completions[@]:0:-1}"
+    fi
+}
+
+__apple-maps_cursor_index_in_current_word() {
+    if [[ -z "${QIPREFIX}${IPREFIX}${PREFIX}" ]]; then
+        printf 0
+    else
+        printf %s "${#${(z)LBUFFER}[-1]}"
+    fi
+}
+
+_apple-maps() {
+    emulate -RL zsh -G
+    setopt extendedglob nullglob numericglobsort
+    unsetopt aliases banghist
+
+    local -xr SAP_SHELL=zsh
+    local -x SAP_SHELL_VERSION
+    SAP_SHELL_VERSION="$(builtin emulate zsh -c 'printf %s "${ZSH_VERSION}"')"
+    local -r SAP_SHELL_VERSION
+
+    local context state state_descr line
+    local -A opt_args
+
+    local -r command_name="${words[1]}"
+    local -ar command_line=("${words[@]}")
+    local -ir current_word_index="$((CURRENT - 1))"
+
+    local -i ret=1
+    local -ar arg_specs=(
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+        '(-): :->command'
+        '(-)*:: :->arg'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+    case "${state}" in
+    command)
+        local -ar subcommands=(
+            'places:List places you have been, most-visited first'
+            'visits:List individual visits, newest first'
+            'guides:List your Maps guides, or show the places in one'
+            'status:Report permission state without requesting it'
+            'help:Show subcommand help information.'
+        )
+        _describe -V subcommand subcommands && ret=0
+        ;;
+    arg)
+        case "${words[1]}" in
+        places|visits|guides|status|help)
+            "_apple-maps_${words[1]}" && ret=0
+            ;;
+        esac
+        ;;
+    esac
+
+    return "${ret}"
+}
+
+_apple-maps_places() {
+    local -i ret=1
+    local -ar arg_specs=(
+        '--since[Only visits from the last N days]:since:'
+        '--before[Only visits older than N days]:before:'
+        '--search[Match name, address, city, or category]:search:'
+        '--min-visits[Only places visited at least N times]:min-visits:'
+        '--limit[Maximum places to list]:limit:'
+        '--json[Output as JSON]'
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+_apple-maps_visits() {
+    local -i ret=1
+    local -ar arg_specs=(
+        '--since[Only visits from the last N days]:since:'
+        '--before[Only visits older than N days]:before:'
+        '--search[Match name, address, city, or category]:search:'
+        '--limit[Maximum visits to list]:limit:'
+        '--json[Output as JSON]'
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+_apple-maps_guides() {
+    local -i ret=1
+    local -ar arg_specs=(
+        ':guide:'
+        '--search[Match a guide'\''s title, description, or place names]:search:'
+        '--places[Include every guide'\''s places in the listing]'
+        '--json[Output as JSON]'
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+_apple-maps_status() {
+    local -i ret=1
+    local -ar arg_specs=(
+        '--json[Output as JSON]'
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+_apple-maps_help() {
+    local -i ret=1
+    local -ar arg_specs=(
+        '*:subcommands:'
+        '--version[Show the version.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+if [[ "${funcstack[1]}" = _apple-maps ]]; then
+    _apple-maps "${@}"
+else
+    compdef _apple-maps apple-maps
+fi
