@@ -53,6 +53,7 @@ _apple-maps() {
             'places:List places you have been, most-visited first'
             'visits:List individual visits, newest first'
             'guides:List your Maps guides, or show the places in one'
+            'geocode:Turn a place name or address into a coordinate'
             'status:Report permission state without requesting it'
             'help:Show subcommand help information.'
         )
@@ -60,7 +61,7 @@ _apple-maps() {
         ;;
     arg)
         case "${words[1]}" in
-        places|visits|guides|status|help)
+        places|visits|guides|geocode|status|help)
             "_apple-maps_${words[1]}" && ret=0
             ;;
         esac
@@ -109,6 +110,23 @@ _apple-maps_guides() {
         ':guide:'
         '--search[Match a guide'\''s title, description, or place names]:search:'
         '--places[Include every guide'\''s places in the listing]'
+        '--json[Output as JSON]'
+        '--version[Show the version.]'
+        '(-h --help)'{-h,--help}'[Show help information.]'
+    )
+    _arguments -w -s -S : "${arg_specs[@]}" && ret=0
+
+    return "${ret}"
+}
+
+_apple-maps_geocode() {
+    local -i ret=1
+    local -ar arg_specs=(
+        ':query:'
+        '--near[Bias the search near this place or "lat,lon"]:near:'
+        '--limit[Maximum results]:limit:'
+        '--local-only[Never touch the network; only places you have been or saved]'
+        '--network-only[Skip your own places and ask Apple Maps]'
         '--json[Output as JSON]'
         '--version[Show the version.]'
         '(-h --help)'{-h,--help}'[Show help information.]'
