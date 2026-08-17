@@ -946,8 +946,15 @@ def format_as_markdown(title, text, links=None):
         while lines and not lines[0].strip():
             lines = lines[1:]
 
-    # Reconstruct with title as header
-    markdown = f"# {title}\n\n"
+    # Reconstruct with title as header.
+    #
+    # ⚠️ **The title can itself hold a U+FFFC.** A note whose first line is
+    # nothing but an embedded object takes that placeholder as its `ZTITLE1`,
+    # so the heading came out as a literal `# ￼`. Two notes here do that.
+    # Render it the way the body renders one rather than leaking the raw
+    # character.
+    heading = title.replace(OBJECT_REPLACEMENT_CHAR, "[attachment]")
+    markdown = f"# {heading}\n\n"
     markdown += "\n".join(lines)
 
     # Ensure file ends with newline
