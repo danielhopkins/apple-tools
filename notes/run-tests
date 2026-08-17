@@ -47,6 +47,17 @@ export RUN_LIVE_NOTES_TESTS=1
 
 if [ "$#" -gt 0 ]; then
   "$PY" -m unittest -v "tests.$1"
-else
-  "$PY" -m unittest discover -s tests -t . -v
+  exit $?
 fi
+
+"$PY" -m unittest discover -s tests -t . -v
+status=$?
+
+# 🛑 The Markdown capability matrix is the record of what Apple's interpreter
+# supports, and it is generated. Check it here so a macOS update that moves the
+# API surface fails the suite rather than going unnoticed.
+echo
+echo "== Markdown capability matrix =="
+"$ROOT/capability-report" --check || status=1
+
+exit $status

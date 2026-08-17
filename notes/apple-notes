@@ -38,7 +38,11 @@ sys.path.insert(0, str(SCRIPT_DIR))
 # invoked through a symlink (~/bin/apple-notes, Homebrew's bin shim).
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
-from notestore import Color, parse_note_store
+from notestore import (Color, NO_MARKS, SOFT_LINE_BREAKS,
+                       escape_markdown_char, is_highlight_color,
+                       mark_transition, parse_note_store, run_is_bold,
+                       run_is_italic, usable_link)
+import mergeable
 from mergeable import all_recordings, recordings_for_note
 
 
@@ -175,6 +179,12 @@ def shortcuts_status():
 
     Deliberately does not run one — running is what triggers the permission
     prompt, and status must never prompt.
+
+    ⚠️ **This cannot tell you whether a shortcut is *allowed* to run**, and no
+    known local state can. `ZACCESSRESOURCEPERMISSION` in the Shortcuts library
+    looks like the grant store and is **not** — it stayed empty on this machine
+    after a permission dialog was answered "Always Allow". A check was built on
+    that table and removed; do not rebuild it without evidence.
     """
     have = installed_shortcuts()
     if have is None:
@@ -470,20 +480,6 @@ def find_note(identifier):
     return result
 
 
-def is_highlight_color(color):
-    """Check if a color represents a highlight (yellow-ish background)."""
-    if color is None:
-        return False
-    # Apple Notes uses yellow highlight: high red, high green, low blue
-    # Typical values: red~1.0, green~0.95, blue~0.55, alpha~1.0
-    return (
-        color.red > 0.9
-        and color.green > 0.8
-        and color.blue < 0.7
-        and color.alpha > 0.5
-    )
-
-
 def parse_note_content(compressed_data):
     """Parse the note content and extract text with formatting.
 
@@ -532,14 +528,16 @@ def parse_note_content(compressed_data):
                 "identifier": ai.string(1),
             }
 
-        font_weight = attr_run.int32(5)
         runs.append({
             "length": attr_run.int32(1),
             "highlight": is_highlight,
             "link": link,
             "underlined": attr_run.int32(6, 0),
             "strikethrough": attr_run.int32(7, 0),
-            "bold": font_weight == 1 if font_weight else False,
+            # 🛑 `font_weight` is an enum: 1 bold, 2 italic, 3 BOTH. Testing
+            # `== 1` for bold dropped it on every weight-3 run.
+            "bold": run_is_bold(attr_run),
+            "italic": run_is_italic(attr_run),
             "paragraph_style": para_style,
             "attachment": attachment,
         })
@@ -582,7 +580,93 @@ def get_attachment_labels(identifiers):
     return labels
 
 
-def embedded_object_markdown(attachment, labels):
+def get_attachment_links(identifiers):
+    """Map attachment ZIDENTIFIER -> the target it points at.
+
+    A note link's target lives in `ZTOKENCONTENTIDENTIFIER` as
+    `applenotes:note/<uuid>`. ⚠️ **The same column holds non-URI tokens** for
+    other inline attachments — a hashtag stores a bare word, a mention stores
+    an account id — so the caller must check the value parses as a URI before
+    building a link from it.
+    """
+    identifiers = [i for i in identifiers if i]
+    if not identifiers:
+        return {}
+
+    conn = sqlite3.connect("file:%s?mode=ro" % get_db_path(), uri=True)
+    try:
+        placeholders = ",".join("?" * len(identifiers))
+        rows = conn.execute(
+            f"""
+            SELECT ZIDENTIFIER, ZTOKENCONTENTIDENTIFIER
+            FROM ZICCLOUDSYNCINGOBJECT
+            WHERE ZIDENTIFIER IN ({placeholders})
+              AND ZTOKENCONTENTIDENTIFIER IS NOT NULL
+            """,
+            identifiers,
+        ).fetchall()
+    finally:
+        conn.close()
+    return {ident: token for ident, token in rows if token}
+
+
+def get_note_tables(identifiers, labels, links=None):
+    """Map attachment ZIDENTIFIER -> rendered Markdown table.
+
+    The cells are not in the note body at all. They live in the attachment
+    row's ZMERGEABLEDATA1 blob, which `mergeable.py` also reads for call
+    recordings. A table that fails to decode is left out, so the caller falls
+    back to the `[attachment: table]` placeholder rather than printing nothing.
+    """
+    identifiers = [i for i in identifiers if i]
+    if not identifiers:
+        return {}
+
+    import mergeable
+
+    conn = sqlite3.connect("file:%s?mode=ro" % get_db_path(), uri=True)
+    try:
+        placeholders = ",".join("?" * len(identifiers))
+        rows = conn.execute(
+            f"""
+            SELECT ZIDENTIFIER, ZMERGEABLEDATA1
+            FROM ZICCLOUDSYNCINGOBJECT
+            WHERE ZIDENTIFIER IN ({placeholders})
+              AND ZTYPEUTI = ? AND ZMERGEABLEDATA1 IS NOT NULL
+            """,
+            identifiers + [mergeable.TABLE_UTI],
+        ).fetchall()
+    finally:
+        conn.close()
+
+    def decode(known_labels, known_links):
+        out, wanted = {}, set()
+        for ident, blob in rows:
+            try:
+                table = mergeable.table_from_blob(blob, known_labels, known_links)
+            except Exception:
+                continue
+            if table is not None and table.rows:
+                out[ident] = table
+                wanted |= table.attachment_ids
+        return out, wanted
+
+    # Two passes, because a link inside a cell is an attachment row with a NULL
+    # ZNOTE — nothing joins it to this note, so the first decode is what tells
+    # us which identifiers to look up at all.
+    links = dict(links or {})
+    decoded, wanted = decode(labels, links)
+    unresolved = wanted - set(labels)
+    if unresolved:
+        labels = dict(labels)
+        labels.update(get_attachment_labels(sorted(unresolved)))
+        links.update(get_attachment_links(sorted(unresolved)))
+        decoded, _ = decode(labels, links)
+
+    return {ident: table.markdown() for ident, table in decoded.items()}
+
+
+def embedded_object_markdown(attachment, labels, tables=None, links=None):
     """Render an embedded object (the U+FFFC placeholder) as markdown."""
     if not attachment:
         return "[attachment]"
@@ -591,7 +675,21 @@ def embedded_object_markdown(attachment, labels):
     if uti == DIVIDER_UTI:
         return "---"
 
-    label = labels.get(attachment.get("identifier"))
+    identifier = attachment.get("identifier")
+    rendered = (tables or {}).get(identifier)
+    if rendered:
+        return rendered
+
+    label = labels.get(identifier)
+
+    # 🛑 An inline text attachment is TEXT, not a file. A hashtag, a mention, an
+    # inline calculation result and a link to another note all live here, and
+    # `[attachment: #trips]` was wrong for every one of them — 227 on the
+    # development store. Render the text itself, and make a link where there is
+    # a real URI to link to.
+    if uti.startswith("com.apple.notes.inlinetextattachment.") and label:
+        return mergeable.inline_attachment_markdown(identifier, uti, labels, links)
+
     if not label:
         if uti.startswith("com.apple.notes.inlinetextattachment."):
             label = uti.rsplit(".", 1)[-1]  # e.g. hashtag, mention
@@ -602,14 +700,34 @@ def embedded_object_markdown(attachment, labels):
     return f"[attachment: {label}]"
 
 
-def apply_formatting(text, runs, attachment_labels=None):
+def utf16_length(s):
+    """Length of `s` in UTF-16 code units.
+
+    🛑 **An AttributeRun's `length` counts UTF-16 code units, not code
+    points**, and Python indexes strings by code point. Every astral character
+    — every 🎢-style emoji — is 2 units and 1 code point, so a note carrying
+    one silently shifts every later run left by one character.
+
+    The failure is invisible and cumulative: bold and highlight markers land
+    mid-word, a heading loses its `##`, and an embedded object's run drifts off
+    its U+FFFC so a real table renders as a bare `[attachment]`. Measured on a
+    real note: 40 astral characters, run lengths summing to 6692 against 6652
+    code points, and the table at the end of the note lost entirely.
+    """
+    return sum(2 if ord(ch) > 0xFFFF else 1 for ch in s)
+
+
+def apply_formatting(text, runs, attachment_labels=None, tables=None, links=None):
     """Apply markdown formatting based on attribute runs."""
     if not runs:
         return text
 
     labels = attachment_labels or {}
+    tables = tables or {}
+    links = links or {}
 
-    # Build character-level formatting map
+    # Build character-level formatting map. Indexed in UTF-16 code units, to
+    # match what the runs count — see utf16_length.
     char_formats = []
     position = 0
     for run in runs:
@@ -617,6 +735,7 @@ def apply_formatting(text, runs, attachment_labels=None):
             char_formats.append({
                 "highlight": run["highlight"],
                 "bold": run["bold"],
+                "italic": run["italic"],
                 "link": run["link"],
                 "strikethrough": run["strikethrough"],
                 "underlined": run["underlined"],
@@ -624,6 +743,31 @@ def apply_formatting(text, runs, attachment_labels=None):
                 "attachment": run.get("attachment"),
             })
         position += run["length"]
+
+    # Decide, once, which link spans are worth marking up.
+    #
+    # A link is decided over its WHOLE span, not per character, for two
+    # reasons. A pasted link has the URL as its own text, and `[url](url)` is
+    # noise — 88 of 297 body links here are that shape. And Notes splits one
+    # link across several runs, so the span has to be gathered before its text
+    # can be compared to its URL.
+    raw_text = text.encode("utf-16-le")
+    link_at = [usable_link(f["link"]) for f in char_formats]
+    bare_link = [False] * len(char_formats)
+    start = 0
+    while start < len(link_at):
+        url = link_at[start]
+        if not url:
+            start += 1
+            continue
+        end = start
+        while end < len(link_at) and link_at[end] == url:
+            end += 1
+        span = raw_text[start * 2:end * 2].decode("utf-16-le", "replace")
+        if span.strip() == url.strip():
+            for i in range(start, end):
+                bare_link[i] = True
+        start = end
 
     # Process text line by line for paragraph-level formatting
     lines = text.split('\n')
@@ -635,8 +779,6 @@ def apply_formatting(text, runs, attachment_labels=None):
             result_lines.append("")
             char_idx += 1  # account for newline
             continue
-
-        line_start_idx = char_idx
 
         # Get paragraph style from first char of line
         para_style = None
@@ -651,47 +793,75 @@ def apply_formatting(text, runs, attachment_labels=None):
             and (char_formats[char_idx].get("attachment") or {}).get("type_uti") == DIVIDER_UTI
         )
 
-        # Apply inline formatting to the line
-        formatted_chars = []
-        in_bold = False
-        in_highlight = False
+        # A table sits alone on its line too, and expands to several lines. It
+        # needs a blank line on BOTH sides: without one before it, the row above
+        # is absorbed as the table's own header; without one after, the line
+        # below is parsed as another table row.
+        is_table_line = (
+            line == OBJECT_REPLACEMENT_CHAR
+            and char_idx < len(char_formats)
+            and (char_formats[char_idx].get("attachment") or {}).get("identifier")
+            in tables
+        )
 
+        # Apply inline formatting to the line.
+        #
+        # Marks nest in MARKS order — bold, italic, highlight, strikethrough,
+        # link — and close in reverse, so a bold italic link reads
+        # `***[text](url)***`. `mark_transition` closes only what must close,
+        # so an italic span ending inside a bold one does not split the bold.
+        formatted_chars = []
+        active = NO_MARKS
+
+        offset = char_idx
         for i, char in enumerate(line):
-            if char_idx + i >= len(char_formats):
+            if offset >= len(char_formats):
                 formatted_chars.append(char)
+                offset += 2 if ord(char) > 0xFFFF else 1
                 continue
 
-            fmt = char_formats[char_idx + i]
+            fmt = char_formats[offset]
+            # A bare pasted link is its own text, and `[url](url)` is noise.
+            url = None if bare_link[offset] else link_at[offset]
+            wanted = (fmt["bold"], fmt["italic"], fmt["highlight"],
+                      bool(fmt["strikethrough"]), url)
+            offset += 2 if ord(char) > 0xFFFF else 1
 
             # Embedded objects (dividers, tables, files, ...) are a single U+FFFC
             # placeholder; substitute a readable markdown rendering for them.
             if char == OBJECT_REPLACEMENT_CHAR:
-                formatted_chars.append(embedded_object_markdown(fmt.get("attachment"), labels))
+                formatted_chars.append(embedded_object_markdown(
+                    fmt.get("attachment"), labels, tables, links))
                 continue
 
-            # Handle bold transitions
-            if fmt["bold"] and not in_bold:
-                formatted_chars.append("**")
-                in_bold = True
-            elif not fmt["bold"] and in_bold:
-                formatted_chars.append("**")
-                in_bold = False
+            # 🛑 U+2028 is a soft line break, and `split("\n")` does not split on
+            # it — so a bold span crossing one straddles what every editor draws
+            # as a line break. Close every mark around it and let the next
+            # character reopen. The character itself is passed through
+            # unchanged, so no paragraph structure moves. 254 of these here, 239
+            # of them in plain paragraphs.
+            if char in SOFT_LINE_BREAKS:
+                formatted_chars.append(mark_transition(active, NO_MARKS))
+                active = NO_MARKS
+                formatted_chars.append(char)
+                continue
 
-            # Handle highlight transitions
-            if fmt["highlight"] and not in_highlight:
-                formatted_chars.append("==")
-                in_highlight = True
-            elif not fmt["highlight"] and in_highlight:
-                formatted_chars.append("==")
-                in_highlight = False
+            formatted_chars.append(mark_transition(active, wanted))
+            active = wanted
 
-            formatted_chars.append(char)
+            # ⚠️ Escape AFTER the markers are placed, and only the source
+            # character — never the markers this loop just emitted. 219 literal
+            # asterisks live in these notes, and they came back mixed with real
+            # bold markers.
+            formatted_chars.append(escape_markdown_char(
+                char,
+                line[i - 1] if i else "",
+                line[i + 1] if i + 1 < len(line) else ""))
 
-        # Close any open formatting at end of line
-        if in_bold:
-            formatted_chars.append("**")
-        if in_highlight:
-            formatted_chars.append("==")
+        # Close anything still open at end of line. ⚠️ A link may not span a
+        # line in Markdown, and 9 link runs here contain a newline, so one is
+        # closed and reopened per line rather than dropped.
+        formatted_chars.append(mark_transition(active, NO_MARKS))
 
         formatted_line = "".join(formatted_chars)
 
@@ -705,7 +875,13 @@ def apply_formatting(text, runs, attachment_labels=None):
             # 0 = title, 1 = heading, 2 = subheading, 4 = monospace
             # 100 = bullet list, 101 = dashed list, 102 = numbered list
             # 103 = checklist
-            if style_type == 1:  # Heading
+            if style_type == 0:  # Title
+                # 🛑 A `# heading` written through the Markdown path lands on
+                # the TITLE style, not the heading style, so a title paragraph
+                # mid-note is ordinary. The reader used to emit nothing for it,
+                # which silently flattened it into body text.
+                formatted_line = f"# {formatted_line}"
+            elif style_type == 1:  # Heading
                 formatted_line = f"## {formatted_line}"
             elif style_type == 2:  # Subheading
                 formatted_line = f"### {formatted_line}"
@@ -728,11 +904,13 @@ def apply_formatting(text, runs, attachment_labels=None):
                 formatted_line = prefix + formatted_line
 
         # Keep a divider as a proper thematic break by padding with a blank line.
-        if is_divider_line and result_lines and result_lines[-1] != "":
+        if (is_divider_line or is_table_line) and result_lines and result_lines[-1] != "":
             result_lines.append("")
 
         result_lines.append(formatted_line)
-        char_idx += len(line) + 1  # +1 for newline
+        if is_table_line:
+            result_lines.append("")
+        char_idx += utf16_length(line) + 1  # +1 for newline
 
     return "\n".join(result_lines)
 
@@ -928,12 +1106,20 @@ def cmd_export(args):
         sys.exit(1)
 
     # Resolve human-readable labels for embedded objects (attachments, files, ...).
-    attachment_labels = get_attachment_labels(
-        [r["attachment"]["identifier"] for r in runs if r.get("attachment")]
-    )
+    identifiers = [r["attachment"]["identifier"] for r in runs if r.get("attachment")]
+    attachment_labels = get_attachment_labels(identifiers)
 
-    # Apply formatting (highlights, embedded objects)
-    formatted_text = apply_formatting(text, runs, attachment_labels)
+    # A note link, a hashtag and a mention all store their target here. Only
+    # the ones that parse as a URI become links.
+    attachment_links = get_attachment_links(identifiers)
+
+    # Tables carry their cells in a separate blob, and the labels resolve any
+    # note link, hashtag or mention sitting inside a cell.
+    tables = get_note_tables(identifiers, attachment_labels, attachment_links)
+
+    # Apply formatting (highlights, links, embedded objects)
+    formatted_text = apply_formatting(text, runs, attachment_labels, tables,
+                                      attachment_links)
 
     # Format as markdown
     markdown = format_as_markdown(title, formatted_text)
@@ -1276,6 +1462,25 @@ def require_shortcuts():
     sys.exit(1)
 
 
+def fail_write(what, title):
+    """Exit non-zero after a write the store could not corroborate.
+
+    🛑 `shortcuts run` exits 0 whether or not the shortcut did anything, so its
+    return code proves nothing. Every write here is confirmed by re-reading the
+    store, the same discipline `apple calendar` and `apple contacts` use.
+
+    The most common cause is a missing permission grant, which is invisible
+    from the run itself, so it is named here rather than left to be guessed.
+    """
+    print("error: the shortcut ran but %s (%r)." % (what, title), file=sys.stderr)
+    print("       `shortcuts run` exits 0 whether or not it did anything, so "
+          "this is the only signal.", file=sys.stderr)
+    print("       Run the shortcut by hand to see whether it asks for "
+          "permission: `shortcuts run \"%s\" --input-path <file.md>`"
+          % sorted(SHORTCUTS)[0], file=sys.stderr)
+    sys.exit(1)
+
+
 def run_shortcut(name, payload, suffix):
     """Run a shortcut with `payload` as its input.
 
@@ -1319,6 +1524,26 @@ def note_pks_titled(title):
         conn.close()
 
 
+# Apple epoch (2001-01-01) to Unix epoch, seconds. ZCREATIONDATE3 is in these.
+APPLE_EPOCH_OFFSET = 978307200
+
+
+def note_created_since(when):
+    """The newest live note created at or after `when` (Apple-epoch seconds)."""
+    conn = sqlite3.connect("file:%s?mode=ro" % get_db_path(), uri=True)
+    try:
+        row = conn.execute(
+            "SELECT n.Z_PK, n.ZTITLE1 FROM ZICCLOUDSYNCINGOBJECT n "
+            "LEFT JOIN ZICCLOUDSYNCINGOBJECT f ON n.ZFOLDER = f.Z_PK "
+            "WHERE n.ZCREATIONDATE3 >= ? AND n.ZTITLE1 IS NOT NULL "
+            "AND n.ZMARKEDFORDELETION = 0 "
+            "AND COALESCE(f.ZTITLE2, '') != 'Recently Deleted' "
+            "ORDER BY n.ZCREATIONDATE3 DESC LIMIT 1", (when,)).fetchone()
+        return (row[0], row[1]) if row else (None, None)
+    finally:
+        conn.close()
+
+
 def cmd_create(args):
     """Create a note from Markdown. Checklists and tables come out native."""
     require_shortcuts()
@@ -1327,30 +1552,44 @@ def cmd_create(args):
         body = "%s\n\n%s" % (args.title, body.lstrip("\n"))
     # The first line becomes the note's title either way — that is Notes'
     # behaviour on every write, not something this adds.
-    title = body.splitlines()[0].strip() if body.strip() else ""
+    requested = body.splitlines()[0].strip() if body.strip() else ""
 
-    before = len(note_pks_titled(title)) if title else 0
+    # 🛑 **Confirm by creation time, never by title.** The shortcut interprets
+    # the body as Markdown, so Apple rewrites the first line before it becomes
+    # the title: `__name__` is bold, and the note lands titled `name`. Matching
+    # on the title we sent therefore reported `created: false` for a note that
+    # had been created correctly — and every run of this tool's own test suite
+    # hit it, because the fixture prefix `__claude_notes_test__` is itself bold.
+    started = time.time() - APPLE_EPOCH_OFFSET
     run_shortcut("Apple Tools Create Note", body, ".md")
 
     # Verify through the store, never through AppleScript.
-    pk = None
+    pk = title = None
     for _ in range(20):
-        pks = note_pks_titled(title)
-        if len(pks) > before:
-            pk = max(pks)
+        pk, title = note_created_since(started)
+        if pk:
             break
         time.sleep(0.5)
 
     if args.json:
-        out = {"created": pk is not None, "title": title}
+        out = {"created": pk is not None, "title": title or requested}
         if pk:
             out["id"] = pk
+            # ⚠️ Report what the store holds, not what was asked for. They
+            # differ whenever the first line carries Markdown.
+            if title != requested:
+                out["requested_title"] = requested
         print(json.dumps(out, indent=2, ensure_ascii=False))
     elif pk:
         print("Created note %d: %s" % (pk, title))
-    else:
-        print("note: the shortcut ran but no new note appeared yet; Notes may "
-              "still be settling.", file=sys.stderr)
+        if title != requested:
+            print("note: Notes interpreted the first line as Markdown, so the "
+                  "title is %r, not %r." % (title, requested), file=sys.stderr)
+
+    # 🛑 A write that did nothing must not exit 0. Nothing else signals failure:
+    # `shortcuts run` exits 0 whether or not the shortcut did anything.
+    if pk is None:
+        fail_write("no new note appeared", requested)
 
 
 def cmd_append(args):
@@ -1372,10 +1611,33 @@ def cmd_append(args):
               "by title." % pk, file=sys.stderr)
         sys.exit(1)
 
-    # The shortcut matches on Name, and names are not unique. Appending to every
-    # match would be a silent, unrecoverable mistake, so refuse — the same rule
-    # `apple messages` applies to an ambiguous chat reference.
+    # 🛑 **The shortcut matches the target by Name, and a name that matches
+    # nothing does not fail — Shortcuts opens a NOTE PICKER listing every note
+    # and waits for a human.** Whatever they pick receives the text. Measured:
+    # four queued appends all landed on one note chosen minutes later, and the
+    # note the caller asked for was in Recently Deleted the whole time.
+    #
+    # ⚠️ `shortcuts run` still returns in ~2s while that picker is open, so the
+    # exit code and the elapsed time both look like success. There is no signal
+    # after the fact. The only safe move is to refuse before running it.
+    #
+    # `note_pks_titled` counts live notes only, so a target in Recently Deleted
+    # comes back as zero matches. Refusing on zero is what stops a write from
+    # being redirected onto one of the user's real notes.
     matches = note_pks_titled(title)
+    if pk not in matches:
+        print("error: note %d (%r) is not a live note, so there is nothing to "
+              "append to." % (pk, title), file=sys.stderr)
+        print("       It is in Recently Deleted, or its title changed since it "
+              "was looked up.", file=sys.stderr)
+        print("       Refusing to run the shortcut: with no target it opens a "
+              "note picker, and whatever", file=sys.stderr)
+        print("       is chosen receives the text.", file=sys.stderr)
+        sys.exit(1)
+
+    # Names are not unique. Appending to every match would be a silent,
+    # unrecoverable mistake, so refuse — the same rule `apple messages` applies
+    # to an ambiguous chat reference.
     if len(matches) > 1:
         print("error: %d notes are titled %r; refusing to append to all of them."
               % (len(matches), title), file=sys.stderr)
@@ -1384,14 +1646,21 @@ def cmd_append(args):
         print("       Rename one in Notes.app, then retry.", file=sys.stderr)
         sys.exit(1)
 
+    # Read the body BEFORE the write, so the confirmation below can compare.
+    before_text = sqlite_text_for(pk)
+
     payload = json.dumps({"note": title, "text": body})
     run_shortcut("Apple Tools Append Note", payload, ".txt")
 
-    marker = body.strip().splitlines()[0].strip() if body.strip() else ""
+    # 🛑 **Confirm that the note CHANGED, never that it contains what we sent.**
+    # The shortcut interprets the body as Markdown, so Apple rewrites it before
+    # storing: `- [x] item` lands as `item`, `## head` as `head`, and a pipe
+    # table as a single U+FFFC. Matching the first line we sent therefore
+    # reported failure for appends that worked perfectly — six of them in the
+    # first run of tests/test_append.py. Same trap `create` had with titles.
     landed = False
     for _ in range(20):
-        text = sqlite_text_for(pk)
-        if text and marker and marker in text:
+        if sqlite_text_for(pk) != before_text:
             landed = True
             break
         time.sleep(0.5)
@@ -1401,9 +1670,9 @@ def cmd_append(args):
                          indent=2, ensure_ascii=False))
     elif landed:
         print("Appended to note %d: %s" % (pk, title))
-    else:
-        print("note: the shortcut ran but the text has not appeared yet; Notes "
-              "may still be settling.", file=sys.stderr)
+
+    if not landed:
+        fail_write("the text did not appear on the note", title)
 
 
 def sqlite_text_for(pk):

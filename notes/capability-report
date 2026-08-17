@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""Measure what the Notes Markdown write path supports, and write it down.
+
+    ./notes/capability-report              # measure, print, rewrite the doc
+    ./notes/capability-report --check      # measure and diff against the doc
+    ./notes/capability-report --json       # machine-readable
+
+🛑 **Run this after every macOS update.** Apple's Markdown interpreter is
+undocumented and it moves. `--check` exits non-zero when any answer differs
+from what the checked-in doc records, which is the signal that the API surface
+changed.
+
+⚠️ **It writes real notes to the user's iCloud**, one per fixture, and deletes
+them afterwards. It refuses to run unless RUN_LIVE_NOTES_TESTS=1.
+
+The measurement is two independent things per construct:
+
+  store      what Apple did — paragraph style and run attributes
+  roundtrip  what `apple notes export` gives back
+
+A construct can survive the write and be lost on the read. Both columns are
+reported, so it is always clear which side is at fault.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tests"))
+
+from tests import harness as h                      # noqa: E402
+from tests import markdown_cases as mc              # noqa: E402
+
+cli = h.cli
+DOC = ROOT.parent / "docs" / "apple-notes-markdown-support.md"
+
+
+def macos_build():
+    out = subprocess.run(["sw_vers"], capture_output=True, text=True)
+    fields = dict(
+        line.split(":", 1) for line in out.stdout.strip().splitlines() if ":" in line)
+    return ("%s %s (%s)" % (fields.get("ProductName", "macOS").strip(),
+                            fields.get("ProductVersion", "?").strip(),
+                            fields.get("BuildVersion", "?").strip()))
+
+
+def runs_by_word(pk):
+    """[(text, run)] for the note, in order.
+
+    ⚠️ Returned as a LIST, not a dict keyed on the run text. A run rarely holds
+    exactly the probe word — `escaped 2 * 3` is one run — so lookup has to be
+    by containment. Keying on the whole run silently reported five real,
+    working constructs as MISSING.
+    """
+    found = cli.find_note(str(pk))
+    text, runs = cli.parse_note_content(found[3])
+    raw = text.encode("utf-16-le")
+    out, offset = [], 0
+    for run in runs:
+        length = run["length"]
+        chunk = raw[offset * 2:(offset + length) * 2].decode("utf-16-le", "replace")
+        offset += length
+        out.append((chunk, run))
+    return out
+
+
+def find_run(runs, probe):
+    """The first run whose text contains `probe`."""
+    for chunk, run in runs:
+        if probe in chunk:
+            return run
+    return None
+
+
+def find_attachment(runs, uti):
+    """The first run carrying an attachment of this UTI.
+
+    A table and a divider are attachments, not text: the body holds one U+FFFC
+    and nothing to match a probe word against.
+    """
+    for _chunk, run in runs:
+        if (run.get("attachment") or {}).get("type_uti") == uti:
+            return run
+    return None
+
+
+def export_of(pk):
+    found = cli.find_note(str(pk))
+    text, runs = cli.parse_note_content(found[3])
+    ids = [r["attachment"]["identifier"] for r in runs if r.get("attachment")]
+    labels = cli.get_attachment_labels(ids)
+    links = cli.get_attachment_links(ids)
+    return cli.apply_formatting(text, runs, labels,
+                                cli.get_note_tables(ids, labels, links), links)
+
+
+def measure():
+    """Write the fixtures, read them back, and return one row per case."""
+    h.sweep_test_notes()
+    title = h.unique_title("matrix")
+    pk = h.create_note_markdown(mc.probe_body(title))
+
+    # ⚠️ Notes needs a moment before the store settles; the create already
+    # polled for the note, but attribute runs can lag the row itself.
+    time.sleep(2)
+    runs = runs_by_word(pk)
+    exported = export_of(pk)
+
+    rows = []
+    for case in mc.CASES:
+        run = (find_attachment(runs, case.attachment_uti)
+               if case.attachment_uti else find_run(runs, case.probe))
+        row = {
+            "group": case.group, "name": case.name, "markdown": case.md,
+            "note": case.note, "expected_supported": case.supported,
+        }
+        if run is None:
+            row.update(store="MISSING", store_ok=False,
+                       roundtrip="MISSING", roundtrip_ok=False)
+            rows.append(row)
+            continue
+
+        if case.attachment_uti:
+            want = case.roundtrip
+            row.update(store="attachment: %s" % case.attachment_uti.rsplit(".", 1)[-1],
+                       store_ok=True, roundtrip=want,
+                       roundtrip_ok=(want in exported))
+            rows.append(row)
+            continue
+
+        style = (run["paragraph_style"] or {}).get("style_type", mc.PLAIN)
+        checklist = (run["paragraph_style"] or {}).get("checklist") or {}
+
+        store_ok = style == case.style and all(
+            run.get(k) == v for k, v in case.attrs.items())
+        if case.checked is not None:
+            store_ok = store_ok and checklist.get("done") == case.checked
+
+        described = mc.STYLE_NAMES.get(style, str(style))
+        marks = [k for k in ("bold", "italic") if run.get(k)]
+        if run.get("strikethrough"):
+            marks.append("strikethrough")
+        if run.get("link"):
+            marks.append("link")
+        if case.checked is not None:
+            described += ", done=%s" % checklist.get("done")
+        if marks:
+            described += " + " + "+".join(marks)
+
+        want = case.roundtrip
+        roundtrip_ok = (want in exported) if want else (case.probe in exported)
+
+        row.update(store=described, store_ok=store_ok,
+                   roundtrip=(want if want else "— lost —"),
+                   roundtrip_ok=roundtrip_ok)
+        rows.append(row)
+
+    extra = measure_table_bug()
+    h.sweep_test_notes()
+    return rows, extra
+
+
+def measure_table_bug():
+    """The list-before-table bug: a property of the sequence, not a construct."""
+    title = h.unique_title("tableeats")
+    pk = h.create_note_markdown(mc.TABLE_EATS_BODY % title)
+    time.sleep(2)
+    runs = runs_by_word(pk)
+
+    def style(word):
+        run = find_run(runs, word)
+        if run is None:
+            return None
+        return (run["paragraph_style"] or {}).get("style_type", mc.PLAIN)
+
+    return {
+        "no_table_after": [style("aaone"), style("aatwo")],
+        "table_after": [style("bbone"), style("bbtwo")],
+        "plain_bullets_then_table": [style("ccone"), style("cctwo")],
+        "paragraph_between": [style("ddone"), style("ddtwo")],
+    }
+
+
+def render(rows, extra):
+    build = macos_build()
+    lines = [
+        "# What the Notes Markdown write path supports",
+        "",
+        "🛑 **This file is generated. Do not edit it.**",
+        "",
+        "```",
+        "./notes/capability-report            # rewrite this file",
+        "./notes/capability-report --check    # fail if anything moved",
+        "```",
+        "",
+        "Run it after every macOS update. Apple's Markdown interpreter is",
+        "undocumented and it moves; `--check` is the alarm.",
+        "",
+        "| | |",
+        "|---|---|",
+        "| measured on | %s |" % build,
+        "| cases | %d |" % len(rows),
+        "| constructs Apple keeps | %d |"
+        % sum(1 for r in rows if r["expected_supported"]),
+        "",
+        "Two independent columns. **store** is what Apple did with the Markdown,",
+        "which is the API surface. **round trip** is what `apple notes export`",
+        "gives back. A construct can survive the write and be lost on the read.",
+        "",
+    ]
+
+    for group in ("inline", "block", "table"):
+        group_rows = [r for r in rows if r["group"] == group]
+        if not group_rows:
+            continue
+        lines += ["## %s" % group, "",
+                  "| markdown | store | round trip | |",
+                  "|---|---|---|---|"]
+        for r in group_rows:
+            mark = "✅" if (r["store_ok"] and r["roundtrip_ok"]) else "🛑"
+            if not r["expected_supported"]:
+                mark = "❌" if r["roundtrip_ok"] is False else "⚠️"
+            md = r["markdown"].replace("\n", " ⏎ ").replace("|", "\\|")
+            rt = str(r["roundtrip"]).replace("\n", " ⏎ ").replace("|", "\\|")
+            lines.append("| `%s` | %s | `%s` | %s |"
+                         % (md, r["store"], rt, mark))
+        lines.append("")
+        for r in group_rows:
+            if r["note"]:
+                lines.append("- **%s** — %s" % (r["name"], r["note"]))
+        lines.append("")
+
+    names = {mc.PLAIN: "plain", mc.DASHED: "dashed list",
+             mc.BULLET: "bullet", mc.CHECKLIST: "checklist"}
+    lines += [
+        "## 🛑 A pipe table destroys the last item of the list above it",
+        "",
+        "That item becomes a plain paragraph. It is not about the checked",
+        "state, and not about checklists — plain bullets lose their last item",
+        "too. One paragraph between the list and the table prevents it.",
+        "",
+        "| sequence | first item | last item |",
+        "|---|---|---|",
+    ]
+    for key, label in (("no_table_after", "checklist, no table after"),
+                       ("table_after", "checklist, then a table"),
+                       ("plain_bullets_then_table", "plain bullets, then a table"),
+                       ("paragraph_between", "checklist, paragraph, table")):
+        first, last = extra[key]
+        lines.append("| %s | %s | %s |"
+                     % (label, names.get(first, first), names.get(last, last)))
+    lines += ["",
+              "⚠️ This is what made `- [x]` look unsupported. A probe that",
+              "\"proved\" it had a table on the next line.",
+              ""]
+    return "\n".join(lines) + "\n"
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--check", action="store_true",
+                    help="fail if the measurement differs from the doc")
+    ap.add_argument("--json", action="store_true", help="machine-readable")
+    args = ap.parse_args()
+
+    if os.environ.get("RUN_LIVE_NOTES_TESTS") != "1":
+        print("error: this writes real notes to iCloud.", file=sys.stderr)
+        print("       Re-run with RUN_LIVE_NOTES_TESTS=1.", file=sys.stderr)
+        return 2
+
+    rows, extra = measure()
+
+    if args.json:
+        print(json.dumps({"macos": macos_build(), "cases": rows,
+                          "table_bug": extra}, indent=2, ensure_ascii=False))
+        return 0
+
+    text = render(rows, extra)
+    broken = [r for r in rows if not (r["store_ok"] and r["roundtrip_ok"])
+              and r["expected_supported"]]
+
+    if args.check:
+        old = DOC.read_text() if DOC.exists() else ""
+        # The build line always differs, so compare everything else.
+        strip = lambda s: "\n".join(              # noqa: E731
+            l for l in s.splitlines() if not l.startswith("| measured on |"))
+        if strip(old) != strip(text):
+            print("CHANGED: the Markdown capability matrix no longer matches "
+                  "%s" % DOC, file=sys.stderr)
+            print("Run `./notes/capability-report` to update it, and read the "
+                  "diff — Apple changed something.", file=sys.stderr)
+            return 1
+        print("unchanged on %s" % macos_build())
+        return 0
+
+    DOC.write_text(text)
+    print(text)
+    print("wrote %s" % DOC, file=sys.stderr)
+    if broken:
+        print("\n%d case(s) expected to work and did not:" % len(broken),
+              file=sys.stderr)
+        for r in broken:
+            print("  %-24s store_ok=%s roundtrip_ok=%s"
+                  % (r["name"], r["store_ok"], r["roundtrip_ok"]), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

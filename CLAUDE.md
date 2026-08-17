@@ -116,7 +116,68 @@ also answers `status` on its own.
 ### notes — `apple notes`
 
 Reads `NoteStore.sqlite` directly, ungzips the protobuf body, and renders
-Markdown (preserves `==highlights==`, bold, headings, lists, checklists).
+Markdown: `**bold**`, `_italic_`, `==highlight==`, `~~strike~~`,
+`[text](url)`, headings, lists, checklists, and **tables**.
+
+🛑 **`font_weight` is an enum, not a weight**: 1 bold, 2 italic, **3 both**. A
+reader testing `== 1` for bold loses it on every weight-3 run.
+
+**`export` reads table cells, not just a placeholder.** A table's contents are
+not in the note body at all — the body holds one U+FFFC and the cells live in
+the attachment row's `ZMERGEABLEDATA1` blob, the same column call recordings
+use. `export` decodes it and emits a GitHub pipe table. Measured: 76 of 76
+tables on this store decode, and the one that comes out empty really is an
+empty 2×2 in Notes.app.
+
+- ⚠️ **Notes has no header row and Markdown demands one, so row 1 is
+  promoted.** For a table whose first row is data that changes the meaning, and
+  the output alone cannot tell you which happened.
+- ⚠️ **A newline inside a cell collapses to a space**, and a `|` is escaped.
+  Both are needed to keep the pipe table parseable, and both are lossy.
+- 🛑 A note link inside a cell has an attachment row with a **NULL `ZNOTE`**, so
+  nothing joins it to the note it visibly sits in. `get_note_tables` decodes
+  once to learn which identifiers the cells use, then looks them up and decodes
+  again.
+- **What is not read**: column widths and `crTableColumnDirection`.
+
+**A cell renders like a paragraph**: `**bold**`, `==highlight==` and
+`[text](url)`. Reading only the cell's text made `export` call a bold cell plain
+while calling a bold paragraph bold. ⚠️ Highlight in a cell is covered by a unit
+test only — all 40 coloured runs in cells here are link blue or near-black.
+
+**Links now render inline, everywhere.** Three mechanisms carry one, and all
+three used to be dropped or mangled:
+
+- **A URL on text** (`AttributeRun.link`) — 297 runs in bodies, 264 in cells.
+  ⚠️ 88 body links have the URL as their own text, so those stay bare rather
+  than becoming `[url](url)`.
+- **A note link** as an inline attachment — 126 in bodies, 15 in cells, with
+  the target in `ZTOKENCONTENTIDENTIFIER`. 🛑 Both mechanisms are in use for
+  note links; handling one alone leaves most of them broken.
+- **A hashtag, mention or inline calculation** — 101 more. 🛑 None is an
+  attachment in any useful sense, and `[attachment: #trips]` was wrong for all
+  227. They render as their own text now.
+
+🛑 **Not every link value is a link the user made.** `x-apple-data-detectors` is
+Notes recognising a date or an address, and `x-coredata` is an internal row
+reference. Both are refused. ⚠️ `ZTOKENCONTENTIDENTIFIER` is likewise not always
+a URI — a hashtag stores a bare word — so only values that parse as one become
+links.
+
+**Source text is escaped so it cannot read as a marker.** `\` and `*` always;
+`=` only beside another `=`; `_` only outside a word. 🛑 `[` and `]` are
+deliberately left alone — they only form a link beside a `](`, which no note in
+the store contains.
+
+🛑 **`split("\n")` misses the line breaks a renderer honours.** Notes writes
+U+2028 for Shift-Return (254 here) and `\r` survives in pasted text, so a bold
+span crossing one used to be unbalanced on both halves. Every marker now closes
+at each of them and reopens after. Over the whole store, split the way a
+renderer splits: **58 unbalanced bold lines before this work, 0 after.**
+
+Traps in the blob itself are in
+[`docs/apple-notes-tables.md`](docs/apple-notes-tables.md). All four produce a
+wrong table rather than an error.
 
 ```
 apple notes search [TERM] [--limit N] [--json] [--include-locked]  # title search
@@ -139,8 +200,22 @@ extension the underlying shortcut needs. Markdown becomes native structure:
 are real tables.
 
 `append` is a genuine append: it **preserves attachments and existing
-checklists**, unlike the AppleScript body write. It refuses when the title
-matches more than one note rather than appending to all of them.
+checklists**, unlike the AppleScript body write. Pinned by
+`notes/tests/test_append.py`, which checks that a checklist keeps its checked
+state across an append.
+
+🛑 **No target means no append.** The shortcut matches the note by *Name*, and
+a name matching nothing does **not** fail — Shortcuts lists every note in a
+picker and waits, then writes the text to whatever the human picks. Measured:
+four queued appends all landed on a note chosen minutes later, while the note
+the caller named sat in Recently Deleted.
+
+⚠️ **Nothing after the fact reveals this.** `shortcuts run` returns in ~2s with
+exit 0 while the picker is still open. Timing cannot distinguish a picker from
+a permission dialog either. So `append` refuses **before** running: the target
+must be a live note, outside Recently Deleted, whose title matches it and
+nothing else. It also still refuses an ambiguous title rather than appending to
+every match.
 
 `ID` accepts a numeric note ID, a note title, or an `applenotes://` URL.
 
@@ -210,6 +285,61 @@ Unix-epoch start time, and the two incompatible word tokenizations — in
 **Writes need `install-shortcuts` first.** `apple notes status` reports whether
 the write path is available and names anything missing; until then Notes is
 read-only.
+
+🛑 **Installed is not the same as allowed, and an unallowed shortcut fails
+silently.** `shortcuts run` against a shortcut with no permission grant **exits
+0, prints nothing, writes nothing, and raises no dialog** — so every layer above
+it read success. Observed on macOS 27.0 build 26A5406e with
+`ZACCESSRESOURCEPERMISSION` empty for both shortcuts; the docs' write path was
+verified on build 26A5388g.
+
+Three things reported success for a write that did nothing, all now fixed:
+
+- **`status` said "shortcuts installed (2)"** and called the write path
+  available. It now reads the grants out of `ZACCESSRESOURCEPERMISSION` and
+  reports `unauthorized` per shortcut. ⚠️ An unreadable Shortcuts library is
+  **unknown**, not denied — it must not invent a refusal.
+- **`create` exited 0** having created nothing, with the only signal a
+  `"created": false` field nobody checks. Both `create` and `append` now exit
+  non-zero and name the likely cause.
+- **`create`/`append` ran the shortcut at all.** They refuse up front when no
+  grant exists, since running is pure loss.
+
+⚠️ **`shortcuts run`'s exit code proves nothing about whether the shortcut did
+anything.** Confirm every write by re-reading the store, the way `apple
+calendar` and `apple contacts` do.
+
+`APPLE_NOTES_SHORTCUTS_DB` points the grant reader at a different library, which
+is how `notes/tests/test_write_path.py` covers all of this offline. 14 tests;
+13 of them fail against the code before this fix.
+
+🛑 **What the Markdown write path supports is measured, generated, and
+checked — never assumed.** The matrix lives in
+[`docs/apple-notes-markdown-support.md`](docs/apple-notes-markdown-support.md),
+generated from `notes/tests/markdown_cases.py`:
+
+```
+./notes/capability-report            # measure and rewrite the doc
+./notes/capability-report --check    # exit 1 if any answer moved
+```
+
+**Run `--check` after every macOS update.** `notes/run-tests` runs it too, so a
+change in Apple's interpreter fails the suite. It reports two independent
+columns per construct — what **Apple stored** (the API surface) and what our
+**reader gives back** — because a construct can survive the write and be lost
+on the read. That is exactly what happened to italic and strikethrough.
+
+Measured on 26A5406e: everything works except **`==highlight==`** and
+**`` `code` ``**, which Apple ignores, plus **`- [X]`** and **`* [x]`**, which
+do not make checklists. ⚠️ **`#` becomes the *title* style, not a heading.**
+⚠️ **Apple drops bold inside link text.**
+
+⚠️ **Do not hand-probe these answers.** Three wrong conclusions came out of
+doing that.
+
+🛑 **A pipe table destroys the last item of the list directly above it.** The
+item becomes a plain paragraph. It applies to bullets and checklists alike,
+whatever the checked state. Put one paragraph between the list and the table.
 
 ⚠️ **The gotchas below are about the AppleScript write path, which is the wrong
 tool for most writes.** It cannot create a checklist at all, and its only body
@@ -1685,12 +1815,26 @@ swift/                    one Swift package, seven binaries
         GeocodingTests/
 notes/                    Python; apple-notes, notestore.py, notestore.proto,
                           mergeable.py (ZMERGEABLEDATA1 reader — recordings,
-                          transcripts, summaries), tests/ (live Notes.app suite)
+                          transcripts, summaries, and table cells),
+                          tests/ (live Notes.app suite +
+                          test_markdown_capabilities.py, which measures what
+                          the Markdown write path supports; plus offline
+                          test_rendering.py, test_tables.py, test_write_path.py)
 docs/apple-notes-api.md   NoteStore schema, AppleScript API, verified bugs
 docs/apple-notes-shortcuts.md  driving Notes' AppIntents from the CLI —
                           the only route to checklist writes and a real append
 docs/apple-notes-transcripts.md  where call recordings actually store their
                           transcript, and the four traps in decoding it
+docs/apple-notes-tables.md  where a table keeps its cells, the four traps that
+                          each yield a wrong table rather than an error, and
+                          the UTF-16 run-length bug an emoji exposes
+docs/apple-notes-markdown-support.md  GENERATED. What Apple's Markdown
+                          interpreter does with each construct, and what our
+                          reader gives back. Regenerate with
+                          `notes/capability-report`; never edit by hand
+notes/capability-report   measures the matrix above, writes the doc, and
+                          `--check`s it — the alarm for a macOS update moving
+                          the API surface
 notes/shortcuts/          .shortcut build scripts + signed files to install
 docs/apple-mail-store.md  Envelope Index schema, .emlx layout, verified traps
 docs/apple-mail-drafts.md why apple-mail never writes a body: the cite-blockquote

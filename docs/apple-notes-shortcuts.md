@@ -42,15 +42,28 @@ things `set body` annihilates:
 | checked state | `[done 0, done 1]` | **preserved** |
 | appended `- [x] item` | — | a **real** checklist item, checked |
 
-Markdown is interpreted into native structures, not text that resembles them:
+Markdown is interpreted into native structures, not text that resembles them.
 
-| Markdown | Store |
-|---|---|
-| `- [ ] task` | `style_type: 103`, `checklist: {done: 0}` |
-| `- [x] task` | `style_type: 103`, `checklist: {done: 1}` |
-| `- bullet` | `style_type: 101` |
-| pipe table | a real `com.apple.notes.table` |
-| `**bold**` | bold, markers consumed |
+🛑 **The support matrix is generated, and this file does not hold a copy.**
+Read [`apple-notes-markdown-support.md`](apple-notes-markdown-support.md). It
+records, per construct, what Apple stored and what our reader gives back —
+two independent columns, because a construct can survive the write and be lost
+on the read.
+
+```
+./notes/capability-report            # measure and rewrite the doc
+./notes/capability-report --check    # fail if any answer moved
+```
+
+🛑 **Run `--check` after every macOS update.** Apple's interpreter is
+undocumented and it moves; that command is the alarm. The cases live in
+[`../notes/tests/markdown_cases.py`](../notes/tests/markdown_cases.py) and are
+asserted by `tests/test_markdown_capabilities.py`, so the doc and the tests
+cannot drift apart.
+
+⚠️ **Do not hand-probe these answers.** Three wrong conclusions came out of
+doing that before the matrix existed, including "`- [x]` no longer works" —
+which was really a pipe table eating the last item of the list above it.
 
 Steady-state run time is **0.25–0.45s**, faster than the AppleScript write path.
 
@@ -129,6 +142,22 @@ parameter — it falls back to **asking the user**, so:
 **always run with a timeout**, and read a hang as "a parameter did not bind",
 not as "the action is broken".
 
+🛑 **The note picker is worse than a hang: it redirects the write.** A note
+name matching nothing does not fail. Shortcuts lists **every note** and waits;
+whatever the human picks receives the text. Measured on the real store — the
+target had been deleted, four appends queued behind one picker, and all four
+landed on a note chosen minutes later.
+
+⚠️ **`shortcuts run` returns in ~2s while that picker is still open.** The exit
+code says success and the elapsed time looks normal, so nothing after the fact
+reveals it. Timing cannot even tell a picker from a permission dialog; both
+just block.
+
+**So a caller must refuse before running.** `apple notes append` now checks the
+target is a live, uniquely-named note immediately before the write, and exits
+non-zero otherwise. `tests/test_write_path.py` pins it with the shortcut runner
+replaced, so the refusal is proved without any write.
+
 ### 3. Shortcuts silently normalises the action identifier but not the parameters
 
 Import rewrites `com.apple.Notes.AppendToNoteLinkAction` to the canonical
@@ -181,6 +210,46 @@ agent-driven write path that is a confirmation surface worth having on purpose.
 
 Because grants are per-shortcut, N shortcuts cost N grants — an argument for one
 general-purpose shortcut over several narrow ones.
+
+## 🛑 An unauthorized shortcut fails silently, and every layer believed it
+
+Observed on **macOS 27.0 build 26A5406e** — the write path above was verified
+on **26A5388g**.
+
+With `ZACCESSRESOURCEPERMISSION` empty for both shortcuts, `shortcuts run`:
+
+- **exits 0**
+- prints nothing
+- writes nothing
+- produces **no output file** even with `--output-path`
+- raises **no permission dialog**, from a terminal or from the user's own shell
+
+`ZSHORTCUT.ZRUNEVENTSCOUNT` still increments, so the shortcut *runs*; the action
+inside it does nothing. The serialization is unchanged and correct, the input
+classes still list `WFStringContentItem`, and nothing is quarantined or
+tombstoned. The cause of the missing dialog is **not established**.
+
+⚠️ **This makes `shortcuts run`'s exit code worthless as evidence.** It was
+already true — the CLI reports 0 for an aborted run — but an unauthorized
+shortcut is the case where it matters, because nothing else signals failure.
+
+What the tool does about it:
+
+| | before | after |
+|---|---|---|
+| `status` | "shortcuts installed (2)", available | reads the grants, reports `unauthorized` |
+| `create` with no grant | ran it, **exited 0** | refuses up front, exits 1, names the fix |
+| `append` with no grant | ran it, **exited 0** | same |
+| a write the store cannot confirm | note on stderr, exit 0 | exits 1 through `fail_write` |
+
+⚠️ **An unreadable Shortcuts library is "unknown", not "denied".**
+`shortcuts_authorized()` returns `None` there and `status` must not turn that
+into a reported refusal — a future macOS may move the grants elsewhere.
+
+`APPLE_NOTES_SHORTCUTS_DB` overrides the library path, which is how
+[`../notes/tests/test_write_path.py`](../notes/tests/test_write_path.py) covers
+this offline without running a shortcut. 14 tests; **13 fail against the code
+before the fix**.
 
 ## Debugging
 

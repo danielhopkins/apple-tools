@@ -22,6 +22,7 @@ Safety model
 
 import os
 import re
+import json
 import sys
 import time
 import sqlite3
@@ -31,7 +32,23 @@ import contextlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-TEST_PREFIX = "__claude_notes_test__"
+
+# 🛑 **The prefix must survive Apple's Markdown interpreter.** It used to be
+# `__claude_notes_test__`, which is Markdown for **bold**: `apple notes create`
+# passes `interpretAsMarkdown: True`, so Apple ate the underscores and stored
+# the note titled `claude_notes_test…`. Two consequences, both bad:
+#
+#   - `create` matched on the title it sent, found nothing, and reported
+#     `created: false` for a note it had created correctly
+#   - the sweep below could not find its own fixtures, so they were never
+#     deleted — one survived in the real account for weeks
+#
+# Nothing in this prefix may be Markdown syntax. No `_`, `*`, `#`, `[`, `` ` ``
+# or `~`. Verified against the live write path.
+TEST_PREFIX = "zzclaudenotestestzz-"
+
+# The old prefix, so the sweep can still clean up notes left by earlier runs.
+LEGACY_TEST_PREFIXES = ("__claude_notes_test__", "claude_notes_test")
 
 DB_PATH = os.path.expanduser(
     "~/Library/Group Containers/group.com.apple.notes/NoteStore.sqlite"
@@ -121,6 +138,48 @@ def unique_title(label: str = "") -> str:
     """A collision-resistant, prefix-tagged title (also becomes the note's name)."""
     stamp = f"{time.time():.6f}".replace(".", "")
     return f"{TEST_PREFIX}{label}-{stamp}" if label else f"{TEST_PREFIX}{stamp}"
+
+
+def create_note_markdown(body: str) -> int:
+    """Create a note through the Markdown write path. Returns its Z_PK.
+
+    🛑 This is the ONLY route that exercises `interpretAsMarkdown`, and until
+    `test_markdown_capabilities.py` nothing in this suite used it — which is
+    why what Apple's interpreter does had to be guessed one probe at a time.
+
+    ⚠️ It shells out to the real `apple-notes create`, so it writes to the
+    user's iCloud. Every caller must be gated on RUN_LIVE_NOTES_TESTS and must
+    sweep afterwards.
+    """
+    out = subprocess.run(
+        [sys.executable, str(ROOT / "apple-notes"), "create", "--json"],
+        input=body, capture_output=True, text=True, timeout=180)
+    if out.returncode != 0:
+        raise RuntimeError("markdown create failed: %s" % out.stderr.strip())
+    payload = json.loads(out.stdout)
+    if not payload.get("created"):
+        raise RuntimeError("markdown create reported no note: %s" % payload)
+    return payload["id"]
+
+
+def append_note_markdown(identifier, body: str):
+    """Append through the Markdown write path. Returns (returncode, payload).
+
+    ⚠️ Returns the failure rather than raising, because the exit code is itself
+    under test. `create` used to exit 0 after doing nothing.
+    """
+    out = subprocess.run(
+        [sys.executable, str(ROOT / "apple-notes"), "append", str(identifier),
+         "--json"],
+        input=body, capture_output=True, text=True, timeout=180)
+    payload = {}
+    if out.stdout.strip():
+        try:
+            payload = json.loads(out.stdout)
+        except ValueError:
+            pass
+    payload["_stderr"] = out.stderr.strip()
+    return out.returncode, payload
 
 
 def get_name(note_id: str) -> str:
@@ -224,21 +283,27 @@ def sweep_test_notes() -> int:
     leaving every remaining test note behind. Cleanup must be best-effort, since
     the thing it is cleaning up after is usually a run that already went wrong.
     """
-    return int(
-        osascript(
-            'tell application "Notes"\n'
-            f"set victims to (notes whose name starts with {_as_str(TEST_PREFIX)})\n"
-            "set n to 0\n"
-            "repeat with v in victims\n"
-            "  try\n"
-            "    delete v\n"
-            "    set n to n + 1\n"
-            "  end try\n"
-            "end repeat\n"
-            "return n\n"
-            "end tell"
+    deleted = 0
+    # ⚠️ Sweep the legacy prefixes too. Notes created through the Markdown write
+    # path under the old prefix lost their leading underscores, so the old sweep
+    # could not match them and left them in the account.
+    for prefix in (TEST_PREFIX,) + LEGACY_TEST_PREFIXES:
+        deleted += int(
+            osascript(
+                'tell application "Notes"\n'
+                f"set victims to (notes whose name starts with {_as_str(prefix)})\n"
+                "set n to 0\n"
+                "repeat with v in victims\n"
+                "  try\n"
+                "    delete v\n"
+                "    set n to n + 1\n"
+                "  end try\n"
+                "end repeat\n"
+                "return n\n"
+                "end tell"
+            )
         )
-    )
+    return deleted
 
 
 @contextlib.contextmanager

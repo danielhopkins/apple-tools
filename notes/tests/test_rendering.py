@@ -41,6 +41,7 @@ class ApplyFormattingEmbeddedTests(unittest.TestCase):
             "length": length,
             "highlight": False,
             "bold": False,
+            "italic": False,
             "link": None,
             "strikethrough": 0,
             "underlined": 0,
