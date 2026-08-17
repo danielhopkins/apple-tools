@@ -880,7 +880,13 @@ def apply_formatting(text, runs, attachment_labels=None, tables=None, links=None
                 # the TITLE style, not the heading style, so a title paragraph
                 # mid-note is ordinary. The reader used to emit nothing for it,
                 # which silently flattened it into body text.
-                formatted_line = f"# {formatted_line}"
+                #
+                # ⚠️ Except when the line is only an embedded object. A note
+                # that opens with an image takes its title FROM that image, so
+                # `# [attachment: clouds.png]` under the heading `# clouds.png`
+                # reads as the same thing twice.
+                if line.strip() != OBJECT_REPLACEMENT_CHAR:
+                    formatted_line = f"# {formatted_line}"
             elif style_type == 1:  # Heading
                 formatted_line = f"## {formatted_line}"
             elif style_type == 2:  # Subheading
@@ -919,9 +925,23 @@ def format_as_markdown(title, text, links=None):
     """Format the note text as markdown"""
     lines = text.split("\n")
 
-    # Check if the first line is the title
-    if lines and lines[0].strip() == title:
-        lines = lines[1:]
+    # Drop the body's own title line, so the title is not printed twice.
+    #
+    # 🛑 Compare with any marker stripped. The note's first paragraph carries
+    # the TITLE style, and once the renderer learned to emit `# ` for that
+    # style the raw comparison stopped matching — so every export printed the
+    # title twice, once from here and once from the body. Bold markers can
+    # appear too, since Notes makes a title bold.
+    #
+    # ⚠️ And skip leading blank lines first. A note whose body opens with an
+    # empty line put its title on line 1, which the old check never looked at.
+    start = 0
+    while start < len(lines) and not lines[start].strip():
+        start += 1
+    if start < len(lines):
+        first = lines[start].strip().lstrip("#").strip().strip("*").strip()
+        if first == title.strip():
+            lines = lines[start + 1:]
         # Skip leading empty lines after title
         while lines and not lines[0].strip():
             lines = lines[1:]

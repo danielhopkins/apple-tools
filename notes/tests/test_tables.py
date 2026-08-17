@@ -587,6 +587,75 @@ class TableMarkdownTests(unittest.TestCase):
         self.assertEqual(mergeable.Table([]).markdown(), "")
 
 
+class TitleLineTests(unittest.TestCase):
+    """🛑 The note title must not be printed twice.
+
+    `format_as_markdown` emits `# <title>` and then drops the body's own title
+    line. Teaching the renderer to emit `# ` for the TITLE paragraph style
+    broke that comparison, so **every export printed the title twice** until
+    this was caught while checking the release.
+    """
+
+    def render(self, title, body):
+        return cli.format_as_markdown(title, body)
+
+    def test_a_plain_title_line_is_dropped(self):
+        out = self.render("Recipe", "Recipe\n\nbody")
+        self.assertEqual(out.count("Recipe"), 1)
+
+    def test_a_hash_prefixed_title_line_is_dropped(self):
+        """The regression: the renderer now prefixes a TITLE paragraph."""
+        out = self.render("Recipe", "# Recipe\n\nbody")
+        self.assertEqual(out.count("Recipe"), 1, out)
+
+    def test_a_bold_title_line_is_dropped(self):
+        """Notes makes a title bold, so the reader emits markers too."""
+        out = self.render("Recipe", "# **Recipe**\n\nbody")
+        self.assertEqual(out.count("Recipe"), 1, out)
+
+    def test_a_title_after_a_blank_line_is_dropped(self):
+        """⚠️ One real note opens with an empty line, putting its title on line 1."""
+        out = self.render("Trip", "\nTrip\n\nbody")
+        self.assertEqual(out.count("Trip"), 1, out)
+
+    def test_a_body_that_repeats_the_title_keeps_the_second_copy(self):
+        """⚠️ 4 real notes type their own title twice. That is content."""
+        out = self.render("Banana Bread", "Banana Bread\n\nBanana Bread\n\nbody")
+        self.assertEqual(out.count("Banana Bread"), 2, out)
+
+    def test_a_different_first_line_is_kept(self):
+        out = self.render("Recipe", "Ingredients\n\nbody")
+        self.assertIn("Ingredients", out)
+
+
+class TitleStyleTests(unittest.TestCase):
+    """⚠️ An attachment-only line must not get a title prefix.
+
+    A note that opens with an image takes its title FROM that image, so
+    `# [attachment: clouds.png]` under `# clouds.png` reads as the same thing
+    twice. Two real notes did that.
+    """
+
+    def _run(self, length, attachment=None, style_type=-1):
+        return {
+            "length": length, "highlight": False, "bold": False, "italic": False,
+            "link": None, "strikethrough": 0, "underlined": 0,
+            "attachment": attachment,
+            "paragraph_style": {"style_type": style_type, "indent": 0,
+                                "checklist": None},
+        }
+
+    def test_an_attachment_only_title_line_gets_no_hash(self):
+        att = {"type_uti": "public.png", "identifier": "a"}
+        out = cli.apply_formatting("￼", [self._run(1, attachment=att, style_type=0)],
+                                   {"a": "clouds.png"})
+        self.assertEqual(out, "[attachment: clouds.png]")
+
+    def test_a_text_title_line_still_gets_a_hash(self):
+        out = cli.apply_formatting("Heading", [self._run(7, style_type=0)])
+        self.assertEqual(out, "# Heading")
+
+
 class TableRenderingTests(unittest.TestCase):
     """The CLI side: a decoded table replaces the placeholder."""
 
