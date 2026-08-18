@@ -182,6 +182,35 @@ def append_note_markdown(identifier, body: str):
     return out.returncode, payload
 
 
+def delete_note_cli(identifier, yes: bool = True, extra=()):
+    """Delete through the real `apple-notes delete`. Returns (rc, payload).
+
+    ⚠️ Returns the failure rather than raising, because the exit code is itself
+    under test: an UNCONFIRMED delete must still exit 0, and every refusal must
+    exit non-zero.
+
+    🛑 Callers must gate on RUN_LIVE_NOTES_TESTS and must only ever pass a note
+    they created with TEST_PREFIX. This drives a real delete on real iCloud
+    data; the note is recoverable from Recently Deleted for about 30 days, and
+    nothing here can empty that folder.
+    """
+    argv = [sys.executable, str(ROOT / "apple-notes"), "delete", str(identifier),
+            "--json"]
+    if yes:
+        argv.append("--yes")
+    argv.extend(extra)
+    out = subprocess.run(argv, input="", capture_output=True, text=True,
+                         timeout=180)
+    payload = {}
+    if out.stdout.strip():
+        try:
+            payload = json.loads(out.stdout)
+        except ValueError:
+            pass
+    payload["_stderr"] = out.stderr.strip()
+    return out.returncode, payload
+
+
 def get_name(note_id: str) -> str:
     return osascript(f'tell application "Notes" to return name of note id {_as_str(note_id)}')
 

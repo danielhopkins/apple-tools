@@ -17,7 +17,7 @@ these tools is that the edge cases are already handled.
 
 | Tool | Reads | Writes |
 |------|-------|--------|
-| `apple notes` | titles, folders, note bodies as Markdown | **yes**, once shortcuts are installed |
+| `apple notes` | titles, folders, note bodies as Markdown | **yes** — create/append once shortcuts are installed; delete needs only Automation |
 | `apple mail` | accounts, message search, message bodies, attachments | **opens a compose window** (you paste the body; `--attach` files are already in it); **`move` refiles messages** |
 | `apple messages` | conversations, message search, attachments | no |
 | `apple phone` | call history with names, blocked list, stats | **`dial` only** (you confirm in Phone.app) |
@@ -66,6 +66,7 @@ apple notes search "budget" --json
 apple notes export 261                    # body as Markdown
 apple notes create --title "Trip" --body-file -            # Markdown on stdin
 apple notes append 261 --body "- [ ] pack charger"         # real checklist item
+apple notes delete 261                    # -> Recently Deleted; asks first
 
 # Mail — reads Mail's own store; fast, and works with Mail.app closed
 apple mail accounts --json
@@ -156,6 +157,27 @@ Check `apple notes status` before a write; it reports whether the write path is
 available and names anything missing. If it is unavailable, tell the user to run
 that command — you cannot do it for them, and the first run of each shortcut
 also raises a permission dialog only they can answer.
+
+## Deleting a note
+
+`apple notes delete ID` moves a note to Recently Deleted, where it stays for
+about 30 days. It needs no Shortcut — it uses AppleScript — but it does need
+**Automation → Notes** for the calling terminal, and it launches Notes.app.
+
+🛑 **Ask the user before you run it, and do not reach for `--yes` to avoid
+asking.** The command prompts on a tty and refuses without one unless given
+`--yes`. That flag exists for a user who scripted it, not as a way past a
+conversation you have not had. Nothing here can empty Recently Deleted.
+
+- **A title must match in full.** `export` accepts a partial title; `delete`
+  does not, and an ambiguous title is refused listing the ids. Prefer the id.
+- **Read `confirmed` in the JSON, not `store_confirmed`.** `confirmed` is
+  Notes.app's answer and is authoritative. `store_confirmed` is sqlite's, and
+  the store lags by minutes — `false` there is normal, not a failure.
+- ⚠️ **`apple notes search` still lists a deleted note**, because the reader can
+  see Recently Deleted. Do not read that as the delete having failed.
+- **A locked note is refused with exit 2.** Its body cannot be read, so the user
+  cannot be shown what they would lose.
 
 🛑 **Never edit a note by exporting and re-writing the body.** That path
 destroys every attachment on the note and flattens every checklist into a plain
