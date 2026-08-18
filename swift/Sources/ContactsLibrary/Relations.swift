@@ -7,9 +7,9 @@
 // that is needed to build one. Keeping the names (rather than the ~210 symbols)
 // means new relations can be supported by regenerating this list.
 
-enum ContactRelations {
+public enum ContactRelations {
     /// Canonical relation names, exactly as they appear inside _$!<...>!$_.
-    static let names: [String] = [
+    public static let names: [String] = [
         "Assistant",
         "Aunt",
         "AuntFathersBrothersWife",
@@ -229,6 +229,6 @@ enum ContactRelations {
     ]
 
     /// Lowercased name -> canonical name, for matching user input.
-    static let byLowercasedName: [String: String] = Dictionary(
+    public static let byLowercasedName: [String: String] = Dictionary(
         names.map { ($0.lowercased(), $0) }, uniquingKeysWith: { first, _ in first })
 }

@@ -1,4 +1,5 @@
 import Contacts
+import ContactsLibrary
 import Foundation
 
 /// Contacts stores its built-in labels wrapped as `_$!<Home>!$_`. Custom labels

@@ -558,8 +558,10 @@ other card `child`; `brother` gives `sibling`. That is not a guess — `child` i
 the term for "son or daughter". Pass `--inverse son` when the specific word
 matters. ⚠️ Do not guess someone's gender to pick one.
 
-⚠️ **Only `uncle`, `aunt`, `nephew` and `niece` are refused**, because Contacts
-has no neutral term for either direction.
+⚠️ **Seven labels are refused** because Contacts defines no label for the other
+side: `stepbrother`, `stepsister`, `grandaunt`, `granduncle`, `grandnephew`,
+`grandniece` and `teacher`. Everything else everyday inverts, including
+aunt/uncle and nephew/niece.
 
 **Use `link`, never `edit --relation`, to add one relation.** `edit` replaces the
 whole set, so it silently deletes every relation you did not re-pass.

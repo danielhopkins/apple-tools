@@ -1825,10 +1825,25 @@ states nothing untrue. Pass `--inverse son` when you want the specific term.
 `child` → `parent`, not back to `father`. Correct — the child's card never
 recorded the parent's gender.
 
-**Only `uncle`, `aunt`, `nephew` and `niece` are refused.** The SDK has `Nephew`
-and `Niece` and **no neutral term for either direction**, so nothing can be
-written without inventing a gender. The refusal names what to pass.
+🛑 **`ParentsSibling` and `SiblingsChild` are the SDK's neutral terms for
+aunt/uncle and nephew/niece.** An earlier version refused all four, claiming no
+such term existed. That came from searching for an obvious English word instead
+of reading the generated list. The table now covers **every everyday English
+label**: spouse, partner, boyfriend/girlfriend, the whole parent/child/sibling
+tree, grandparents, great-grandparents, step-family, birth order
+(`elderbrother` → `youngersibling`), and manager/assistant.
+
+**Seven labels are genuinely refused**, each checked against the label list
+rather than assumed: `stepbrother`/`stepsister` (no `Stepsibling`),
+`grandaunt`/`granduncle` and `grandnephew`/`grandniece` (no neutral either way),
+and `teacher` (the SDK defines no `Student`). The refusal names what to pass, and
 `--no-inverse` writes one side only.
+
+⚠️ **The remaining ~150 labels are specific kinship paths** —
+`AuntFathersElderBrothersWife` and the like — deliberately unmapped. They refuse
+cleanly and `--inverse` still works. `RelationCoverageTests` audits the table
+against the generated vocabulary, so a rule naming a label the SDK does not
+define fails the suite.
 
 🛑 **Relation labels are stored in two spellings, and both are live here.** One
 card holds `_$!<Father>!$_` and another a plain `Sibling`, and `Labels.decode`

@@ -44,7 +44,7 @@ public enum RelationGraph {
     /// ⚠️ Every entry is a claim written onto somebody else's card, so a label
     /// only appears here when its inverse is true for certain.
     static let rules: [String: RelationDirection] = [
-        // Symmetric: the relation reads the same from either side.
+        // MARK: Symmetric — the relation reads the same from either side.
         "spouse": .symmetric,
         "partner": .symmetric,
         "friend": .symmetric,
@@ -52,19 +52,60 @@ public enum RelationGraph {
         "cousin": .symmetric,
         "sibling": .symmetric,
 
-        // Gender-neutral pairs.
+        // MARK: Neutral pairs.
         "parent": .inverse("child"),
         "child": .inverse("parent"),
         "grandparent": .inverse("grandchild"),
         "grandchild": .inverse("grandparent"),
+        "greatgrandparent": .inverse("greatgrandchild"),
+        "greatgrandchild": .inverse("greatgrandparent"),
+        "stepparent": .inverse("stepchild"),
+        "stepchild": .inverse("stepparent"),
         "manager": .inverse("assistant"),
         "assistant": .inverse("manager"),
 
-        // Gendered labels invert to the neutral term for the other side.
+        // 🛑 `ParentsSibling` and `SiblingsChild` are the SDK's neutral terms
+        // for aunt/uncle and nephew/niece. An earlier version claimed no such
+        // term existed and refused all four, because the search only looked for
+        // an obvious English word.
+        "parentssibling": .inverse("siblingschild"),
+        "siblingschild": .inverse("parentssibling"),
+        "uncle": .inverse("siblingschild"),
+        "aunt": .inverse("siblingschild"),
+        "nephew": .inverse("parentssibling"),
+        "niece": .inverse("parentssibling"),
+
+        // MARK: Birth order. Both neutral forms exist, so an elder brother's
+        // other side is a younger sibling — a real inverse, not a guess.
+        "eldersibling": .inverse("youngersibling"),
+        "youngersibling": .inverse("eldersibling"),
+        "elderbrother": .inverse("youngersibling"),
+        "eldersister": .inverse("youngersibling"),
+        "youngerbrother": .inverse("eldersibling"),
+        "youngersister": .inverse("eldersibling"),
+        // ⚠️ The *eldest* sibling's other side is only "younger", not
+        // "youngest" — everyone else is younger than the eldest, but they are
+        // not all the youngest.
+        "eldestbrother": .inverse("youngersibling"),
+        "eldestsister": .inverse("youngersibling"),
+        "youngestbrother": .inverse("eldersibling"),
+        "youngestsister": .inverse("eldersibling"),
+        "eldercousin": .inverse("youngercousin"),
+        "youngercousin": .inverse("eldercousin"),
+
+        // MARK: Gendered labels invert to the neutral term.
         // 🛑 `husband` and `wife` are NOT symmetric: if B is A's husband, A is
         // B's wife or husband, and only `spouse` covers both.
         "husband": .inverse("spouse"),
         "wife": .inverse("spouse"),
+        "boyfriend": .inverse("partner"),
+        "girlfriend": .inverse("partner"),
+        "malepartner": .inverse("partner"),
+        "femalepartner": .inverse("partner"),
+        "malefriend": .inverse("friend"),
+        "femalefriend": .inverse("friend"),
+        "malecousin": .inverse("cousin"),
+        "femalecousin": .inverse("cousin"),
         "father": .inverse("child"),
         "mother": .inverse("child"),
         "son": .inverse("parent"),
@@ -75,14 +116,25 @@ public enum RelationGraph {
         "grandmother": .inverse("grandchild"),
         "grandson": .inverse("grandparent"),
         "granddaughter": .inverse("grandparent"),
+        "greatgrandfather": .inverse("greatgrandchild"),
+        "greatgrandmother": .inverse("greatgrandchild"),
+        "greatgrandson": .inverse("greatgrandparent"),
+        "greatgranddaughter": .inverse("greatgrandparent"),
+        "stepfather": .inverse("stepchild"),
+        "stepmother": .inverse("stepchild"),
+        "stepson": .inverse("stepparent"),
+        "stepdaughter": .inverse("stepparent"),
 
-        // ⚠️ Genuinely ambiguous: the SDK has `Nephew` and `Niece` but no
-        // neutral term for either direction, so nothing here can be written
-        // without inventing a gender.
-        "uncle": .ambiguous,
-        "aunt": .ambiguous,
-        "nephew": .ambiguous,
-        "niece": .ambiguous,
+        // MARK: Genuinely ambiguous — the SDK defines both gendered terms and
+        // NO neutral one, so nothing can be written without inventing a gender.
+        // Each was checked against the generated label list, not assumed.
+        "stepbrother": .ambiguous,   // no `Stepsibling`
+        "stepsister": .ambiguous,
+        "grandaunt": .ambiguous,     // no neutral for grandnephew/grandniece
+        "granduncle": .ambiguous,
+        "grandnephew": .ambiguous,   // no neutral for grandaunt/granduncle
+        "grandniece": .ambiguous,
+        "teacher": .ambiguous,       // the SDK has no `Student`
     ]
 
     /// The label the other card should carry, or nil when nothing can be
@@ -100,10 +152,10 @@ public enum RelationGraph {
         let key = normalize(label)
         switch rules[key] {
         case .ambiguous:
-            return """
-                Contacts has no gender-neutral term for the other side of \
-                '\(key)'
-                """
+            // ⚠️ Not always a gender problem. `teacher` has no inverse because
+            // the SDK defines no `Student` at all, and saying "gender-neutral"
+            // there sent the reader looking for the wrong thing.
+            return "Contacts defines no label for the other side of '\(key)'"
         case .none:
             return "there is no inverse rule for '\(key)'"
         default:
@@ -114,8 +166,9 @@ public enum RelationGraph {
     /// A suggestion to put in the refusal, so the user has something to type.
     public static func inverseSuggestions(for label: String) -> [String] {
         switch normalize(label) {
-        case "uncle", "aunt": return ["nephew", "niece"]
-        case "nephew", "niece": return ["uncle", "aunt"]
+        case "stepbrother", "stepsister": return ["stepbrother", "stepsister"]
+        case "grandaunt", "granduncle": return ["grandnephew", "grandniece"]
+        case "grandnephew", "grandniece": return ["grandaunt", "granduncle"]
         default: return []
         }
     }

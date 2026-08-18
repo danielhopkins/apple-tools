@@ -78,33 +78,76 @@ final class RelationInverseTests: XCTestCase {
 
     // MARK: What genuinely cannot be inferred
 
-    /// ⚠️ The SDK has `Nephew` and `Niece` and no neutral term for either, so
-    /// nothing can be written without inventing a gender. This is the only
-    /// family relation left that really is ambiguous.
-    func testUncleAndAuntAreRefusedBecauseNoNeutralTermExists() {
-        for label in ["uncle", "aunt", "nephew", "niece"] {
+    /// 🛑 **The second guessing mistake.** An earlier version refused `uncle`,
+    /// `aunt`, `nephew` and `niece`, claiming Contacts had no neutral term for
+    /// either direction. It has both: `ParentsSibling` and `SiblingsChild`. The
+    /// error came from searching for an obvious English word instead of reading
+    /// the generated label list.
+    func testAuntAndUncleInvertThroughTheNeutralKinshipTerms() {
+        XCTAssertEqual(RelationGraph.inverse(of: "uncle"), "siblingschild")
+        XCTAssertEqual(RelationGraph.inverse(of: "aunt"), "siblingschild")
+        XCTAssertEqual(RelationGraph.inverse(of: "nephew"), "parentssibling")
+        XCTAssertEqual(RelationGraph.inverse(of: "niece"), "parentssibling")
+        XCTAssertEqual(RelationGraph.inverse(of: "parentssibling"), "siblingschild")
+        XCTAssertEqual(RelationGraph.inverse(of: "siblingschild"), "parentssibling")
+    }
+
+    /// ⚠️ What is left really is ambiguous, and each was checked against the
+    /// label list rather than assumed: there is no `Stepsibling`, no neutral
+    /// term for grandaunt/granduncle or grandnephew/grandniece, and no
+    /// `Student`.
+    func testTheRemainingAmbiguousLabels() {
+        for label in ["stepbrother", "stepsister", "grandaunt", "granduncle",
+                      "grandnephew", "grandniece", "teacher"] {
             XCTAssertNil(RelationGraph.inverse(of: label),
                          "\(label) must not be inverted automatically")
             XCTAssertTrue(
-                RelationGraph.ambiguityReason(for: label).contains("neutral"),
+                RelationGraph.ambiguityReason(for: label).contains("no label"),
                 "the refusal for \(label) must say why")
         }
+    }
+
+    /// Birth order inverts, because both neutral forms exist.
+    func testBirthOrderInverts() {
+        XCTAssertEqual(RelationGraph.inverse(of: "elderbrother"), "youngersibling")
+        XCTAssertEqual(RelationGraph.inverse(of: "youngersister"), "eldersibling")
+        // ⚠️ The *eldest* sibling's other side is only "younger", not
+        // "youngest": everyone is younger than the eldest, but not all of them
+        // are the youngest.
+        XCTAssertEqual(RelationGraph.inverse(of: "eldestbrother"), "youngersibling")
+        XCTAssertEqual(RelationGraph.inverse(of: "youngestsister"), "eldersibling")
+        XCTAssertEqual(RelationGraph.inverse(of: "eldercousin"), "youngercousin")
+    }
+
+    /// Step-family inverts through its own neutral terms.
+    func testStepFamilyInverts() {
+        XCTAssertEqual(RelationGraph.inverse(of: "stepfather"), "stepchild")
+        XCTAssertEqual(RelationGraph.inverse(of: "stepdaughter"), "stepparent")
+        XCTAssertEqual(RelationGraph.inverse(of: "stepparent"), "stepchild")
+    }
+
+    /// A gender-qualified form of a symmetric relation drops the qualifier.
+    func testGenderQualifiedSymmetricLabelsDropTheQualifier() {
+        XCTAssertEqual(RelationGraph.inverse(of: "malefriend"), "friend")
+        XCTAssertEqual(RelationGraph.inverse(of: "femalecousin"), "cousin")
+        XCTAssertEqual(RelationGraph.inverse(of: "boyfriend"), "partner")
+        XCTAssertEqual(RelationGraph.inverse(of: "girlfriend"), "partner")
     }
 
     func testAnUnknownLabelIsRefused() {
         XCTAssertNil(RelationGraph.inverse(of: "landlord"))
         let reason = RelationGraph.ambiguityReason(for: "landlord")
         XCTAssertTrue(reason.contains("landlord"))
-        XCTAssertFalse(reason.contains("neutral"),
+        XCTAssertFalse(reason.contains("no label for the other side"),
                        "an unknown label is not a missing-term problem")
     }
 
     /// A refusal the user cannot act on is a dead end.
     func testRefusalsSuggestSomething() {
-        XCTAssertEqual(RelationGraph.inverseSuggestions(for: "uncle"),
-                       ["nephew", "niece"])
-        XCTAssertEqual(RelationGraph.inverseSuggestions(for: "niece"),
-                       ["uncle", "aunt"])
+        XCTAssertEqual(RelationGraph.inverseSuggestions(for: "stepbrother"),
+                       ["stepbrother", "stepsister"])
+        XCTAssertEqual(RelationGraph.inverseSuggestions(for: "grandniece"),
+                       ["grandaunt", "granduncle"])
         XCTAssertTrue(RelationGraph.inverseSuggestions(for: "landlord").isEmpty)
     }
 
@@ -129,5 +172,108 @@ final class RelationInverseTests: XCTestCase {
         XCTAssertEqual(RelationGraph.normalize("father"), "father")
         XCTAssertEqual(RelationGraph.normalize("Grand Parent"),
                        RelationGraph.normalize("grandparent"))
+    }
+}
+
+// MARK: - Coverage against the real SDK vocabulary
+
+/// 🛑 **The inverse table was built by guessing which labels exist, and it was
+/// wrong twice.**
+///
+/// First it refused `father` on the reasoning that "son or daughter" had no
+/// single term — `Child` does. Then it refused `uncle`, `aunt`, `nephew` and
+/// `niece` claiming no neutral term existed — `ParentsSibling` and
+/// `SiblingsChild` both do. Neither error came from a bad rule; both came from
+/// not reading the list.
+///
+/// So these tests check the table against the generated vocabulary itself.
+final class RelationCoverageTests: XCTestCase {
+
+    private var vocabulary: Set<String> {
+        Set(ContactRelations.names.map(RelationGraph.normalize))
+    }
+
+    /// 🛑 **Every inverse must be a label the SDK actually defines.** Writing a
+    /// label Contacts does not know stores it as a custom string, so the other
+    /// card ends up with a relation that never matches anything.
+    func testEveryInverseIsARealSDKLabel() {
+        let known = vocabulary
+        for (label, _) in RelationGraph.rules {
+            guard let other = RelationGraph.inverse(of: label) else { continue }
+            XCTAssertTrue(known.contains(other),
+                          "\(label) inverts to '\(other)', which is not an SDK label")
+        }
+    }
+
+    /// Every label the table names must itself exist. A typo'd key is a rule
+    /// that silently never fires.
+    func testEveryRuleKeyIsARealSDKLabel() {
+        let known = vocabulary
+        for (label, _) in RelationGraph.rules {
+            XCTAssertTrue(known.contains(label),
+                          "'\(label)' has a rule but is not an SDK label")
+        }
+    }
+
+    /// ⚠️ **A label marked ambiguous must really have no neutral partner.**
+    /// This is the check that would have caught the aunt/uncle mistake: if a
+    /// plausible neutral term exists in the vocabulary, the refusal is wrong.
+    func testAmbiguousLabelsHaveNoObviousNeutralTerm() {
+        let known = vocabulary
+        // The neutral term for a gendered pair, where one exists.
+        let neutralCandidates: [String: String] = [
+            "stepbrother": "stepsibling",
+            "stepsister": "stepsibling",
+            "grandaunt": "grandparentssibling",
+            "granduncle": "grandparentssibling",
+            "grandnephew": "grandsiblingschild",
+            "grandniece": "grandsiblingschild",
+            "teacher": "student",
+        ]
+        for (label, candidate) in neutralCandidates {
+            XCTAssertNil(RelationGraph.inverse(of: label),
+                         "\(label) should still be ambiguous")
+            XCTAssertFalse(
+                known.contains(candidate),
+                "'\(candidate)' IS an SDK label, so \(label) should not be refused")
+        }
+    }
+
+    /// The plain English labels a person would actually type must all resolve.
+    /// The 190-odd hyper-specific kinship terms are left unmapped on purpose.
+    func testTheCommonEnglishLabelsAllHaveRules() {
+        let everyday = [
+            "spouse", "husband", "wife", "partner", "boyfriend", "girlfriend",
+            "friend", "colleague", "cousin", "sibling",
+            "parent", "child", "father", "mother", "son", "daughter",
+            "brother", "sister",
+            "grandparent", "grandchild", "grandfather", "grandmother",
+            "grandson", "granddaughter",
+            "uncle", "aunt", "nephew", "niece",
+            "stepparent", "stepchild", "stepfather", "stepmother",
+            "stepson", "stepdaughter",
+            "manager", "assistant",
+        ]
+        for label in everyday {
+            XCTAssertNotNil(RelationGraph.inverse(of: label),
+                            "'\(label)' is an everyday relation and must invert")
+        }
+    }
+
+    /// ⚠️ Records how much of the vocabulary is deliberately unmapped, so a
+    /// reader is not left wondering whether the gap is an oversight.
+    func testTheUnmappedRemainderIsTheSpecificKinshipTerms() {
+        let known = vocabulary
+        let mapped = Set(RelationGraph.rules.keys)
+        let unmapped = known.subtracting(mapped)
+        // These are terms like `auntfatherselderbrotherswife` — a kinship path,
+        // not a word anyone types at a CLI. They refuse cleanly and --inverse
+        // still works.
+        XCTAssertGreaterThan(unmapped.count, 100,
+                             "the remainder should be the specific kinship terms")
+        for label in unmapped {
+            XCTAssertNil(RelationGraph.inverse(of: label),
+                         "'\(label)' is unmapped but returns an inverse")
+        }
     }
 }
