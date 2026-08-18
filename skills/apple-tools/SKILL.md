@@ -24,7 +24,7 @@ these tools is that the edge cases are already handled.
 | `apple maps` | visited places with coordinates, visits, saved guides | no, and never |
 | `apple reminders` | lists, items, due dates | **yes** |
 | `apple calendar` | calendars, events, **invitees with RSVP status** | **yes** — and `invite` **emails real people** |
-| `apple contacts` | names, emails, phones, addresses, notes | **yes** (except notes) |
+| `apple contacts` | names, emails, phones, addresses, notes | **yes** (except notes and postal addresses) |
 
 ## Rules
 
@@ -117,6 +117,7 @@ apple reminders add Errands "Call" --at "39.96,-105.17" --on leave --radius 250
 apple calendar calendars --writable --json
 apple calendar events --days 7 --json          # attendees, organizer, my_status
 apple calendar add "Dentist" --start "tomorrow 2pm" --duration 45
+apple calendar unsynced                   # did anything fail to reach the server
 apple calendar add "Board" --start "2026-09-28 10:00" \
     --repeat monthly --on-the "4th monday"   # same --repeat flags as reminders
 apple calendar edit <id> --series --repeat weekly    # rule changes need --series
@@ -135,6 +136,51 @@ apple contacts groups add "Family" <contact-id>
 apple contacts move <id> --to "iCloud" --dry-run  # between accounts; keeps the id
 apple contacts containers --json               # accounts; which is default
 ```
+
+## Did that calendar write actually reach the server?
+
+🛑 **`add` and `edit` used to say yes when the answer was no.** EventKit saving
+is local; the push happens afterwards. Measured 2026-08-18: `add` returned a full
+event record and exit 0 for a write Google refused with HTTP 403. The event never
+reached the server, and the caller had already told the user it was on their
+calendar.
+
+Both commands now wait for the server before reporting success. On by default,
+about 4 seconds. **Read `sync.state` in the JSON:**
+
+| state | means |
+|---|---|
+| `synced` | the server has it |
+| `pending` | it does not, and the command exits non-zero |
+| `notApplicable` | there is no server — a local or generated calendar |
+| `unknown` | the tool could not check. **Never report this as a failure.** |
+
+⚠️ **An Exchange *edit* always reports `unknown`**, because Exchange records
+nothing locally when an edit reaches the server. That is a real limit, not a
+fault. Say so rather than claiming the edit landed.
+
+Use `--no-confirm-sync` only when the user is writing many events and will check
+afterwards with `unsynced`.
+
+Three read commands, none of which write anything:
+
+```
+apple calendar sync-status <id>    # one event
+apple calendar unsynced            # everything the server never took
+apple calendar sync-errors         # what Calendar recorded and hid
+```
+
+🛑 **`sync-errors` printing nothing is not proof everything synced.** One of the
+two known failure modes leaves no error row at all. Run `unsynced` too.
+
+**`apple calendar resync <id>` rebuilds a stuck event.** EventKit stops retrying
+an item once it records an error, so nothing fixes itself. Ask the user first:
+the event gets a **new identifier**, and with `--force` on an event with guests
+it mails everyone a fresh invitation. Run `--dry-run` first. A recurring event is
+refused outright.
+
+⚠️ **These four commands need Full Disk Access**, which the Calendar grant does
+not carry. Without it they say so; they do not guess.
 
 ## Writing notes
 

@@ -100,6 +100,7 @@ let package = Package(
                 "AppleToolsVersion",
                 "AppleToolsStyle",
                 "TCCResponsibility",
+                "CalendarSyncLibrary",
                 // `--at` gives an event a real map pin. Nothing geocodes a
                 // location string after the fact — not EventKit, not the
                 // calDAV server, not Calendar.app — so the coordinate has to
@@ -193,6 +194,16 @@ let package = Package(
             path: "Sources/ApplePhone"
         ),
         .target(
+            name: "CalendarSyncLibrary",
+            linkerSettings: [
+                // Calendar.sqlitedb is read directly, because EventKit exposes
+                // nothing about whether a write reached the server. It is a
+                // separate target from apple-calendar so the reader can be
+                // tested against a synthetic store, the way MapsLibrary is.
+                .linkedLibrary("sqlite3"),
+            ]
+        ),
+        .target(
             name: "MapsLibrary",
             dependencies: ["AppleToolsSearch", "Geocoding"],
             linkerSettings: [
@@ -220,6 +231,10 @@ let package = Package(
         .testTarget(
             name: "MapsTests",
             dependencies: ["MapsLibrary"]
+        ),
+        .testTarget(
+            name: "CalendarSyncTests",
+            dependencies: ["CalendarSyncLibrary"]
         ),
         .testTarget(
             name: "GeocodingTests",
