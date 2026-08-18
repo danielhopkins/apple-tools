@@ -450,29 +450,26 @@ final class SyncErrorTests: XCTestCase {
         XCTAssertEqual(failures[0].item, "stuck event")
     }
 
-    /// ⚠️ `user_info` is an NSKeyedArchiver plist. The HTTP status is inside it,
-    /// and reading it is why diagnosing one 403 took an hour by hand.
-    func testTheArchivedUserInfoYieldsTheHTTPStatus() throws {
-        let archived: [String: Any] = [
-            "$version": 100_000,
-            "$archiver": "NSKeyedArchiver",
-            "$top": ["root": 1],
-            "$objects": [
-                "$null",
-                ["NSCode": 403, "NSDomain": 2],
-                "CoreDAVHTTPStatusErrorDomain",
-            ],
-        ]
-        let blob = try PropertyListSerialization.data(
-            fromPropertyList: archived, format: .binary, options: 0)
+    /// Archives an NSError chain with Apple's own NSKeyedArchiver.
+    ///
+    /// 🛑 **Do not hand-build the plist here.** An earlier version of this test
+    /// did, and it passed while proving nothing: a hand-built object table can
+    /// be given whatever shape the decoder already expects. A real archive puts
+    /// `NSDomain` behind a `CFKeyedArchiverUID` reference, which is the part
+    /// that is actually hard to read.
+    private func archivedError(_ error: NSError) throws -> Data {
+        try NSKeyedArchiver.archivedData(
+            withRootObject: [NSUnderlyingErrorKey: error],
+            requiringSecureCoding: false)
+    }
 
-        try fixture.insert(id: 501, calendar: 10, summary: "403 event", unique: "u-403")
+    private func insertError(blob: Data, itemRowID: Int) throws {
         var handle: OpaquePointer?
         XCTAssertEqual(sqlite3_open(fixture.url.path, &handle), SQLITE_OK)
         var statement: OpaquePointer?
         let sql = """
-            INSERT INTO Error (ROWID, calendaritem_owner_id, error_type, error_code, user_info)
-            VALUES (9, 501, 1, 3, ?)
+            INSERT INTO Error (calendaritem_owner_id, error_type, error_code, user_info)
+            VALUES (\(itemRowID), 1, 3, ?)
             """
         XCTAssertEqual(sqlite3_prepare_v2(handle, sql, -1, &statement, nil), SQLITE_OK)
         _ = blob.withUnsafeBytes { raw in
@@ -481,10 +478,65 @@ final class SyncErrorTests: XCTestCase {
         XCTAssertEqual(sqlite3_step(statement), SQLITE_DONE)
         sqlite3_finalize(statement)
         sqlite3_close(handle)
+    }
+
+    /// ⚠️ `user_info` is an NSKeyedArchiver plist. The HTTP status is inside it,
+    /// and reading it is why diagnosing one 403 took an hour by hand.
+    func testTheArchivedUserInfoYieldsTheHTTPStatus() throws {
+        let blob = try archivedError(NSError(
+            domain: "CoreDAVHTTPStatusErrorDomain", code: 403,
+            userInfo: ["CoreDAVHTTPHeaders": ["Server": "GSE"]]))
+
+        try fixture.insert(id: 501, calendar: 10, summary: "403 event", unique: "u-403")
+        try insertError(blob: blob, itemRowID: 501)
 
         let failure = try XCTUnwrap(SyncStore.failures().first)
         XCTAssertEqual(failure.httpStatus, 403)
         XCTAssertEqual(failure.domain, "CoreDAVHTTPStatusErrorDomain")
+    }
+
+    /// 🛑 **CoreDAV wraps errors, and the wrapper's code is not the HTTP
+    /// status.** Measured on a real Apple-produced archive: `NSCode` 8 in
+    /// `CalDAVErrorDomain` carrying `NSCode` 403 in
+    /// `CoreDAVHTTPStatusErrorDomain`.
+    ///
+    /// Scanning `$objects` for any `NSCode` and any "…ErrorDomain" string —
+    /// the shortcut that avoids resolving a `CFKeyedArchiverUID` — gave the
+    /// right answer here purely because of emission order. This pins the
+    /// pairing instead.
+    func testAWrappedErrorReportsTheInnerHTTPStatusNotTheWrapper() throws {
+        let http = NSError(domain: "CoreDAVHTTPStatusErrorDomain", code: 403,
+                           userInfo: [:])
+        let outer = NSError(domain: "CalDAVErrorDomain", code: 8,
+                            userInfo: [NSUnderlyingErrorKey: http])
+
+        try fixture.insert(id: 503, calendar: 10, summary: "wrapped", unique: "u-wrap")
+        try insertError(blob: try archivedError(outer), itemRowID: 503)
+
+        let failure = try XCTUnwrap(SyncStore.failures().first)
+        XCTAssertEqual(failure.httpStatus, 403, "it reported the wrapper's code")
+        XCTAssertEqual(failure.domain, "CoreDAVHTTPStatusErrorDomain")
+
+        // Nothing is hidden: the whole chain is reported.
+        XCTAssertEqual(failure.chain.count, 2)
+        XCTAssertEqual(Set(failure.chain.map(\.code)), [8, 403])
+        // 🛑 And every code keeps its OWN domain. A shortcut that scans for a
+        // loose string can pair 8 with the HTTP domain, which is a number and a
+        // name that never belonged together.
+        for link in failure.chain where link.code == 8 {
+            XCTAssertEqual(link.domain, "CalDAVErrorDomain")
+        }
+    }
+
+    /// An unreadable blob must not invent a status.
+    func testGarbageUserInfoYieldsNoStatus() throws {
+        try fixture.insert(id: 504, calendar: 10, summary: "junk", unique: "u-junk")
+        try insertError(blob: Data([0x00, 0x01, 0x02, 0x03]), itemRowID: 504)
+
+        let failure = try XCTUnwrap(SyncStore.failures().first)
+        XCTAssertNil(failure.httpStatus)
+        XCTAssertNil(failure.domain)
+        XCTAssertEqual(failure.chain.count, 0)
     }
 
     /// An error on the item's calendar or account applies to the item too, so a

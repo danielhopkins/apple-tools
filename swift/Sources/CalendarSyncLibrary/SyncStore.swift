@@ -88,6 +88,12 @@ public enum SyncStore {
         case unknown
     }
 
+    /// One link of an archived `NSError` chain.
+    public struct ErrorLink: Encodable {
+        public let code: Int
+        public let domain: String?
+    }
+
     public struct Failure: Encodable {
         /// Which of the three owner columns the `Error` row names.
         public let scope: String            // "item" | "calendar" | "store"
@@ -101,9 +107,12 @@ public enum SyncStore {
         public let item: String?
         public let calendar: String?
         public let store: String?
+        /// Every link of the archived error chain, outermost first. Reported in
+        /// full so a wrapper code is never mistaken for the cause.
+        public let chain: [ErrorLink]
 
         enum CodingKeys: String, CodingKey {
-            case scope, domain, item, calendar, store
+            case scope, domain, item, calendar, store, chain
             case errorCode = "error_code"
             case errorType = "error_type"
             case httpStatus = "http_status"
@@ -259,27 +268,53 @@ public enum SyncStore {
     /// than unarchive it — which needs a class whitelist and can throw on an
     /// unexpected class — this walks `$objects` for the values directly. That
     /// is what the plist is: a flat object table plus references into it.
-    private static func decodeUserInfo(_ data: Data) -> (code: Int?, domain: String?) {
+    private static func decodeUserInfo(_ data: Data) -> [ErrorLink] {
         guard let plist = try? PropertyListSerialization.propertyList(
                 from: data, options: [], format: nil) as? [String: Any],
               let objects = plist["$objects"] as? [Any] else {
-            return (nil, nil)
+            return []
         }
 
-        var code: Int?
-        var domain: String?
+        var chain: [ErrorLink] = []
         for object in objects {
-            if let dictionary = object as? [String: Any], let raw = dictionary["NSCode"] {
-                code = (raw as? NSNumber)?.intValue ?? code
+            guard let dictionary = object as? [String: Any],
+                  let code = (dictionary["NSCode"] as? NSNumber)?.intValue else { continue }
+            var domain: String?
+            if let index = uidValue(dictionary["NSDomain"]), objects.indices.contains(index) {
+                domain = objects[index] as? String
             }
-            // The domain is a plain string in the object table. Matching on the
-            // suffix avoids having to resolve a keyed-archiver UID reference,
-            // which PropertyListSerialization surfaces as an opaque type.
-            if let string = object as? String, string.hasSuffix("ErrorDomain") {
-                domain = string
-            }
+            chain.append(ErrorLink(code: code, domain: domain))
         }
-        return (code, domain)
+        return chain
+    }
+
+    /// Reads a keyed-archiver UID, which is how one archived object references
+    /// another.
+    ///
+    /// 🛑 **There is no public Swift API for this, and pairing matters.**
+    /// `PropertyListSerialization` surfaces a UID as an opaque `__NSCFType`
+    /// whose only readable face is its description,
+    /// `<CFKeyedArchiverUID 0x… [0x…]>{value = 7}`. `NSKeyedUnarchiver` is the
+    /// documented route and is worse here: it needs a class allowlist, and an
+    /// archived `userInfo` can carry arbitrary classes.
+    ///
+    /// ⚠️ **Scanning `$objects` for a loose "…ErrorDomain" string instead — the
+    /// obvious shortcut — is wrong.** CoreDAV wraps errors, so a real blob holds
+    /// a chain. Measured on an archive built by Apple's own `NSKeyedArchiver`:
+    /// `NSCode` 8 (`CalDAVErrorDomain`) wrapping `NSCode` 403
+    /// (`CoreDAVHTTPStatusErrorDomain`). Taking the last of each happened to
+    /// give the right pair, and only because of emission order. Reversed, it
+    /// would report the wrapper's code with the HTTP domain — a number and a
+    /// name that never belonged together.
+    private static func uidValue(_ object: Any?) -> Int? {
+        guard let object else { return nil }
+        if let number = object as? NSNumber { return number.intValue }
+        let description = String(describing: object)
+        guard let range = description.range(of: "{value = "),
+              let end = description[range.upperBound...].firstIndex(of: "}") else {
+            return nil
+        }
+        return Int(description[range.upperBound..<end].trimmingCharacters(in: .whitespaces))
     }
 
     /// Every row of the `Error` table, with its owner columns resolved to names.
@@ -314,16 +349,19 @@ public enum SyncStore {
 
         var found: [Failure] = []
         query(handle, sql) { row in
-            var httpStatus: Int?
-            var domain: String?
+            var chain: [ErrorLink] = []
             if let blob = sqlite3_column_blob(row, 2) {
                 let count = Int(sqlite3_column_bytes(row, 2))
                 if count > 0 {
-                    let decoded = decodeUserInfo(Data(bytes: blob, count: count))
-                    httpStatus = decoded.code
-                    domain = decoded.domain
+                    chain = decodeUserInfo(Data(bytes: blob, count: count))
                 }
             }
+            // Prefer the link that carries a real HTTP status; the outer links
+            // are transport wrappers whose codes mean something else entirely.
+            let chosen = chain.first { ($0.domain ?? "").contains("HTTPStatus") }
+                ?? chain.first
+            let httpStatus = chosen?.code
+            let domain = chosen?.domain
             let scope: String
             if sqlite3_column_int64(row, 6) != 0 {
                 scope = "item"
@@ -342,7 +380,8 @@ public enum SyncStore {
                 domain: domain,
                 item: text(row, 3),
                 calendar: text(row, 4),
-                store: text(row, 5)))
+                store: text(row, 5),
+                chain: chain))
         }
         return found
     }
