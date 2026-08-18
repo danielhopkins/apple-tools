@@ -825,6 +825,47 @@ class NoteBearingContacts(GroupFixtures):
         self.assertFalse(removed["member"])
         self.assertTrue(removed["changed"])
 
+    def test_link_reaches_a_note_bearing_contact(self):
+        """🛑 `link` writes relations through its own path, which had no fallback.
+
+        `edit` and `groups add` both routed around the note wall; `writeRelations`
+        did not, so every `link` touching one of the 52 note-bearing contacts here
+        failed with a bare `NSCocoaErrorDomain 134092` and wrote **neither** card.
+        Found while linking a real family tree, not by a test.
+        """
+        noted = self.noted("NoteLink")
+        plain = self.add("LinkPeer")
+
+        run("link", noted["id"], plain["id"], "--relation", "brother",
+            "--inverse", "brother")
+
+        # Both sides, since link writes the note-bearing card first and a
+        # failure there used to abandon the second one too.
+        self.assertEqual(
+            self.labelled(self.get(noted["id"])["relations"], "name"),
+            {"brother": plain["name"]})
+        self.assertEqual(
+            self.labelled(self.get(plain["id"])["relations"], "name"),
+            {"brother": noted["name"]})
+
+    def test_unlink_reaches_a_note_bearing_contact(self):
+        """The removal goes through the same writer, so it had the same wall."""
+        noted = self.noted("NoteUnlink")
+        plain = self.add("UnlinkPeer")
+        run("link", noted["id"], plain["id"], "--relation", "spouse")
+
+        run("unlink", noted["id"], plain["id"], "--relation", "spouse")
+
+        self.assertEqual(self.get(noted["id"]).get("relations"), None)
+        self.assertEqual(self.get(plain["id"]).get("relations"), None)
+
+    def test_linking_leaves_the_note_alone(self):
+        """The fallback must not become a way to lose the note it works around."""
+        noted = self.noted("NoteLinkKept")
+        plain = self.add("LinkKeptPeer")
+        run("link", noted["id"], plain["id"], "--relation", "friend")
+        self.assertEqual(note_of(noted["id"]), self.NOTE)
+
     def test_a_note_bearing_contact_cannot_be_moved_and_says_why(self):
         """The one thing the note wall genuinely blocks rather than routes around.
 

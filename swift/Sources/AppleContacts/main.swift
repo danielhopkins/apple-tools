@@ -2319,7 +2319,66 @@ private func writeRelations(
     mutable.contactRelations = relations
     let request = CNSaveRequest()
     request.update(mutable)
-    try store.execute(request)
+    do {
+        try store.execute(request)
+    } catch where isNotePropertyFault(error) {
+        // 🛑 **A note on the card blocks every `CNContactStore` write to it**,
+        // relations included — the save faults the whole record and faulting
+        // reads the note. `edit` and `groups add` already route around this
+        // through the legacy AddressBook framework; `link` and `unlink` did
+        // not, so 52 of the 669 contacts here could not be linked at all and
+        // the only signal was a bare `NSCocoaErrorDomain 134092`.
+        //
+        // ⚠️ `link` writes two cards. It writes the first card first, so a
+        // failure here left BOTH sides unwritten rather than half-written.
+        try writeRelationsViaAddressBook(id: backing.identifier, relations: relations)
+    }
+}
+
+/// The same relation write, expressed against the legacy AddressBook record.
+///
+/// Reached only when `CNContactStore` refuses the save because the contact
+/// carries a note — see `editViaAddressBook`, which this mirrors. AddressBook
+/// stores a relation under `kABRelatedNamesProperty` with the identical
+/// `_$!<Father>!$_` label spellings, so nothing is translated.
+///
+/// ⚠️ **The first save fails and the second one works**, exactly as it does for
+/// an edit: faulting trips the note wall once and the pending changes then
+/// commit. A lone failure here means nothing, which is why `link` re-reads the
+/// contact afterwards instead of trusting any return value.
+private func writeRelationsViaAddressBook(
+    id: String, relations: [CNLabeledValue<CNContactRelation>]
+) throws {
+    guard let book = ABAddressBook.shared() else {
+        throw RuntimeError("could not open the AddressBook store.")
+    }
+    guard let person = book.record(forUniqueId: id) as? ABPerson else {
+        throw RuntimeError("no contact with id '\(id)' in the AddressBook store.")
+    }
+
+    let multi = ABMutableMultiValue()
+    for entry in relations {
+        // AddressBook has no nil label; the empty string is what it stores for
+        // an unlabelled value, and Contacts reads that back as no label.
+        _ = multi.add(entry.value.name as NSString, withLabel: entry.label ?? "")
+    }
+    guard person.setValue(multi, forProperty: kABRelatedNamesProperty) else {
+        throw RuntimeError("the AddressBook store refused the relation list.")
+    }
+
+    var lastFailure: Error?
+    // Two is all the note fault costs; the third is margin, not a busy-wait.
+    for _ in 1...3 {
+        do {
+            try book.saveAndReturnError()
+            return
+        } catch {
+            lastFailure = error
+        }
+    }
+    throw RuntimeError(
+        "the AddressBook store refused the save: "
+        + (lastFailure.map(saveFailureDetail) ?? "no error reported"))
 }
 
 struct Link: ParsableCommand {
