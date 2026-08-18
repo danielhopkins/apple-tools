@@ -1,7 +1,17 @@
 # `add` reports success for a write the server rejected
 
-**Status:** open bug in `apple-calendar add` / `edit`. Reproduced 2026-08-18.
-**Severity:** high. The tool tells the caller an event exists when it does not.
+**Status:** addressed in 26.818.0. `add` and `edit` now confirm the server took
+the write before reporting success, and four commands expose the sync state:
+`sync-status`, `unsynced`, `sync-errors`, `resync`. See the calendar section of
+`CLAUDE.md`.
+
+⚠️ **Addressed is not the same as fixed.** Nothing here stops the server
+returning a 403. The change makes the failure visible instead of silent, and
+gives a repair path. Neither failure mode below could be reproduced on demand:
+123 probe writes across three sessions all synced.
+
+**Severity when it happens:** high. The tool told the caller an event existed
+when it did not.
 
 ## The failure
 
