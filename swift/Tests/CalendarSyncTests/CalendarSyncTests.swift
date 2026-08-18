@@ -591,3 +591,66 @@ final class UnreadableStoreTests: XCTestCase {
         XCTAssertNil(SyncStore.pending())
     }
 }
+
+// MARK: - Rebuilding a stuck event
+
+/// 🛑 **`resync` is the one part of this work with no real failure behind it.**
+/// 123 probe writes across two sessions produced no 403, so the rebuild is
+/// verified end to end on healthy events only. Whether a fresh item escapes a
+/// poisoned account is untested.
+///
+/// These tests pin what CAN be checked offline: the guards, and the state a
+/// rebuilt event must be judged against.
+final class ResyncGuardTests: XCTestCase {
+    var fixture: CalendarFixture!
+
+    override func setUpWithError() throws {
+        fixture = try CalendarFixture()
+        try fixture.seedStores()
+        fixture.use()
+    }
+
+    override func tearDown() {
+        unsetenv("APPLE_CALENDAR_DB_PATH")
+        fixture = nil
+    }
+
+    /// The command refuses a synced event without --force, so the state it
+    /// reads must be right. A `pending` event is the one worth rebuilding.
+    func testAStuckEventReadsAsPending() throws {
+        try fixture.insert(id: 600, calendar: 10, summary: "stuck", unique: "u-stuck")
+        let status = SyncStore.status(eventIdentifier: "DEVICE:u-stuck",
+                                      calendarIdentifier: CalendarFixture.calDAVUUID)
+        XCTAssertEqual(status.state, .pending, "resync would refuse this as synced")
+    }
+
+    /// ⚠️ After a rebuild the NEW event is a different row with a different
+    /// identifier. The old one must be gone from the scan, and the new one must
+    /// read as synced — not both, and not neither.
+    func testARebuiltEventReplacesTheStuckOne() throws {
+        try fixture.insert(id: 601, calendar: 10, summary: "stuck", unique: "u-old")
+        XCTAssertEqual(SyncStore.pending()?.count, 1)
+
+        // What the rebuild leaves behind: a new row that reached the server.
+        try fixture.insert(id: 602, calendar: 10, summary: "stuck",
+                           unique: "u-new", externalId: "/new.ics", modTag: "1")
+        try fixture.run("DELETE FROM CalendarItem WHERE ROWID = 601")
+
+        XCTAssertEqual(SyncStore.pending()?.count, 0)
+        let status = SyncStore.status(eventIdentifier: "DEVICE:u-new",
+                                      calendarIdentifier: CalendarFixture.calDAVUUID)
+        XCTAssertEqual(status.state, .synced)
+    }
+
+    /// 🛑 A rebuild that fails partway must leave TWO events, never zero. The
+    /// command creates the copy before deleting the original for exactly this
+    /// reason, so the scan has to cope with both being present.
+    func testBothCopiesPresentIsVisibleRatherThanHidden() throws {
+        try fixture.insert(id: 603, calendar: 10, summary: "dupe", unique: "u-a")
+        try fixture.insert(id: 604, calendar: 10, summary: "dupe",
+                           unique: "u-b", externalId: "/b.ics", modTag: "1")
+        // The stuck one is still reported; the rebuilt one is not.
+        let pending = try XCTUnwrap(SyncStore.pending())
+        XCTAssertEqual(pending.map(\.uniqueIdentifier), ["u-a"])
+    }
+}

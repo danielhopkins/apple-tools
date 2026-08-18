@@ -6,7 +6,7 @@ import EventKit
 import Foundation
 import TCCResponsibility
 
-private let store = EKEventStore()
+let store = EKEventStore()
 
 // MARK: - Access
 
@@ -460,6 +460,7 @@ struct AppleCalendar: ParsableCommand {
         subcommands: [Calendars.self, Events.self, Show.self, Add.self, Edit.self,
                       Invitees.self, Invite.self, Delete.self,
                       SyncStatusCommand.self, SyncErrors.self, Unsynced.self,
+                      Resync.self,
                       Status.self],
         defaultSubcommand: Events.self
     )

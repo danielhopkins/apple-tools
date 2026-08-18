@@ -331,3 +331,203 @@ enum SyncConfirmation {
         }
     }
 }
+
+// MARK: - resync
+
+/// Rebuilds an event the server never accepted.
+///
+/// 🛑 **EventKit stops retrying an item once it records an `Error` row.** The
+/// item then sits in the local store forever — visible in Calendar.app, returned
+/// by `events` — while the server does not have it. Nothing local un-sticks it:
+/// re-saving the same item does not re-push it.
+///
+/// ⚠️ **The one route that worked was rebuilding.** In the incident on
+/// 2026-08-18 the local copy had to be deleted and the event written again from
+/// scratch. This does that through EventKit rather than by hand.
+///
+/// ⚠️ **This is the one part of the sync work that could not be tested against a
+/// real failure.** 123 probe writes across two sessions produced no 403, so the
+/// mechanism below is verified end to end on healthy events only. Whether a
+/// fresh item escapes a poisoned account is untested, and the command says so.
+struct Resync: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "resync",
+        abstract: "Rebuild an event the server never accepted",
+        discussion: """
+          Copies the event, writes the copy, waits for the server to take it,
+          and then deletes the original.
+
+          🛑 The new event gets a NEW identifier. Anything holding the old one
+          must be updated.
+
+          ⚠️ Order matters and is deliberate: the copy is created BEFORE the
+          original is deleted, so a failure leaves two events rather than none.
+          Two are recoverable by hand; zero are not.
+
+          Refused, because each would do damage a rebuild cannot undo:
+            - an event with invitees      rebuilding re-sends every invitation
+            - a recurring event           the rule and its exceptions cannot be
+                                          rebuilt faithfully
+            - an event already synced     there is nothing to repair
+          Pass --force to override the first and third. Recurring is never
+          allowed.
+          """)
+
+    @Argument(help: "Event identifier, from `events --json` or `unsynced`")
+    var id: String
+
+    @Flag(name: .long, help: "Show the plan without writing anything")
+    var dryRun = false
+
+    @Flag(name: .long, help: "Rebuild even if the event is synced or has invitees")
+    var force = false
+
+    @Flag(name: .long, help: "Output as JSON")
+    var json = false
+
+    @OptionGroup var sync: SyncConfirmationOptions
+
+    struct Result: Encodable {
+        let rebuilt: Bool
+        let oldId: String
+        let newId: String?
+        let title: String
+        let calendar: String
+        let syncState: String?
+
+        enum CodingKeys: String, CodingKey {
+            case rebuilt, title, calendar
+            case oldId = "old_id"
+            case newId = "new_id"
+            case syncState = "sync_state"
+        }
+    }
+
+    func run() throws {
+        try requireCalendarAccess()
+        let original = try event(withId: id)
+        guard let calendar = original.calendar else {
+            throw ValidationError("that event has no calendar")
+        }
+        let title = original.title ?? "<untitled>"
+
+        // 🛑 A series carries a recurrence rule plus detached exceptions, and
+        // rebuilding it would silently drop every exception — the same damage
+        // `edit --series` refuses to do. Never allowed, not even with --force.
+        if original.hasRecurrenceRules {
+            throw ValidationError("""
+                '\(title)' is a recurring event, and a rebuild cannot carry its \
+                exceptions across.
+                Rebuilding would collapse every moved or edited occurrence back \
+                onto the rule.
+                Fix a recurring series in Calendar.app.
+                """)
+        }
+
+        // ⚠️ Rebuilding mails every invitee a fresh invitation, and there is no
+        // undo. Refuse rather than surprise anyone.
+        if let guests = Attendees.list(original), !guests.isEmpty, !force {
+            throw ValidationError("""
+                '\(title)' has \(guests.count) invitee\(guests.count == 1 ? "" : "s"), \
+                and a rebuild sends each of them a NEW invitation.
+                Pass --force if that is what you want.
+                """)
+        }
+
+        let before = SyncStore.status(
+            eventIdentifier: original.eventIdentifier ?? id,
+            calendarIdentifier: calendar.calendarIdentifier)
+
+        if before.state == .synced && !force {
+            throw ValidationError("""
+                '\(title)' already reached the server, so there is nothing to \
+                repair.
+                Pass --force to rebuild it anyway.
+                """)
+        }
+
+        if dryRun {
+            let plan = """
+                Would rebuild '\(title)' on \(calendar.title).
+                  current sync state: \(before.state.rawValue)
+                  1. create a copy carrying every field, including the map pin
+                  2. wait up to \(Int(sync.syncTimeout))s for the server to take it
+                  3. delete the original
+                Nothing was written. The new event would get a NEW identifier.
+                """
+            if json {
+                printJSON(Result(rebuilt: false, oldId: id, newId: nil,
+                                 title: title, calendar: calendar.title,
+                                 syncState: before.state.rawValue))
+            } else {
+                print(plan)
+            }
+            return
+        }
+
+        // 🛑 **Create BEFORE deleting.** If the create fails we still have the
+        // original; if the delete fails we have two copies. The stuck original
+        // is not on the server, so the copy cannot duplicate anything there.
+        // Same rule `apple contacts move` follows: two are recoverable, zero
+        // are not.
+        let copy = EKEvent(eventStore: store)
+        copy.calendar = calendar
+        copy.title = original.title
+        copy.startDate = original.startDate
+        copy.endDate = original.endDate
+        copy.isAllDay = original.isAllDay
+        copy.notes = original.notes
+        copy.url = original.url
+        copy.timeZone = original.timeZone
+        copy.availability = original.availability
+        // ⚠️ Carry the STRUCTURED location, not just the text. Only the
+        // structured one holds the coordinate, and re-resolving it would mean
+        // another network call that could land on a different branch.
+        //
+        // 🛑 **Build a NEW EKStructuredLocation; do not assign the original's.**
+        // A structured location belongs to one event, and handing the same
+        // object to a second one makes the save fail with "Object not found. It
+        // may have been deleted." Measured on a real event carrying a map pin:
+        // the copy was never created, and only the fact that the original
+        // survived kept it from being a data-losing bug.
+        if let structured = original.structuredLocation {
+            let fresh = EKStructuredLocation(title: structured.title ?? "")
+            fresh.geoLocation = structured.geoLocation
+            fresh.radius = structured.radius
+            copy.structuredLocation = fresh
+        } else {
+            copy.location = original.location
+        }
+
+        try store.save(copy, span: .thisEvent, commit: true)
+
+        let after = try SyncConfirmation.check(event: copy, options: sync)
+
+        // Only now is the original safe to remove.
+        do {
+            try store.remove(original, span: .thisEvent, commit: true)
+        } catch {
+            throw ValidationError("""
+                the rebuilt copy is on the server, but the stuck original could \
+                not be deleted:
+                  \(error.localizedDescription)
+                There are now TWO copies of '\(title)'. Delete the old one in \
+                Calendar.app.
+                  old id: \(id)
+                  new id: \(copy.eventIdentifier ?? "?")
+                """)
+        }
+
+        if json {
+            printJSON(Result(rebuilt: true, oldId: id,
+                             newId: copy.eventIdentifier, title: title,
+                             calendar: calendar.title,
+                             syncState: after?.state.rawValue))
+        } else {
+            print("Rebuilt '\(title)' on \(calendar.title).")
+            print("  old id: \(id)")
+            print("  new id: \(copy.eventIdentifier ?? "?")")
+            if let state = after?.state { print("  sync:   \(state.rawValue)") }
+        }
+    }
+}
