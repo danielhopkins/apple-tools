@@ -20,9 +20,7 @@ enum RelationDirection {
     case symmetric
     /// The inverse exists and is unambiguous.
     case inverse(String)
-    /// The inverse depends on something the store does not know — usually the
-    /// other person's gender. `father` inverts to son or daughter, and nothing
-    /// here may guess which.
+    /// No inverse can be written, because the SDK has no term for it.
     case ambiguous
 }
 
@@ -30,23 +28,31 @@ public enum RelationGraph {
 
     /// What the other side of a relation should say.
     ///
-    /// ⚠️ **Deliberately small.** Every entry is a claim that one label implies
-    /// another, and a wrong entry writes a wrong fact onto somebody's card. The
-    /// gendered pairs — father/son, mother/daughter, brother/sister — are all
-    /// left out, because the inverse of "my father" is "my son" or "my
-    /// daughter" and the store does not know which.
+    /// 🛑 **A gendered label inverts to the NEUTRAL term, and that is not a
+    /// guess.** An earlier version refused `father` outright, reasoning that the
+    /// other side is "son or daughter" and Contacts records no gender. That was
+    /// wrong: `child` is exactly the term for "son or daughter", the SDK defines
+    /// it, and writing it states nothing that is not true. The same holds for
+    /// `sibling` and `grandchild`.
+    ///
+    /// ⚠️ **The inverse generalises; it does not round-trip.** `father` gives the
+    /// other card `child`, and `child` inverts to `parent`, not back to
+    /// `father`. That is correct — the store never knew the father's gender was
+    /// recoverable from the child's side — and it is why `--inverse son` exists
+    /// for anyone who wants the specific term.
+    ///
+    /// ⚠️ Every entry is a claim written onto somebody else's card, so a label
+    /// only appears here when its inverse is true for certain.
     static let rules: [String: RelationDirection] = [
         // Symmetric: the relation reads the same from either side.
         "spouse": .symmetric,
-        "husband": .symmetric,
-        "wife": .symmetric,
         "partner": .symmetric,
         "friend": .symmetric,
         "colleague": .symmetric,
         "cousin": .symmetric,
         "sibling": .symmetric,
 
-        // Unambiguous inverses: neither side depends on gender.
+        // Gender-neutral pairs.
         "parent": .inverse("child"),
         "child": .inverse("parent"),
         "grandparent": .inverse("grandchild"),
@@ -54,22 +60,33 @@ public enum RelationGraph {
         "manager": .inverse("assistant"),
         "assistant": .inverse("manager"),
 
-        // Named here so the refusal can say WHY, rather than falling through to
-        // a generic "no rule". Each is ambiguous for the same reason.
-        "father": .ambiguous,
-        "mother": .ambiguous,
-        "son": .ambiguous,
-        "daughter": .ambiguous,
-        "brother": .ambiguous,
-        "sister": .ambiguous,
+        // Gendered labels invert to the neutral term for the other side.
+        // 🛑 `husband` and `wife` are NOT symmetric: if B is A's husband, A is
+        // B's wife or husband, and only `spouse` covers both.
+        "husband": .inverse("spouse"),
+        "wife": .inverse("spouse"),
+        "father": .inverse("child"),
+        "mother": .inverse("child"),
+        "son": .inverse("parent"),
+        "daughter": .inverse("parent"),
+        "brother": .inverse("sibling"),
+        "sister": .inverse("sibling"),
+        "grandfather": .inverse("grandchild"),
+        "grandmother": .inverse("grandchild"),
+        "grandson": .inverse("grandparent"),
+        "granddaughter": .inverse("grandparent"),
+
+        // ⚠️ Genuinely ambiguous: the SDK has `Nephew` and `Niece` but no
+        // neutral term for either direction, so nothing here can be written
+        // without inventing a gender.
+        "uncle": .ambiguous,
+        "aunt": .ambiguous,
+        "nephew": .ambiguous,
+        "niece": .ambiguous,
     ]
 
     /// The label the other card should carry, or nil when nothing can be
     /// inferred.
-    ///
-    /// Returns nil for both "no rule" and "ambiguous". The caller distinguishes
-    /// them through `ambiguityReason`, so a user who wrote `--as father` is told
-    /// what to pass rather than just refused.
     public static func inverse(of label: String) -> String? {
         switch rules[normalize(label)] {
         case .symmetric: return normalize(label)
@@ -84,8 +101,8 @@ public enum RelationGraph {
         switch rules[key] {
         case .ambiguous:
             return """
-                the inverse of '\(key)' depends on the other person's gender, \
-                which Contacts does not record
+                Contacts has no gender-neutral term for the other side of \
+                '\(key)'
                 """
         case .none:
             return "there is no inverse rule for '\(key)'"
@@ -97,9 +114,8 @@ public enum RelationGraph {
     /// A suggestion to put in the refusal, so the user has something to type.
     public static func inverseSuggestions(for label: String) -> [String] {
         switch normalize(label) {
-        case "father", "mother": return ["son", "daughter", "child"]
-        case "son", "daughter": return ["father", "mother", "parent"]
-        case "brother", "sister": return ["brother", "sister", "sibling"]
+        case "uncle", "aunt": return ["nephew", "niece"]
+        case "nephew", "niece": return ["uncle", "aunt"]
         default: return []
         }
     }

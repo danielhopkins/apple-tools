@@ -553,10 +553,13 @@ none of them listed him back, so the two directions genuinely differ.
 running it. Use `--dry-run` first; it resolves and prints the plan without
 writing. Contacts writes sync everywhere and have no undo.
 
-⚠️ **A gendered relation is refused, and that is correct.** `--relation father`
-cannot infer the other side, because it is son or daughter and Contacts records
-no gender. Pass `--inverse son`, or `--no-inverse` to write one side only. Do
-not guess the person's gender to pick one.
+**A gendered label inverts to the neutral term.** `--relation father` gives the
+other card `child`; `brother` gives `sibling`. That is not a guess — `child` is
+the term for "son or daughter". Pass `--inverse son` when the specific word
+matters. ⚠️ Do not guess someone's gender to pick one.
+
+⚠️ **Only `uncle`, `aunt`, `nephew` and `niece` are refused**, because Contacts
+has no neutral term for either direction.
 
 **Use `link`, never `edit --relation`, to add one relation.** `edit` replaces the
 whole set, so it silently deletes every relation you did not re-pass.

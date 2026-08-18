@@ -1810,12 +1810,25 @@ back**; only his parents do.
 one and re-passing it, and forgetting one deletes it silently.
 
 ⚠️ **`link` writes the other card too, so it states a fact about someone else.**
-The inverse is only inferred where it cannot be wrong: `spouse`, `friend`,
-`cousin` and `sibling` are symmetric, and `parent`/`child`,
-`grandparent`/`grandchild`, `manager`/`assistant` invert cleanly.
-**`father`, `mother`, `son`, `daughter`, `brother` and `sister` are refused** —
-the other side is son *or* daughter and Contacts records no gender. The refusal
-names what to pass. `--no-inverse` writes one side only.
+
+🛑 **A gendered label inverts to the NEUTRAL term, and that is not a guess.**
+`father` gives the other card `child`, `brother` gives `sibling`, `grandmother`
+gives `grandchild`. An earlier version refused these, reasoning that the other
+side is "son or daughter" and Contacts records no gender. That was wrong: `child`
+is exactly the term for "son or daughter", the SDK defines it, and writing it
+states nothing untrue. Pass `--inverse son` when you want the specific term.
+
+⚠️ **`husband` and `wife` are NOT symmetric.** If B is A's husband, A is B's wife
+*or* husband, so both invert to `spouse`.
+
+⚠️ **The inverse generalises; it does not round-trip.** `father` → `child`, and
+`child` → `parent`, not back to `father`. Correct — the child's card never
+recorded the parent's gender.
+
+**Only `uncle`, `aunt`, `nephew` and `niece` are refused.** The SDK has `Nephew`
+and `Niece` and **no neutral term for either direction**, so nothing can be
+written without inventing a gender. The refusal names what to pass.
+`--no-inverse` writes one side only.
 
 🛑 **Relation labels are stored in two spellings, and both are live here.** One
 card holds `_$!<Father>!$_` and another a plain `Sibling`, and `Labels.decode`

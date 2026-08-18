@@ -10,14 +10,40 @@ import XCTest
 /// hard as what it must.
 final class RelationInverseTests: XCTestCase {
 
-    // MARK: What may be inferred
+    // MARK: Symmetric
 
     func testSymmetricRelationsInvertToThemselves() {
-        for label in ["spouse", "husband", "wife", "partner", "friend",
-                      "colleague", "cousin", "sibling"] {
+        for label in ["spouse", "partner", "friend", "colleague", "cousin", "sibling"] {
             XCTAssertEqual(RelationGraph.inverse(of: label), label,
                            "\(label) should be symmetric")
         }
+    }
+
+    /// 🛑 **`husband` and `wife` are NOT symmetric.** If B is A's husband, A is
+    /// B's wife *or* husband, and only `spouse` covers both. An earlier version
+    /// had them symmetric, which would have written "husband" onto a wife's card.
+    func testHusbandAndWifeInvertToSpouseNotThemselves() {
+        XCTAssertEqual(RelationGraph.inverse(of: "husband"), "spouse")
+        XCTAssertEqual(RelationGraph.inverse(of: "wife"), "spouse")
+    }
+
+    // MARK: Gendered labels invert to the neutral term
+
+    /// 🛑 **The bug this class exists for.** An earlier version refused `father`
+    /// outright, reasoning that the other side is "son or daughter" and Contacts
+    /// records no gender. That was wrong. `child` is exactly the term for "son
+    /// or daughter", the SDK defines it, and writing it states nothing untrue.
+    func testGenderedLabelsInvertToTheNeutralTerm() {
+        XCTAssertEqual(RelationGraph.inverse(of: "father"), "child")
+        XCTAssertEqual(RelationGraph.inverse(of: "mother"), "child")
+        XCTAssertEqual(RelationGraph.inverse(of: "son"), "parent")
+        XCTAssertEqual(RelationGraph.inverse(of: "daughter"), "parent")
+        XCTAssertEqual(RelationGraph.inverse(of: "brother"), "sibling")
+        XCTAssertEqual(RelationGraph.inverse(of: "sister"), "sibling")
+        XCTAssertEqual(RelationGraph.inverse(of: "grandfather"), "grandchild")
+        XCTAssertEqual(RelationGraph.inverse(of: "grandmother"), "grandchild")
+        XCTAssertEqual(RelationGraph.inverse(of: "grandson"), "grandparent")
+        XCTAssertEqual(RelationGraph.inverse(of: "granddaughter"), "grandparent")
     }
 
     func testGenderNeutralPairsInvert() {
@@ -29,9 +55,19 @@ final class RelationInverseTests: XCTestCase {
         XCTAssertEqual(RelationGraph.inverse(of: "assistant"), "manager")
     }
 
-    func testEveryInverseIsItselfInvertible() {
-        // A rule that does not round-trip is a rule that would write one card
-        // and then refuse to undo it.
+    /// ⚠️ **The inverse generalises; it does not round-trip.** `father` gives
+    /// `child`, and `child` gives `parent` — not back to `father`. That is
+    /// correct: the child's card never recorded the parent's gender.
+    func testTheInverseGeneralisesRatherThanRoundTripping() {
+        let child = try? XCTUnwrap(RelationGraph.inverse(of: "father"))
+        XCTAssertEqual(child, "child")
+        XCTAssertEqual(RelationGraph.inverse(of: "child"), "parent")
+        XCTAssertNotEqual(RelationGraph.inverse(of: "child"), "father")
+    }
+
+    /// Every label that inverts must invert to one that has a rule of its own,
+    /// or `unlink` could write a link it cannot later match.
+    func testEveryInverseHasARuleOfItsOwn() {
         for (label, _) in RelationGraph.rules {
             guard let other = RelationGraph.inverse(of: label) else { continue }
             XCTAssertNotNil(
@@ -40,49 +76,46 @@ final class RelationInverseTests: XCTestCase {
         }
     }
 
-    // MARK: What must NOT be inferred
+    // MARK: What genuinely cannot be inferred
 
-    /// 🛑 The inverse of "my father" is "my son" or "my daughter", and Contacts
-    /// records no gender. Guessing writes a wrong fact.
-    func testGenderedRelationsAreRefused() {
-        for label in ["father", "mother", "son", "daughter", "brother", "sister"] {
+    /// ⚠️ The SDK has `Nephew` and `Niece` and no neutral term for either, so
+    /// nothing can be written without inventing a gender. This is the only
+    /// family relation left that really is ambiguous.
+    func testUncleAndAuntAreRefusedBecauseNoNeutralTermExists() {
+        for label in ["uncle", "aunt", "nephew", "niece"] {
             XCTAssertNil(RelationGraph.inverse(of: label),
                          "\(label) must not be inverted automatically")
             XCTAssertTrue(
-                RelationGraph.ambiguityReason(for: label).contains("gender"),
+                RelationGraph.ambiguityReason(for: label).contains("neutral"),
                 "the refusal for \(label) must say why")
         }
     }
 
-    func testAnUnknownLabelIsRefusedWithoutClaimingGender() {
+    func testAnUnknownLabelIsRefused() {
         XCTAssertNil(RelationGraph.inverse(of: "landlord"))
         let reason = RelationGraph.ambiguityReason(for: "landlord")
         XCTAssertTrue(reason.contains("landlord"))
-        XCTAssertFalse(reason.contains("gender"),
-                       "an unknown label is not a gender problem")
+        XCTAssertFalse(reason.contains("neutral"),
+                       "an unknown label is not a missing-term problem")
     }
 
-    /// A refusal the user cannot act on is a dead end, so a gendered label must
-    /// come with something to type.
-    func testGenderedRefusalsSuggestSomething() {
-        XCTAssertEqual(RelationGraph.inverseSuggestions(for: "father"),
-                       ["son", "daughter", "child"])
-        XCTAssertEqual(RelationGraph.inverseSuggestions(for: "daughter"),
-                       ["father", "mother", "parent"])
-        XCTAssertEqual(RelationGraph.inverseSuggestions(for: "sister"),
-                       ["brother", "sister", "sibling"])
+    /// A refusal the user cannot act on is a dead end.
+    func testRefusalsSuggestSomething() {
+        XCTAssertEqual(RelationGraph.inverseSuggestions(for: "uncle"),
+                       ["nephew", "niece"])
+        XCTAssertEqual(RelationGraph.inverseSuggestions(for: "niece"),
+                       ["uncle", "aunt"])
         XCTAssertTrue(RelationGraph.inverseSuggestions(for: "landlord").isEmpty)
     }
 
     // MARK: Matching
 
     /// ⚠️ Matching ignores case, spaces and hyphens, matching `Labels.relation`.
-    /// A user typing `Spouse` or `grand-parent` must not fall through to a
-    /// refusal.
     func testMatchingIgnoresCaseAndPunctuation() {
         XCTAssertEqual(RelationGraph.inverse(of: "SPOUSE"), "spouse")
         XCTAssertEqual(RelationGraph.inverse(of: "Grand-Parent"), "grandchild")
         XCTAssertEqual(RelationGraph.inverse(of: "grand parent"), "grandchild")
+        XCTAssertEqual(RelationGraph.inverse(of: "Father"), "child")
         XCTAssertEqual(RelationGraph.normalize("younger-sister"),
                        RelationGraph.normalize("youngerSister"))
     }
@@ -90,8 +123,7 @@ final class RelationInverseTests: XCTestCase {
     /// 🛑 A relation is stored in two spellings on one real machine —
     /// `_$!<Father>!$_` on one card and a plain `Sibling` on another. Anything
     /// comparing labels has to normalise, or it misses real matches. That bug
-    /// made `link` report "would add" for a relation the contact already had,
-    /// and a second run would have written a duplicate.
+    /// made `link` report "would add" for a relation the contact already had.
     func testNormalizeCollapsesTheSpellingsThatActuallyOccur() {
         XCTAssertEqual(RelationGraph.normalize("Father"), "father")
         XCTAssertEqual(RelationGraph.normalize("father"), "father")
