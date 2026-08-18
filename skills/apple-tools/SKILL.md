@@ -129,8 +129,11 @@ apple calendar invite <id> --add "Dana White <d@x.com>"   # sends real mail
 # Contacts — JSON by default; add/edit/delete are real writes
 apple contacts search "smith"
 apple contacts edit <id> --company "New Co" --phone "mobile:+15551234567"
-apple contacts edit <id> --relation "daughter:Margot Hopkins"
-apple contacts edit <id> --birthday 1980-04-12 --date "death:2020-05-01"
+apple contacts link <id> <id> --relation daughter --dry-run  # writes BOTH cards
+apple contacts relations <id>                  # who they link to, both directions
+apple contacts edit <id> --died 2020-04-30     # a death; merges, keeps other dates
+apple contacts edit <id> --died 2020           # when only the year is known
+apple contacts deceased --json                 # everyone recorded as having died
 apple contacts groups                          # list groups with counts
 apple contacts groups add "Family" <contact-id>
 apple contacts move <id> --to "iCloud" --dry-run  # between accounts; keeps the id
@@ -486,10 +489,30 @@ addresses to keep alongside the new one. Same for `--phone` and `--url`.
 colleague/in-law and step variants); case, spaces and hyphens are ignored. An
 unknown label is stored as a custom one with a note on stderr — if you see that
 note, check for a typo before moving on. Dates: `--birthday` and `--anniversary`
-are built in; anything else is `--date LABEL:DATE`, e.g. `--date death:2020-05-01`.
-There is no standard death-date label, so it is stored as a custom one. A
-year-less date must be passed with `=`: `--birthday=--04-13`, never
-`--birthday --04-13`, which the parser reads as a missing value.
+are built in; anything else is `--date LABEL:DATE`. A year-less date must be
+passed with `=`: `--birthday=--04-13`, never `--birthday --04-13`, which the
+parser reads as a missing value.
+
+**Use `link` to add ONE relation, not `edit --relation`.** `--relation` replaces
+every relation on the card, so adding one that way means re-passing all the
+others and forgetting one deletes it silently. `link A B --relation father`
+writes both cards — B gets the inverse — and refuses rather than guessing an
+inverse it cannot infer. `relations <id>` reads them, in both directions.
+
+**Use `--died` for a death, never `--date death:...`.** `--died` merges, so other
+dates survive; `--date` replaces the whole set. Apple defines no death field, so
+the tool writes a labelled date and owns the spelling.
+
+- `--died 2020-04-30` for a full date, `--died=--04-30` when the year is unknown.
+- `--died 2020` when only the year is known. **Contacts refuses a date with no
+  month or day**, so a year-only death is stored as `2020-01-01` under the label
+  `death-year`, which is what declares the day is a placeholder.
+- **Read `died`, never the raw `dates` array.** `died` reports what is known —
+  `2020` — while `dates` still shows the stored `2020-01-01`. `died_precision`
+  is `date`, `year` or `day-only`. `deceased` is absent, never `false`.
+- `apple contacts deceased` lists everyone, and reports separately any card whose
+  note carries a dagger with no date recorded. The tool cannot write a note, so
+  it can never resolve one of those itself.
 
 `get`, `add` and `edit` return a single JSON object; `search`, `list` and
 `groups members` return arrays. Unlabelled emails and phones have no `label`
