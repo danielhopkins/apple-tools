@@ -19,6 +19,7 @@ installed via `make install`.
 |------|---------|
 | Search notes | `apple notes search "budget" --json` |
 | Read a note | `apple notes export 261` |
+| Delete a note | `apple notes delete 261` |
 | List note folders | `apple notes folders --json` |
 | List call recordings | `apple notes recordings --json` |
 | Find a recording by what was said | `apple notes recordings "apple watch" --transcripts` |
@@ -96,7 +97,9 @@ also answers `status` on its own.
    search/get/list`, `calendar events`, `reminders show*`, and every `phone`
    subcommand except `dial` only read. Anything that creates, edits, completes,
    or deletes touches the user's real data — confirm with them first unless they
-   clearly asked for the write. Contacts writes sync to every device and there is
+   clearly asked for the write. `notes delete` asks the user itself and refuses
+   without a tty unless given `--yes`; do not reach for `--yes` to skip a
+   conversation the user has not had. Contacts writes sync to every device and there is
    no undo. `phone dial` places a real, billable call: Phone.app will ask the
    user to confirm, and that panel is theirs to click, never yours. `mail move`
    refiles real mail and syncs everywhere — show the user `--dry-run` output
@@ -189,6 +192,7 @@ apple notes transcript ID [-o FILE] [--no-timestamps] [--words] [--json]
 apple notes summary ID [--json]                  # Apple's generated summary
 apple notes create [--title T] [--body TEXT | --body-file FILE|-] [--json]
 apple notes append ID  [--body TEXT | --body-file FILE|-] [--json]
+apple notes delete ID  [--yes] [--wait SECONDS] [--json]   # -> Recently Deleted
 apple notes install-shortcuts [--force]          # install the write path
 apple notes status [--json]                      # access + write-path state
 ```
@@ -281,6 +285,55 @@ nor duration matches.
 Full record — the 0-based indices, the undocumented `ObjectID` double field, the
 Unix-epoch start time, and the two incompatible word tokenizations — in
 [`docs/apple-notes-transcripts.md`](docs/apple-notes-transcripts.md).
+
+**`delete` moves a note to Recently Deleted, and needs no Shortcut.** AppleScript
+`delete` has always worked, and the test harness has used it since the suite was
+written — so this costs no build, no signing step and no third permission
+dialog. It does need **Automation → Notes** for the calling terminal, and it
+**launches Notes.app** if the app is closed. Reads need neither.
+
+🛑 **It addresses the note by primary key, not by name.** An AppleScript note id
+is `x-coredata://<Z_METADATA.Z_UUID>/ICNote/p<Z_PK>`, and that UUID is in the
+same file the reader already opens — verified equal to the id Notes reports. So
+`delete` never hands Notes a name to match, and the note-picker trap that
+governs `append` cannot arise here at all.
+
+🛑 **A partial title is refused, unlike `export`.** `find_note` falls through to
+`LIKE '%term%'` and returns the **first** row it finds, which is right for a read
+and destructive for a delete: `delete budget` would remove whichever note sqlite
+happened to return first, silently. A title here must match in **full**, must
+name a **live** note, and **more than one match is refused** listing the ids.
+
+⚠️ **It asks before it deletes.** Without a tty it refuses unless you pass
+`--yes`, because a pipe is not consent. Answering anything but `y` exits
+non-zero, so a cancel never reads as a delete.
+
+🛑 **Confirmation goes through Notes.app, not the store — the opposite of every
+other write here.** The sqlite store lags an **unbounded** amount: measured on
+this machine, one delete appeared in sqlite in **3.5s** and another was still
+sitting in `ZFOLDER` = `Notes` **more than ten minutes** after Notes.app already
+listed it in Recently Deleted. A store read alone cannot tell a slow delete from
+a failed one, so it must not decide.
+
+- **`confirmed` is Notes.app's answer**, in about 0.7s, and it is the field to
+  read. **`store_confirmed` is sqlite's**, reported separately for a caller that
+  goes on to read the store; `--wait` gives it longer, and defaults to 0.
+- ⚠️ **`container of note id …` distinguishes nothing.** It fails with **-1728**
+  for a deleted note *and* for a live one. Enumerating the Recently Deleted
+  folder and asking for the id is what works.
+- **A note still in its folder afterwards is a hard failure.** `osascript`
+  exiting 0 is not evidence the note moved, the same way `shortcuts run` exiting
+  0 is not evidence a note was written.
+- ⚠️ **The folder moves; `ZMARKEDFORDELETION` stays 0.** Measured on every
+  delete here. Both are checked, since the reverse can appear mid-sync.
+
+⚠️ **A locked note is refused with exit 2.** Its body cannot be read, so the user
+cannot be shown what they are about to destroy. Delete it in Notes.app.
+
+⚠️ **`apple notes search` still lists a deleted note**, because the reader can
+see Recently Deleted. A search straight after a delete therefore looks like a
+failure and is not; the command says so on stderr. Deletion is recoverable for
+about 30 days, and **there is no API to empty that folder**.
 
 **Writes need `install-shortcuts` first.** `apple notes status` reports whether
 the write path is available and names anything missing; until then Notes is
@@ -1818,8 +1871,9 @@ notes/                    Python; apple-notes, notestore.py, notestore.proto,
                           transcripts, summaries, and table cells),
                           tests/ (live Notes.app suite +
                           test_markdown_capabilities.py, which measures what
-                          the Markdown write path supports; plus offline
-                          test_rendering.py, test_tables.py, test_write_path.py)
+                          the Markdown write path supports, and test_delete.py;
+                          plus offline test_rendering.py, test_tables.py,
+                          test_write_path.py)
 docs/apple-notes-api.md   NoteStore schema, AppleScript API, verified bugs
 docs/apple-notes-shortcuts.md  driving Notes' AppIntents from the CLI —
                           the only route to checklist writes and a real append

@@ -1702,6 +1702,281 @@ def cmd_append(args):
         fail_write("the text did not appear on the note", title)
 
 
+RECENTLY_DELETED = "Recently Deleted"
+
+
+def store_uuid():
+    """The Core Data store UUID that AppleScript note ids are built from.
+
+    An AppleScript note id is `x-coredata://<UUID>/ICNote/p<Z_PK>`, and the UUID
+    is `Z_METADATA.Z_UUID` in the same file the reader already opens. Verified
+    equal on this store.
+
+    🛑 That join is the whole reason `delete` is safe. It addresses a note by
+    primary key, so the name matching that forces `append` to refuse an
+    ambiguous title cannot arise here at all.
+    """
+    conn = sqlite3.connect("file:%s?mode=ro" % get_db_path(), uri=True)
+    try:
+        row = conn.execute("SELECT Z_UUID FROM Z_METADATA").fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    value = row[0] if row else None
+    if not value or not re.fullmatch(r"[0-9A-Fa-f-]{36}", value):
+        return None
+    return value
+
+
+def note_state(pk):
+    """(title, folder, marked_for_deletion, locked) for a Z_PK, or None."""
+    conn = sqlite3.connect("file:%s?mode=ro" % get_db_path(), uri=True)
+    try:
+        row = conn.execute(
+            "SELECT n.ZTITLE1, COALESCE(f.ZTITLE2, ''), "
+            "COALESCE(n.ZMARKEDFORDELETION, 0), "
+            "COALESCE(n.ZISPASSWORDPROTECTED, 0) "
+            "FROM ZICCLOUDSYNCINGOBJECT n "
+            "LEFT JOIN ZICCLOUDSYNCINGOBJECT f ON n.ZFOLDER = f.Z_PK "
+            "WHERE n.Z_PK = ?", (pk,)).fetchone()
+    finally:
+        conn.close()
+    return tuple(row) if row else None
+
+
+def note_is_live(pk):
+    """True while a note is still in a normal folder."""
+    state = note_state(pk)
+    if state is None:
+        return False
+    _title, folder, marked, _locked = state
+    return not marked and folder != RECENTLY_DELETED
+
+
+def resolve_delete_target(identifier):
+    """Every LIVE note Z_PK this identifier names. Exact titles only.
+
+    🛑 `find_note` falls through to `LIKE '%term%'` and returns the FIRST row it
+    finds. That is right for `export`, which reads, and wrong for a delete:
+    `delete budget` would destroy whichever of several notes sqlite happened to
+    return first, and say nothing. So a title here must match in full, and more
+    than one match is refused rather than picked between.
+    """
+    if identifier.isdigit() or identifier.startswith("applenotes://"):
+        found = find_note(identifier)
+        return [found[0]] if found else []
+    return sorted(note_pks_titled(identifier))
+
+
+def applescript_delete(pk, uuid):
+    """Move one note to Recently Deleted, addressed by its primary key.
+
+    🛑 **No third Shortcut is needed for this.** AppleScript `delete` works
+    today, and the test harness has used it since the suite was written. It
+    costs a build, a signing step and a permission dialog to reimplement.
+
+    ⚠️ It needs Automation -> Notes for the calling terminal, and it LAUNCHES
+    Notes.app if the app is closed. Reads need neither.
+    """
+    note_id = "x-coredata://%s/ICNote/p%d" % (uuid, pk)
+    script = 'tell application "Notes" to delete note id "%s"' % note_id
+    try:
+        return subprocess.run(["osascript", "-e", script],
+                              capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        print("error: the delete timed out after 120s.", file=sys.stderr)
+        print("       Notes.app may be waiting on a permission dialog.",
+              file=sys.stderr)
+        sys.exit(1)
+
+
+def applescript_note_deleted(pk, uuid):
+    """Ask Notes.app whether a note is in Recently Deleted.
+
+    Returns "deleted", "live", or None when Notes could not answer.
+
+    🛑 **This is the authoritative answer, and the sqlite store is not.**
+    Measured on this machine: a note Notes.app already listed in Recently
+    Deleted still had `ZFOLDER` pointing at `Notes` in the store more than ten
+    minutes later, while another delete showed up in the store in 3.5 seconds.
+    The lag is unbounded in practice, so a store read alone cannot tell a slow
+    delete from a failed one.
+
+    ⚠️ `container of note id …` does NOT work here. It fails with -1728 for a
+    deleted note AND for a live one, so it distinguishes nothing. Enumerating
+    the Recently Deleted folder and asking for the id does work, in about 0.7s.
+    """
+    script = (
+        'set target to "x-coredata://%s/ICNote/p%d"\n'
+        'tell application "Notes"\n'
+        '  repeat with acc in accounts\n'
+        '    repeat with f in folders of acc\n'
+        '      if name of f is "Recently Deleted" then\n'
+        '        if (count of (notes of f whose id is target)) > 0 then '
+        'return "deleted"\n'
+        '      end if\n'
+        '    end repeat\n'
+        '  end repeat\n'
+        '  return "live"\n'
+        'end tell' % (uuid, pk))
+    try:
+        proc = subprocess.run(["osascript", "-e", script],
+                              capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return None
+    if proc.returncode != 0:
+        return None
+    answer = proc.stdout.strip()
+    return answer if answer in ("deleted", "live") else None
+
+
+def cmd_delete(args):
+    """Move a note to Recently Deleted. Recoverable for about 30 days."""
+    matches = resolve_delete_target(args.identifier)
+
+    if not matches:
+        print("Note not found: %s" % args.identifier, file=sys.stderr)
+        print("       A title must match in full. `delete` does not take a "
+              "partial title the way `export` does,", file=sys.stderr)
+        print("       and it only ever names live notes.", file=sys.stderr)
+        sys.exit(1)
+
+    # Names are not unique, and deleting every match would be a silent mistake.
+    # Same rule `append` applies, and the same rule `apple messages` applies to
+    # an ambiguous chat reference.
+    if len(matches) > 1:
+        print("error: %d live notes are titled %r; refusing to delete all of "
+              "them." % (len(matches), args.identifier), file=sys.stderr)
+        for pk in matches:
+            state = note_state(pk)
+            print("       %d  in %s" % (pk, (state[1] if state else "?") or "?"),
+                  file=sys.stderr)
+        print("       Pass the id of the one you mean.", file=sys.stderr)
+        sys.exit(1)
+
+    pk = matches[0]
+    state = note_state(pk)
+    if state is None:
+        print("error: note %d is not in the store." % pk, file=sys.stderr)
+        sys.exit(1)
+    title, folder, marked, locked = state
+
+    # ⚠️ A locked note has no readable body, so the user cannot be shown what
+    # they are about to destroy. `export` refuses it with exit 2 for the same
+    # reason; this keeps the code consistent. Delete it in Notes.app.
+    if locked:
+        print("error: note %d (%r) is password-protected, so its contents "
+              "cannot be shown." % (pk, title), file=sys.stderr)
+        print("       Refusing to delete a note nobody can read first. Delete "
+              "it in Notes.app.", file=sys.stderr)
+        sys.exit(2)
+
+    if marked or folder == RECENTLY_DELETED:
+        print("error: note %d (%r) is already in Recently Deleted."
+              % (pk, title), file=sys.stderr)
+        print("       There is no API to empty that folder. It purges itself "
+              "in about 30 days.", file=sys.stderr)
+        sys.exit(1)
+
+    uuid = store_uuid()
+    if uuid is None:
+        print("error: cannot read the Core Data store UUID (Z_METADATA.Z_UUID).",
+              file=sys.stderr)
+        print("       Without it a note cannot be addressed by id, and this "
+              "command will not fall back to", file=sys.stderr)
+        print("       matching by name.", file=sys.stderr)
+        sys.exit(1)
+
+    if not args.yes:
+        # ⚠️ Never assume consent from a pipe. An agent running this command
+        # unattended must pass --yes deliberately.
+        if not sys.stdin.isatty():
+            print("error: refusing to delete without confirmation. Pass --yes.",
+                  file=sys.stderr)
+            sys.exit(1)
+        print("Delete note %d: %s" % (pk, title or "(untitled)"))
+        print("  folder: %s" % (folder or "?"))
+        print("  It moves to Recently Deleted and purges itself in ~30 days.")
+        try:
+            answer = input("Delete it? [y/N] ")
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+            print()
+        if answer.strip().lower() not in ("y", "yes"):
+            if args.json:
+                print(json.dumps({"deleted": False, "cancelled": True,
+                                  "id": pk, "title": title},
+                                 indent=2, ensure_ascii=False))
+            else:
+                print("Cancelled.", file=sys.stderr)
+            sys.exit(1)
+
+    proc = applescript_delete(pk, uuid)
+    if proc.returncode != 0:
+        err = proc.stderr.strip()
+        print("error: Notes refused the delete: %s" % err, file=sys.stderr)
+        if "-1743" in err or "not authorized" in err.lower():
+            print("       Deleting needs Automation -> Notes for this terminal. "
+                  "Reads do not.", file=sys.stderr)
+        sys.exit(1)
+
+    # 🛑 **`osascript` exiting 0 is not evidence the note moved**, the same way
+    # `shortcuts run` exiting 0 is not evidence a note was written. Confirm it.
+    #
+    # ⚠️ **Ask Notes.app, not the store.** The store lags an unbounded amount:
+    # measured here, one delete appeared in sqlite in 3.5s and another was still
+    # in `ZFOLDER` = `Notes` more than ten minutes after Notes.app had already
+    # listed it in Recently Deleted. A store read alone cannot tell a slow
+    # delete from a failed one, so it must not be the deciding signal.
+    state = applescript_note_deleted(pk, uuid)
+
+    if state == "live":
+        print("error: Notes accepted the delete and note %d (%r) is still in "
+              "its folder." % (pk, title), file=sys.stderr)
+        print("       Nothing was deleted. Try again, or delete it in "
+              "Notes.app.", file=sys.stderr)
+        sys.exit(1)
+
+    # The store is reported separately, because a caller that goes on to read
+    # the store needs to know whether it has caught up. `--wait` is how long to
+    # give it; the default is 0, since the answer above is already authoritative.
+    store_confirmed = False
+    deadline = time.time() + max(0.0, args.wait)
+    while True:
+        if not note_is_live(pk):
+            store_confirmed = True
+            break
+        if time.time() >= deadline:
+            break
+        time.sleep(0.5)
+
+    if args.json:
+        print(json.dumps({"deleted": True,
+                          "confirmed": state == "deleted",
+                          "store_confirmed": store_confirmed,
+                          "id": pk, "title": title, "folder": folder},
+                         indent=2, ensure_ascii=False))
+    else:
+        print("Deleted note %d: %s" % (pk, title or "(untitled)"))
+
+    # Flush before the stderr notes, so a piped run keeps the two in order.
+    sys.stdout.flush()
+
+    if state is None:
+        print("note: Notes.app could not say whether note %d moved, so the "
+              "delete is unconfirmed." % pk, file=sys.stderr)
+    if not store_confirmed:
+        print("note: the sqlite store still shows note %d in %r. It settles "
+              "over minutes and this is normal," % (pk, folder), file=sys.stderr)
+        print("      not a failure. Pass --wait to give it longer.",
+              file=sys.stderr)
+    # ⚠️ The reader can see Recently Deleted, so a search straight after a
+    # delete still lists the note and reads as a failure.
+    print("note: it is in Recently Deleted, which `apple notes search` still "
+          "lists.", file=sys.stderr)
+
+
 def sqlite_text_for(pk):
     """Decoded note text for a Z_PK, or None."""
     conn = sqlite3.connect("file:%s?mode=ro" % get_db_path(), uri=True)
@@ -1741,6 +2016,7 @@ Examples:
     apple-notes recordings verizon --transcripts   # Search inside transcripts
     apple-notes transcript 11426           # Transcript of a call recording
     apple-notes summary 11426              # Apple's summary of it
+    apple-notes delete 261                 # Move note 261 to Recently Deleted
         """,
     )
 
@@ -1852,6 +2128,21 @@ Examples:
     add_body_args(append_parser)
     append_parser.add_argument("--json", action="store_true", help="Output as JSON")
 
+    delete_parser = subparsers.add_parser(
+        "delete",
+        help="Move a note to Recently Deleted (recoverable for ~30 days)")
+    delete_parser.add_argument(
+        "identifier",
+        help="Note ID, exact title, or applenotes:// URL (no partial titles)")
+    delete_parser.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Skip the confirmation prompt")
+    delete_parser.add_argument(
+        "--wait", type=float, default=0.0, metavar="SECONDS",
+        help="Seconds to wait for the sqlite store to catch up (default: 0; "
+             "the delete is confirmed through Notes.app either way)")
+    delete_parser.add_argument("--json", action="store_true", help="Output as JSON")
+
     install_parser = subparsers.add_parser(
         "install-shortcuts",
         help="Install the Shortcuts that provide the write path",
@@ -1894,6 +2185,8 @@ Examples:
         cmd_create(args)
     elif args.command == "append":
         cmd_append(args)
+    elif args.command == "delete":
+        cmd_delete(args)
 
 
 if __name__ == "__main__":

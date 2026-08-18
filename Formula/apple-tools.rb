@@ -164,6 +164,11 @@ class AppleTools < Formula
     assert_match "install-shortcuts", notes_help
     assert_match "append", notes_help
 
+    # `delete` is the one Notes command that removes something the user made.
+    # It is soft — the note goes to Recently Deleted — but nothing here can
+    # bring it back, so it must never go missing silently from a build.
+    assert_match "delete", notes_help
+
     # Call-recording commands. These live in mergeable.py, a sibling module
     # added after notestore.py — the one file a literal install list would have
     # dropped. apple-notes imports it at module scope, so every assertion above

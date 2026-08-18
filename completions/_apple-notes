@@ -1,9 +1,9 @@
 #compdef apple-notes
 # zsh completion for apple-notes (argparse, so hand-written).
 #
-# `export` and `get-url` take a note ID or title; completing those would mean
-# querying NoteStore.sqlite on every TAB, which is slow and needs Full Disk
-# Access, so IDs are left to the user.
+# `export`, `delete` and `get-url` take a note ID or title; completing those
+# would mean querying NoteStore.sqlite on every TAB, which is slow and needs
+# Full Disk Access, so IDs are left to the user.
 
 _apple-notes() {
     local -a commands
@@ -12,6 +12,14 @@ _apple-notes() {
         'folders:List folders, or notes in one folder'
         'export:Export a note to Markdown'
         'get-url:Get the applenotes:// URL for a note'
+        'recordings:List call recordings and voice memos'
+        'transcript:Print the transcript of a recording'
+        'summary:Print Apple'"'"'s generated summary of a recording'
+        'create:Create a note from Markdown'
+        'append:Append Markdown to an existing note'
+        'delete:Move a note to Recently Deleted'
+        'install-shortcuts:Install the Shortcuts that provide the write path'
+        'status:Report access and write-path state'
     )
 
     local curcontext="$curcontext" state
@@ -30,6 +38,7 @@ _apple-notes() {
                 search)
                     _arguments \
                         '(-n --limit)'{-n,--limit}'[Max results (default 50)]:count:' \
+                        '--include-locked[List password-protected notes too]' \
                         '--json[Output as JSON]' \
                         '--help[Show usage]' \
                         '*:search term:'
@@ -52,6 +61,64 @@ _apple-notes() {
                         '--json[Output as JSON]' \
                         '--help[Show usage]' \
                         '1:note id or title:'
+                    ;;
+                recordings)
+                    _arguments \
+                        '--calls-only[Exclude voice memos and imported audio]' \
+                        '--transcripts[Also search transcript text (slower)]' \
+                        '--limit[Maximum rows]:count:' \
+                        '--json[Output as JSON]' \
+                        '--help[Show usage]' \
+                        '1:search term:'
+                    ;;
+                transcript)
+                    _arguments \
+                        '(-o --output)'{-o,--output}'[Write to a file instead of stdout]:file:_files' \
+                        '--no-timestamps[Omit the [m:ss] marker on each turn]' \
+                        '--words[With --json, emit per-word segments]' \
+                        '--json[Output as JSON]' \
+                        '--help[Show usage]' \
+                        '1:note id, title, or applenotes:// URL:'
+                    ;;
+                summary)
+                    _arguments \
+                        '--json[Output as JSON]' \
+                        '--help[Show usage]' \
+                        '1:note id, title, or applenotes:// URL:'
+                    ;;
+                create)
+                    _arguments \
+                        '--title[Prepend a title line]:title:' \
+                        '--body[Body text (Markdown)]:text:' \
+                        '--body-file[Read the body from FILE, or - for stdin]:file:_files' \
+                        '--json[Output as JSON]' \
+                        '--help[Show usage]'
+                    ;;
+                append)
+                    _arguments \
+                        '--body[Body text (Markdown)]:text:' \
+                        '--body-file[Read the body from FILE, or - for stdin]:file:_files' \
+                        '--json[Output as JSON]' \
+                        '--help[Show usage]' \
+                        '1:note id, title, or applenotes:// URL:'
+                    ;;
+                delete)
+                    _arguments \
+                        '(-y --yes)'{-y,--yes}'[Skip the confirmation prompt]' \
+                        '--wait[Seconds to wait for the sqlite store to catch up]:seconds:' \
+                        '--json[Output as JSON]' \
+                        '--help[Show usage]' \
+                        '1:note id, exact title, or applenotes:// URL:'
+                    ;;
+                install-shortcuts)
+                    _arguments \
+                        '--force[Reinstall even if already present]' \
+                        '--help[Show usage]'
+                    ;;
+                status)
+                    _arguments \
+                        '--json[Output as JSON]' \
+                        '--help[Show usage]'
                     ;;
             esac
             ;;
