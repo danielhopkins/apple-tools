@@ -2047,12 +2047,21 @@ error: Unhandled error occurred during faulting` on stderr. **52 of 669 contacts
 here carry a note**, so this was ~8% of a real address book that could not be
 edited or added to a group at all.
 
-`edit` and `groups add` now catch it and rewrite through the **legacy
-`AddressBook` framework**, which writes the same records under the same
+`edit`, `groups add`, `link` and `unlink` now catch it and rewrite through the
+**legacy `AddressBook` framework**, which writes the same records under the same
 `UUID:ABPerson` identifiers, needs no permission beyond the Contacts access the
 tool already has, and is not subject to the note wall for other properties.
 Consequences worth knowing:
 
+- 🛑 **`link` and `unlink` were left out of this until 26.818.2**, and they are
+  the commands most likely to meet a note: relations are what you write when you
+  are filling in a family. `writeRelations` is their shared writer and had no
+  fallback, so every link touching one of the 52 note-bearing contacts here
+  failed with the bare 134092 above. ⚠️ `link` writes its **first** argument
+  first, so the failure left **neither** card written rather than half of a pair
+  — the one merciful part of it. Pinned by three tests in
+  `tests/test_contacts_write.py::NoteBearingContacts`, all three of which fail
+  against the code before the fix.
 - ⚠️ **AddressBook's first save always fails and the second one works.**
   Faulting trips the wall once; afterwards the pending changes commit. So a lone
   failure means nothing there, and the write is confirmed by re-reading rather
