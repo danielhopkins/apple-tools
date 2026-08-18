@@ -158,7 +158,13 @@ class AppleTools < Formula
     # through private AddressBook API. If those symbols ever go missing the
     # command refuses at runtime rather than disappearing, so this only checks
     # it is registered at all.
-    assert_match "move", shell_output("#{bin}/apple-contacts --help")
+    contacts_help = shell_output("#{bin}/apple-contacts --help")
+    assert_match "move", contacts_help
+
+    # `get` returned an addresses array that `edit` could not write until
+    # 26.818.1, and the skill claimed otherwise. An unregistered flag is a
+    # silent regression back to that.
+    assert_match "address", shell_output("#{bin}/apple-contacts edit --help")
 
     # The Notes write path is the signed shortcuts plus the commands that drive
     # them. `make dist` cannot know this formula's install list, so a shortcut

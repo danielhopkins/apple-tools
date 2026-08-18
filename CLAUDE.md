@@ -1691,6 +1691,7 @@ FIELDS, shared by `add` and `edit`:
 --email    [LABEL:]ADDRESS   repeatable
 --phone    [LABEL:]NUMBER    repeatable
 --url      [LABEL:]URL       repeatable
+--address  [LABEL:]ADDRESS   repeatable
 --relation LABEL:NAME        repeatable
 --date     LABEL:DATE        repeatable
 ```
@@ -1716,6 +1717,42 @@ the value. The cost is that those words cannot be used as labels.
 and confirm each labelled value asked for is really there, failing loudly
 otherwise. It is a subset check, because `get` returns the unified contact and a
 linked card can contribute values this edit never mentioned.
+
+**Postal addresses.** `--address` takes free text or exact fields:
+
+```
+apple contacts edit ID --address "home:500 W Madison St, Chicago, IL 60661"
+apple contacts edit ID --address "home:street=500 W Madison St;city=Chicago;state=IL;zip=60661"
+```
+
+Labels are the four generic ones — `home`, `work`, `school`, `other`. There is no
+address-specific constant in the SDK, unlike email's `icloud`.
+
+⚠️ **Free text is a guess, and the tool prints what it decided** on stderr before
+writing. It knows one shape, `street, city, STATE ZIP, country`, and nothing
+about any other country's conventions. When it gets one wrong, use the
+`key=value` form; `zip` and `postalCode` are both accepted, so what `get` prints
+can be passed straight back.
+
+🛑 **Three parse bugs were found by probing real addresses, and every one was
+silent.** They are pinned by tests in `swift/Tests/ContactsTests/`:
+
+| input | wrong result | why |
+|---|---|---|
+| `…, Cupertino, CA` | `country=CA` | a state abbreviation has no digits either |
+| `SW1A 2AA` | `state=SW1A;zip=2AA` | a UK postcode is one token pair, not two fields |
+| `ON M5H 2N2` | `state=ON M5H;zip=2N2` | a Canadian postcode is two tokens after a province |
+
+🛑 **A typo'd key is an error, not a dropped field.** `citty=Chicago` used to
+fall through to the free-text parser and land as a *street* reading
+`citty=Chicago`, with exit 0 — the same silent-drop failure the label encoders
+were fixed for. Anything of the form `word=` now goes to the structured parser,
+where an unknown key is refused naming the valid ones.
+
+🛑 **Never probe this parser by running `add`.** Seventeen contacts were created
+in the user's real iCloud to see how strings parsed, and they synced to every
+device before being deleted. `PostalAddress` lives in its own `ContactsLibrary`
+target so every such question is answered offline.
 
 **Relations.** `--relation father:"Robert Hopkins"`. All 216 relation labels the
 Contacts SDK defines are accepted — `father`, `mother`, `son`, `daughter`,
@@ -1968,10 +2005,12 @@ swift/                    one Swift package, seven binaries
                           target so it can be tested against a synthetic store
   Sources/AppleContacts/  + Notes.swift (SQLite note reader),
                           Move.swift (the private cross-account move)
+  Sources/ContactsLibrary/  PostalAddress.swift — the --address parser, in its
+                          own target so it is testable without writing a contact
   Sources/ObjCExceptions/ @try/@catch for Swift — the move raises rather
                           than returning when it hits the note wall
   Tests/RemindersTests/ MailTests/ MessagesTests/ PhoneTests/ MapsTests/
-        GeocodingTests/ CalendarSyncTests/
+        GeocodingTests/ CalendarSyncTests/ ContactsTests/
 notes/                    Python; apple-notes, notestore.py, notestore.proto,
                           mergeable.py (ZMERGEABLEDATA1 reader — recordings,
                           transcripts, summaries, and table cells),

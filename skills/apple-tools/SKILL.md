@@ -24,7 +24,7 @@ these tools is that the edge cases are already handled.
 | `apple maps` | visited places with coordinates, visits, saved guides | no, and never |
 | `apple reminders` | lists, items, due dates | **yes** |
 | `apple calendar` | calendars, events, **invitees with RSVP status** | **yes** — and `invite` **emails real people** |
-| `apple contacts` | names, emails, phones, addresses, notes | **yes** (except notes and postal addresses) |
+| `apple contacts` | names, emails, phones, addresses, notes | **yes** (except notes) |
 
 ## Rules
 
@@ -531,6 +531,22 @@ will empty and writes nothing. Say what those are before doing it for real.
 copying the record reads the note and that needs an entitlement no CLI can hold.
 Tell the user to drag that card between accounts in Contacts.app instead —
 don't try another route.
+
+**Postal addresses are writable now.** `--address` on `add` and `edit`, free
+text or exact fields:
+
+```
+apple contacts edit ID --address "home:500 W Madison St, Chicago, IL 60661"
+apple contacts edit ID --address "work:street=1 Radicle Way;city=Chicago;state=IL;zip=60601"
+```
+
+⚠️ **The free-text parse is a guess and the tool prints what it decided.** Read
+that line. It handles `street, city, STATE ZIP, country` and knows nothing about
+other countries' conventions. When it is wrong, use `key=value`. What `get`
+prints can be passed straight back, since `zip` and `postalCode` both work.
+
+⚠️ **Like every multi-value flag here, `--address` replaces the whole set.** Read
+the contact first and re-pass the addresses you want to keep.
 
 **Contact notes cannot be written.** They are readable, but writing needs an
 Apple-granted entitlement no CLI can hold, so `--note` is rejected. Tell the user

@@ -3,6 +3,7 @@ import AppleToolsStyle
 import AppleToolsVersion
 import ArgumentParser
 import Contacts
+import ContactsLibrary
 import Foundation
 import TCCResponsibility
 
@@ -720,6 +721,12 @@ private func confirmWritten(_ fields: ContactFields, on saved: CNContact, name: 
     check(
         "relation", wanted: fields.relations,
         stored: saved.contactRelations.map { ($0.label, $0.value.name) })
+    // 🛑 Compare every field, not just the street. A parse that put the city in
+    // the street would otherwise write a wrong address and report success.
+    check(
+        "address",
+        wanted: fields.addresses.map { ($0.label, PostalAddress.describe($0.value)) },
+        stored: saved.postalAddresses.map { ($0.label, PostalAddress.describe($0.value)) })
     check(
         "date",
         wanted: fields.dates.map { ($0.label, ContactDate.format($0.value) ?? "") },
@@ -1007,6 +1014,13 @@ struct ContactFields: ParsableArguments {
 
     @Option(
         name: .long,
+        help: """
+          Postal address, optionally labelled:           'home:124 Gregory St, Chicago, IL 60601'. Or exactly:           'home:street=124 Gregory St;city=Chicago;state=IL;zip=60601'.           Repeat to set several; replaces existing.
+          """)
+    var address: [String] = []
+
+    @Option(
+        name: .long,
         help: "Relation as LABEL:NAME, e.g. 'father:Robert Hopkins'. Repeat to set several; replaces existing.")
     var relation: [String] = []
 
@@ -1027,6 +1041,7 @@ struct ContactFields: ParsableArguments {
             && department == nil && jobTitle == nil && birthday == nil
             && anniversary == nil && email.isEmpty && phone.isEmpty
             && url.isEmpty && relation.isEmpty && date.isEmpty
+            && address.isEmpty
     }
 
     /// Splits "father:Robert Hopkins" on the FIRST colon only, so values that
@@ -1094,6 +1109,32 @@ struct ContactFields: ParsableArguments {
                 throw ValidationError("could not parse date '\(value)' in --date \(entry); use YYYY-MM-DD or --MM-DD")
             }
         }
+        // 🛑 Parse every address BEFORE any Apple Event. A bad one must fail
+        // here, not halfway through a save, and not silently as an address
+        // with fields missing. The free-text parse is a guess, so it is echoed.
+        for entry in address {
+            let (_, value) = split(entry)
+            guard !value.isEmpty else {
+                throw ValidationError("--address \(entry) has no address after the colon")
+            }
+            let parsed: CNMutablePostalAddress
+            do {
+                parsed = try PostalAddress.parse(value)
+            } catch let error as PostalAddress.ParseError {
+                throw ValidationError("--address \(entry): \(error.description)")
+            }
+            if !PostalAddress.isStructured(value) {
+                // ⚠️ Always show what the heuristic decided. It knows one
+                // shape, `street, city, STATE ZIP, country`, and nothing
+                // about any other country. Showing the split is the only way
+                // a wrong one is visible before it is written.
+                FileHandle.standardError.write(Data("""
+                    note: read '\(value)' as \(PostalAddress.describe(parsed))
+                          Use street=…;city=…;state=…;zip=… if that is wrong.
+
+                    """.utf8))
+            }
+        }
         for entry in relation {
             let (label, value) = split(entry)
             guard let label else {
@@ -1139,6 +1180,11 @@ struct ContactFields: ParsableArguments {
         if !urls.isEmpty {
             contact.urlAddresses = urls.map {
                 CNLabeledValue(label: $0.label, value: $0.value as NSString)
+            }
+        }
+        if !addresses.isEmpty {
+            contact.postalAddresses = addresses.map {
+                CNLabeledValue(label: $0.label, value: $0.value)
             }
         }
         if !relations.isEmpty {
@@ -1203,6 +1249,19 @@ struct ContactFields: ParsableArguments {
         if !urls.isEmpty {
             setMulti(urls.map { ($0.label, $0.value as NSString) }, kABURLsProperty)
         }
+        if !addresses.isEmpty {
+            // ⚠️ AddressBook stores an address as a dictionary of its own keys,
+            // not as a CNPostalAddress. The spellings differ from the SDK's.
+            setMulti(addresses.map { entry -> (String?, NSDictionary) in
+                var fields: [String: String] = [:]
+                if !entry.value.street.isEmpty { fields[kABAddressStreetKey as String] = entry.value.street }
+                if !entry.value.city.isEmpty { fields[kABAddressCityKey as String] = entry.value.city }
+                if !entry.value.state.isEmpty { fields[kABAddressStateKey as String] = entry.value.state }
+                if !entry.value.postalCode.isEmpty { fields[kABAddressZIPKey as String] = entry.value.postalCode }
+                if !entry.value.country.isEmpty { fields[kABAddressCountryKey as String] = entry.value.country }
+                return (entry.label, fields as NSDictionary)
+            }, kABAddressProperty)
+        }
         if !relations.isEmpty {
             setMulti(relations.map { ($0.label, $0.value as NSString) }, kABRelatedNamesProperty)
         }
@@ -1234,6 +1293,16 @@ struct ContactFields: ParsableArguments {
     var phones: [(label: String?, value: String)] { parse(phone, Labels.phone) }
     var urls: [(label: String?, value: String)] { parse(url, Labels.url) }
     var relations: [(label: String?, value: String)] { parse(relation, Labels.relation) }
+
+    /// ⚠️ Parsed here rather than in `apply`, so a bad address is caught by
+    /// `validate()` before any Apple Event and before the AddressBook fallback
+    /// can see it. Both write paths and the post-write check then read the same
+    /// values, which is the rule `parse` was written for.
+    var addresses: [(label: String?, value: CNMutablePostalAddress)] {
+        parse(address, Labels.address).compactMap { entry in
+            (try? PostalAddress.parse(entry.value)).map { (entry.label, $0) }
+        }
+    }
 
     /// `--anniversary` is sugar for a labelled date, so the two inputs merge.
     var dates: [(label: String?, value: DateComponents)] {
