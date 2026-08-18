@@ -2330,8 +2330,12 @@ struct Link: ParsableCommand {
           set. Both contacts may be named by id or by name; an ambiguous name is
           refused listing the candidates.
 
+          `link A B --relation manager` reads "B is A's manager", so the label
+          describes the SECOND contact.
+
           By default the inverse is written onto the other card too, so the link
-          reads correctly from both sides. --no-inverse writes one side only.
+          reads correctly from both sides: that example also gives B an
+          `assistant` relation naming A. --no-inverse writes one side only.
 
           🛑 The inverse is only inferred where it is unambiguous. `spouse` and
           `friend` are symmetric; `parent` inverts to `child`. `father` does NOT
@@ -2344,13 +2348,17 @@ struct Link: ParsableCommand {
             apple-contacts link <id> <id> --as father --inverse son
           """)
 
-    @Argument(help: "The contact the relation is written onto (id or name)")
+    @Argument(help: "The contact whose card names the other (id or name)")
     var subject: String
 
-    @Argument(help: "The contact it points at (id or name)")
+    @Argument(help: "The contact being named (id or name)")
     var other: String
 
-    @Option(name: .long, help: "The relation, e.g. brother, spouse, manager")
+    @Option(
+        name: .long,
+        help: """
+          How B relates to A: `link A B --relation manager` means B is A's           manager. e.g. brother, spouse, parent, manager.
+          """)
     var relation: String
 
     @Option(name: .long, help: "The label for the other card. Inferred when unambiguous.")
@@ -2482,16 +2490,24 @@ struct Unlink: ParsableCommand {
         abstract: "Remove a relation between two contacts",
         discussion: """
           Removes the relation naming the other contact, from both cards by
-          default. --relation narrows it to one label when several exist.
+          default.
+
+          --relation narrows it to one label, and the OTHER card is matched on
+          that label's inverse: `--relation parent` removes `parent` from A and
+          `child` from B. When the inverse cannot be inferred — the gendered
+          labels — the other card is left alone and the command says so, rather
+          than clearing a relation it had to guess at.
           """)
 
-    @Argument(help: "The contact to remove the relation from (id or name)")
+    @Argument(help: "The contact whose card names the other (id or name)")
     var subject: String
 
-    @Argument(help: "The contact it points at (id or name)")
+    @Argument(help: "The contact being named (id or name)")
     var other: String
 
-    @Option(name: .long, help: "Only remove this label")
+    @Option(
+        name: .long,
+        help: "Only remove this label. The other card is matched on its inverse.")
     var relation: String?
 
     @Flag(name: .long, help: "Leave the other card alone")
@@ -2510,15 +2526,32 @@ struct Unlink: ParsableCommand {
         let firstName = displayName(first)
         let secondName = displayName(second)
 
-        func plan(on person: CNContact, naming name: String)
+        // 🛑 **The other card carries the INVERSE label, not the same one.**
+        // Filtering both sides on `--relation parent` removed `parent` from one
+        // card and left `child` on the other, while the command reported that it
+        // had removed both. Measured on real fixtures.
+        //
+        // ⚠️ When the inverse cannot be inferred — the gendered labels — the
+        // other card is left alone rather than cleared on a guess. Removing
+        // "any relation naming this person" would take an unrelated one they
+        // also carry.
+        var otherLabel: String?
+        var otherSkipped = false
+        if let relation {
+            if let inferred = RelationGraph.inverse(of: relation) {
+                otherLabel = inferred
+            } else if !noInverse {
+                otherSkipped = true
+            }
+        }
+
+        func plan(on person: CNContact, naming name: String, label: String?)
             -> (relations: [CNLabeledValue<CNContactRelation>], gone: [String])
         {
             var gone: [String] = []
             let kept = person.contactRelations.filter { entry in
                 let sameName = entry.value.name.lowercased() == name.lowercased()
-                let sameLabel = relation.map {
-                    sameRelationLabel(entry.label, $0)
-                } ?? true
+                let sameLabel = label.map { sameRelationLabel(entry.label, $0) } ?? true
                 if sameName && sameLabel {
                     gone.append(Labels.decode(entry.label) ?? "(unlabelled)")
                     return false
@@ -2529,7 +2562,7 @@ struct Unlink: ParsableCommand {
         }
 
         var removed: [RelationChange] = []
-        let forward = plan(on: first, naming: secondName)
+        let forward = plan(on: first, naming: secondName, label: relation)
         for label in forward.gone {
             removed.append(RelationChange(
                 contactId: first.identifier, name: firstName,
@@ -2537,13 +2570,23 @@ struct Unlink: ParsableCommand {
         }
 
         var back: (relations: [CNLabeledValue<CNContactRelation>], gone: [String])?
-        if !noInverse {
-            back = plan(on: second, naming: firstName)
+        if !noInverse && !otherSkipped {
+            back = plan(on: second, naming: firstName, label: otherLabel)
             for label in back!.gone {
                 removed.append(RelationChange(
                     contactId: second.identifier, name: secondName,
                     label: label, other: firstName, changed: true))
             }
+        }
+
+        if otherSkipped, let relation {
+            FileHandle.standardError.write(Data("""
+                note: \(RelationGraph.ambiguityReason(for: relation)), so \
+                '\(secondName)' was left alone.
+                      Clear that side with: apple contacts unlink \
+                <their id> <this id> --relation <label>
+
+                """.utf8))
         }
 
         guard !removed.isEmpty else {

@@ -1824,6 +1824,13 @@ raw labels misses real matches: `link` reported "would add" for a relation the
 contact already had, and a second run would have written a duplicate. Compare
 through `sameRelationLabel`, never on the raw string.
 
+- 🛑 **`unlink --relation L` matches the other card on L's INVERSE.** Filtering
+  both sides on the same label removed `parent` from one card and left `child`
+  on the other, while reporting that it had removed both. When the inverse
+  cannot be inferred, the other card is **left alone** and the command says so —
+  it never clears a relation it had to guess at.
+- **The label describes the SECOND contact.** `link A B --relation manager`
+  reads "B is A's manager", and gives B an `assistant` relation naming A.
 - **Both arguments take an id or a name.** An ambiguous name is refused listing
   the candidates; an exact full-name match beats a partial one.
 - **Re-linking is a reported no-op**, not an error and not a duplicate row —
