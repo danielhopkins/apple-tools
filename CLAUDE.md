@@ -68,6 +68,9 @@ installed via `make install`.
 | Move one occurrence | `apple calendar edit <id> --occurrence 2026-09-21 --start "2026-09-21 14:00"` |
 | Find a person | `apple contacts search "smith" --json` |
 | Update a contact | `apple contacts edit <id> --company "New Co"` |
+| Record a death | `apple contacts edit <id> --died 2020-04-30` |
+| ...when only the year is known | `apple contacts edit <id> --died 2020` |
+| Who has died | `apple contacts deceased --json` |
 | Who is this person linked to | `apple contacts relations <id>` |
 | Link two contacts | `apple contacts link <id> <id> --relation spouse` |
 | Move a contact between accounts | `apple contacts move <id> --to "iCloud" --dry-run` |
@@ -1302,6 +1305,27 @@ the answer costs a SQLite lookup per event.
   Access** — a different grant from the Calendar one everything else uses. Without
   it the answer is `unknown`, and a good write must not be called broken.
 
+🛑 **An `Error` row is only evidence about the write that made it.** Two defects
+made a healthy calendar fail every write after one stale row, fixed after
+26.818.1:
+
+- **An item-scoped error names ONE item.** The filter compared only the calendar,
+  so every item error attached itself to every event on that calendar — forever,
+  since EventKit never clears the row. It matches `CalendarItem.ROWID` now.
+- **A pre-existing error stopped the wait at t=0.** A fresh create has no
+  `external_id` yet, so the first look is always `pending`; giving up on any
+  error at all threw before the ~4s round trip a good write needs. `add` and
+  `edit` now snapshot the `Error` table's rowids **before** the save and act only
+  on a row that is new since then.
+- **A synced item no longer reports calendar- or store-scoped errors.** Its push
+  succeeded, so a broad row is about something else. Its own item-scoped rows
+  stay — an edit can fail after a create succeeded.
+
+Measured: `add` on the affected calendar printed `HTTP 400 … (scope: item)` and
+exited non-zero for an event the server had taken, while `sync-status` on that
+same event said `synced`. Full record in
+[`docs/apple-calendar-caldav-403.md`](docs/apple-calendar-caldav-403.md).
+
 🛑 **`external_mod_tag` is the obvious signal and it is wrong.** Exchange never
 populates the ETag — **172 of 172 items**, including one written and confirmed
 synced during this work. A check keyed on it calls a healthy Exchange account
@@ -1587,6 +1611,37 @@ mailed anyone. "invitees: 8" is not evidence anyone was invited, and an empty
 list is not evidence nobody was. The server is the only authority; check OWA or
 the web UI when it matters.
 
+🛑 **There is no "propose a new time", and there is no way to build one.**
+Counter-proposing a different time on somebody else's meeting is a Calendar.app
+feature and nothing else can reach it. Searched 2026-08-18: no match for
+"propos" or "counter" in EventKit's public headers, its framework binary, or
+CalendarDaemon, and Calendar.app's `sdef` has no term for it. Every symbol lives
+in the Calendar.app binary itself — `_supportsProposeNewTime`,
+`_proposeOrEditOrCancelProposeNewTimeAlertWithTitle:eventTitle:suggestedTime:`,
+and `_bringUpMailComposeWindowWithProposalStart:withAttendee:withEvent:`, which
+shows the app builds the proposal and hands it to Mail. Tell the user to use
+Calendar.app; do not offer an `edit` instead, which is a different thing that
+does not work.
+
+🛑 **So `edit` refuses an invitation you received.** The test is **"am I an
+attendee"**, not "am I the organizer", and the difference is load-bearing. On a
+delegated calendar the organizer is somebody else and the user is not invited,
+and a write there really does sync. Surveyed over 30 days on this machine:
+
+| what the event is | count | `edit` |
+|---|---|---|
+| no organizer (an ordinary event) | 71 | allowed |
+| the user organizes it | 2 | allowed |
+| an invitation to the user | 14 | **refused** |
+| somebody else's, user not invited (delegated) | 1 | allowed |
+
+An organizer-only check would have wrongly refused that last one. `--force`
+changes the local copy anyway; the server will still undo it.
+
+⚠️ **Rescheduling a meeting you DO organize is just `edit --start`.** The server
+mails the attendees itself. That mail is expected rather than measured — this
+repo has only measured the invitation and cancellation mail below.
+
 🛑 **Writing invitees sends real mail, and there is no undo.** `add --invitee`
 and `invite --add` make the server email an invitation; `invite --remove` and
 deleting the event email a cancellation. **Run `invite --dry-run` first** — it
@@ -1642,6 +1697,9 @@ touch becomes detached.
   local change *appears to succeed* and is then reverted by the server, so
   `invite` refuses up front rather than lying. Reply to the invitation in
   Calendar.app instead.
+- 🛑 **`edit` refuses an invitation you received, for the same reason.** It used
+  to change one locally and report success, which is the exact failure `invite`
+  has refused since it shipped. `--force` overrides it.
 - 🛑 **EventKit adds the organizer and a self-attendee itself on save.** Don't
   call `addOrganizerAndSelfAttendeeForNewInvitation`; report what the event
   ended up with, not what was asked for.
@@ -1669,6 +1727,7 @@ apple contacts edit ID [FIELDS] [--json]
 apple contacts move ID --to CONTAINER [--dry-run] [--json]
 apple contacts delete ID
 apple contacts export ID... [--group GROUP] [-o FILE]   # vCard 3.0
+apple contacts deceased [--json]                   # everyone recorded as having died
 apple contacts relations ID [--json]               # who this contact links to, resolved
 apple contacts link A B --relation LABEL [--inverse LABEL] [--no-inverse] [--dry-run]
 apple contacts unlink A B [--relation LABEL] [--no-inverse] [--dry-run]
@@ -1693,6 +1752,7 @@ FIELDS, shared by `add` and `edit`:
 --company --department --job-title
 --birthday YYYY-MM-DD|--MM-DD
 --anniversary YYYY-MM-DD|--MM-DD
+--died YYYY-MM-DD|YYYY|--MM-DD
 --email    [LABEL:]ADDRESS   repeatable
 --phone    [LABEL:]NUMBER    repeatable
 --url      [LABEL:]URL       repeatable
@@ -1758,6 +1818,86 @@ where an unknown key is refused naming the valid ones.
 in the user's real iCloud to see how strings parsed, and they synced to every
 device before being deleted. `PostalAddress` lives in its own `ContactsLibrary`
 target so every such question is answered offline.
+
+**Deaths.** `--died` on `add`/`edit` writes one, `deceased` lists them.
+
+```
+apple contacts edit <id> --died 2020-04-30     # a full date
+apple contacts edit <id> --died 2020           # only the year is known
+apple contacts edit <id> --died=--04-30        # the day, but not the year
+apple contacts deceased --json
+```
+
+🛑 **Apple defines no death field anywhere.** Measured across all three layers a
+contact can be written through:
+
+| Layer | Date labels it defines | Death? |
+|---|---|---|
+| `CNContact` | `CNLabelDateAnniversary`, and nothing else | none |
+| legacy `AddressBook` | `kABAnniversaryLabel`, and nothing else | none |
+| `AddressBook-v22.abcddb` | `ZABCDCONTACTDATE.ZLABEL`, free text | no column |
+
+So a custom label on `dates` is the only route. `DeathDate` in `ContactsLibrary`
+is the one place that decides how it is spelled: **`death`** for a full date,
+**`death-year`** when only the year is known.
+
+🛑 **A labelled date REQUIRES a month and a day; only the year is optional** —
+the exact inverse of what "died in 2020" needs. Measured against a real store,
+with fixtures deleted afterwards:
+
+| Written | Result |
+|---|---|
+| `2020` | refused — `CNErrorDomain 302`, key paths `dates.value.month`, `dates.value.day` |
+| `2020-04` | refused — `CNErrorDomain 302`, key path `dates.value.day` |
+| `--04-30` | accepted |
+| `2020-04-30` | accepted |
+
+`--birthday 2020` fails the same way, so the rule belongs to Contacts and not to
+one key path.
+
+🛑 **A year-only death therefore stores a day it never had, and `died` must never
+report it.** The card holds `2020-01-01`; `died` says `2020`. Nothing else can
+carry that fact — `CNContact` has no free-text field but the note, and the note
+needs `com.apple.developer.contacts.notes`, which no CLI can hold. So the
+*label* is the disclosure.
+
+- **Read `died`, never the raw `dates` array.** `dates` still shows
+  `2020-01-01`, unchanged, because that really is what the card holds and
+  `get` → `edit` → `get` has to stay a no-op.
+- **`died_precision`** is `date`, `year`, or `day-only`, and says how much of
+  `died` is real.
+- **`deceased` is absent, never `false`**, like every other optional key here.
+- 🛑 **`2020-04` is refused rather than padded.** Contacts rejects it anyway, and
+  inventing a day would record a month as though it were exact — with no label
+  left to disclose it.
+
+🛑 **`--died` merges; `--date` replaces.** That is the whole reason it is its own
+flag, the same way `link` exists alongside `edit --relation`. Getting a death
+onto a card with `--date` alone means re-passing every other date it holds, and
+forgetting one deletes it silently. Restating `--died` at a different precision
+**replaces** the old entry, so a card never ends up holding both a `death` and a
+`death-year`.
+
+⚠️ **The AddressBook fallback is the NORMAL path for a death, not the
+exception.** All four cards recorded as deceased on this store carry a note — an
+obituary link, or the marker — and a note blocks every `CNContactStore` write to
+the card. So `--died` reaches the legacy framework far more often than it reaches
+Contacts, and both paths are pinned by live tests.
+
+⚠️ **Matching a label ignores case, writing never does.** A card written by hand
+may say `Death`, and a person who died is not a thing to miss over one letter.
+Writes always use the lowercase spelling. 🛑 The **whole** label must match: a
+prefix test would make `death-year` match `death` and report its placeholder day
+as real.
+
+⚠️ **`--MM-DD` needs `=`.** `--died --04-30` fails, because the parser reads the
+value as the next flag. Write `--died=--04-30`, the same as `--birthday`.
+
+**`marked_without_date` is the second half of `deceased`.** Some address books
+mark a death with a dagger (`†`) in the note. That marker is **never the record
+and never makes anyone deceased** — it is reported only because the tool cannot
+write a note, so it can never resolve such a card itself. It is always present in
+the JSON, `[]` when empty.
 
 **Relations.** `--relation father:"Robert Hopkins"`. All 216 relation labels the
 Contacts SDK defines are accepted — `father`, `mother`, `son`, `daughter`,
@@ -2107,9 +2247,11 @@ swift/                    one Swift package, seven binaries
                           target so it can be tested against a synthetic store
   Sources/AppleContacts/  + Notes.swift (SQLite note reader),
                           Move.swift (the private cross-account move)
-  Sources/ContactsLibrary/  PostalAddress.swift — the --address parser, and
+  Sources/ContactsLibrary/  PostalAddress.swift — the --address parser,
                           RelationGraph.swift — which relation labels invert and
-                          which must never be guessed. Its own target so both
+                          which must never be guessed, and DeathDate.swift —
+                          🛑 how a death is spelled, and why a year-only one
+                          stores a day it never had. Its own target so all three
                           are testable without writing a contact
   Sources/ObjCExceptions/ @try/@catch for Swift — the move raises rather
                           than returning when it hits the note wall

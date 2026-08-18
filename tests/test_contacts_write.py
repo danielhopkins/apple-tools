@@ -866,6 +866,39 @@ class NoteBearingContacts(GroupFixtures):
         run("link", noted["id"], plain["id"], "--relation", "friend")
         self.assertEqual(note_of(noted["id"]), self.NOTE)
 
+    def test_died_reaches_a_note_bearing_contact(self):
+        """🛑 This is the NORMAL path for a death, not the exception.
+
+        All four cards recorded as deceased on the store this was built against
+        carry a note — an obituary link, or the marker itself. A note blocks
+        every `CNContactStore` write to the card, so `--died` reaches the
+        AddressBook fallback far more often than it reaches Contacts.
+        """
+        noted = self.noted("NoteDied")
+        self.edit(noted["id"], "--died", "2020-04-30")
+
+        fetched = self.get(noted["id"])
+        self.assertTrue(fetched["deceased"])
+        self.assertEqual(fetched["died"], "2020-04-30")
+        self.assertEqual(fetched["died_precision"], "date")
+        self.assertEqual(note_of(noted["id"]), self.NOTE)
+
+    def test_a_year_only_death_survives_the_fallback(self):
+        """The fallback writes a different framework's date property.
+
+        A year-only death is the one shape where the stored value and the
+        reported value differ, so it has to be checked on both write paths.
+        """
+        noted = self.noted("NoteDiedYear")
+        self.edit(noted["id"], "--died", "2020")
+
+        fetched = self.get(noted["id"])
+        self.assertEqual(fetched["died"], "2020")
+        self.assertEqual(fetched["died_precision"], "year")
+        # The card really does hold a January placeholder; only `died` hides it.
+        self.assertEqual(
+            self.labelled(fetched["dates"], "date"), {"death-year": "2020-01-01"})
+
     def test_a_note_bearing_contact_cannot_be_moved_and_says_why(self):
         """The one thing the note wall genuinely blocks rather than routes around.
 
@@ -1057,3 +1090,125 @@ class MoveBetweenContainers(GroupFixtures):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeathDates(GroupFixtures):
+    """`--died`, on a card with no note, so `CNContactStore` handles it.
+
+    🛑 The rule every test here defends: **`died` reports what is KNOWN, never
+    what is stored.** Contacts refuses a date with no month or day (measured:
+    `CNErrorDomain 302`, key paths `dates.value.month` and `dates.value.day`), so
+    a year-only death has to occupy a real day it never had. The card holds
+    `2020-01-01`; the answer must say `2020`.
+    """
+
+    def test_a_full_date(self):
+        created = self.add("Died")
+        self.edit(created["id"], "--died", "2020-04-30")
+        fetched = self.get(created["id"])
+        self.assertTrue(fetched["deceased"])
+        self.assertEqual(fetched["died"], "2020-04-30")
+        self.assertEqual(fetched["died_precision"], "date")
+        self.assertEqual(self.labelled(fetched["dates"], "date"), {"death": "2020-04-30"})
+
+    def test_a_year_only_death_never_leaks_its_placeholder(self):
+        created = self.add("DiedYear")
+        self.edit(created["id"], "--died", "2020")
+        fetched = self.get(created["id"])
+        self.assertEqual(fetched["died"], "2020")
+        self.assertEqual(fetched["died_precision"], "year")
+        self.assertNotEqual(fetched["died"], "2020-01-01")
+        # The placeholder is visible in the raw dates, and declared by the label.
+        self.assertEqual(
+            self.labelled(fetched["dates"], "date"), {"death-year": "2020-01-01"})
+
+    def test_a_year_with_no_known_day(self):
+        created = self.add("DiedNoYear")
+        # ⚠️ `--MM-DD` needs `=`. Without it ArgumentParser reads the value as
+        # the next flag and reports a missing value — the same trap `--birthday`
+        # and `--anniversary` have.
+        self.edit(created["id"], "--died=--04-30")
+        fetched = self.get(created["id"])
+        self.assertEqual(fetched["died"], "--04-30")
+        self.assertEqual(fetched["died_precision"], "day-only")
+        # Nothing is invented here, so nothing needs declaring in the label.
+        self.assertEqual(self.labelled(fetched["dates"], "date"), {"death": "--04-30"})
+
+    def test_died_merges_and_does_not_replace_other_dates(self):
+        """🛑 `--date` replaces the whole set; `--died` must not.
+
+        Getting a death onto a card with `--date` alone means re-passing every
+        other date it holds, and forgetting one deletes it silently. That trap is
+        the whole reason `--died` is its own flag.
+        """
+        created = self.add("DiedMerge", "--date", "anniversary:1999-06-15")
+        self.edit(created["id"], "--died", "2020-04-30")
+        self.assertEqual(
+            self.labelled(self.get(created["id"])["dates"], "date"),
+            {"anniversary": "1999-06-15", "death": "2020-04-30"})
+
+    def test_changing_the_precision_replaces_rather_than_stacks(self):
+        """A card must never end up with both a `death` and a `death-year`."""
+        created = self.add("DiedRestate")
+        self.edit(created["id"], "--died", "2020-04-30")
+        self.edit(created["id"], "--died", "2020")
+        fetched = self.get(created["id"])
+        self.assertEqual(len(fetched["dates"]), 1, "the old death date was left behind")
+        self.assertEqual(fetched["died"], "2020")
+
+        self.edit(created["id"], "--died", "2020-04-30")
+        fetched = self.get(created["id"])
+        self.assertEqual(len(fetched["dates"]), 1)
+        self.assertEqual(fetched["died"], "2020-04-30")
+
+    def test_a_living_contact_reports_no_death_keys_at_all(self):
+        """Absent, never false — the rule every optional key here follows."""
+        fetched = self.get(self.add("Living")["id"])
+        self.assertIsNone(fetched.get("deceased"))
+        self.assertIsNone(fetched.get("died"))
+        self.assertIsNone(fetched.get("died_precision"))
+
+    def test_died_is_settable_at_creation(self):
+        created = self.add("DiedAtBirth", "--died", "2020")
+        self.assertEqual(created["died"], "2020")
+        self.assertEqual(created["died_precision"], "year")
+
+    def test_a_partial_date_is_refused_before_any_apple_event(self):
+        """🛑 `2020-04` is refused, not padded.
+
+        Contacts rejects it outright, and inventing a day would record a month as
+        though it were exact — with no label left to disclose it.
+        """
+        created = self.add("DiedPartial")
+        code, out, err = run("edit", created["id"], "--died", "2020-04", check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("day", err)
+        self.assertIn("2020", err, "the refusal must offer the year as the way out")
+        self.assertIsNone(self.get(created["id"]).get("deceased"))
+
+    def test_garbage_is_refused(self):
+        created = self.add("DiedGarbage")
+        for bad in ["yesterday", "20-4-30", "2020-13-01", "2020-04-32"]:
+            code, _, err = run("edit", created["id"], "--died", bad, check=False)
+            self.assertNotEqual(code, 0, f"'{bad}' should be refused")
+            self.assertIn("YYYY-MM-DD", err)
+        self.assertIsNone(self.get(created["id"]).get("deceased"))
+
+    def test_the_deceased_listing_finds_a_fixture(self):
+        created = self.add("DiedListed")
+        self.edit(created["id"], "--died", "2020")
+        report = run_json("deceased", "--json")
+        mine = [e for e in report["deceased"] if e["id"] == created["id"]]
+        self.assertEqual(len(mine), 1)
+        self.assertEqual(mine[0]["died"], "2020")
+        self.assertEqual(mine[0]["died_precision"], "year")
+        # ⚠️ Always present, `[]` when empty — never omitted.
+        self.assertIsInstance(report["marked_without_date"], list)
+
+    def test_get_edit_get_is_a_no_op_for_a_year_only_death(self):
+        """The documented read-then-re-pass workflow, on the one lossy shape."""
+        created = self.add("DiedRoundTrip")
+        self.edit(created["id"], "--died", "2020")
+        before = self.get(created["id"])["dates"]
+        self.edit(created["id"], "--date", "death-year:2020-01-01")
+        self.assertEqual(self.get(created["id"])["dates"], before)

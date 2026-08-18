@@ -116,6 +116,17 @@ struct ContactInfo: Encodable {
     let department: String?
     let job_title: String?
     let birthday: String?
+    /// True when the card records a death. Absent otherwise, never `false` —
+    /// the same rule every optional key here follows.
+    let deceased: Bool?
+    /// What is KNOWN about when they died: `2020-04-30`, `2020`, or `--04-30`.
+    ///
+    /// 🛑 **Never the stored value.** A year-only death has to occupy a real
+    /// month and day, because Contacts refuses a date without them, so the card
+    /// holds `2020-01-01` and this key says `2020`. Read `died`, not `dates`.
+    let died: String?
+    /// `date`, `year`, or `day-only`. Says how much of `died` is real.
+    let died_precision: String?
     let emails: [EmailInfo]?
     let phones: [PhoneInfo]?
     let addresses: [AddressInfo]?
@@ -180,6 +191,11 @@ private func info(
 
     let birthday = ContactDate.format(contact.birthday)
 
+    // 🛑 Read the death off the DECODED labels. A card written by hand can say
+    // `Death`, and a person who died is not a thing to miss over one letter.
+    let death = DeathDate.read(
+        contact.dates.map { (Labels.decode($0.label), $0.value as DateComponents) })
+
     return ContactInfo(
         id: contact.identifier,
         name: name,
@@ -193,6 +209,9 @@ private func info(
         department: blankToNil(contact.departmentName),
         job_title: blankToNil(contact.jobTitle),
         birthday: birthday,
+        deceased: death == nil ? nil : true,
+        died: death?.died,
+        died_precision: death?.precision.rawValue,
         emails: emails.isEmpty ? nil : emails,
         phones: phones.isEmpty ? nil : phones,
         addresses: addresses.isEmpty ? nil : addresses,
@@ -739,6 +758,22 @@ private func confirmWritten(_ fields: ContactFields, on saved: CNContact, name: 
         "phone", wanted: fields.phones.map { ($0.label, digits($0.value)) },
         stored: saved.phoneNumbers.map { ($0.label, digits($0.value.stringValue)) })
 
+    // 🛑 `--died` is checked on what the card MEANS, not on what it stores. A
+    // year-only death is written as `2020-01-01`, so a raw comparison against
+    // the input `2020` would fail on every correct write. Comparing the read-back
+    // instead also catches the real failure this guards: a card that came back
+    // holding `death` where `death-year` was asked for, which would report a
+    // placeholder day as a real one.
+    if let died = fields.died, let wanted = try? DeathDate.parse(died) {
+        let stored = DeathDate.read(
+            saved.dates.map { (Labels.decode($0.label), $0.value as DateComponents) })
+        if stored?.died != wanted.known || stored?.precision != wanted.precision {
+            var reads = "no death date"
+            if let stored { reads = stored.died + " [" + stored.precision.rawValue + "]" }
+            missing.append("--died \(wanted.known)  (the card reads \(reads))")
+        }
+    }
+
     guard missing.isEmpty else {
         throw RuntimeError(
             """
@@ -825,11 +860,132 @@ struct AppleContacts: ParsableCommand {
         version: appleToolsVersion,
         subcommands: [Search.self, Get.self, List.self, Add.self, Edit.self, Move.self,
                       Delete.self, Export.self, Groups.self,
-                      Relations.self, Link.self, Unlink.self,
+                      Relations.self, Link.self, Unlink.self, Deceased.self,
                       Containers.self, Status.self],
         defaultSubcommand: Search.self)
 
     static func plainText(_ contacts: [ContactInfo]) -> String { plain(contacts) }
+}
+
+struct DeceasedEntry: Encodable {
+    let id: String
+    let name: String
+    let died: String
+    let died_precision: String
+    let contact_url: String
+}
+
+struct MarkedEntry: Encodable {
+    let id: String
+    let name: String
+    let contact_url: String
+}
+
+struct DeceasedReport: Encodable {
+    let count: Int
+    let deceased: [DeceasedEntry]
+    /// Cards whose note carries a dagger but which record no death date.
+    ///
+    /// ⚠️ Always present, `[]` when empty. `apple calendar invitees` learned this
+    /// the hard way: a key omitted when empty makes a careful reader conclude the
+    /// field was dropped from the build, rather than that the answer is none.
+    let marked_without_date: [MarkedEntry]
+}
+
+struct Deceased: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "List everyone recorded as having died",
+        discussion: """
+          Reads the death date off each card. Apple defines no death field, so
+          the record is a labelled date: `death` for a full date, `death-year`
+          when only the year is known. Write one with `--died` on `add` or
+          `edit`.
+
+          🛑 `died` reports what is KNOWN, never what is stored. Contacts refuses
+          a date with no month or day, so a year-only death occupies a real day
+          it never had — `2020-01-01` on the card, `2020` in this listing. Read
+          `died`, never the raw `dates` array.
+
+          Sorted most recent first. A death with no year sorts last, because
+          nothing places it in time.
+
+          `marked_without_date` lists cards whose note carries a dagger and which
+          record no date. That marker is never the record and never makes anyone
+          deceased; it is reported because the tool cannot write a note, so it
+          can never resolve such a card itself. Add the date in `edit --died`, or
+          the note in Contacts.app.
+          """)
+
+    @Flag(name: .long, help: "Output as JSON")
+    var json = false
+
+    func run() throws {
+        try requireContactsAccess()
+        let notes = NoteStore.allNotes()
+
+        var found: [DeceasedEntry] = []
+        var marked: [MarkedEntry] = []
+
+        for contact in try allContacts() {
+            let name = displayName(contact)
+            let url = "addressbook://\(contact.identifier)"
+            let record = DeathDate.read(
+                contact.dates.map { (Labels.decode($0.label), $0.value as DateComponents) })
+
+            if let record {
+                found.append(DeceasedEntry(
+                    id: contact.identifier, name: name,
+                    died: record.died, died_precision: record.precision.rawValue,
+                    contact_url: url))
+            } else if DeathDate.noteMarksDeath(notes[contact.identifier]) {
+                marked.append(MarkedEntry(id: contact.identifier, name: name, contact_url: url))
+            }
+        }
+
+        // ⚠️ A year-less date has no year to sort on, so it goes last rather
+        // than sorting as though it happened in year zero. `--04-30` would sort
+        // before every real date otherwise, since `-` precedes every digit.
+        found.sort { left, right in
+            let leftUndated = left.died.hasPrefix("--")
+            let rightUndated = right.died.hasPrefix("--")
+            if leftUndated != rightUndated { return rightUndated }
+            if left.died != right.died { return left.died > right.died }
+            return left.name < right.name
+        }
+        marked.sort { $0.name < $1.name }
+
+        let report = DeceasedReport(
+            count: found.count, deceased: found, marked_without_date: marked)
+
+        if json {
+            printJSON(report)
+            return
+        }
+
+        if found.isEmpty && marked.isEmpty {
+            print("No contact records a death date.")
+            return
+        }
+
+        if !found.isEmpty {
+            let width = found.map(\.name.count).max() ?? 0
+            for entry in found {
+                let note = entry.died_precision == "year" ? "  (year only)"
+                    : entry.died_precision == "day-only" ? "  (year unknown)" : ""
+                print("\(entry.name.padding(toLength: max(width, 4), withPad: " ", startingAt: 0))"
+                      + "  \(entry.died)\(note)")
+            }
+        }
+
+        if !marked.isEmpty {
+            if !found.isEmpty { print("") }
+            print("Marked in the note, but no death date recorded:")
+            for entry in marked { print("  \(entry.name)") }
+            print("")
+            print("Add one with:  apple contacts edit <id> --died YYYY-MM-DD")
+            print("...or just the year:  --died YYYY")
+        }
+    }
 }
 
 struct Containers: ParsableCommand {
@@ -1034,6 +1190,13 @@ struct ContactFields: ParsableArguments {
         help: "Dated event as LABEL:DATE, e.g. 'death:2020-05-01'. Repeat to set several; replaces existing.")
     var date: [String] = []
 
+    @Option(
+        name: .long,
+        help: """
+          Death date as YYYY-MM-DD, YYYY (year only), or --MM-DD (year unknown).           Merges: other dates are kept. A --MM-DD value needs '=', as           --died=--04-30.
+          """)
+    var died: String?
+
     @Option(name: .long, help: "Not supported — see the error text for why")
     var note: String?
 
@@ -1041,7 +1204,7 @@ struct ContactFields: ParsableArguments {
         first == nil && middle == nil && last == nil && namePrefix == nil
             && nameSuffix == nil && nickname == nil && company == nil
             && department == nil && jobTitle == nil && birthday == nil
-            && anniversary == nil && email.isEmpty && phone.isEmpty
+            && anniversary == nil && died == nil && email.isEmpty && phone.isEmpty
             && url.isEmpty && relation.isEmpty && date.isEmpty
             && address.isEmpty
     }
@@ -1102,6 +1265,13 @@ struct ContactFields: ParsableArguments {
             throw ValidationError(
                 "could not parse --anniversary '\(anniversary)'; use YYYY-MM-DD or --MM-DD")
         }
+        // 🛑 Validated BEFORE any Apple Event, like every other field here.
+        if let died {
+            do { _ = try DeathDate.parse(died) }
+            catch let error as DeathDate.ParseError {
+                throw ValidationError("--died \(error.description)")
+            }
+        }
         for entry in date {
             let (label, value) = split(entry)
             guard label != nil else {
@@ -1157,6 +1327,38 @@ struct ContactFields: ParsableArguments {
     }
 
     /// Applies the flags that were actually supplied onto a mutable contact.
+    /// The date list this edit should write, with the death date merged in.
+    ///
+    /// 🛑 **`--died` merges; `--date` replaces.** That difference is the whole
+    /// reason `--died` exists as its own flag. Getting a death onto a card with
+    /// `--date` alone means re-passing every other date the card holds, and
+    /// forgetting one deletes it silently — the same trap `link` exists to avoid
+    /// for relations.
+    ///
+    /// The rule when both are given: `--date` establishes the set, then `--died`
+    /// is merged into it. So the death date is always present afterwards,
+    /// whatever else was asked for.
+    ///
+    /// ⚠️ Existing labels are carried through **raw**, never decoded and
+    /// re-encoded. Decoding is lossless for every label this tool writes, but a
+    /// round trip is a chance to be wrong about one, and there is no reason to
+    /// take it for entries this edit never mentioned.
+    ///
+    /// Returns nil when neither flag was given, meaning "leave the dates alone".
+    func mergedDates(existing: [(label: String?, value: DateComponents)])
+        -> [(label: String?, value: DateComponents)]?
+    {
+        guard !dates.isEmpty || died != nil else { return nil }
+        var result = dates.isEmpty ? existing : dates
+        guard let died, let written = try? DeathDate.parse(died) else { return result }
+        // Drop any death already recorded, so `--died` restates rather than
+        // stacking a second one. This is also what moves a card from `death` to
+        // `death-year`, or back, when the precision changes.
+        result.removeAll { DeathDate.isDeathLabel(Labels.decode($0.label)) }
+        result.append((written.label, written.components))
+        return result
+    }
+
     func apply(to contact: CNMutableContact) {
         if let first { contact.givenName = first }
         if let middle { contact.middleName = middle }
@@ -1194,8 +1396,9 @@ struct ContactFields: ParsableArguments {
                 CNLabeledValue(label: $0.label, value: CNContactRelation(name: $0.value))
             }
         }
-        if !dates.isEmpty {
-            contact.dates = dates.map {
+        let existingDates = contact.dates.map { ($0.label, $0.value as DateComponents) }
+        if let merged = mergedDates(existing: existingDates) {
+            contact.dates = merged.map {
                 CNLabeledValue(label: $0.label, value: $0.value as NSDateComponents)
             }
         }
@@ -1267,12 +1470,36 @@ struct ContactFields: ParsableArguments {
         if !relations.isEmpty {
             setMulti(relations.map { ($0.label, $0.value as NSString) }, kABRelatedNamesProperty)
         }
-        if !dates.isEmpty {
+        // ⚠️ **This path is the normal one for a death, not the exception.** All
+        // four cards recorded as deceased on the store this was built against
+        // carry a note, and a note blocks every `CNContactStore` write to the
+        // card. So `--died` reaches AddressBook far more often than it reaches
+        // Contacts, and the merge has to work identically here.
+        if let merged = mergedDates(existing: existingDates(of: person)) {
             setMulti(
-                dates.map { ($0.label, $0.value as NSDateComponents) },
+                merged.map { ($0.label, $0.value as NSDateComponents) },
                 kABOtherDateComponentsProperty)
         }
         return ok
+    }
+
+    /// The labelled dates AddressBook already holds for this record.
+    ///
+    /// Needed because `--died` merges, and the AddressBook fallback writes the
+    /// whole multivalue at once — so the existing entries have to be read back
+    /// before anything is written, or the merge would delete them.
+    private func existingDates(of person: ABPerson) -> [(label: String?, value: DateComponents)] {
+        guard let multi = person.value(forProperty: kABOtherDateComponentsProperty)
+                as? ABMultiValue else { return [] }
+        var out: [(label: String?, value: DateComponents)] = []
+        for index in 0..<multi.count() {
+            guard let components = multi.value(at: index) as? NSDateComponents else { continue }
+            // AddressBook stores an unlabelled value as the empty string, which
+            // Contacts reads back as no label at all.
+            let label = multi.label(at: index)
+            out.append((label?.isEmpty == true ? nil : label, components as DateComponents))
+        }
+        return out
     }
 
     // MARK: Parsed inputs
