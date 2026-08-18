@@ -68,6 +68,8 @@ installed via `make install`.
 | Move one occurrence | `apple calendar edit <id> --occurrence 2026-09-21 --start "2026-09-21 14:00"` |
 | Find a person | `apple contacts search "smith" --json` |
 | Update a contact | `apple contacts edit <id> --company "New Co"` |
+| Who is this person linked to | `apple contacts relations <id>` |
+| Link two contacts | `apple contacts link <id> <id> --relation spouse` |
 | Move a contact between accounts | `apple contacts move <id> --to "iCloud" --dry-run` |
 | Export contacts | `apple contacts export --group "Family" -o family.vcf` |
 | List contact accounts | `apple contacts containers --json` |
@@ -1667,6 +1669,9 @@ apple contacts edit ID [FIELDS] [--json]
 apple contacts move ID --to CONTAINER [--dry-run] [--json]
 apple contacts delete ID
 apple contacts export ID... [--group GROUP] [-o FILE]   # vCard 3.0
+apple contacts relations ID [--json]               # who this contact links to, resolved
+apple contacts link A B --relation LABEL [--inverse LABEL] [--no-inverse] [--dry-run]
+apple contacts unlink A B [--relation LABEL] [--no-inverse] [--dry-run]
 apple contacts containers [--json]                 # accounts, and which is default
 apple contacts status [--json]                     # permission state, never prompts
 
@@ -1772,6 +1777,59 @@ no year.
 Search matches first/middle/last/nickname/company/department/job title/full name,
 email addresses, and phone numbers (digits only, so `7205551234` finds
 `+1 (720) 555-1234`). **JSON is the default**; pass `--plain` for human output.
+
+**Relationships between contacts.** `relations` reads them, `link` and `unlink`
+write them.
+
+```
+apple contacts relations <id>                       # both directions
+apple contacts link <id> <id> --relation spouse     # writes both cards
+apple contacts link A B --relation father --inverse son
+apple contacts unlink A B --relation friend
+```
+
+🛑 **A relation stores a NAME, not a reference.** Contacts.app renders one as a
+tappable link, which reads as though it holds the other card's id. It does not.
+Measured: all 54 relation rows here carry a `ZUNIQUEID`, all 54 values are
+distinct, and **none** matches any `ZABCDRECORD.ZUNIQUEID` — that column is the
+relation row's own sync id. Three consequences:
+
+- **Renaming a contact silently breaks every link to it.** Nothing updates.
+- **A relation can name nobody.** Two do on this store, and that is not corruption.
+- **A relation can name several people**, when two cards share a name. `matches`
+  in the JSON says which of the three you have.
+
+**`relations` reports both directions**, and the reverse half is the one people
+want. `related_from` is a scan of every card for anyone naming this contact —
+Contacts has no reverse index, so there is no cheaper way. 1.1s over 679
+contacts. On this store Dan lists three brothers and **none of them lists him
+back**; only his parents do.
+
+🛑 **`link` appends; `edit --relation` replaces.** That is the whole reason
+`link` exists. Adding one relation through `edit` means reading every existing
+one and re-passing it, and forgetting one deletes it silently.
+
+⚠️ **`link` writes the other card too, so it states a fact about someone else.**
+The inverse is only inferred where it cannot be wrong: `spouse`, `friend`,
+`cousin` and `sibling` are symmetric, and `parent`/`child`,
+`grandparent`/`grandchild`, `manager`/`assistant` invert cleanly.
+**`father`, `mother`, `son`, `daughter`, `brother` and `sister` are refused** —
+the other side is son *or* daughter and Contacts records no gender. The refusal
+names what to pass. `--no-inverse` writes one side only.
+
+🛑 **Relation labels are stored in two spellings, and both are live here.** One
+card holds `_$!<Father>!$_` and another a plain `Sibling`, and `Labels.decode`
+passes an unrecognised bare word through unchanged, capitals and all. Comparing
+raw labels misses real matches: `link` reported "would add" for a relation the
+contact already had, and a second run would have written a duplicate. Compare
+through `sameRelationLabel`, never on the raw string.
+
+- **Both arguments take an id or a name.** An ambiguous name is refused listing
+  the candidates; an exact full-name match beats a partial one.
+- **Re-linking is a reported no-op**, not an error and not a duplicate row —
+  the same shape `groups add` uses. Read `changed`, not the exit code.
+- **Every write is confirmed against a fresh store** and fails loudly otherwise.
+- `--dry-run` resolves and prints the plan without writing.
 
 **Exporting.** `export` writes vCard 3.0 — what Contacts.app and every other
 address book imports. Takes any number of ids, `--group NAME` for a whole group,
@@ -2005,8 +2063,10 @@ swift/                    one Swift package, seven binaries
                           target so it can be tested against a synthetic store
   Sources/AppleContacts/  + Notes.swift (SQLite note reader),
                           Move.swift (the private cross-account move)
-  Sources/ContactsLibrary/  PostalAddress.swift — the --address parser, in its
-                          own target so it is testable without writing a contact
+  Sources/ContactsLibrary/  PostalAddress.swift — the --address parser, and
+                          RelationGraph.swift — which relation labels invert and
+                          which must never be guessed. Its own target so both
+                          are testable without writing a contact
   Sources/ObjCExceptions/ @try/@catch for Swift — the move raises rather
                           than returning when it hits the note wall
   Tests/RemindersTests/ MailTests/ MessagesTests/ PhoneTests/ MapsTests/

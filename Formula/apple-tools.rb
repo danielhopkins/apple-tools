@@ -166,6 +166,11 @@ class AppleTools < Formula
     # silent regression back to that.
     assert_match "address", shell_output("#{bin}/apple-contacts edit --help")
 
+    # Relationship helpers. `link` appends where `edit --relation` replaces, so
+    # losing it silently sends callers back to a command that deletes relations.
+    assert_match "relations", contacts_help
+    assert_match "link", contacts_help
+
     # The Notes write path is the signed shortcuts plus the commands that drive
     # them. `make dist` cannot know this formula's install list, so a shortcut
     # added to the repo can ship inside the tarball and never be installed —

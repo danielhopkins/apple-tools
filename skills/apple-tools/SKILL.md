@@ -532,6 +532,35 @@ copying the record reads the note and that needs an entitlement no CLI can hold.
 Tell the user to drag that card between accounts in Contacts.app instead —
 don't try another route.
 
+## Who is this contact connected to?
+
+```
+apple contacts relations <id> --json      # both directions
+apple contacts link A B --relation spouse # writes BOTH cards
+apple contacts unlink A B --relation friend
+```
+
+🛑 **A relation stores a NAME, not a link to the other card.** So a name can
+match nobody, or several people. Read `matches` in the JSON before saying who
+someone is related to — `1` means it resolved, `0` means the name matches no
+contact, `2+` means it is ambiguous.
+
+**`related_from` is the half people usually mean.** It scans every card for
+anyone naming this contact. On a real store one person listed three brothers and
+none of them listed him back, so the two directions genuinely differ.
+
+⚠️ **`link` edits the other person's card too.** Confirm with the user before
+running it. Use `--dry-run` first; it resolves and prints the plan without
+writing. Contacts writes sync everywhere and have no undo.
+
+⚠️ **A gendered relation is refused, and that is correct.** `--relation father`
+cannot infer the other side, because it is son or daughter and Contacts records
+no gender. Pass `--inverse son`, or `--no-inverse` to write one side only. Do
+not guess the person's gender to pick one.
+
+**Use `link`, never `edit --relation`, to add one relation.** `edit` replaces the
+whole set, so it silently deletes every relation you did not re-pass.
+
 **Postal addresses are writable now.** `--address` on `add` and `edit`, free
 text or exact fields:
 
