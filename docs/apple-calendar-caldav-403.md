@@ -401,3 +401,98 @@ nothing.
   this session was involved and cannot be re-observed. Their own follow-up probes
   ran 33 of 33 clean, which is not evidence against the original loss. Recorded as
   reported-not-reproduced.
+
+---
+
+# Third failure mode: the confirmation itself reports a false failure
+
+Fixed 2026-08-18, after 26.818.1. This one points the other way from the two
+above: the write **succeeds** and `add` calls it a failure.
+
+## What happened
+
+`apple calendar add` exited non-zero on a Google CalDAV calendar with:
+
+```
+Error: the event was saved locally but the server has not accepted it.
+
+  HTTP 400 CoreDAVHTTPStatusErrorDomain (scope: item)
+```
+
+The event was on the server. `sync-status` reported `state: synced` with a real
+`external_id`, and `unsynced` did not list it. The HTTP 400 belonged to a
+**different** event on the same calendar — an Outlook invite the user had
+counter-proposed a new time for, which Google refuses because the user does not
+organise it.
+
+## Two defects, compounding
+
+### 1. The item-scoped filter never compared the item
+
+`SyncStore.status(...)` selected the `Error` rows for an event like this:
+
+```swift
+case "item": return failure.item != nil && failure.calendar == calendarName
+```
+
+That asserts only that *some* item is named. So **every item-scoped error on a
+calendar attached itself to every event on that calendar**, and EventKit never
+clears the row. `failures()` already read `e.calendaritem_owner_id` — it used the
+column to pick the `scope` string and then discarded it, and `Failure` carried no
+owner id for the filter to compare against.
+
+Fixed by carrying `itemRowid` on `Failure` and matching it against the event's
+own `CalendarItem.ROWID`. `pending(...)` had the same overreach and got the same
+fix.
+
+### 2. A borrowed error aborted the wait at t=0
+
+```swift
+while status.state == .pending && status.errors.isEmpty && Date() < deadline {
+```
+
+`status.errors.isEmpty` was read as evidence about *this* write. A fresh create
+has no `external_id` at t=0, so the first look is always `pending`; with an
+inherited error present the loop body never ran, and `check` threw before the
+~4s round trip a healthy write needs.
+
+🛑 **An error recorded before the save cannot be evidence about the save.**
+`SyncStore.errorSnapshot()` now fingerprints the `Error` table's rowids before
+`store.save`, and only a row absent from that snapshot stops the wait or gets
+named in the failure. The `Error` table is AUTOINCREMENT — `sqlite_sequence`
+stands at 1315 on this machine — so a rowid is never reused and the set is a
+sound before/after comparison.
+
+⚠️ **No snapshot means poll to the deadline**, never "treat every error as new".
+A snapshot is nil only when the store is unreadable, and guessing there would
+restore the same false failure.
+
+### 3. A synced item reported errors it could not have caused
+
+`status(...)` now drops calendar- and store-scoped rows once the state is
+`synced` or `notApplicable`. The item's own item-scoped rows stay, because an
+edit can fail after a create succeeded.
+
+## Impact
+
+Any calendar holding one stale item-scoped error row could never report a
+successful write again. Every `add` and `edit` on it failed loudly while the data
+landed correctly — the same class of wrong answer this file exists to remove,
+pointing the other way.
+
+## Verified
+
+Measured on 2026-08-18 against the live store, with `Error` row 1315 still
+present:
+
+| binary | result |
+|---|---|
+| installed 26.818.1 | `Error: … HTTP 400 … (scope: item)`, event synced anyway |
+| this fix | `state: synced`, exit 0 |
+
+`sync-errors` still names the real failure (`Bryce | Dan CodeRabbit`), and
+`sync-status` on that event still carries its own HTTP 400. Both probe events
+were deleted afterwards.
+
+Pinned offline by six tests in `swift/Tests/CalendarSyncTests/`; three of them
+fail against the code before this fix.

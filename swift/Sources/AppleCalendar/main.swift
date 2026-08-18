@@ -843,19 +843,49 @@ struct Add: ParsableCommand {
             AttendeeAPI.add(attendee, to: event)
         }
 
+        // 🛑 Snapshot the Error table BEFORE the save. Anything already in it
+        // belongs to another write, and reading one as this event's refusal is
+        // how a healthy `add` reported failure on a calendar carrying one stale
+        // row.
+        let errorsBefore = SyncConfirmation.errorSnapshot()
+
         // .thisEvent on a brand-new event creates the series; there is no
         // earlier occurrence for a span to be relative to.
         try store.save(event, span: .thisEvent, commit: true)
 
         // 🛑 Confirm the SERVER took it, before printing anything that reads as
         // success. `store.save` returning is only a local write.
-        let syncStatus = try SyncConfirmation.check(event: event, options: sync)
+        let syncStatus = try SyncConfirmation.check(event: event, options: sync,
+                                                    since: errorsBefore)
+
+        // 🛑 **Report the STORE, not the object that was saved.** Waiting for the
+        // server invalidates the saved event's recurrence rule: the daemon
+        // replaces the rule object once the round trip lands, and the old one
+        // stops resolving. The in-memory `EKEvent` then answers from a dead
+        // reference and reports `FREQ=DAILY;INTERVAL=0` for every recurring
+        // event, with `EKCADErrorDomain 1010 "Object not found. It may have been
+        // deleted."` on stderr as the only hint.
+        //
+        // Measured on 26.818.1, which shipped it: `add --repeat monthly --on-the
+        // "4th monday" --json` printed `{"frequency": "daily", "interval": 0}`
+        // while a fresh read of the same event gave `{"frequency": "monthly",
+        // "interval": 1, "on_the": "the 4th Monday"}`. The event was always
+        // written correctly; only the answer was wrong.
+        //
+        // ⚠️ A non-recurring `add` was never affected, which is why this survived
+        // — every field but the recurrence rule reads back fine.
+        //
+        // `edit` has re-read a fresh store since 26.812.x for exactly this class
+        // of failure. `add` did not, because it had nothing to compare against.
+        // It still has nothing to compare against; it just must not answer from
+        // a stale object.
+        let created = freshStore().event(withIdentifier: event.eventIdentifier ?? "") ?? event
 
         if json {
-            printJSON(info(event, sync: syncStatus))
+            printJSON(info(created, sync: syncStatus))
         } else {
-            print("Created '\(name)' — \(describe(event))")
-            if let pattern = RecurrenceInfo(event.recurrenceRules?.first) {
+            print("Created '\(name)' — \(describe(created))")
+            if let pattern = RecurrenceInfo(created.recurrenceRules?.first) {
                 print("Repeats: \(pattern.describe)")
             }
             // EventKit adds the organizer and a self-attendee of its own accord
@@ -912,6 +942,11 @@ struct Edit: ParsableCommand {
         help: "Allow a --series change that returns moved occurrences to their original slots")
     var resetExceptions = false
 
+    @Flag(
+        name: .long,
+        help: "Change an invitation you received anyway, which the server will likely undo")
+    var force = false
+
     @Flag(name: .long, help: "Output the updated event as JSON")
     var json = false
 
@@ -939,6 +974,13 @@ struct Edit: ParsableCommand {
 
         let match = try resolveForWrite(
             id: id, occurrence: occurrence, series: series, verb: "edit")
+
+        // 🛑 An invitation belongs to whoever organized it. A change here is
+        // reverted or refused by the server, silently — the same failure
+        // `invite` has always refused, which `edit` used to walk straight into.
+        if !force, let refusal = Attendees.editRefusal(match) {
+            throw ValidationError(refusal)
+        }
 
         if series {
             try refuseIfSeriesWriteWouldResetExceptions(
@@ -982,6 +1024,7 @@ struct Edit: ParsableCommand {
         // and `external_id` was already set by the create, so there is nothing
         // to compare against afterwards.
         let syncBaseline = SyncConfirmation.baseline(for: match)
+        let errorsBefore = SyncConfirmation.errorSnapshot()
 
         apply(to: match, warn: true)
 
@@ -1064,7 +1107,7 @@ struct Edit: ParsableCommand {
         // says nothing about the server, which is a separate failure with a
         // separate signal.
         let syncStatus = try SyncConfirmation.check(
-            event: saved, options: sync, against: syncBaseline)
+            event: saved, options: sync, against: syncBaseline, since: errorsBefore)
 
         if json {
             printJSON(info(saved, sync: syncStatus))

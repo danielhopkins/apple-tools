@@ -232,7 +232,8 @@ enum SyncConfirmation {
     /// anything up. Measured across the same six trials. So nothing here calls
     /// it.
     static func wait(event: EKEvent, timeout: Double,
-                     against baseline: SyncStore.Baseline? = nil) -> SyncStore.Status {
+                     against baseline: SyncStore.Baseline? = nil,
+                     since snapshot: SyncStore.ErrorSnapshot? = nil) -> SyncStore.Status {
         guard let calendarIdentifier = event.calendar?.calendarIdentifier,
               let eventIdentifier = event.eventIdentifier else {
             return .unknown("the event has no identifier to look up")
@@ -246,11 +247,24 @@ enum SyncConfirmation {
 
         let deadline = Date().addingTimeInterval(max(0, timeout))
         var status = look()
-        while status.state == .pending && status.errors.isEmpty && Date() < deadline {
+        while status.state == .pending && Date() < deadline {
+            // 🛑 **Only an error recorded AFTER the save can stop the wait.**
+            // A fresh create has no `external_id` at t=0, so the first look is
+            // always `pending`; giving up there on any error at all meant one
+            // stale row on the calendar failed every write that followed it.
+            // With no snapshot the store was unreadable, so nothing is known
+            // to be old — poll to the deadline instead of guessing.
+            if let snapshot, status.errors.contains(where: snapshot.isNew) { break }
             Thread.sleep(forTimeInterval: 1)
             status = look()
         }
         return status
+    }
+
+    /// The `Error` rows that existed before a save, so the wait can tell a new
+    /// refusal from an old one. Take it BEFORE calling `store.save`.
+    static func errorSnapshot() -> SyncStore.ErrorSnapshot? {
+        SyncStore.errorSnapshot()
     }
 
     /// The snapshot an `edit` must take before it saves.
@@ -269,12 +283,14 @@ enum SyncConfirmation {
     /// Returns the status so the caller can put it in its own output. A caller
     /// that gets a throw must not have printed a success line yet.
     static func check(event: EKEvent, options: SyncConfirmationOptions,
-                      against baseline: SyncStore.Baseline? = nil) throws
+                      against baseline: SyncStore.Baseline? = nil,
+                      since snapshot: SyncStore.ErrorSnapshot? = nil) throws
         -> SyncStore.Status?
     {
         guard options.confirmSync else { return nil }
 
-        let status = wait(event: event, timeout: options.syncTimeout, against: baseline)
+        let status = wait(event: event, timeout: options.syncTimeout,
+                          against: baseline, since: snapshot)
 
         switch status.state {
         case .synced, .notApplicable:
@@ -313,7 +329,12 @@ enum SyncConfirmation {
                 "the event was saved locally but the server has not accepted it.",
                 "",
             ]
-            if let failure = status.errors.first {
+            // Name only an error this write produced. A row that predates
+            // the save explains nothing about it, and printing it sends the
+            // reader after the wrong event.
+            let blame = snapshot.map { snap in status.errors.filter(snap.isNew) }
+                ?? status.errors
+            if let failure = blame.first {
                 let http = failure.httpStatus.map { "HTTP \($0)" } ?? "no HTTP status"
                 lines.append("  \(http) \(failure.domain ?? "") (scope: \(failure.scope))")
                 lines.append("")
@@ -499,9 +520,14 @@ struct Resync: ParsableCommand {
             copy.location = original.location
         }
 
+        // Taken before the save: the stuck original's own error row is
+        // already in this table, and it is not evidence about the copy.
+        let errorsBefore = SyncConfirmation.errorSnapshot()
+
         try store.save(copy, span: .thisEvent, commit: true)
 
-        let after = try SyncConfirmation.check(event: copy, options: sync)
+        let after = try SyncConfirmation.check(event: copy, options: sync,
+                                               since: errorsBefore)
 
         // Only now is the original safe to remove.
         do {

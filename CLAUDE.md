@@ -1373,6 +1373,25 @@ went, and no duplicate was left.
   refused without `--force`, because a rebuild mails everyone a fresh invitation.
 - ⚠️ **The new event gets a new identifier.**
 
+🛑 **A recurring `add --json` used to report the wrong rule, and the store was
+never wrong.** Waiting for the server invalidates the saved event's recurrence
+rule — the daemon replaces the rule object once the round trip lands, and the old
+one stops resolving, so the in-memory `EKEvent` answered from a dead reference.
+Measured on 26.818.1, which shipped it: `add --repeat monthly --on-the "4th
+monday" --json` printed `{"frequency": "daily", "interval": 0}` while a fresh
+read of the same event gave `{"frequency": "monthly", "interval": 1, "on_the":
+"the 4th Monday"}`. `EKCADErrorDomain 1010 "Object not found. It may have been
+deleted."` on stderr was the only hint. ⚠️ A non-recurring `add` was never
+affected, which is why it survived a release. `add` now re-reads a fresh store
+before printing, the way `edit` has since 26.812.x.
+
+⚠️ **The live suite trips the sync wait about three times per run, and the tool
+is right to say so.** 67 tests in ~322s against one Exchange calendar outruns
+what the server will confirm in 30s; the same write by hand syncs in 6s. The
+failing tests differ every run, which is how you tell this from a defect. Raise
+`--sync-timeout` or pin a quieter calendar with
+`APPLE_CALENDAR_TEST_CALENDAR` if it gets in the way.
+
 ⚠️ **`Error` rows are transient.** The table is empty on this machine, yet
 `sqlite_sequence` puts its high-water mark at **1304** — they are written and
 then cleaned up. So `sync-errors` only helps inside a window, and an empty result

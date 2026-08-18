@@ -393,3 +393,76 @@ spacing helping despite contention having been ruled out as the cause.
 
 The settle path remains untested against a real reversion outside a deliberate
 local reproduction.
+
+---
+
+# Proposing a new time: there is no API, at all
+
+Searched 2026-08-18, macOS 27.0. Calendar.app's **Propose New Time** is an
+app-internal feature. Nothing outside Calendar.app can invoke it.
+
+| where I looked | matches for "propos" / "counter" |
+|---|---|
+| EventKit public headers (`EventKit.framework/Headers/*.h`) | 0 |
+| `EventKit.framework` binary | 0 |
+| `CalendarDaemon.framework` binary | 0 |
+| `iCalendar.framework` binary (`COUNTER`, `DECLINECOUNTER`) | 0 |
+| Calendar.app `sdef` | 0 |
+| **Calendar.app binary** | **all of it** |
+
+The symbols that exist are all in `/System/Applications/Calendar.app/Contents/MacOS/Calendar`:
+
+```
+_supportsProposeNewTime
+allowsProposeNewTime
+shouldOfferToProposeNewTime
+_proposeOrEditOrCancelProposeNewTimeAlertWithTitle:eventTitle:suggestedTime:
+_bringUpMailComposeWindowWithProposalStart:withAttendee:withEvent:
+acceptAlternateTimeProposalMessage:forNotificationAttendee:
+declineAlternateTimeProposalMessage:forNotificationAttendee:
+```
+
+🛑 **`_bringUpMailComposeWindowWithProposalStart:withAttendee:withEvent:` names
+the whole mechanism.** Calendar.app builds the iTIP counter-proposal and hands
+it to Mail. It is not a calendar write, so no amount of EventKit work reaches
+it — and `apple mail` deliberately sends nothing, so the mail half is closed
+here too.
+
+This is not the same wall as the invitee writes above. Those had a **private**
+EventKit API (`EKAttendee.attendeeWithName:emailAddress:`) that could be
+resolved at runtime. A proposal has no API of any kind, public or private,
+outside the app.
+
+## What this means for `edit`
+
+`invite` has always refused an event organized by somebody else. `edit` did not,
+so `apple calendar edit <invitation> --start …` wrote the new time locally and
+reported success, while the server reverted or refused it. That is how the
+HTTP 400 recorded in
+[`docs/apple-calendar-caldav-403.md`](apple-calendar-caldav-403.md) was
+produced by hand.
+
+`edit` now refuses, and points at Calendar.app.
+
+🛑 **The test is "am I an attendee", not "am I the organizer".** A delegated
+calendar has somebody else as organizer and does not invite the user, and a
+write there really does sync — 7 of 9 enabled calDAV calendars on this machine
+are delegated. Surveyed over the next 30 days:
+
+| what the event is | count | `edit` |
+|---|---|---|
+| no organizer (an ordinary event) | 71 | allowed |
+| the user organizes it | 2 | allowed |
+| an invitation to the user | 14 | **refused** |
+| somebody else's, user not invited (delegated) | 1 | allowed |
+
+An organizer-only check would have invented a refusal for that last one.
+`--force` changes the local copy anyway.
+
+⚠️ **The refusal prints the organizer's address, not just their name.** This
+event's organizer name is stored as `bryce ambraziunas.com`, which names nobody
+the user can recognise. Both go in the message.
+
+Pinned by `TestInvitationsAreReadOnly` in `tests/test_calendar_write.py`. It
+finds a real invitation in the next 90 days and **skips** when the machine has
+none, the same way the read-only-calendar and recurring-event tests do.

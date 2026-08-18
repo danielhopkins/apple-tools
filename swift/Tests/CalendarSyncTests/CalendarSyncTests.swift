@@ -553,6 +553,114 @@ final class SyncErrorTests: XCTestCase {
         XCTAssertEqual(status.errors.count, 1)
         XCTAssertEqual(status.errors.first?.scope, "store")
     }
+
+    // MARK: One item's error is not the whole calendar's
+
+    /// 🛑 **An item-scoped error belongs to ONE item.** The old filter asked
+    /// only whether the row named some item and whether the calendar matched,
+    /// so every event on that calendar inherited it — and EventKit never clears
+    /// the row, so the calendar could never report a healthy write again.
+    ///
+    /// Measured 2026-08-18: one HTTP 400 from a counter-proposal on somebody
+    /// else's invite made every later `add` on "Personal" fail while the events
+    /// landed and synced correctly.
+    func testAnItemErrorDoesNotAttachToOtherEventsOnTheCalendar() throws {
+        try fixture.insert(id: 600, calendar: 10, summary: "their invite",
+                           unique: "u-theirs")
+        try fixture.insert(id: 601, calendar: 10, summary: "my new event",
+                           unique: "u-mine", externalId: "/dav/mine.ics",
+                           modTag: "63922751442")
+        try fixture.run(
+            "INSERT INTO Error (ROWID, calendaritem_owner_id, error_type, error_code) "
+            + "VALUES (1, 600, 1, 3);")
+
+        let mine = SyncStore.status(eventIdentifier: "DEVICE:u-mine",
+                                    calendarIdentifier: CalendarFixture.calDAVUUID)
+        XCTAssertEqual(mine.state, .synced)
+        XCTAssertEqual(mine.errors.count, 0,
+                       "another event's error must not be reported against this one")
+
+        // The event that really failed still carries it.
+        let theirs = SyncStore.status(eventIdentifier: "DEVICE:u-theirs",
+                                      calendarIdentifier: CalendarFixture.calDAVUUID)
+        XCTAssertEqual(theirs.state, .pending)
+        XCTAssertEqual(theirs.errors.map(\.scope), ["item"])
+    }
+
+    /// The same rule inside `unsynced`: a stuck event must name its own cause,
+    /// not the one belonging to the event beside it.
+    func testTheScanDoesNotShareOneItemErrorAcrossTheCalendar() throws {
+        try fixture.insert(id: 610, calendar: 10, summary: "theirs", unique: "u-a")
+        try fixture.insert(id: 611, calendar: 10, summary: "mine", unique: "u-b")
+        try fixture.run(
+            "INSERT INTO Error (ROWID, calendaritem_owner_id, error_type, error_code) "
+            + "VALUES (1, 610, 1, 3);")
+
+        let items = try XCTUnwrap(SyncStore.pending())
+        let byName = Dictionary(uniqueKeysWithValues: items.map { ($0.summary ?? "", $0) })
+        XCTAssertEqual(byName["theirs"]?.errors.count, 1)
+        XCTAssertEqual(byName["mine"]?.errors.count, 0)
+    }
+
+    /// ⚠️ **A synced item cannot be blamed for a broad error.** Its push
+    /// succeeded, so a calendar- or store-scoped row is about something else,
+    /// and printing it next to `state: synced` reads as a failure.
+    func testASyncedItemDropsCalendarAndStoreErrors() throws {
+        try fixture.insert(id: 620, calendar: 10, summary: "landed", unique: "u-ok",
+                           externalId: "/dav/ok.ics", modTag: "1")
+        try fixture.run("""
+            INSERT INTO Error (ROWID, calendar_owner_id, error_type, error_code)
+                VALUES (1, 10, 1, 4);
+            INSERT INTO Error (ROWID, store_owner_id, error_type, error_code)
+                VALUES (2, 1, 1, 5);
+            """)
+
+        let status = SyncStore.status(eventIdentifier: "DEVICE:u-ok",
+                                      calendarIdentifier: CalendarFixture.calDAVUUID)
+        XCTAssertEqual(status.state, .synced)
+        XCTAssertEqual(status.errors.count, 0)
+    }
+
+    // MARK: Old errors are not evidence about a new write
+
+    /// 🛑 **A row written before the save says nothing about the save.** This is
+    /// the fingerprint that lets the wait loop tell the two apart.
+    func testTheSnapshotSeparatesOldErrorsFromNewOnes() throws {
+        try fixture.insert(id: 630, calendar: 10, summary: "theirs", unique: "u-old")
+        try fixture.run(
+            "INSERT INTO Error (ROWID, calendaritem_owner_id, error_type, error_code) "
+            + "VALUES (1, 630, 1, 3);")
+
+        let before = try XCTUnwrap(SyncStore.errorSnapshot())
+
+        try fixture.insert(id: 631, calendar: 10, summary: "mine", unique: "u-new")
+        try fixture.run(
+            "INSERT INTO Error (ROWID, calendaritem_owner_id, error_type, error_code) "
+            + "VALUES (2, 631, 1, 3);")
+
+        let now = SyncStore.failures()
+        XCTAssertEqual(now.count, 2)
+        XCTAssertEqual(now.filter(before.isNew).map(\.itemRowid), [631])
+    }
+
+    /// An empty store still gives a usable snapshot, so the first error a write
+    /// produces is recognised as new.
+    func testAnEmptySnapshotCallsEveryLaterErrorNew() throws {
+        let before = try XCTUnwrap(SyncStore.errorSnapshot())
+        try fixture.insert(id: 640, calendar: 10, summary: "mine", unique: "u-first")
+        try fixture.run(
+            "INSERT INTO Error (ROWID, calendaritem_owner_id, error_type, error_code) "
+            + "VALUES (1, 640, 1, 3);")
+
+        XCTAssertEqual(SyncStore.failures().filter(before.isNew).count, 1)
+    }
+
+    /// ⚠️ **An unreadable store yields no snapshot at all**, and the caller must
+    /// poll to its deadline rather than treat every error as new.
+    func testAnUnreadableStoreYieldsNoSnapshot() {
+        setenv("APPLE_CALENDAR_DB_PATH", "/nonexistent/Calendar.sqlitedb", 1)
+        XCTAssertNil(SyncStore.errorSnapshot())
+    }
 }
 
 // MARK: - Degrading safely

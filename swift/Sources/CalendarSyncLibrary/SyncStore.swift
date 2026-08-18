@@ -95,6 +95,25 @@ public enum SyncStore {
     }
 
     public struct Failure: Encodable {
+        /// `Error.ROWID`. Not encoded — it exists so a write can tell an error
+        /// that already existed from one its own save produced.
+        ///
+        /// 🛑 **A pre-existing error must never be read as evidence about a
+        /// write that had not happened yet.** That is exactly what made `add`
+        /// fail at t=0 on a healthy calendar: another event's stale row was
+        /// treated as this write's refusal. The table is AUTOINCREMENT — its
+        /// `sqlite_sequence` high-water mark stands at 1304 on a machine whose
+        /// `Error` table is empty — so a rowid is never reused and a set of
+        /// them is a sound before/after fingerprint.
+        public let rowid: Int64
+        /// `Error.calendaritem_owner_id`, the `CalendarItem.ROWID` this error
+        /// belongs to. Nil for a calendar- or store-scoped row.
+        ///
+        /// 🛑 **Matching on `calendar` instead is the bug this field fixes.**
+        /// An item-scoped error names one item, and comparing only its calendar
+        /// attaches it to every event in that calendar forever, since EventKit
+        /// never clears the row.
+        public let itemRowid: Int64?
         /// Which of the three owner columns the `Error` row names.
         public let scope: String            // "item" | "calendar" | "store"
         public let errorCode: Int
@@ -317,6 +336,36 @@ public enum SyncStore {
         return Int(description[range.upperBound..<end].trimmingCharacters(in: .whitespaces))
     }
 
+    /// The set of `Error` rows that existed at one moment.
+    ///
+    /// 🛑 **A write is judged only on errors that are NEW.** `add` used to give
+    /// up the instant it saw any error on the calendar, so one stale row from
+    /// an unrelated event aborted the poll at t=0 — before the ~4s round trip a
+    /// healthy write needs — and the command reported a failure for an event
+    /// the server had taken. An error recorded before the save cannot say
+    /// anything about the save.
+    public struct ErrorSnapshot {
+        let rowids: Set<Int64>
+
+        public init(rowids: Set<Int64>) { self.rowids = rowids }
+
+        /// True when this row was written after the snapshot was taken.
+        public func isNew(_ failure: Failure) -> Bool {
+            !rowids.contains(failure.rowid)
+        }
+    }
+
+    /// Reads the `Error` table's rowids, for a caller about to write.
+    ///
+    /// Returns nil when the store cannot be read. A caller that gets nil must
+    /// poll to its deadline rather than treat every error as new — see
+    /// `SyncConfirmation.wait`.
+    public static func errorSnapshot() -> ErrorSnapshot? {
+        guard let handle = open() else { return nil }
+        defer { sqlite3_close(handle) }
+        return ErrorSnapshot(rowids: Set(failures(handle).map(\.rowid)))
+    }
+
     /// Every row of the `Error` table, with its owner columns resolved to names.
     ///
     /// ⚠️ **An empty result does not mean the store is healthy.** In the second
@@ -339,7 +388,8 @@ public enum SyncStore {
         let sql = """
             SELECT e.error_code, e.error_type, e.user_info,
                    ci.summary, c.title, s.name,
-                   e.calendaritem_owner_id, e.calendar_owner_id, e.store_owner_id
+                   e.calendaritem_owner_id, e.calendar_owner_id, e.store_owner_id,
+                   e.ROWID
             FROM Error e
             LEFT JOIN CalendarItem ci ON ci.ROWID = e.calendaritem_owner_id
             LEFT JOIN Calendar c ON c.ROWID = COALESCE(ci.calendar_id, e.calendar_owner_id)
@@ -362,8 +412,9 @@ public enum SyncStore {
                 ?? chain.first
             let httpStatus = chosen?.code
             let domain = chosen?.domain
+            let itemOwner = sqlite3_column_int64(row, 6)
             let scope: String
-            if sqlite3_column_int64(row, 6) != 0 {
+            if itemOwner != 0 {
                 scope = "item"
             } else if sqlite3_column_int64(row, 7) != 0 {
                 scope = "calendar"
@@ -373,6 +424,8 @@ public enum SyncStore {
                 scope = "unknown"
             }
             found.append(Failure(
+                rowid: sqlite3_column_int64(row, 9),
+                itemRowid: itemOwner == 0 ? nil : itemOwner,
                 scope: scope,
                 errorCode: Int(sqlite3_column_int(row, 0)),
                 errorType: Int(sqlite3_column_int(row, 1)),
@@ -445,7 +498,7 @@ public enum SyncStore {
 
         let sql = """
             SELECT ci.external_id, ci.external_mod_tag, ci.orig_item_id,
-                   s.type, s.name, c.title
+                   s.type, s.name, c.title, ci.ROWID
             FROM CalendarItem ci
             JOIN Calendar c ON c.ROWID = ci.calendar_id
             JOIN Store s ON s.ROWID = c.store_id
@@ -462,10 +515,19 @@ public enum SyncStore {
             let backend = Backend(rawValue: Int(sqlite3_column_int(row, 3)))
             let storeName = text(row, 4)
             let calendarName = text(row, 5)
+            let itemRowid = sqlite3_column_int64(row, 6)
 
+            // 🛑 **An item-scoped error names ONE item, so compare the item.**
+            // The old filter asked only whether *some* item was named and
+            // whether the calendar matched, which attached every item error on
+            // a calendar to every event on it. Measured 2026-08-18: one stale
+            // HTTP 400 from a counter-proposal on somebody else's invite made
+            // every later `add` on that calendar fail, while the writes landed
+            // and synced correctly. EventKit never clears the row, so the
+            // calendar could never report a successful write again.
             let mine = all.filter { failure in
                 switch failure.scope {
-                case "item": return failure.item != nil && failure.calendar == calendarName
+                case "item": return failure.itemRowid == itemRowid
                 case "calendar": return failure.calendar == calendarName
                 case "store": return failure.store == storeName
                 default: return false
@@ -516,9 +578,18 @@ public enum SyncStore {
                 state = .synced
             }
 
+            // ⚠️ **A synced item cannot be blamed for a broad error.** Its
+            // push succeeded, so a calendar- or store-scoped row is about
+            // something else and printing it beside `state: synced` reads as a
+            // failure. Its own item-scoped rows stay — those are real, and an
+            // edit can fail after a create succeeded.
+            let reported = (state == .synced || state == .notApplicable)
+                ? mine.filter { $0.scope == "item" }
+                : mine
+
             result = Status(state: state, reason: reason, backend: backend?.name,
                             externalId: externalId, hasModTag: modTag != nil,
-                            detached: detached, errors: mine)
+                            detached: detached, errors: reported)
         }
 
         return result ?? .unknown("no row in Calendar.sqlitedb for this event")
@@ -575,7 +646,7 @@ public enum SyncStore {
 
         var sql = """
             SELECT ci.summary, c.title, s.name, s.type, ci.start_date,
-                   ci.unique_identifier
+                   ci.unique_identifier, ci.ROWID
             FROM CalendarItem ci
             JOIN Calendar c ON c.ROWID = ci.calendar_id
             JOIN Store s ON s.ROWID = c.store_id
@@ -601,9 +672,14 @@ public enum SyncStore {
             let raw = sqlite3_column_double(row, 4)
             let start = raw == 0 ? nil : Date(timeIntervalSinceReferenceDate: raw)
 
+            // Same rule `status(...)` follows: an item-scoped error belongs
+            // to one item, and hanging it on every unsynced event in the
+            // calendar names the wrong cause.
+            let itemRowid = sqlite3_column_int64(row, 6)
             let mine = all.filter { failure in
                 switch failure.scope {
-                case "item", "calendar": return failure.calendar == calendarName
+                case "item": return failure.itemRowid == itemRowid
+                case "calendar": return failure.calendar == calendarName
                 case "store": return failure.store == storeName
                 default: return false
                 }

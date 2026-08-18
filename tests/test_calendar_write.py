@@ -877,3 +877,63 @@ class TestInviteesIsReadOnly(LiveCalendarTest):
         code, _, err = run("invite", event["id"], check=False)
         self.assertNotEqual(code, 0)
         self.assertIn("invitees", err)
+
+
+class TestInvitationsAreReadOnly(LiveCalendarTest):
+    """🛑 An invitation you received belongs to whoever organized it.
+
+    `edit` used to change one locally and report success. The server then
+    reverts or refuses it, silently — the same failure `invite` has refused
+    since it shipped. Measured 2026-08-18: Google answered HTTP 400 to a
+    new-time proposal on an Outlook invite, and the Error row it wrote poisoned
+    every later write on that calendar.
+
+    ⚠️ The guard tests "am I an attendee", not "am I the organizer". On a
+    delegated calendar the organizer is somebody else and the user is not
+    invited, and a write there really does sync. Surveyed on this machine over
+    30 days: 71 events with no organizer, 2 organized by the user, 14 real
+    invitations, and 1 event on a shared calendar the user was not invited to.
+    An organizer-only check would have wrongly refused that last one.
+    """
+
+    @staticmethod
+    def _an_invitation():
+        """A real invitation from somebody else, or None."""
+        for event in run_json("events", "--days", "90"):
+            organizer = event.get("organizer")
+            if not organizer or organizer.get("is_me"):
+                continue
+            if any(a.get("is_me") for a in event.get("attendees") or []):
+                return event
+        return None
+
+    def test_edit_refuses_an_invitation_from_somebody_else(self):
+        event = self._an_invitation()
+        if event is None:
+            self.skipTest("no invitations from other people in the next 90 days")
+
+        args = ["edit", event["id"], "--title", "should never be written"]
+        if event.get("occurrence"):
+            args += ["--occurrence", event["occurrence"]]
+
+        code, _, err = run(*args, check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("invitation", err.lower())
+        # The refusal must name the organizer, so the user knows who to ask.
+        organizer = event["organizer"]
+        self.assertIn(organizer.get("email") or organizer["name"], err)
+        # And it must say what to do instead, since no API can propose a time.
+        self.assertIn("Propose New Time", err)
+
+        # Nothing was written.
+        after = run_json("show", event["id"], *(
+            ["--occurrence", event["occurrence"]] if event.get("occurrence") else []
+        ))
+        self.assertEqual(after["title"], event["title"])
+
+    def test_the_guard_does_not_fire_on_an_event_you_organize(self):
+        """A fixture event has no organizer at all, so `edit` must proceed."""
+        event = self.add("guard-noop", "--start", f"{TEST_YEAR}-04-20 09:00")
+        run("edit", event["id"], "--title", self.title("guard-noop-renamed"))
+        self.assertTrue(
+            self.get(event["id"])["title"].endswith("guard-noop-renamed"))

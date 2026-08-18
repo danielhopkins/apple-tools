@@ -279,6 +279,54 @@ enum Attendees {
     return nil
   }
 
+  /// Whether this event will accept a change to its own fields.
+  ///
+  /// 🛑 **An invitation you received belongs to its organizer.** Changing its
+  /// time, title or location locally appears to succeed and is then reverted or
+  /// refused by the server. Measured 2026-08-18: Google answered **HTTP 400**
+  /// to a new-time proposal on an Outlook invite, and the `Error` row it wrote
+  /// then sat in the store forever. `invite` has refused this since it shipped;
+  /// `edit` did not, so it silently did the thing `invite` exists to prevent.
+  ///
+  /// ⚠️ **The test is "am I an attendee", not "am I the organizer".** Those are
+  /// not the same question. On a delegated calendar the organizer is somebody
+  /// else and the user is not invited, and a write there really does sync —
+  /// 7 of 9 enabled calDAV calendars on this machine are delegated. Refusing on
+  /// the organizer alone would invent a refusal for every one of them. Being in
+  /// the attendee list of an event you did not organize is what makes it an
+  /// invitation.
+  ///
+  /// 🛑 **There is no propose-new-time to offer instead.** EventKit has no such
+  /// API: no match for "propos" or "counter" in its public headers or its
+  /// framework binary, and none in CalendarDaemon. Every symbol
+  /// (`_supportsProposeNewTime`, `_bringUpMailComposeWindowWithProposalStart:
+  /// withAttendee:withEvent:`) lives inside the Calendar.app binary, which has
+  /// no scripting term for it either. So the refusal points at Calendar.app.
+  static func editRefusal(_ event: EKEvent) -> String? {
+    guard let organizer = event.organizer, !organizer.isCurrentUser else { return nil }
+    guard let attendees = event.attendees,
+      attendees.contains(where: { $0.isCurrentUser })
+    else { return nil }
+
+    // ⚠️ Print the address alongside the name. A server can store a name that
+    // is itself a mangled address — this event's organizer reads
+    // "bryce ambraziunas.com" — and a refusal that names nobody recognisable is
+    // a refusal the user cannot act on.
+    let address = AttendeeAddress.of(organizer)
+    let who = [organizer.name, address.map { "<\($0)>" }]
+      .compactMap { $0 }
+      .joined(separator: " ")
+    return """
+      '\(event.title ?? "this event")' is an invitation from \(who.isEmpty ? "someone else" : who), \
+      so only they can \
+      change it. A local change here would be reverted or refused by the server, and \
+      nothing would say so.
+      To suggest a different time, open the event in Calendar.app and use \
+      "Propose New Time" — there is no API for that, so this tool cannot do it.
+      Pass --force to change the local copy anyway.
+      """
+  }
+
   /// One line per invitee for the human output.
   static func describe(_ attendee: AttendeeInfo) -> String {
     let who = [attendee.name, attendee.email.map { "<\($0)>" }]
