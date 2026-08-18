@@ -1,6 +1,7 @@
 import AppleToolsStyle
 import AppleToolsVersion
 import ArgumentParser
+import CalendarSyncLibrary
 import EventKit
 import Foundation
 import TCCResponsibility
@@ -205,15 +206,27 @@ struct EventInfo: Encodable {
     let organizer: AttendeeInfo?
     /// The current user's own response, when they are an invitee.
     let myStatus: String?
+    /// Whether the write reached the server.
+    ///
+    /// 🛑 Set by `add` and `edit` only, and absent everywhere else. EventKit
+    /// saving is local and the push to the server happens afterwards, so a
+    /// populated event record is not evidence the server took it. Measured
+    /// 2026-08-18: `add` returned this whole structure, exit 0, for a write
+    /// Google CalDAV refused with HTTP 403.
+    ///
+    /// `events --json` deliberately does NOT carry it — the answer costs a
+    /// SQLite lookup per event, and the question only matters right after a
+    /// write. Ask `sync-status` for one event, or `unsynced` for all of them.
+    let sync: SyncStore.Status?
 
     enum CodingKeys: String, CodingKey {
         case id, title, calendar, start, end, allDay, location, geo, notes, url
-        case recurring, occurrence, recurrence, attendees, organizer
+        case recurring, occurrence, recurrence, attendees, organizer, sync
         case myStatus = "my_status"
     }
 }
 
-private func info(_ event: EKEvent) -> EventInfo {
+private func info(_ event: EKEvent, sync: SyncStore.Status? = nil) -> EventInfo {
     EventInfo(
         id: event.eventIdentifier ?? "",
         title: event.title ?? "<untitled>",
@@ -232,11 +245,12 @@ private func info(_ event: EKEvent) -> EventInfo {
         recurrence: RecurrenceInfo(event.recurrenceRules?.first),
         attendees: Attendees.list(event),
         organizer: Attendees.organizer(event),
-        myStatus: Attendees.myStatus(event)
+        myStatus: Attendees.myStatus(event),
+        sync: sync
     )
 }
 
-private func printJSON<T: Encodable>(_ value: T) {
+func printJSON<T: Encodable>(_ value: T) {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     guard let data = try? encoder.encode(value),
@@ -295,7 +309,7 @@ func writableCalendarNameCompletion(_ arguments: [String]) -> [String] {
 
 // MARK: - Calendar lookup
 
-private func calendars(named names: [String]) throws -> [EKCalendar] {
+func calendars(named names: [String]) throws -> [EKCalendar] {
     let all = store.calendars(for: .event)
     guard !names.isEmpty else { return all }
 
@@ -342,7 +356,7 @@ private func writableCalendar(named name: String?) throws -> EKCalendar {
 /// *series master* — the first occurrence, which can be years before the one
 /// the caller actually saw in `events`. Passing `occurrence` resolves the
 /// specific instance instead by scanning the day it falls on.
-private func event(withId id: String, occurrence: Date? = nil) throws -> EKEvent {
+func event(withId id: String, occurrence: Date? = nil) throws -> EKEvent {
     guard let master = store.event(withIdentifier: id) else {
         throw ValidationError("no event with id '\(id)'")
     }
@@ -439,10 +453,14 @@ struct AppleCalendar: ParsableCommand {
             apple-calendar events --search "swim" --days 30
             apple-calendar add "Dentist" --start "tomorrow 2pm" --duration 45
             apple-calendar edit <id> --occurrence <occurrence> --start "3pm"
+            apple-calendar unsynced                       # writes the server never took
+            apple-calendar sync-errors                    # what Calendar recorded and hid
           """,
         version: appleToolsVersion,
         subcommands: [Calendars.self, Events.self, Show.self, Add.self, Edit.self,
-                      Invitees.self, Invite.self, Delete.self, Status.self],
+                      Invitees.self, Invite.self, Delete.self,
+                      SyncStatusCommand.self, SyncErrors.self, Unsynced.self,
+                      Status.self],
         defaultSubcommand: Events.self
     )
 }
@@ -596,7 +614,7 @@ struct Events: ParsableCommand {
         found.sort { ($0.startDate ?? .distantPast) < ($1.startDate ?? .distantPast) }
 
         if json {
-            printJSON(found.map(info))
+            printJSON(found.map { info($0) })
         } else if found.isEmpty {
             print("No events found")
         } else {
@@ -739,6 +757,8 @@ struct Add: ParsableCommand {
     @Flag(name: .long, help: "Output the created event as JSON")
     var json = false
 
+    @OptionGroup var sync: SyncConfirmationOptions
+
     func validate() throws {
         try recurrence.validate()
         _ = try URLChange.parse(url)
@@ -826,8 +846,12 @@ struct Add: ParsableCommand {
         // earlier occurrence for a span to be relative to.
         try store.save(event, span: .thisEvent, commit: true)
 
+        // 🛑 Confirm the SERVER took it, before printing anything that reads as
+        // success. `store.save` returning is only a local write.
+        let syncStatus = try SyncConfirmation.check(event: event, options: sync)
+
         if json {
-            printJSON(info(event))
+            printJSON(info(event, sync: syncStatus))
         } else {
             print("Created '\(name)' — \(describe(event))")
             if let pattern = RecurrenceInfo(event.recurrenceRules?.first) {
@@ -890,6 +914,8 @@ struct Edit: ParsableCommand {
     @Flag(name: .long, help: "Output the updated event as JSON")
     var json = false
 
+    @OptionGroup var sync: SyncConfirmationOptions
+
     func validate() throws {
         try recurrence.validate()
         _ = try URLChange.parse(url)
@@ -951,6 +977,11 @@ struct Edit: ParsableCommand {
                 event.recurrenceRules = nil
             }
         }
+        // 🛑 Snapshot BEFORE the save. An edit is confirmed by what changed,
+        // and `external_id` was already set by the create, so there is nothing
+        // to compare against afterwards.
+        let syncBaseline = SyncConfirmation.baseline(for: match)
+
         apply(to: match, warn: true)
 
         if let startDate = match.startDate, let endDate = match.endDate, endDate < startDate {
@@ -1028,8 +1059,14 @@ struct Edit: ParsableCommand {
                 """)
         }
 
+        // 🛑 The local read-back above proves the change is in EventKit. It
+        // says nothing about the server, which is a separate failure with a
+        // separate signal.
+        let syncStatus = try SyncConfirmation.check(
+            event: saved, options: sync, against: syncBaseline)
+
         if json {
-            printJSON(info(saved))
+            printJSON(info(saved, sync: syncStatus))
         } else {
             print("Updated '\(saved.title ?? "<untitled>")' — \(describe(saved))")
             if let pattern = RecurrenceInfo(saved.recurrenceRules?.first) {
