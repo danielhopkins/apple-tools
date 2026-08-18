@@ -1,4 +1,5 @@
 import Contacts
+import ContactsLibrary
 import Foundation
 
 /// Contacts stores its built-in labels wrapped as `_$!<Home>!$_`. Custom labels
@@ -70,6 +71,11 @@ enum Labels {
         "applewatch": CNLabelPhoneNumberAppleWatch,
     ]
 
+    private static let addressLabels: [String: String] = [
+        "home": CNLabelHome, "work": CNLabelWork, "school": CNLabelSchool,
+        "other": CNLabelOther,
+    ]
+
     /// URLs have their own vocabulary — `homepage`, and none of email's
     /// `icloud`. This used to be `emailLabels`, a copy-paste that accepted a
     /// label URLs do not have and rejected the one they do.
@@ -93,6 +99,11 @@ enum Labels {
     static func email(_ name: String) -> String { emailLabels[normalize(name)] ?? name }
     static func phone(_ name: String) -> String { phoneLabels[normalize(name)] ?? name }
     static func url(_ name: String) -> String { urlLabels[normalize(name)] ?? name }
+
+    /// Postal addresses take only the four generic labels. There is no
+    /// address-specific constant in the SDK, unlike email's `icloud` or URL's
+    /// `homepage`, so this table is deliberately the short one.
+    static func address(_ name: String) -> String { addressLabels[normalize(name)] ?? name }
 
     /// Relations resolve against the generated SDK vocabulary. Anything else is
     /// kept as a plain custom label, which is exactly how Contacts.app stores a

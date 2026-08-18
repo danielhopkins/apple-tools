@@ -24,7 +24,7 @@ these tools is that the edge cases are already handled.
 | `apple maps` | visited places with coordinates, visits, saved guides | no, and never |
 | `apple reminders` | lists, items, due dates | **yes** |
 | `apple calendar` | calendars, events, **invitees with RSVP status** | **yes** — and `invite` **emails real people** |
-| `apple contacts` | names, emails, phones, addresses, notes | **yes** (except notes and postal addresses) |
+| `apple contacts` | names, emails, phones, addresses, notes | **yes** (except notes) |
 
 ## Rules
 
@@ -531,6 +531,56 @@ will empty and writes nothing. Say what those are before doing it for real.
 copying the record reads the note and that needs an entitlement no CLI can hold.
 Tell the user to drag that card between accounts in Contacts.app instead —
 don't try another route.
+
+## Who is this contact connected to?
+
+```
+apple contacts relations <id> --json      # both directions
+apple contacts link A B --relation spouse # writes BOTH cards
+apple contacts unlink A B --relation friend
+```
+
+🛑 **A relation stores a NAME, not a link to the other card.** So a name can
+match nobody, or several people. Read `matches` in the JSON before saying who
+someone is related to — `1` means it resolved, `0` means the name matches no
+contact, `2+` means it is ambiguous.
+
+**`related_from` is the half people usually mean.** It scans every card for
+anyone naming this contact. On a real store one person listed three brothers and
+none of them listed him back, so the two directions genuinely differ.
+
+⚠️ **`link` edits the other person's card too.** Confirm with the user before
+running it. Use `--dry-run` first; it resolves and prints the plan without
+writing. Contacts writes sync everywhere and have no undo.
+
+**A gendered label inverts to the neutral term.** `--relation father` gives the
+other card `child`; `brother` gives `sibling`. That is not a guess — `child` is
+the term for "son or daughter". Pass `--inverse son` when the specific word
+matters. ⚠️ Do not guess someone's gender to pick one.
+
+⚠️ **Seven labels are refused** because Contacts defines no label for the other
+side: `stepbrother`, `stepsister`, `grandaunt`, `granduncle`, `grandnephew`,
+`grandniece` and `teacher`. Everything else everyday inverts, including
+aunt/uncle and nephew/niece.
+
+**Use `link`, never `edit --relation`, to add one relation.** `edit` replaces the
+whole set, so it silently deletes every relation you did not re-pass.
+
+**Postal addresses are writable now.** `--address` on `add` and `edit`, free
+text or exact fields:
+
+```
+apple contacts edit ID --address "home:500 W Madison St, Chicago, IL 60661"
+apple contacts edit ID --address "work:street=1 Radicle Way;city=Chicago;state=IL;zip=60601"
+```
+
+⚠️ **The free-text parse is a guess and the tool prints what it decided.** Read
+that line. It handles `street, city, STATE ZIP, country` and knows nothing about
+other countries' conventions. When it is wrong, use `key=value`. What `get`
+prints can be passed straight back, since `zip` and `postalCode` both work.
+
+⚠️ **Like every multi-value flag here, `--address` replaces the whole set.** Read
+the contact first and re-pass the addresses you want to keep.
 
 **Contact notes cannot be written.** They are readable, but writing needs an
 Apple-granted entitlement no CLI can hold, so `--note` is rejected. Tell the user

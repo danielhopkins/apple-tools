@@ -3,6 +3,7 @@ import AppleToolsStyle
 import AppleToolsVersion
 import ArgumentParser
 import Contacts
+import ContactsLibrary
 import Foundation
 import TCCResponsibility
 
@@ -720,6 +721,12 @@ private func confirmWritten(_ fields: ContactFields, on saved: CNContact, name: 
     check(
         "relation", wanted: fields.relations,
         stored: saved.contactRelations.map { ($0.label, $0.value.name) })
+    // 🛑 Compare every field, not just the street. A parse that put the city in
+    // the street would otherwise write a wrong address and report success.
+    check(
+        "address",
+        wanted: fields.addresses.map { ($0.label, PostalAddress.describe($0.value)) },
+        stored: saved.postalAddresses.map { ($0.label, PostalAddress.describe($0.value)) })
     check(
         "date",
         wanted: fields.dates.map { ($0.label, ContactDate.format($0.value) ?? "") },
@@ -817,7 +824,9 @@ struct AppleContacts: ParsableCommand {
           """,
         version: appleToolsVersion,
         subcommands: [Search.self, Get.self, List.self, Add.self, Edit.self, Move.self,
-                      Delete.self, Export.self, Groups.self, Containers.self, Status.self],
+                      Delete.self, Export.self, Groups.self,
+                      Relations.self, Link.self, Unlink.self,
+                      Containers.self, Status.self],
         defaultSubcommand: Search.self)
 
     static func plainText(_ contacts: [ContactInfo]) -> String { plain(contacts) }
@@ -1007,6 +1016,13 @@ struct ContactFields: ParsableArguments {
 
     @Option(
         name: .long,
+        help: """
+          Postal address, optionally labelled:           'home:124 Gregory St, Chicago, IL 60601'. Or exactly:           'home:street=124 Gregory St;city=Chicago;state=IL;zip=60601'.           Repeat to set several; replaces existing.
+          """)
+    var address: [String] = []
+
+    @Option(
+        name: .long,
         help: "Relation as LABEL:NAME, e.g. 'father:Robert Hopkins'. Repeat to set several; replaces existing.")
     var relation: [String] = []
 
@@ -1027,6 +1043,7 @@ struct ContactFields: ParsableArguments {
             && department == nil && jobTitle == nil && birthday == nil
             && anniversary == nil && email.isEmpty && phone.isEmpty
             && url.isEmpty && relation.isEmpty && date.isEmpty
+            && address.isEmpty
     }
 
     /// Splits "father:Robert Hopkins" on the FIRST colon only, so values that
@@ -1094,6 +1111,32 @@ struct ContactFields: ParsableArguments {
                 throw ValidationError("could not parse date '\(value)' in --date \(entry); use YYYY-MM-DD or --MM-DD")
             }
         }
+        // 🛑 Parse every address BEFORE any Apple Event. A bad one must fail
+        // here, not halfway through a save, and not silently as an address
+        // with fields missing. The free-text parse is a guess, so it is echoed.
+        for entry in address {
+            let (_, value) = split(entry)
+            guard !value.isEmpty else {
+                throw ValidationError("--address \(entry) has no address after the colon")
+            }
+            let parsed: CNMutablePostalAddress
+            do {
+                parsed = try PostalAddress.parse(value)
+            } catch let error as PostalAddress.ParseError {
+                throw ValidationError("--address \(entry): \(error.description)")
+            }
+            if !PostalAddress.isStructured(value) {
+                // ⚠️ Always show what the heuristic decided. It knows one
+                // shape, `street, city, STATE ZIP, country`, and nothing
+                // about any other country. Showing the split is the only way
+                // a wrong one is visible before it is written.
+                FileHandle.standardError.write(Data("""
+                    note: read '\(value)' as \(PostalAddress.describe(parsed))
+                          Use street=…;city=…;state=…;zip=… if that is wrong.
+
+                    """.utf8))
+            }
+        }
         for entry in relation {
             let (label, value) = split(entry)
             guard let label else {
@@ -1139,6 +1182,11 @@ struct ContactFields: ParsableArguments {
         if !urls.isEmpty {
             contact.urlAddresses = urls.map {
                 CNLabeledValue(label: $0.label, value: $0.value as NSString)
+            }
+        }
+        if !addresses.isEmpty {
+            contact.postalAddresses = addresses.map {
+                CNLabeledValue(label: $0.label, value: $0.value)
             }
         }
         if !relations.isEmpty {
@@ -1203,6 +1251,19 @@ struct ContactFields: ParsableArguments {
         if !urls.isEmpty {
             setMulti(urls.map { ($0.label, $0.value as NSString) }, kABURLsProperty)
         }
+        if !addresses.isEmpty {
+            // ⚠️ AddressBook stores an address as a dictionary of its own keys,
+            // not as a CNPostalAddress. The spellings differ from the SDK's.
+            setMulti(addresses.map { entry -> (String?, NSDictionary) in
+                var fields: [String: String] = [:]
+                if !entry.value.street.isEmpty { fields[kABAddressStreetKey as String] = entry.value.street }
+                if !entry.value.city.isEmpty { fields[kABAddressCityKey as String] = entry.value.city }
+                if !entry.value.state.isEmpty { fields[kABAddressStateKey as String] = entry.value.state }
+                if !entry.value.postalCode.isEmpty { fields[kABAddressZIPKey as String] = entry.value.postalCode }
+                if !entry.value.country.isEmpty { fields[kABAddressCountryKey as String] = entry.value.country }
+                return (entry.label, fields as NSDictionary)
+            }, kABAddressProperty)
+        }
         if !relations.isEmpty {
             setMulti(relations.map { ($0.label, $0.value as NSString) }, kABRelatedNamesProperty)
         }
@@ -1234,6 +1295,16 @@ struct ContactFields: ParsableArguments {
     var phones: [(label: String?, value: String)] { parse(phone, Labels.phone) }
     var urls: [(label: String?, value: String)] { parse(url, Labels.url) }
     var relations: [(label: String?, value: String)] { parse(relation, Labels.relation) }
+
+    /// ⚠️ Parsed here rather than in `apply`, so a bad address is caught by
+    /// `validate()` before any Apple Event and before the AddressBook fallback
+    /// can see it. Both write paths and the post-write check then read the same
+    /// values, which is the rule `parse` was written for.
+    var addresses: [(label: String?, value: CNMutablePostalAddress)] {
+        parse(address, Labels.address).compactMap { entry in
+            (try? PostalAddress.parse(entry.value)).map { (entry.label, $0) }
+        }
+    }
 
     /// `--anniversary` is sugar for a labelled date, so the two inputs merge.
     var dates: [(label: String?, value: DateComponents)] {
@@ -2023,3 +2094,525 @@ if let help = HelpColor.requested(root: AppleContacts.self, arguments: CommandLi
 }
 
 AppleContacts.main()
+
+// MARK: - Relations between contacts
+
+/// 🛑 **A relation stores a NAME, not a reference.** Measured on this store: all
+/// 54 relation rows carry a `ZUNIQUEID`, all 54 are distinct, and none matches
+/// any contact record — that column is the relation row's own sync id.
+///
+/// So "who is this person connected to" is a name lookup done at read time, and
+/// it can return nothing or several people. Both are normal, not corruption.
+
+/// One relation, with whoever the name resolves to.
+struct RelationLink: Encodable {
+    let label: String?
+    let name: String
+    /// The contact this name matches, when exactly one does.
+    let contactId: String?
+    /// How many contacts the name matched. `0` and `2+` are both real answers.
+    let matches: Int
+
+    enum CodingKeys: String, CodingKey {
+        case label, name, matches
+        case contactId = "contact_id"
+    }
+}
+
+struct ReverseLink: Encodable {
+    let label: String?
+    /// The contact who names this person.
+    let contactId: String
+    let name: String
+
+    /// ⚠️ snake_case, matching `RelationLink` and every other id key here.
+    /// The synthesized encoder emits `contactId`, which reads as a different
+    /// field to anything parsing the output.
+    enum CodingKeys: String, CodingKey {
+        case label, name
+        case contactId = "contact_id"
+    }
+}
+
+struct RelationReport: Encodable {
+    let id: String
+    let name: String
+    let relations: [RelationLink]
+    /// ⚠️ Contacts has no reverse index, so this is a scan of every card. It is
+    /// the half people actually want — "who thinks I am their father" — and it
+    /// cannot be answered any other way.
+    let relatedFrom: [ReverseLink]
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, relations
+        case relatedFrom = "related_from"
+    }
+}
+
+/// Contacts whose display name matches `name` exactly, ignoring case.
+///
+/// ⚠️ Exact, not partial. A relation names a whole person, and a partial match
+/// would link `Dan` to `Danielle`.
+private func contactsNamed(_ name: String, in everyone: [CNContact]) -> [CNContact] {
+    let needle = name.lowercased().trimmingCharacters(in: .whitespaces)
+    guard !needle.isEmpty else { return [] }
+    return everyone.filter { displayName($0).lowercased() == needle }
+}
+
+struct Relations: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Show who a contact is connected to",
+        discussion: """
+          Resolves each relation's name against the address book, and also scans
+          for anyone who names this contact.
+
+          🛑 A relation stores a NAME, not a link. Renaming a contact silently
+          breaks every relation pointing at it, a relation can match nobody, and
+          it can match several people. `matches` reports which.
+          """)
+
+    @Argument(help: "Contact id, from `search --json`")
+    var id: String
+
+    @Flag(name: .long, help: "Output as JSON")
+    var json = false
+
+    func run() throws {
+        try requireContactsAccess()
+        let subject = try contact(withId: id)
+        let everyone = try allContacts()
+        let subjectName = displayName(subject)
+
+        let relations = subject.contactRelations.map { entry -> RelationLink in
+            let matched = contactsNamed(entry.value.name, in: everyone)
+            return RelationLink(
+                label: Labels.decode(entry.label),
+                name: entry.value.name,
+                contactId: matched.count == 1 ? matched[0].identifier : nil,
+                matches: matched.count)
+        }
+
+        // The reverse half. No index exists, so this is a full scan.
+        var reverse: [ReverseLink] = []
+        for other in everyone where other.identifier != subject.identifier {
+            for entry in other.contactRelations
+            where entry.value.name.lowercased() == subjectName.lowercased() {
+                reverse.append(ReverseLink(
+                    label: Labels.decode(entry.label),
+                    contactId: other.identifier,
+                    name: displayName(other)))
+            }
+        }
+
+        let report = RelationReport(
+            id: subject.identifier, name: subjectName,
+            relations: relations, relatedFrom: reverse)
+
+        if json {
+            printJSON(report)
+            return
+        }
+
+        print(subjectName)
+        if relations.isEmpty {
+            print("  (no relations)")
+        }
+        for link in relations {
+            let label = link.label.map { "\($0): " } ?? ""
+            switch link.matches {
+            case 1:
+                print("  \(label)\(link.name)  [\(link.contactId ?? "")]")
+            case 0:
+                print("  \(label)\(link.name)  (no contact with that name)")
+            default:
+                print("  \(label)\(link.name)  (\(link.matches) contacts share that name)")
+            }
+        }
+        if !reverse.isEmpty {
+            print("Named by:")
+            for link in reverse {
+                let label = link.label.map { "\($0): " } ?? ""
+                print("  \(link.name) \(label.isEmpty ? "" : "(\(label.dropLast(2)))")  [\(link.contactId)]")
+            }
+        }
+    }
+}
+
+/// Resolves a contact from an id or a name, refusing ambiguity.
+///
+/// ⚠️ **An ambiguous name is an error listing the candidates, never a guess.**
+/// Same rule `apple messages` applies to a chat and `apple maps` to a guide.
+/// Writing a relation onto the wrong card is a mistake nobody notices for
+/// months.
+private func resolveOne(_ reference: String, verb: String) throws -> CNContact {
+    if let found = try? contact(withId: reference) { return found }
+
+    let everyone = try allContacts()
+    let exact = contactsNamed(reference, in: everyone)
+    let candidates = exact.isEmpty
+        ? everyone.filter { matches($0, reference.lowercased()) }
+        : exact
+
+    switch candidates.count {
+    case 1:
+        return candidates[0]
+    case 0:
+        throw ValidationError("no contact matches '\(reference)'")
+    default:
+        let listed = candidates.prefix(10)
+            .map { "  \(displayName($0))  [\($0.identifier)]" }
+            .joined(separator: "\n")
+        throw ValidationError("""
+            '\(reference)' matches \(candidates.count) contacts; refusing to \
+            \(verb) without knowing which.
+            \(listed)
+            Pass the id.
+            """)
+    }
+}
+
+/// Compares two relation labels the way a human means them.
+///
+/// 🛑 **Raw labels are stored in two spellings and both are live.** This store
+/// holds `_$!<Father>!$_` on one card and a plain `Sibling` on another, and
+/// `Labels.decode` passes an unrecognised bare word through unchanged, capital
+/// letters and all. So comparing raw labels — or comparing an encoded label
+/// against a stored one — misses real matches.
+///
+/// Measured: `link Dan Mark --relation father` reported "would add" for a
+/// relation Dan already had, because `_$!<Father>!$_` != `Father`. A second run
+/// would have written a duplicate.
+private func sameRelationLabel(_ raw: String?, _ plain: String) -> Bool {
+    let stored = Labels.decode(raw) ?? raw ?? ""
+    return RelationGraph.normalize(stored) == RelationGraph.normalize(plain)
+}
+
+struct RelationChange: Encodable {
+    let contactId: String
+    let name: String
+    let label: String
+    let other: String
+    let changed: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case name, label, other, changed
+        case contactId = "contact_id"
+    }
+}
+
+/// Writes one contact's relation list, appending rather than replacing.
+///
+/// 🛑 **`--relation` replaces the whole set**, which is right for `edit` and
+/// wrong for adding one link. Getting a relation onto a card with `edit` means
+/// reading every existing relation and re-passing it, and forgetting one
+/// deletes it silently. That is the whole reason `link` exists.
+///
+/// ⚠️ Writes the **container-backed** record, not the unified merge — the same
+/// rule group membership follows, and for the same reason.
+private func writeRelations(
+    _ relations: [CNLabeledValue<CNContactRelation>], on subject: CNContact
+) throws {
+    let backing = (try? containerContact(withId: subject.identifier)) ?? subject
+    guard let mutable = backing.mutableCopy() as? CNMutableContact else {
+        throw RuntimeError("could not open '\(displayName(subject))' for writing")
+    }
+    mutable.contactRelations = relations
+    let request = CNSaveRequest()
+    request.update(mutable)
+    try store.execute(request)
+}
+
+struct Link: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Link two contacts to each other",
+        discussion: """
+          Appends a relation, unlike `edit --relation`, which replaces the whole
+          set. Both contacts may be named by id or by name; an ambiguous name is
+          refused listing the candidates.
+
+          `link A B --relation manager` reads "B is A's manager", so the label
+          describes the SECOND contact.
+
+          By default the inverse is written onto the other card too, so the link
+          reads correctly from both sides: that example also gives B an
+          `assistant` relation naming A. --no-inverse writes one side only.
+
+          🛑 The inverse is only inferred where it is unambiguous. `spouse` and
+          `friend` are symmetric; `parent` inverts to `child`. `father` does NOT
+          invert, because the other side is son or daughter and Contacts does
+          not record gender — pass --inverse to say which.
+
+          Examples:
+            apple-contacts link "Dan Hopkins" "Ross Hopkins" --as brother --inverse brother
+            apple-contacts link <id> <id> --as spouse
+            apple-contacts link <id> <id> --as father --inverse son
+          """)
+
+    @Argument(help: "The contact whose card names the other (id or name)")
+    var subject: String
+
+    @Argument(help: "The contact being named (id or name)")
+    var other: String
+
+    @Option(
+        name: .long,
+        help: """
+          How B relates to A: `link A B --relation manager` means B is A's           manager. e.g. brother, spouse, parent, manager.
+          """)
+    var relation: String
+
+    @Option(name: .long, help: "The label for the other card. Inferred when unambiguous.")
+    var inverse: String?
+
+    @Flag(name: .long, help: "Write only one side")
+    var noInverse = false
+
+    @Flag(name: .long, help: "Show what would change without writing")
+    var dryRun = false
+
+    @Flag(name: .long, help: "Output as JSON")
+    var json = false
+
+    func run() throws {
+        try requireContactsAccess()
+        let first = try resolveOne(subject, verb: "link")
+        let second = try resolveOne(other, verb: "link")
+
+        guard first.identifier != second.identifier else {
+            throw ValidationError("a contact cannot be linked to itself")
+        }
+
+        let firstName = displayName(first)
+        let secondName = displayName(second)
+
+        // Decide the inverse before writing anything, so a refusal costs nothing.
+        var inverseLabel: String?
+        if !noInverse {
+            if let explicit = inverse {
+                inverseLabel = explicit
+            } else if let inferred = RelationGraph.inverse(of: relation) {
+                inverseLabel = inferred
+            } else {
+                let suggestions = RelationGraph.inverseSuggestions(for: relation)
+                let hint = suggestions.isEmpty
+                    ? "Pass --inverse LABEL, or --no-inverse to write one side only."
+                    : "Pass --inverse "
+                        + suggestions.joined(separator: "/")
+                        + ", or --no-inverse to write one side only."
+                throw ValidationError(
+                    RelationGraph.ambiguityReason(for: relation) + ".\n" + hint)
+            }
+        }
+
+        func plan(on person: CNContact, label: String, naming name: String)
+            -> (relations: [CNLabeledValue<CNContactRelation>], changed: Bool)
+        {
+            let encoded = Labels.relation(label)
+            var existing = person.contactRelations
+            // ⚠️ Re-linking is a reported no-op, not an error and not a
+            // duplicate row. Same shape `groups add` uses.
+            let already = existing.contains {
+                sameRelationLabel($0.label, label)
+                    && $0.value.name.lowercased() == name.lowercased()
+            }
+            if !already {
+                existing.append(CNLabeledValue(
+                    label: encoded, value: CNContactRelation(name: name)))
+            }
+            return (existing, !already)
+        }
+
+        var changes: [RelationChange] = []
+        let forward = plan(on: first, label: relation, naming: secondName)
+        changes.append(RelationChange(
+            contactId: first.identifier, name: firstName,
+            label: relation, other: secondName, changed: forward.changed))
+
+        var back: (relations: [CNLabeledValue<CNContactRelation>], changed: Bool)?
+        if let inverseLabel {
+            back = plan(on: second, label: inverseLabel, naming: firstName)
+            changes.append(RelationChange(
+                contactId: second.identifier, name: secondName,
+                label: inverseLabel, other: firstName, changed: back!.changed))
+        }
+
+        if dryRun {
+            if json { printJSON(changes) } else { report(changes, dryRun: true) }
+            return
+        }
+
+        if forward.changed { try writeRelations(forward.relations, on: first) }
+        if let back, back.changed { try writeRelations(back.relations, on: second) }
+
+        // 🛑 Confirm through a fresh store. `CNSaveRequest` reporting success is
+        // not evidence the change persisted — `groups remove` saves without
+        // error and changes nothing at all on an iCloud group.
+        try confirmLinked(changes)
+
+        if json { printJSON(changes) } else { report(changes, dryRun: false) }
+    }
+
+    private func report(_ changes: [RelationChange], dryRun: Bool) {
+        for change in changes {
+            let verb = change.changed ? (dryRun ? "would add" : "added") : "already had"
+            print("\(change.name): \(verb) \(change.label) -> \(change.other)")
+        }
+        if dryRun { print("Nothing was written.") }
+    }
+}
+
+/// Re-reads each card from a fresh store and fails loudly if it does not hold
+/// what was asked for.
+private func confirmLinked(_ changes: [RelationChange]) throws {
+    let fresh = CNContactStore()
+    var missing: [String] = []
+    for change in changes {
+        let contact = try? fresh.unifiedContact(
+            withIdentifier: change.contactId, keysToFetch: readKeys)
+        let holds = contact?.contactRelations.contains {
+            sameRelationLabel($0.label, change.label)
+                && $0.value.name.lowercased() == change.other.lowercased()
+        } ?? false
+        if !holds {
+            missing.append("\(change.name): \(change.label) -> \(change.other)")
+        }
+    }
+    guard missing.isEmpty else {
+        throw RuntimeError("""
+            the save reported success but the store does not hold:
+            \(missing.map { "  \($0)" }.joined(separator: "\n"))
+            """)
+    }
+}
+
+struct Unlink: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Remove a relation between two contacts",
+        discussion: """
+          Removes the relation naming the other contact, from both cards by
+          default.
+
+          --relation narrows it to one label, and the OTHER card is matched on
+          that label's inverse: `--relation parent` removes `parent` from A and
+          `child` from B. When the inverse cannot be inferred — the gendered
+          labels — the other card is left alone and the command says so, rather
+          than clearing a relation it had to guess at.
+          """)
+
+    @Argument(help: "The contact whose card names the other (id or name)")
+    var subject: String
+
+    @Argument(help: "The contact being named (id or name)")
+    var other: String
+
+    @Option(
+        name: .long,
+        help: "Only remove this label. The other card is matched on its inverse.")
+    var relation: String?
+
+    @Flag(name: .long, help: "Leave the other card alone")
+    var noInverse = false
+
+    @Flag(name: .long, help: "Show what would change without writing")
+    var dryRun = false
+
+    @Flag(name: .long, help: "Output as JSON")
+    var json = false
+
+    func run() throws {
+        try requireContactsAccess()
+        let first = try resolveOne(subject, verb: "unlink")
+        let second = try resolveOne(other, verb: "unlink")
+        let firstName = displayName(first)
+        let secondName = displayName(second)
+
+        // 🛑 **The other card carries the INVERSE label, not the same one.**
+        // Filtering both sides on `--relation parent` removed `parent` from one
+        // card and left `child` on the other, while the command reported that it
+        // had removed both. Measured on real fixtures.
+        //
+        // ⚠️ When the inverse cannot be inferred — the gendered labels — the
+        // other card is left alone rather than cleared on a guess. Removing
+        // "any relation naming this person" would take an unrelated one they
+        // also carry.
+        var otherLabel: String?
+        var otherSkipped = false
+        if let relation {
+            if let inferred = RelationGraph.inverse(of: relation) {
+                otherLabel = inferred
+            } else if !noInverse {
+                otherSkipped = true
+            }
+        }
+
+        func plan(on person: CNContact, naming name: String, label: String?)
+            -> (relations: [CNLabeledValue<CNContactRelation>], gone: [String])
+        {
+            var gone: [String] = []
+            let kept = person.contactRelations.filter { entry in
+                let sameName = entry.value.name.lowercased() == name.lowercased()
+                let sameLabel = label.map { sameRelationLabel(entry.label, $0) } ?? true
+                if sameName && sameLabel {
+                    gone.append(Labels.decode(entry.label) ?? "(unlabelled)")
+                    return false
+                }
+                return true
+            }
+            return (kept, gone)
+        }
+
+        var removed: [RelationChange] = []
+        let forward = plan(on: first, naming: secondName, label: relation)
+        for label in forward.gone {
+            removed.append(RelationChange(
+                contactId: first.identifier, name: firstName,
+                label: label, other: secondName, changed: true))
+        }
+
+        var back: (relations: [CNLabeledValue<CNContactRelation>], gone: [String])?
+        if !noInverse && !otherSkipped {
+            back = plan(on: second, naming: firstName, label: otherLabel)
+            for label in back!.gone {
+                removed.append(RelationChange(
+                    contactId: second.identifier, name: secondName,
+                    label: label, other: firstName, changed: true))
+            }
+        }
+
+        if otherSkipped, let relation {
+            FileHandle.standardError.write(Data("""
+                note: \(RelationGraph.ambiguityReason(for: relation)), so \
+                '\(secondName)' was left alone.
+                      Clear that side with: apple contacts unlink \
+                <their id> <this id> --relation <label>
+
+                """.utf8))
+        }
+
+        guard !removed.isEmpty else {
+            let suffix = relation.map { " labelled \($0)" } ?? ""
+            print("No relation between '\(firstName)' and '\(secondName)'\(suffix).")
+            if json { printJSON([RelationChange]()) }
+            return
+        }
+
+        if dryRun {
+            if json { printJSON(removed) } else {
+                for change in removed {
+                    print("\(change.name): would remove \(change.label) -> \(change.other)")
+                }
+                print("Nothing was written.")
+            }
+            return
+        }
+
+        if !forward.gone.isEmpty { try writeRelations(forward.relations, on: first) }
+        if let back, !back.gone.isEmpty { try writeRelations(back.relations, on: second) }
+
+        if json { printJSON(removed) } else {
+            for change in removed {
+                print("\(change.name): removed \(change.label) -> \(change.other)")
+            }
+        }
+    }
+}

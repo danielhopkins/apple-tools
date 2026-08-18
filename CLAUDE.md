@@ -68,6 +68,8 @@ installed via `make install`.
 | Move one occurrence | `apple calendar edit <id> --occurrence 2026-09-21 --start "2026-09-21 14:00"` |
 | Find a person | `apple contacts search "smith" --json` |
 | Update a contact | `apple contacts edit <id> --company "New Co"` |
+| Who is this person linked to | `apple contacts relations <id>` |
+| Link two contacts | `apple contacts link <id> <id> --relation spouse` |
 | Move a contact between accounts | `apple contacts move <id> --to "iCloud" --dry-run` |
 | Export contacts | `apple contacts export --group "Family" -o family.vcf` |
 | List contact accounts | `apple contacts containers --json` |
@@ -1667,6 +1669,9 @@ apple contacts edit ID [FIELDS] [--json]
 apple contacts move ID --to CONTAINER [--dry-run] [--json]
 apple contacts delete ID
 apple contacts export ID... [--group GROUP] [-o FILE]   # vCard 3.0
+apple contacts relations ID [--json]               # who this contact links to, resolved
+apple contacts link A B --relation LABEL [--inverse LABEL] [--no-inverse] [--dry-run]
+apple contacts unlink A B [--relation LABEL] [--no-inverse] [--dry-run]
 apple contacts containers [--json]                 # accounts, and which is default
 apple contacts status [--json]                     # permission state, never prompts
 
@@ -1691,6 +1696,7 @@ FIELDS, shared by `add` and `edit`:
 --email    [LABEL:]ADDRESS   repeatable
 --phone    [LABEL:]NUMBER    repeatable
 --url      [LABEL:]URL       repeatable
+--address  [LABEL:]ADDRESS   repeatable
 --relation LABEL:NAME        repeatable
 --date     LABEL:DATE        repeatable
 ```
@@ -1717,6 +1723,42 @@ and confirm each labelled value asked for is really there, failing loudly
 otherwise. It is a subset check, because `get` returns the unified contact and a
 linked card can contribute values this edit never mentioned.
 
+**Postal addresses.** `--address` takes free text or exact fields:
+
+```
+apple contacts edit ID --address "home:500 W Madison St, Chicago, IL 60661"
+apple contacts edit ID --address "home:street=500 W Madison St;city=Chicago;state=IL;zip=60661"
+```
+
+Labels are the four generic ones — `home`, `work`, `school`, `other`. There is no
+address-specific constant in the SDK, unlike email's `icloud`.
+
+⚠️ **Free text is a guess, and the tool prints what it decided** on stderr before
+writing. It knows one shape, `street, city, STATE ZIP, country`, and nothing
+about any other country's conventions. When it gets one wrong, use the
+`key=value` form; `zip` and `postalCode` are both accepted, so what `get` prints
+can be passed straight back.
+
+🛑 **Three parse bugs were found by probing real addresses, and every one was
+silent.** They are pinned by tests in `swift/Tests/ContactsTests/`:
+
+| input | wrong result | why |
+|---|---|---|
+| `…, Cupertino, CA` | `country=CA` | a state abbreviation has no digits either |
+| `SW1A 2AA` | `state=SW1A;zip=2AA` | a UK postcode is one token pair, not two fields |
+| `ON M5H 2N2` | `state=ON M5H;zip=2N2` | a Canadian postcode is two tokens after a province |
+
+🛑 **A typo'd key is an error, not a dropped field.** `citty=Chicago` used to
+fall through to the free-text parser and land as a *street* reading
+`citty=Chicago`, with exit 0 — the same silent-drop failure the label encoders
+were fixed for. Anything of the form `word=` now goes to the structured parser,
+where an unknown key is refused naming the valid ones.
+
+🛑 **Never probe this parser by running `add`.** Seventeen contacts were created
+in the user's real iCloud to see how strings parsed, and they synced to every
+device before being deleted. `PostalAddress` lives in its own `ContactsLibrary`
+target so every such question is answered offline.
+
 **Relations.** `--relation father:"Robert Hopkins"`. All 216 relation labels the
 Contacts SDK defines are accepted — `father`, `mother`, `son`, `daughter`,
 `brother`, `sister`, `spouse`, `partner`, `grandfather`, `niece`, `colleague`,
@@ -1735,6 +1777,94 @@ no year.
 Search matches first/middle/last/nickname/company/department/job title/full name,
 email addresses, and phone numbers (digits only, so `7205551234` finds
 `+1 (720) 555-1234`). **JSON is the default**; pass `--plain` for human output.
+
+**Relationships between contacts.** `relations` reads them, `link` and `unlink`
+write them.
+
+```
+apple contacts relations <id>                       # both directions
+apple contacts link <id> <id> --relation spouse     # writes both cards
+apple contacts link A B --relation father --inverse son
+apple contacts unlink A B --relation friend
+```
+
+🛑 **A relation stores a NAME, not a reference.** Contacts.app renders one as a
+tappable link, which reads as though it holds the other card's id. It does not.
+Measured: all 54 relation rows here carry a `ZUNIQUEID`, all 54 values are
+distinct, and **none** matches any `ZABCDRECORD.ZUNIQUEID` — that column is the
+relation row's own sync id. Three consequences:
+
+- **Renaming a contact silently breaks every link to it.** Nothing updates.
+- **A relation can name nobody.** Two do on this store, and that is not corruption.
+- **A relation can name several people**, when two cards share a name. `matches`
+  in the JSON says which of the three you have.
+
+**`relations` reports both directions**, and the reverse half is the one people
+want. `related_from` is a scan of every card for anyone naming this contact —
+Contacts has no reverse index, so there is no cheaper way. 1.1s over 679
+contacts. On this store Dan lists three brothers and **none of them lists him
+back**; only his parents do.
+
+🛑 **`link` appends; `edit --relation` replaces.** That is the whole reason
+`link` exists. Adding one relation through `edit` means reading every existing
+one and re-passing it, and forgetting one deletes it silently.
+
+⚠️ **`link` writes the other card too, so it states a fact about someone else.**
+
+🛑 **A gendered label inverts to the NEUTRAL term, and that is not a guess.**
+`father` gives the other card `child`, `brother` gives `sibling`, `grandmother`
+gives `grandchild`. An earlier version refused these, reasoning that the other
+side is "son or daughter" and Contacts records no gender. That was wrong: `child`
+is exactly the term for "son or daughter", the SDK defines it, and writing it
+states nothing untrue. Pass `--inverse son` when you want the specific term.
+
+⚠️ **`husband` and `wife` are NOT symmetric.** If B is A's husband, A is B's wife
+*or* husband, so both invert to `spouse`.
+
+⚠️ **The inverse generalises; it does not round-trip.** `father` → `child`, and
+`child` → `parent`, not back to `father`. Correct — the child's card never
+recorded the parent's gender.
+
+🛑 **`ParentsSibling` and `SiblingsChild` are the SDK's neutral terms for
+aunt/uncle and nephew/niece.** An earlier version refused all four, claiming no
+such term existed. That came from searching for an obvious English word instead
+of reading the generated list. The table now covers **every everyday English
+label**: spouse, partner, boyfriend/girlfriend, the whole parent/child/sibling
+tree, grandparents, great-grandparents, step-family, birth order
+(`elderbrother` → `youngersibling`), and manager/assistant.
+
+**Seven labels are genuinely refused**, each checked against the label list
+rather than assumed: `stepbrother`/`stepsister` (no `Stepsibling`),
+`grandaunt`/`granduncle` and `grandnephew`/`grandniece` (no neutral either way),
+and `teacher` (the SDK defines no `Student`). The refusal names what to pass, and
+`--no-inverse` writes one side only.
+
+⚠️ **The remaining ~150 labels are specific kinship paths** —
+`AuntFathersElderBrothersWife` and the like — deliberately unmapped. They refuse
+cleanly and `--inverse` still works. `RelationCoverageTests` audits the table
+against the generated vocabulary, so a rule naming a label the SDK does not
+define fails the suite.
+
+🛑 **Relation labels are stored in two spellings, and both are live here.** One
+card holds `_$!<Father>!$_` and another a plain `Sibling`, and `Labels.decode`
+passes an unrecognised bare word through unchanged, capitals and all. Comparing
+raw labels misses real matches: `link` reported "would add" for a relation the
+contact already had, and a second run would have written a duplicate. Compare
+through `sameRelationLabel`, never on the raw string.
+
+- 🛑 **`unlink --relation L` matches the other card on L's INVERSE.** Filtering
+  both sides on the same label removed `parent` from one card and left `child`
+  on the other, while reporting that it had removed both. When the inverse
+  cannot be inferred, the other card is **left alone** and the command says so —
+  it never clears a relation it had to guess at.
+- **The label describes the SECOND contact.** `link A B --relation manager`
+  reads "B is A's manager", and gives B an `assistant` relation naming A.
+- **Both arguments take an id or a name.** An ambiguous name is refused listing
+  the candidates; an exact full-name match beats a partial one.
+- **Re-linking is a reported no-op**, not an error and not a duplicate row —
+  the same shape `groups add` uses. Read `changed`, not the exit code.
+- **Every write is confirmed against a fresh store** and fails loudly otherwise.
+- `--dry-run` resolves and prints the plan without writing.
 
 **Exporting.** `export` writes vCard 3.0 — what Contacts.app and every other
 address book imports. Takes any number of ids, `--group NAME` for a whole group,
@@ -1968,10 +2098,14 @@ swift/                    one Swift package, seven binaries
                           target so it can be tested against a synthetic store
   Sources/AppleContacts/  + Notes.swift (SQLite note reader),
                           Move.swift (the private cross-account move)
+  Sources/ContactsLibrary/  PostalAddress.swift — the --address parser, and
+                          RelationGraph.swift — which relation labels invert and
+                          which must never be guessed. Its own target so both
+                          are testable without writing a contact
   Sources/ObjCExceptions/ @try/@catch for Swift — the move raises rather
                           than returning when it hits the note wall
   Tests/RemindersTests/ MailTests/ MessagesTests/ PhoneTests/ MapsTests/
-        GeocodingTests/ CalendarSyncTests/
+        GeocodingTests/ CalendarSyncTests/ ContactsTests/
 notes/                    Python; apple-notes, notestore.py, notestore.proto,
                           mergeable.py (ZMERGEABLEDATA1 reader — recordings,
                           transcripts, summaries, and table cells),

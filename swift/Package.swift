@@ -122,6 +122,7 @@ let package = Package(
         .executableTarget(
             name: "apple-contacts",
             dependencies: [
+                "ContactsLibrary",
                 "AppleToolsVersion",
                 "AppleToolsStyle",
                 "TCCResponsibility",
@@ -194,6 +195,10 @@ let package = Package(
             path: "Sources/ApplePhone"
         ),
         .target(
+            name: "ContactsLibrary",
+            dependencies: []
+        ),
+        .target(
             name: "CalendarSyncLibrary",
             linkerSettings: [
                 // Calendar.sqlitedb is read directly, because EventKit exposes
@@ -235,6 +240,10 @@ let package = Package(
         .testTarget(
             name: "CalendarSyncTests",
             dependencies: ["CalendarSyncLibrary"]
+        ),
+        .testTarget(
+            name: "ContactsTests",
+            dependencies: ["ContactsLibrary"]
         ),
         .testTarget(
             name: "GeocodingTests",
