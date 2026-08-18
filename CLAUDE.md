@@ -61,6 +61,8 @@ installed via `make install`.
 | Recurring meeting | `apple calendar add "Board" --start … --repeat monthly --on-the "4th monday"` |
 | Fix a stale meeting link | `apple calendar edit <id> --url ""` |
 | See who is invited | `apple calendar events --days 7 --json` → `attendees`, `organizer`, `my_status` |
+| Did that write reach the server | `apple calendar sync-status <id>` |
+| Everything the server never took | `apple calendar unsynced` |
 | See the guest list (read-only) | `apple calendar invitees <id>` |
 | Invite someone (sends mail) | `apple calendar invite <id> --add a@b.com --dry-run` |
 | Move one occurrence | `apple calendar edit <id> --occurrence 2026-09-21 --start "2026-09-21 14:00"` |
@@ -1269,7 +1271,106 @@ apple calendar invite ID [--add ADDR]... [--remove ADDR]...
                        [--occurrence DATE | --series] [--future] [--dry-run] [--json]
 apple calendar delete ID [--occurrence DATE | --series] [--future]
 apple calendar status [--json]                # report permission state, never prompts
+
+apple calendar sync-status ID [--json]        # did this one write reach the server
+apple calendar unsynced [--calendar NAME] [--json]   # everything that did not
+apple calendar sync-errors [--json]           # what Calendar recorded and hid
+apple calendar resync ID [--dry-run] [--force] [--json]   # rebuild a stuck event
 ```
+
+🛑 **`add` and `edit` used to report success for a write the server refused.**
+EventKit saving is local; the push happens afterwards, so `store.save` returning
+says nothing about the server. Measured 2026-08-18: `add` returned a full,
+populated event record and exit 0 for a write Google CalDAV refused with **HTTP
+403**. The event sat in the local store forever and never reached the server.
+Calendar.app surfaced it hours later, by which time the caller had told the user
+it was on their calendar.
+
+**Both commands now confirm the server took the write before printing anything.**
+On by default. Measured round trip: **4.2s on calDAV, 3.1s on Exchange.**
+`--no-confirm-sync` opts out, `--sync-timeout` defaults to 30s. `add --json` and
+`edit --json` carry a `sync` object; `events --json` deliberately does not, since
+the answer costs a SQLite lookup per event.
+
+- **Read `confirmed`… read `sync.state`.** `synced` means the server has it.
+  `pending` at the deadline exits non-zero. `notApplicable` means there is no
+  server to reach. `unknown` means the tool could not check, which is **never**
+  reported as a failure.
+- ⚠️ **These four commands read `Calendar.sqlitedb`, which needs Full Disk
+  Access** — a different grant from the Calendar one everything else uses. Without
+  it the answer is `unknown`, and a good write must not be called broken.
+
+🛑 **`external_mod_tag` is the obvious signal and it is wrong.** Exchange never
+populates the ETag — **172 of 172 items**, including one written and confirmed
+synced during this work. A check keyed on it calls a healthy Exchange account
+100% broken. `external_id` is the only column that works on both backends.
+
+🛑 **A bare "empty `external_id`" scan reports 468 healthy events.** Three filters
+close that, each measured:
+
+| filter | rows it drops | why they are not unsynced |
+|---|---|---|
+| `orig_item_id = 0` | 329 | detached CalDAV occurrences never get an `external_id` |
+| store type in (1,2) | 139 | generated stores have no server — 138 Birthdays, 1 Siri |
+| `disabled = 0` | 0 today | 10 of 16 stores here are switched-off accounts |
+
+⚠️ **`orig_item_id` is `0` for a normal item, not NULL.** `IS NOT NULL` matches
+every row and reports the whole store as detached occurrences.
+
+🛑 **An edit cannot be confirmed by `external_id`** — the create already set one,
+so a presence check returns `synced` instantly for an edit the server never saw.
+`edit` snapshots before it saves. On calDAV the ETag moves (`"63922751442"` →
+`"63922751478"` at t+4s). ⚠️ **On Exchange nothing moves at all**: no ETag,
+`external_id` byte-identical, `sequence_num` and `modified_properties` unchanged.
+So an Exchange edit reports **`unknown` with the reason**, never `synced`.
+
+🛑 **The join is `(unique_identifier, calendar_id)`.** `unique_identifier` alone is
+not unique — 64 values are shared here, one naming three rows, because an
+Exchange meeting syncs into several Google calendars. ⚠️ A detached occurrence
+carries `/RID=<seconds>` in **both** the EventKit id and the store column, so it
+must not be stripped.
+
+**`resync` rebuilds an event the server never accepted.** EventKit stops retrying
+an item once it records an `Error` row, and re-saving does not re-push it; the
+only repair that worked was rebuilding. Verified on a real event: coordinate,
+notes, URL, start and end all came across, the copy synced in 4.1s, the original
+went, and no duplicate was left.
+
+- 🛑 **The copy is created BEFORE the original is deleted**, so a failure leaves
+  two events rather than none. Same rule `apple contacts move` follows.
+- 🛑 **Build a fresh `EKStructuredLocation`; never assign the original's.** One
+  belongs to a single event, and reusing it fails the save with "Object not
+  found. It may have been deleted." Measured — the copy was never created, and
+  only the create-first ordering kept it from losing the event.
+- **A recurring event is refused, even with `--force`** — a rebuild collapses
+  every detached occurrence back onto the rule. An event with invitees is
+  refused without `--force`, because a rebuild mails everyone a fresh invitation.
+- ⚠️ **The new event gets a new identifier.**
+
+⚠️ **`Error` rows are transient.** The table is empty on this machine, yet
+`sqlite_sequence` puts its high-water mark at **1304** — they are written and
+then cleaned up. So `sync-errors` only helps inside a window, and an empty result
+is not proof everything synced.
+
+🛑 **The 403 could not be reproduced, and that is the limit of this work.** 90
+writes here and 33 in another session all synced:
+
+| burst | calendar | result |
+|---|---|---|
+| 25 sequential in 2s | Personal (owned) | 25/25 synced in 5s |
+| 40 parallel in 1s | Personal (owned) | 40/40 synced in 5s |
+| 25 parallel in 1s | Family (delegated) | 25/25 synced in 10s |
+
+So `resync` is verified on healthy events only. Whether a rebuilt item escapes a
+poisoned account is **untested**. A second reported failure mode — the local copy
+*deleted* with an empty `Error` table — was not reproduced either, and is why
+`unsynced` matters alongside `sync-errors`.
+
+⚠️ **A calendar's owner is readable and did not explain the bug.**
+`Calendar.external_id` holds the CalDAV path, so a path carrying another
+account's address is a delegated calendar; `self_identity_email` is the user's own
+address on every row and distinguishes nothing. 7 of 9 enabled calDAV calendars
+here are delegated. Writing to one syncs fine.
 
 Dates accept natural language (`tomorrow 2pm`) or `YYYY-MM-DD [HH:MM]`. Default
 event length is 1 hour.
@@ -1859,13 +1960,18 @@ swift/                    one Swift package, seven binaries
                           and the local geocoder that needs no network)
   Sources/Geocoding/      🛑 the only target that touches the network: Apple Maps
                           search and CLGeocoder, behind `--at` and `maps geocode`
-  Sources/AppleCalendar/    + Attendees.swift (the private invitee write path)
+  Sources/AppleCalendar/    + Attendees.swift (the private invitee write path),
+                          SyncCommands.swift (sync-status / unsynced /
+                          sync-errors / resync, and the add/edit confirmation)
+  Sources/CalendarSyncLibrary/  🛑 reads Calendar.sqlitedb, because EventKit
+                          cannot say whether a write reached the server. Its own
+                          target so it can be tested against a synthetic store
   Sources/AppleContacts/  + Notes.swift (SQLite note reader),
                           Move.swift (the private cross-account move)
   Sources/ObjCExceptions/ @try/@catch for Swift — the move raises rather
                           than returning when it hits the note wall
   Tests/RemindersTests/ MailTests/ MessagesTests/ PhoneTests/ MapsTests/
-        GeocodingTests/
+        GeocodingTests/ CalendarSyncTests/
 notes/                    Python; apple-notes, notestore.py, notestore.proto,
                           mergeable.py (ZMERGEABLEDATA1 reader — recordings,
                           transcripts, summaries, and table cells),
@@ -1899,6 +2005,9 @@ docs/apple-contacts-move.md  no public API changes a contact's container; the
                           a move costs
 docs/apple-calendar-invitees.md  reading invitees is public API, writing them is
                           not; what the server rewrites, and what it mails
+docs/apple-calendar-caldav-403.md  the two ways a calendar write reports success
+                          and never reaches the server, and how to tell them
+                          apart. Neither is reproducible on demand
 docs/apple-reminders-tags.md  tags have no public API at all — what EventKit,
                           AppleScript and App Intents each fail to do, the
                           private call that works, and the store behind it

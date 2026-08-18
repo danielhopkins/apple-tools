@@ -138,7 +138,15 @@ class AppleTools < Formula
     assert_match "apple-notes", shell_output("#{bin}/apple --which")
 
     # --help must work without any TCC grant, so it is safe in a sandbox.
-    assert_match "events", shell_output("#{bin}/apple-calendar --help")
+    calendar_help = shell_output("#{bin}/apple-calendar --help")
+    assert_match "events", calendar_help
+
+    # The sync-visibility commands. `add` reported success for a write the
+    # server refused with a 403 until these existed, so an unregistered one is
+    # a silent regression back to that.
+    assert_match "unsynced", calendar_help
+    assert_match "sync-errors", calendar_help
+    assert_match "resync", calendar_help
 
     # `move` is the one mail command that writes to real mailboxes, and an
     # unregistered subcommand fails silently: apple-mail prints root help and
