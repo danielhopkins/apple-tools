@@ -1944,6 +1944,7 @@ write them.
 apple contacts relations <id>                       # both directions
 apple contacts link <id> <id> --relation spouse     # writes both cards
 apple contacts link A B --relation father --inverse son
+apple contacts link A "David M. Merritt" --relation spouse --name-only
 apple contacts unlink A B --relation friend
 ```
 
@@ -2010,6 +2011,37 @@ passes an unrecognised bare word through unchanged, capitals and all. Comparing
 raw labels misses real matches: `link` reported "would add" for a relation the
 contact already had, and a second run would have written a duplicate. Compare
 through `sameRelationLabel`, never on the raw string.
+
+🛑 **`--name-only` is how you name somebody who has no card.** A relation stores
+a name, so a card can legitimately name a person the address book has never held
+— a spouse who died before it existed, a relative nobody has details for. Before
+this flag the only route was `edit --relation`, which **replaces the whole set**,
+so adding one meant re-passing every existing relation and forgetting one deleted
+it silently. That is the exact trap `link` exists to close, and it stayed open for
+this one case.
+
+- 🛑 **It is opt-in, and that is the point.** Falling back to a plain name
+  whenever the second argument fails to resolve would turn a typo in a real
+  contact's name into a dangling relation, **silently** — the opposite of the
+  rule every other name lookup here follows. Without the flag an unmatched name
+  is still refused.
+- **One side only.** `--inverse` is refused, since there is no card to write it
+  onto, and the plain output says `no contact is named '…'` so the next reader
+  does not mistake it for a failure.
+- `unlink --name-only` removes one again. `relations` reports it as
+  `(no contact with that name)`.
+
+⚠️ **`--clear-dates` on `edit` empties the labelled-date set**, which nothing
+could do before: `--date` replaces the set but cannot empty it, so a date written
+by mistake was permanent. The **birthday is a separate field and is kept**.
+Refused alongside `--date`/`--anniversary`, because "clear then set" and "set
+then clear" differ and one reading loses the value; allowed alongside `--died`,
+which means only one thing.
+
+🛑 **`unlink` used to confirm nothing.** Every other write here re-reads a fresh
+store, because `CNSaveRequest` reporting success is not evidence — `groups
+remove` saves without error and changes nothing at all on an iCloud group. A
+removal had the same exposure and no guard until 26.818.3.
 
 - 🛑 **`unlink --relation L` matches the other card on L's INVERSE.** Filtering
   both sides on the same label removed `parent` from one card and left `child`

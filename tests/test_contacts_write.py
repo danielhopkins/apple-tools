@@ -1212,3 +1212,142 @@ class DeathDates(GroupFixtures):
         before = self.get(created["id"])["dates"]
         self.edit(created["id"], "--date", "death-year:2020-01-01")
         self.assertEqual(self.get(created["id"])["dates"], before)
+
+
+class NameOnlyRelations(GroupFixtures):
+    """A relation naming somebody who has no contact card.
+
+    🛑 **A relation stores a NAME, not a reference**, so a card can legitimately
+    name somebody with no card of their own — a spouse who died before the
+    address book existed, a relative nobody has details for. Two such relations
+    already existed on the store this was built against, and they are not
+    corruption.
+
+    Before `--name-only` the only route was `edit --relation`, which replaces
+    the whole set: adding one meant re-passing every existing relation, and
+    forgetting one deleted it silently. That is the exact trap `link` exists to
+    close, and it stayed open for this one case.
+    """
+
+    GHOST = "Nobody McGhost"
+
+    def test_a_name_only_relation_is_written(self):
+        created = self.add("NameOnly")
+        run("link", created["id"], self.GHOST, "--relation", "father", "--name-only")
+        self.assertEqual(
+            self.labelled(self.get(created["id"])["relations"], "name"),
+            {"father": self.GHOST})
+
+    def test_it_is_one_sided_and_says_so(self):
+        """No card exists to carry an inverse, and the output must not imply one."""
+        created = self.add("NameOnlySide")
+        _, out, _ = run("link", created["id"], self.GHOST,
+                        "--relation", "father", "--name-only")
+        self.assertIn("no contact is named", out)
+        self.assertEqual(out.count("added"), 1, "only one card can change")
+
+    def test_inverse_is_refused(self):
+        created = self.add("NameOnlyInverse")
+        code, _, err = run("link", created["id"], self.GHOST, "--relation", "father",
+                           "--name-only", "--inverse", "child", check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("--inverse", err)
+        self.assertIsNone(self.get(created["id"]).get("relations"))
+
+    def test_other_relations_survive(self):
+        """🛑 The whole reason this is not `edit --relation`, which replaces."""
+        created = self.add("NameOnlyMerge")
+        peer = self.add("NameOnlyPeer")
+        run("link", created["id"], peer["id"], "--relation", "brother",
+            "--inverse", "brother")
+        run("link", created["id"], self.GHOST, "--relation", "father", "--name-only")
+        self.assertEqual(
+            self.labelled(self.get(created["id"])["relations"], "name"),
+            {"brother": peer["name"], "father": self.GHOST})
+
+    def test_relinking_is_a_reported_no_op(self):
+        created = self.add("NameOnlyRepeat")
+        run("link", created["id"], self.GHOST, "--relation", "father", "--name-only")
+        _, out, _ = run("link", created["id"], self.GHOST,
+                        "--relation", "father", "--name-only")
+        self.assertIn("already had", out)
+        self.assertEqual(len(self.get(created["id"])["relations"]), 1)
+
+    def test_dry_run_writes_nothing(self):
+        created = self.add("NameOnlyDry")
+        _, out, _ = run("link", created["id"], self.GHOST,
+                        "--relation", "father", "--name-only", "--dry-run")
+        self.assertIn("would add", out)
+        self.assertIsNone(self.get(created["id"]).get("relations"))
+
+    def test_unlink_removes_it_again(self):
+        created = self.add("NameOnlyUnlink")
+        run("link", created["id"], self.GHOST, "--relation", "father", "--name-only")
+        run("unlink", created["id"], self.GHOST, "--name-only")
+        self.assertIsNone(self.get(created["id"]).get("relations"))
+
+    def test_unlinking_something_absent_is_an_error(self):
+        created = self.add("NameOnlyMissing")
+        code, _, err = run("unlink", created["id"], "Not There", "--name-only",
+                           check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("no relation naming", err)
+
+    def test_without_the_flag_an_unknown_name_is_still_refused(self):
+        """🛑 The flag is opt-in, and that is the point.
+
+        Falling back to a plain name whenever the second argument failed to
+        resolve would turn a typo in a real contact's name into a dangling
+        relation, silently — the opposite of the rule every other name lookup
+        here follows.
+        """
+        created = self.add("NameOnlyStrict")
+        code, _, err = run("link", created["id"], self.GHOST,
+                           "--relation", "father", check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("no contact matches", err)
+        self.assertIsNone(self.get(created["id"]).get("relations"))
+
+
+class ClearDates(GroupFixtures):
+    """`--clear-dates`, which had no equivalent at all.
+
+    `--date` replaces the set but cannot empty it, so a labelled date written by
+    mistake could never be removed by this tool. Found on a real card carrying an
+    `anniversary` that was actually the person's birth date.
+    """
+
+    def test_it_removes_every_labelled_date(self):
+        created = self.add("ClearDates",
+                           "--date", "anniversary:1977-09-17",
+                           "--date", "graduation:1999-06-15")
+        self.assertEqual(len(created["dates"]), 2)
+        self.edit(created["id"], "--clear-dates")
+        self.assertIsNone(self.get(created["id"]).get("dates"))
+
+    def test_the_birthday_is_a_separate_field_and_survives(self):
+        created = self.add("ClearKeepBirthday", "--birthday", "1977-09-17",
+                           "--date", "anniversary:2001-01-01")
+        self.edit(created["id"], "--clear-dates")
+        fetched = self.get(created["id"])
+        self.assertEqual(fetched["birthday"], "1977-09-17")
+        self.assertIsNone(fetched.get("dates"))
+
+    def test_it_combines_with_died(self):
+        """Clear the dates and record the death means only one thing."""
+        created = self.add("ClearThenDied", "--date", "anniversary:2001-01-01")
+        self.edit(created["id"], "--clear-dates", "--died", "2020")
+        fetched = self.get(created["id"])
+        self.assertEqual(fetched["died"], "2020")
+        self.assertEqual(self.labelled(fetched["dates"], "date"),
+                         {"death-year": "2020-01-01"})
+
+    def test_it_is_refused_alongside_date(self):
+        """⚠️ Ambiguous, so refused rather than resolved one way."""
+        created = self.add("ClearConflict", "--date", "anniversary:2001-01-01")
+        code, _, err = run("edit", created["id"], "--clear-dates",
+                           "--date", "death:2020-01-01", check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("--clear-dates", err)
+        # Nothing was touched.
+        self.assertEqual(len(self.get(created["id"])["dates"]), 1)

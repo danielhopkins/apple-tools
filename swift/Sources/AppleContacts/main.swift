@@ -1197,6 +1197,11 @@ struct ContactFields: ParsableArguments {
           """)
     var died: String?
 
+    @Flag(
+        name: .long,
+        help: "Remove every labelled date. The birthday is a separate field and is kept.")
+    var clearDates = false
+
     @Option(name: .long, help: "Not supported — see the error text for why")
     var note: String?
 
@@ -1204,7 +1209,8 @@ struct ContactFields: ParsableArguments {
         first == nil && middle == nil && last == nil && namePrefix == nil
             && nameSuffix == nil && nickname == nil && company == nil
             && department == nil && jobTitle == nil && birthday == nil
-            && anniversary == nil && died == nil && email.isEmpty && phone.isEmpty
+            && anniversary == nil && died == nil && !clearDates
+            && email.isEmpty && phone.isEmpty
             && url.isEmpty && relation.isEmpty && date.isEmpty
             && address.isEmpty
     }
@@ -1264,6 +1270,16 @@ struct ContactFields: ParsableArguments {
         if let anniversary, ContactDate.parse(anniversary) == nil {
             throw ValidationError(
                 "could not parse --anniversary '\(anniversary)'; use YYYY-MM-DD or --MM-DD")
+        }
+        // ⚠️ Refused rather than resolved. `--clear-dates --date x:y` reads as
+        // "clear, then set", which is just `--date x:y` — and reading it the
+        // other way round would silently drop the value. `--died` IS allowed
+        // alongside, because "clear the dates and record the death" means only
+        // one thing.
+        if clearDates && (!date.isEmpty || anniversary != nil) {
+            throw ValidationError(
+                "--clear-dates cannot be combined with --date or --anniversary. "
+                + "--date already replaces the whole set; use it alone to set one.")
         }
         // 🛑 Validated BEFORE any Apple Event, like every other field here.
         if let died {
@@ -1348,8 +1364,11 @@ struct ContactFields: ParsableArguments {
     func mergedDates(existing: [(label: String?, value: DateComponents)])
         -> [(label: String?, value: DateComponents)]?
     {
-        guard !dates.isEmpty || died != nil else { return nil }
-        var result = dates.isEmpty ? existing : dates
+        guard !dates.isEmpty || died != nil || clearDates else { return nil }
+        // ⚠️ `--clear-dates` starts from nothing, so a `--died` given alongside
+        // is the only entry that survives.
+        var result: [(label: String?, value: DateComponents)]
+        if clearDates { result = [] } else { result = dates.isEmpty ? existing : dates }
         guard let died, let written = try? DeathDate.parse(died) else { return result }
         // Drop any death already recorded, so `--died` restates rather than
         // stacking a second one. This is also what moves a card from `death` to
@@ -2653,6 +2672,14 @@ struct Link: ParsableCommand {
     @Flag(name: .long, help: "Write only one side")
     var noInverse = false
 
+    @Flag(
+        name: .long,
+        help: """
+          Take the second argument as a plain name, for somebody who has no \
+          contact card. One side only, since there is no card to write back to.
+          """)
+    var nameOnly = false
+
     @Flag(name: .long, help: "Show what would change without writing")
     var dryRun = false
 
@@ -2662,6 +2689,38 @@ struct Link: ParsableCommand {
     func run() throws {
         try requireContactsAccess()
         let first = try resolveOne(subject, verb: "link")
+
+        // 🛑 **A relation stores a NAME, not a reference**, so a card can name
+        // somebody who has no card of their own — a spouse who died before the
+        // address book existed, a relative nobody has contact details for. Two
+        // such relations already exist on this store, and they are not
+        // corruption.
+        //
+        // Before this flag the only route was `edit --relation`, which
+        // **replaces the whole set**: adding one meant reading every existing
+        // relation and re-passing it, and forgetting one deleted it silently.
+        // That is the exact trap `link` was built to close, and it stayed open
+        // for the one case where the other party is not a contact.
+        //
+        // 🛑 **It is opt-in, and that is deliberate.** Falling back to a plain
+        // name whenever the second argument fails to resolve would turn a typo
+        // in a real contact's name into a dangling relation, silently — the
+        // opposite of the rule every other name lookup here follows, where an
+        // unmatched or ambiguous name is refused rather than guessed.
+        if nameOnly {
+            guard inverse == nil else {
+                throw ValidationError(
+                    "--inverse cannot be used with --name-only: there is no card "
+                    + "to write the other side onto.")
+            }
+            let plain = other.trimmingCharacters(in: .whitespaces)
+            guard !plain.isEmpty else {
+                throw ValidationError("--name-only needs a name to record")
+            }
+            try linkToName(first, name: plain)
+            return
+        }
+
         let second = try resolveOne(other, verb: "link")
 
         guard first.identifier != second.identifier else {
@@ -2738,12 +2797,96 @@ struct Link: ParsableCommand {
         if json { printJSON(changes) } else { report(changes, dryRun: false) }
     }
 
+    /// Record a relation naming somebody with no contact card.
+    ///
+    /// One card only, by construction. ⚠️ Nothing can confirm the other side,
+    /// because there is no other side — so the read-back check covers the
+    /// subject alone, which is all this write touches.
+    private func linkToName(_ subject: CNContact, name: String) throws {
+        let subjectName = displayName(subject)
+        let encoded = Labels.relation(relation)
+        var existing = subject.contactRelations
+        let already = existing.contains {
+            sameRelationLabel($0.label, relation)
+                && $0.value.name.lowercased() == name.lowercased()
+        }
+        if !already {
+            existing.append(CNLabeledValue(
+                label: encoded, value: CNContactRelation(name: name)))
+        }
+
+        let change = RelationChange(
+            contactId: subject.identifier, name: subjectName,
+            label: relation, other: name, changed: !already)
+
+        if dryRun {
+            if json { printJSON([change]) } else { report([change], dryRun: true) }
+            return
+        }
+        if !already { try writeRelations(existing, on: subject) }
+        try confirmLinked([change])
+
+        if json {
+            printJSON([change])
+        } else {
+            report([change], dryRun: false)
+            // ⚠️ Say it plainly. A relation that resolves to nobody looks like a
+            // failure the next time anyone reads the card, and it is not.
+            print("Note: no contact is named '\(name)'. "
+                  + "The relation records the name only.")
+        }
+    }
+
     private func report(_ changes: [RelationChange], dryRun: Bool) {
         for change in changes {
             let verb = change.changed ? (dryRun ? "would add" : "added") : "already had"
             print("\(change.name): \(verb) \(change.label) -> \(change.other)")
         }
         if dryRun { print("Nothing was written.") }
+    }
+}
+
+extension Unlink {
+    /// Remove a relation naming somebody with no contact card.
+    ///
+    /// One card only. ⚠️ Matching is on the name as stored, case-insensitively,
+    /// and on the label when `--relation` is given — the same rule the two-card
+    /// path uses for its own side.
+    fileprivate func unlinkName(_ subject: CNContact, name: String) throws {
+        let subjectName = displayName(subject)
+        var gone: [String] = []
+        let kept = subject.contactRelations.filter { entry in
+            let sameName = entry.value.name.lowercased() == name.lowercased()
+            let sameLabel = relation.map { sameRelationLabel(entry.label, $0) } ?? true
+            if sameName && sameLabel {
+                gone.append(Labels.decode(entry.label) ?? "(unlabelled)")
+                return false
+            }
+            return true
+        }
+
+        guard !gone.isEmpty else {
+            let what = relation.map { "'\($0)' relation" } ?? "relation"
+            throw ValidationError(
+                "'\(subjectName)' has no \(what) naming '\(name)'")
+        }
+
+        let changes = gone.map {
+            RelationChange(contactId: subject.identifier, name: subjectName,
+                           label: $0, other: name, changed: true)
+        }
+        if dryRun {
+            if json { printJSON(changes) } else {
+                for c in changes { print("\(c.name): would remove \(c.label) -> \(c.other)") }
+                print("Nothing was written.")
+            }
+            return
+        }
+        try writeRelations(kept, on: subject)
+        try confirmUnlinked(changes)
+        if json { printJSON(changes) } else {
+            for c in changes { print("\(c.name): removed \(c.label) -> \(c.other)") }
+        }
     }
 }
 
@@ -2767,6 +2910,34 @@ private func confirmLinked(_ changes: [RelationChange]) throws {
         throw RuntimeError("""
             the save reported success but the store does not hold:
             \(missing.map { "  \($0)" }.joined(separator: "\n"))
+            """)
+    }
+}
+
+/// The counterpart to `confirmLinked`: check the relation really went.
+///
+/// 🛑 **`unlink` did not confirm anything before this.** Every other write in
+/// this tool re-reads a fresh store, because `CNSaveRequest` reporting success
+/// is not evidence — `groups remove` saves without error and changes nothing at
+/// all on an iCloud group. A removal had the same exposure and no guard.
+private func confirmUnlinked(_ changes: [RelationChange]) throws {
+    let fresh = CNContactStore()
+    var survived: [String] = []
+    for change in changes {
+        let contact = try? fresh.unifiedContact(
+            withIdentifier: change.contactId, keysToFetch: readKeys)
+        let stillThere = contact?.contactRelations.contains {
+            sameRelationLabel($0.label, change.label)
+                && $0.value.name.lowercased() == change.other.lowercased()
+        } ?? false
+        if stillThere {
+            survived.append("\(change.name): \(change.label) -> \(change.other)")
+        }
+    }
+    guard survived.isEmpty else {
+        throw RuntimeError("""
+            the save reported success but the store still holds:
+            \(survived.map { "  \($0)" }.joined(separator: "\n"))
             """)
     }
 }
@@ -2799,6 +2970,14 @@ struct Unlink: ParsableCommand {
     @Flag(name: .long, help: "Leave the other card alone")
     var noInverse = false
 
+    @Flag(
+        name: .long,
+        help: """
+          Take the second argument as a plain name, for a relation naming \
+          somebody who has no contact card.
+          """)
+    var nameOnly = false
+
     @Flag(name: .long, help: "Show what would change without writing")
     var dryRun = false
 
@@ -2808,6 +2987,19 @@ struct Unlink: ParsableCommand {
     func run() throws {
         try requireContactsAccess()
         let first = try resolveOne(subject, verb: "unlink")
+
+        // The counterpart to `link --name-only`. Without it a relation naming a
+        // non-contact could be written and never removed, since `unlink` resolved
+        // both arguments and refused an unmatched name.
+        if nameOnly {
+            let plain = other.trimmingCharacters(in: .whitespaces)
+            guard !plain.isEmpty else {
+                throw ValidationError("--name-only needs a name to remove")
+            }
+            try unlinkName(first, name: plain)
+            return
+        }
+
         let second = try resolveOne(other, verb: "unlink")
         let firstName = displayName(first)
         let secondName = displayName(second)
@@ -2894,6 +3086,7 @@ struct Unlink: ParsableCommand {
 
         if !forward.gone.isEmpty { try writeRelations(forward.relations, on: first) }
         if let back, !back.gone.isEmpty { try writeRelations(back.relations, on: second) }
+        try confirmUnlinked(removed)
 
         if json { printJSON(removed) } else {
             for change in removed {
