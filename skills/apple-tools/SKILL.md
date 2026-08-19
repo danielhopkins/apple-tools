@@ -499,6 +499,13 @@ others and forgetting one deletes it silently. `link A B --relation father`
 writes both cards — B gets the inverse — and refuses rather than guessing an
 inverse it cannot infer. `relations <id>` reads them, in both directions.
 
+**To name somebody who has no contact card, pass `--name-only`.** A relation
+stores a name, not a reference, so a card can legitimately name a person the
+address book has never held. `link <id> "David M. Merritt" --relation spouse
+--name-only` records one side; `--inverse` is refused, since there is no card to
+write it onto. Without the flag an unmatched name is still an error, so a typo
+never becomes a dangling relation by accident.
+
 **Use `--died` for a death, never `--date death:...`.** `--died` merges, so other
 dates survive; `--date` replaces the whole set. Apple defines no death field, so
 the tool writes a labelled date and owns the spelling.
@@ -513,6 +520,11 @@ the tool writes a labelled date and owns the spelling.
 - `apple contacts deceased` lists everyone, and reports separately any card whose
   note carries a dagger with no date recorded. The tool cannot write a note, so
   it can never resolve one of those itself.
+
+**`edit --clear-dates` empties the labelled-date set.** `--date` replaces the set
+but cannot empty it, so a date written by mistake was otherwise permanent. The
+birthday is a separate field and survives. It is refused alongside
+`--date`/`--anniversary`, and allowed alongside `--died`.
 
 `get`, `add` and `edit` return a single JSON object; `search`, `list` and
 `groups members` return arrays. Unlabelled emails and phones have no `label`
