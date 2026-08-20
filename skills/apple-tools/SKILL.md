@@ -116,6 +116,7 @@ apple reminders add Errands "Call" --at "39.96,-105.17" --on leave --radius 250
 # Calendar
 apple calendar calendars --writable --json
 apple calendar events --days 7 --json          # attendees, organizer, my_status
+apple calendar events --from 2010-01-01 --to 2026-12-31 --search wedding --json
 apple calendar add "Dentist" --start "tomorrow 2pm" --duration 45
 apple calendar unsynced                   # did anything fail to reach the server
 apple calendar add "Board" --start "2026-09-28 10:00" \
@@ -479,6 +480,13 @@ from the filename alone.
 only inside the directory you name, so it is safe to point at a real folder.
 Prefer a scratch directory over `~/Downloads` unless the user asked for a
 specific place.
+
+**A calendar range of any length is safe now, and did not used to be.** EventKit
+clamps one fetch to four years after the start, silently — no error, no warning,
+and a result that reads as complete. An 18-year search once returned 1,138 of
+14,616 events and stopped in 2011. `events` splits the range into windows itself
+and reports the count on stderr, so search widely rather than guessing at a
+narrow window.
 
 **Contact multi-value flags replace, they don't append.** `contacts edit --email`
 replaces every email on that contact. Read it first with `get`, then re-pass the
