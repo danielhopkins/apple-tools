@@ -508,9 +508,36 @@ and a result that reads as complete. An 18-year search once returned 1,138 of
 and reports the count on stderr, so search widely rather than guessing at a
 narrow window.
 
-**Contact multi-value flags replace, they don't append.** `contacts edit --email`
-replaces every email on that contact. Read it first with `get`, then re-pass the
-addresses to keep alongside the new one. Same for `--phone` and `--url`.
+🛑 **Use `--add-*` to add one value. The plain flag DELETES the rest.**
+`contacts edit --email X` replaces every email on that contact and prints
+`Updated` either way.
+
+```
+apple contacts edit <id> --add-url "school:https://coe.bvsd.org"   # keeps the rest
+apple contacts edit <id> --add-email "work:a@b.com"
+apple contacts edit <id> --add-phone "mobile:+15551234567"
+apple contacts edit <id> --add-address "home:500 W Madison St, Chicago, IL 60661"
+```
+
+Reach for `--email` / `--phone` / `--url` / `--address` only when you mean to
+replace the whole field. Asked to "add the school website", use `--add-url`: you
+have no reason to know how many URLs the card already holds, and the plain flag
+would delete them without saying so.
+
+**To delete one value, use `--remove-*`.** The value identifies it; a label
+narrows it when two entries share a value.
+
+```
+apple contacts edit <id> --remove-url "https://old.example.com"
+apple contacts edit <id> --remove-email "home:a@b.com"    # only the home one
+```
+
+Removing something that is not on the card is an error naming what is, so a typo
+never reads as done. Re-adding a value already present is a no-op, not a
+duplicate. Mixing `--url` with `--add-url` or `--remove-url` is refused.
+
+A plain flag warns on stderr when it discards values, naming them. If you see
+that warning you probably wanted `--add-*` or `--remove-*`.
 
 **Relations and dates.** `--relation father:"Robert Hopkins"` accepts any of the
 216 relation labels Contacts defines (father/mother/son/daughter/spouse/niece/

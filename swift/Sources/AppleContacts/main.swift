@@ -732,10 +732,10 @@ private func confirmWritten(_ fields: ContactFields, on saved: CNContact, name: 
     }
 
     check(
-        "email", wanted: fields.emails,
+        "email", wanted: fields.allEmails,
         stored: saved.emailAddresses.map { ($0.label, $0.value as String) })
     check(
-        "url", wanted: fields.urls,
+        "url", wanted: fields.allUrls,
         stored: saved.urlAddresses.map { ($0.label, $0.value as String) })
     check(
         "relation", wanted: fields.relations,
@@ -744,7 +744,7 @@ private func confirmWritten(_ fields: ContactFields, on saved: CNContact, name: 
     // the street would otherwise write a wrong address and report success.
     check(
         "address",
-        wanted: fields.addresses.map { ($0.label, PostalAddress.describe($0.value)) },
+        wanted: fields.allAddresses.map { ($0.label, PostalAddress.describe($0.value)) },
         stored: saved.postalAddresses.map { ($0.label, PostalAddress.describe($0.value)) })
     check(
         "date",
@@ -755,7 +755,7 @@ private func confirmWritten(_ fields: ContactFields, on saved: CNContact, name: 
     // to catch a value that went missing, not one that was tidied.
     func digits(_ value: String) -> String { value.filter(\.isNumber) }
     check(
-        "phone", wanted: fields.phones.map { ($0.label, digits($0.value)) },
+        "phone", wanted: fields.allPhones.map { ($0.label, digits($0.value)) },
         stored: saved.phoneNumbers.map { ($0.label, digits($0.value.stringValue)) })
 
     // 🛑 `--died` is checked on what the card MEANS, not on what it stores. A
@@ -1177,6 +1177,53 @@ struct ContactFields: ParsableArguments {
           """)
     var address: [String] = []
 
+    // 🛑 **`--email`/`--phone`/`--url`/`--address` REPLACE the whole field.**
+    // Passing one value deletes every other value in that field, silently, and
+    // the command prints "Updated '<name>'" either way. The name reads as
+    // additive: `edit --url X` looks like "set the URL", not "delete every URL
+    // then set X".
+    //
+    // ⚠️ **Agents are the caller this hurts most.** An agent told to "add the
+    // school website" has no reason to read the card first. A peer session
+    // nearly destroyed a real contact's URLs that way; the card happened to
+    // hold exactly one, so the replace was indistinguishable from an update.
+    //
+    // The read-modify-write workaround is worse than it looks: it makes the
+    // caller reconstruct every existing label exactly, so one typo turns a
+    // correction into a second silent loss.
+    @Option(name: .long, help: "Email to ADD, keeping existing ones. Repeat for several.")
+    var addEmail: [String] = []
+
+    @Option(name: .long, help: "Phone to ADD, keeping existing ones. Repeat for several.")
+    var addPhone: [String] = []
+
+    @Option(name: .long, help: "URL to ADD, keeping existing ones. Repeat for several.")
+    var addUrl: [String] = []
+
+    @Option(name: .long, help: "Postal address to ADD, keeping existing ones. Repeat for several.")
+    var addAddress: [String] = []
+
+    // 🛑 **Without these there was no way to delete ONE value.** The only route
+    // was the plain flag: read the card, then re-pass every value except the one
+    // to drop. That makes the caller reconstruct each remaining label exactly,
+    // so a single typo turns a deletion into a silent loss of something else.
+    //
+    // ⚠️ Matching mirrors `unlink`: the VALUE identifies the entry, and a label
+    // prefix narrows it. Removing something that is not there is an ERROR, not a
+    // no-op — a typo must not read as done. That is deliberately the opposite of
+    // `--add-*`, where re-adding an existing value already achieves the intent.
+    @Option(name: .long, help: "Email to REMOVE, by address. 'work:a@b.com' narrows to that label.")
+    var removeEmail: [String] = []
+
+    @Option(name: .long, help: "Phone to REMOVE, by number. Compared on digits.")
+    var removePhone: [String] = []
+
+    @Option(name: .long, help: "URL to REMOVE, by value. 'blog:https://…' narrows to that label.")
+    var removeUrl: [String] = []
+
+    @Option(name: .long, help: "Postal address to REMOVE, by value.")
+    var removeAddress: [String] = []
+
     @Option(
         name: .long,
         help: "Relation as LABEL:NAME, e.g. 'father:Robert Hopkins'. Repeat to set several; replaces existing.")
@@ -1211,6 +1258,10 @@ struct ContactFields: ParsableArguments {
             && department == nil && jobTitle == nil && birthday == nil
             && anniversary == nil && died == nil && !clearDates
             && email.isEmpty && phone.isEmpty
+            && addEmail.isEmpty && addPhone.isEmpty
+            && addUrl.isEmpty && addAddress.isEmpty
+            && removeEmail.isEmpty && removePhone.isEmpty
+            && removeUrl.isEmpty && removeAddress.isEmpty
             && url.isEmpty && relation.isEmpty && date.isEmpty
             && address.isEmpty
     }
@@ -1390,6 +1441,26 @@ struct ContactFields: ParsableArguments {
                 "--clear-dates cannot be combined with --date or --anniversary. "
                 + "--date already replaces the whole set; use it alone to set one.")
         }
+        // ⚠️ **Refused rather than resolved.** `--email X --add-email Y` could
+        // mean "replace with X, then add Y" or "add Y to a list already set to
+        // X", and those differ. `apple reminders` refuses `--tag` alongside
+        // `--add-tag` for the same reason.
+        for (replace, other, name, style) in [
+            (!email.isEmpty, !addEmail.isEmpty, "email", "add"),
+            (!phone.isEmpty, !addPhone.isEmpty, "phone", "add"),
+            (!url.isEmpty, !addUrl.isEmpty, "url", "add"),
+            (!address.isEmpty, !addAddress.isEmpty, "address", "add"),
+            (!email.isEmpty, !removeEmail.isEmpty, "email", "remove"),
+            (!phone.isEmpty, !removePhone.isEmpty, "phone", "remove"),
+            (!url.isEmpty, !removeUrl.isEmpty, "url", "remove"),
+            (!address.isEmpty, !removeAddress.isEmpty, "address", "remove"),
+        ] where replace && other {
+            throw ValidationError(
+                "--\(name) and --\(style)-\(name) cannot be combined. "
+                + "--\(name) replaces every \(name) on the contact; "
+                + "--\(style)-\(name) works from the existing ones. Use one or the other.")
+        }
+
         // ⚠️ A note, not a refusal. The reading is defensible either way, and
         // refusing would break a URL whose scheme simply is not well known.
         for case let (input, label) in ambiguousURLs {
@@ -1420,7 +1491,7 @@ struct ContactFields: ParsableArguments {
         // 🛑 Parse every address BEFORE any Apple Event. A bad one must fail
         // here, not halfway through a save, and not silently as an address
         // with fields missing. The free-text parse is a guess, so it is echoed.
-        for entry in address {
+        for entry in address + addAddress {
             let (_, value) = split(entry)
             guard !value.isEmpty else {
                 throw ValidationError("--address \(entry) has no address after the colon")
@@ -1463,6 +1534,142 @@ struct ContactFields: ParsableArguments {
     }
 
     /// Applies the flags that were actually supplied onto a mutable contact.
+    /// A unit separator, so a label ending in a colon cannot forge a match.
+    /// The same key shape `confirmWritten` uses.
+    static func key(_ label: String?, _ value: String) -> String {
+        "\(label ?? "")\u{1f}\(value)"
+    }
+
+    /// Checks that need the contact as it stands, run before anything is written.
+    ///
+    /// 🛑 **A removal matching nothing is an error, not a no-op.** A silent
+    /// no-op lets `--remove-email a@x.con` read as done while the address is
+    /// still on the card. This is deliberately the opposite of `--add-*`, where
+    /// re-adding a value already present achieves the intent.
+    ///
+    /// ⚠️ **A plain flag that discards values says so, naming them.** It still
+    /// replaces — the behaviour is unchanged and callers depending on it are
+    /// safe. The loss is simply no longer invisible.
+    func preflight(against existing: CNContact) throws {
+        // 🛑 **The pre-flight must accept exactly what `apply` removes.** An
+        // address matches on its street OR its full structured form, so a check
+        // that knew only one form refused `--remove-address "work:1 Main St"`
+        // for an address `apply` would have removed. Every entry therefore
+        // carries every string it can be named by.
+        func checkRemovals(
+            _ raw: [String], _ flag: String,
+            _ stored: [(label: String?, names: [String], shown: String)],
+            url: Bool = false, normalise: @escaping (String) -> String = { $0 }
+        ) throws {
+            for removal in removals(raw, url: url)
+            where !stored.contains(where: { entry in
+                entry.names.contains {
+                    matches(removal, label: entry.label, value: $0, normalise: normalise)
+                }
+            }) {
+                let present = stored.isEmpty
+                    ? "the contact has no \(flag)s at all"
+                    : "it has: " + stored.map {
+                        (Labels.decode($0.label).map { "\($0):" } ?? "") + $0.shown
+                    }.joined(separator: ", ")
+                throw ValidationError(
+                    "--remove-\(flag) '\(removal.raw)' matches nothing on "
+                    + "'\(displayName(existing))'. \(present)")
+            }
+        }
+
+        let storedEmails = existing.emailAddresses.map { ($0.label, $0.value as String) }
+        let storedPhones = existing.phoneNumbers.map { ($0.label, $0.value.stringValue) }
+        let storedUrls = existing.urlAddresses.map { ($0.label, $0.value as String) }
+        let storedAddresses = existing.postalAddresses.map {
+            ($0.label, PostalAddress.describe($0.value))
+        }
+
+        func simple(_ entries: [(String?, String)]) -> [(String?, [String], String)] {
+            entries.map { ($0.0, [$0.1], $0.1) }
+        }
+        try checkRemovals(removeEmail, "email", simple(storedEmails))
+        try checkRemovals(removePhone, "phone", simple(storedPhones),
+                          normalise: { $0.filter(\.isNumber) })
+        try checkRemovals(removeUrl, "url", simple(storedUrls), url: true)
+        // ⚠️ An address is nameable by its street or by its full structured
+        // form. `shown` is the street, because the structured form is unreadable
+        // in an error message.
+        try checkRemovals(removeAddress, "address", existing.postalAddresses.map {
+            ($0.label, [PostalAddress.describe($0.value), $0.value.street], $0.value.street)
+        })
+
+        func warnReplacing(_ asked: Bool, _ flag: String,
+                           _ stored: [(label: String?, value: String)]) {
+            guard asked, !stored.isEmpty else { return }
+            let listed = stored.map {
+                Labels.decode($0.label) ?? $0.value
+            }.joined(separator: ", ")
+            FileHandle.standardError.write(Data("""
+                warning: --\(flag) replaces every \(flag) on this contact. \
+                Discarding \(stored.count) (\(listed)).
+                         Use --add-\(flag) to keep them, or --remove-\(flag) to \
+                drop just one.
+
+                """.utf8))
+        }
+        warnReplacing(!email.isEmpty, "email", storedEmails)
+        warnReplacing(!phone.isEmpty, "phone", storedPhones)
+        warnReplacing(!url.isEmpty, "url", storedUrls)
+        warnReplacing(!address.isEmpty, "address", storedAddresses)
+    }
+
+    /// A removal request: the value to drop, and a label if one narrows it.
+    struct Removal {
+        let label: String?
+        let value: String
+        let raw: String
+    }
+
+    /// Does this stored entry match the removal?
+    ///
+    /// ⚠️ The VALUE identifies the entry. A label only narrows, matching how
+    /// `unlink --relation` works. `--remove-url https://b` drops it under any
+    /// label; `--remove-url "blog:https://b"` drops only the labelled one.
+    func matches(
+        _ removal: Removal, label: String?, value: String,
+        normalise: (String) -> String = { $0 }
+    ) -> Bool {
+        guard normalise(value) == normalise(removal.value) else { return false }
+        guard let wanted = removal.label else { return true }
+        return Labels.decode(label)?.lowercased() == Labels.decode(wanted)?.lowercased()
+    }
+
+    /// Parse a `--remove-*` value into a label and a value.
+    ///
+    /// ⚠️ `splitURL` for URLs, so `--remove-url https://b` is not read as the
+    /// label `https`.
+    func removals(_ raw: [String], url: Bool = false) -> [Removal] {
+        raw.map { entry in
+            let (label, value) = url ? splitURL(entry) : split(entry)
+            return Removal(label: label, value: value, raw: entry)
+        }
+    }
+
+    /// The entries not already present, comparing label AND value.
+    ///
+    /// ⚠️ **Re-adding an existing value is a silent no-op, not a duplicate
+    /// row.** Same shape `link` and `groups add` use. A caller running the same
+    /// `--add-email` twice must not end up with the address twice.
+    ///
+    /// ⚠️ Only an exact label+value match counts. The same address under a
+    /// different label is a different entry and is added.
+    static func newOnly(
+        _ wanted: [(label: String?, value: String)],
+        notIn existing: [(label: String?, value: String)],
+        normalise: (String) -> String = { $0 }
+    ) -> [(label: String?, value: String)] {
+        var seen = Set(existing.map { key($0.label, normalise($0.value)) })
+        return wanted.filter { entry in
+            seen.insert(key(entry.label, normalise(entry.value))).inserted
+        }
+    }
+
     /// The date list this edit should write, with the death date merged in.
     ///
     /// 🛑 **`--died` merges; `--date` replaces.** That difference is the whole
@@ -1510,25 +1717,89 @@ struct ContactFields: ParsableArguments {
         if let jobTitle { contact.jobTitle = jobTitle }
         if let birthday { contact.birthday = ContactDate.parse(birthday) }
 
+        // ⚠️ Removal runs BEFORE the append, so `--remove-x A --add-x A` ends
+        // with A present. Doing it the other way round would delete what was
+        // just added, which nobody means.
+        if !removeEmail.isEmpty {
+            let wanted = removals(removeEmail)
+            contact.emailAddresses = contact.emailAddresses.filter { entry in
+                !wanted.contains { matches($0, label: entry.label, value: entry.value as String) }
+            }
+        }
+        if !removePhone.isEmpty {
+            let wanted = removals(removePhone)
+            contact.phoneNumbers = contact.phoneNumbers.filter { entry in
+                !wanted.contains {
+                    matches($0, label: entry.label, value: entry.value.stringValue,
+                            normalise: { $0.filter(\.isNumber) })
+                }
+            }
+        }
+        if !removeUrl.isEmpty {
+            let wanted = removals(removeUrl, url: true)
+            contact.urlAddresses = contact.urlAddresses.filter { entry in
+                !wanted.contains { matches($0, label: entry.label, value: entry.value as String) }
+            }
+        }
+        if !removeAddress.isEmpty {
+            let wanted = removals(removeAddress)
+            contact.postalAddresses = contact.postalAddresses.filter { entry in
+                !wanted.contains {
+                    matches($0, label: entry.label,
+                            value: PostalAddress.describe(entry.value))
+                        || matches($0, label: entry.label, value: entry.value.street)
+                }
+            }
+        }
+
         if !emails.isEmpty {
             contact.emailAddresses = emails.map {
                 CNLabeledValue(label: $0.label, value: $0.value as NSString)
             }
+        } else if !addedEmails.isEmpty {
+            contact.emailAddresses += Self.newOnly(
+                addedEmails, notIn: contact.emailAddresses.map { ($0.label, $0.value as String) }
+            ).map { CNLabeledValue(label: $0.label, value: $0.value as NSString) }
         }
+
         if !phones.isEmpty {
             contact.phoneNumbers = phones.map {
                 CNLabeledValue(label: $0.label, value: CNPhoneNumber(stringValue: $0.value))
             }
+        } else if !addedPhones.isEmpty {
+            // ⚠️ Compared on digits, matching the post-write check. How a
+            // number is punctuated is the store's business, and `+1 555 0100`
+            // must not be added again next to `+15550100`.
+            contact.phoneNumbers += Self.newOnly(
+                addedPhones,
+                notIn: contact.phoneNumbers.map { ($0.label, $0.value.stringValue) },
+                normalise: { $0.filter(\.isNumber) }
+            ).map { CNLabeledValue(label: $0.label, value: CNPhoneNumber(stringValue: $0.value)) }
         }
+
         if !urls.isEmpty {
             contact.urlAddresses = urls.map {
                 CNLabeledValue(label: $0.label, value: $0.value as NSString)
             }
+        } else if !addedUrls.isEmpty {
+            contact.urlAddresses += Self.newOnly(
+                addedUrls, notIn: contact.urlAddresses.map { ($0.label, $0.value as String) }
+            ).map { CNLabeledValue(label: $0.label, value: $0.value as NSString) }
         }
+
         if !addresses.isEmpty {
             contact.postalAddresses = addresses.map {
                 CNLabeledValue(label: $0.label, value: $0.value)
             }
+        } else if !addedAddresses.isEmpty {
+            let existing = contact.postalAddresses.map {
+                ($0.label, PostalAddress.describe($0.value))
+            }
+            let wanted = addedAddresses.map { ($0.label, PostalAddress.describe($0.value)) }
+            let keep = Set(Self.newOnly(wanted, notIn: existing).map { Self.key($0.label, $0.value) })
+            contact.postalAddresses += addedAddresses
+                .filter { keep.contains(Self.key($0.label, PostalAddress.describe($0.value))) }
+                .map { CNLabeledValue(label: $0.label, value: $0.value) }
         }
         if !relations.isEmpty {
             contact.contactRelations = relations.map {
@@ -1584,15 +1855,25 @@ struct ContactFields: ParsableArguments {
             set(components as NSDateComponents, kABBirthdayComponentsProperty)
         }
 
-        if !emails.isEmpty {
-            setMulti(emails.map { ($0.label, $0.value as NSString) }, kABEmailProperty)
+        // ⚠️ The fallback writes the whole multivalue at once, so an append
+        // has to read the existing entries back first — the same shape
+        // `mergedDates` needs, and for the same reason.
+        func merge(
+            _ replace: [(label: String?, value: String)],
+            _ add: [(label: String?, value: String)],
+            _ property: String
+        ) {
+            if !replace.isEmpty {
+                setMulti(replace.map { ($0.label, $0.value as NSString) }, property)
+            } else if !add.isEmpty {
+                let existing = Self.existingStrings(of: person, property: property)
+                let merged = existing + Self.newOnly(add, notIn: existing)
+                setMulti(merged.map { ($0.label, $0.value as NSString) }, property)
+            }
         }
-        if !phones.isEmpty {
-            setMulti(phones.map { ($0.label, $0.value as NSString) }, kABPhoneProperty)
-        }
-        if !urls.isEmpty {
-            setMulti(urls.map { ($0.label, $0.value as NSString) }, kABURLsProperty)
-        }
+        merge(emails, addedEmails, kABEmailProperty)
+        merge(phones, addedPhones, kABPhoneProperty)
+        merge(urls, addedUrls, kABURLsProperty)
         if !addresses.isEmpty {
             // ⚠️ AddressBook stores an address as a dictionary of its own keys,
             // not as a CNPostalAddress. The spellings differ from the SDK's.
@@ -1620,6 +1901,20 @@ struct ContactFields: ParsableArguments {
                 kABOtherDateComponentsProperty)
         }
         return ok
+    }
+
+    /// The labelled strings AddressBook already holds under one property.
+    static func existingStrings(
+        of person: ABPerson, property: String
+    ) -> [(label: String?, value: String)] {
+        guard let multi = person.value(forProperty: property) as? ABMultiValue else { return [] }
+        var out: [(label: String?, value: String)] = []
+        for index in 0..<multi.count() {
+            guard let value = multi.value(at: index) as? String else { continue }
+            let label = multi.label(at: index)
+            out.append((label?.isEmpty == true ? nil : label, value))
+        }
+        return out
     }
 
     /// The labelled dates AddressBook already holds for this record.
@@ -1667,6 +1962,26 @@ struct ContactFields: ParsableArguments {
     }
     var relations: [(label: String?, value: String)] { parse(relation, Labels.relation) }
 
+    // The append-only counterparts. Parsed identically, so a label behaves the
+    // same whichever flag carried it.
+    var addedEmails: [(label: String?, value: String)] { parse(addEmail, Labels.email) }
+    var addedPhones: [(label: String?, value: String)] { parse(addPhone, Labels.phone) }
+    var addedUrls: [(label: String?, value: String)] {
+        addUrl.map { raw in
+            let (label, value) = splitURL(raw)
+            return (label.map(Labels.url), value)
+        }
+    }
+
+    /// Everything this edit intends the contact to end up holding, replacing and
+    /// appending alike.
+    ///
+    /// 🛑 The post-write check reads these, not the raw flags. A value added
+    /// with `--add-email` has to be confirmed as hard as one set with `--email`.
+    var allEmails: [(label: String?, value: String)] { emails + addedEmails }
+    var allPhones: [(label: String?, value: String)] { phones + addedPhones }
+    var allUrls: [(label: String?, value: String)] { urls + addedUrls }
+
     /// ⚠️ Parsed here rather than in `apply`, so a bad address is caught by
     /// `validate()` before any Apple Event and before the AddressBook fallback
     /// can see it. Both write paths and the post-write check then read the same
@@ -1675,6 +1990,15 @@ struct ContactFields: ParsableArguments {
         parse(address, Labels.address).compactMap { entry in
             (try? PostalAddress.parse(entry.value)).map { (entry.label, $0) }
         }
+    }
+
+    var addedAddresses: [(label: String?, value: CNMutablePostalAddress)] {
+        parse(addAddress, Labels.address).compactMap { entry in
+            (try? PostalAddress.parse(entry.value)).map { (entry.label, $0) }
+        }
+    }
+    var allAddresses: [(label: String?, value: CNMutablePostalAddress)] {
+        addresses + addedAddresses
     }
 
     /// `--anniversary` is sugar for a labelled date, so the two inputs merge.
@@ -1791,6 +2115,9 @@ struct Edit: ParsableCommand {
         }
 
         let existing = try contact(withId: id)
+        // 🛑 Before any write. A removal that matches nothing is a typo, and a
+        // replace that discards values should say what it is about to destroy.
+        try fields.preflight(against: existing)
         guard let mutable = existing.mutableCopy() as? CNMutableContact else {
             throw ValidationError("could not prepare '\(id)' for editing")
         }

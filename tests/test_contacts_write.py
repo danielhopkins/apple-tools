@@ -899,6 +899,32 @@ class NoteBearingContacts(GroupFixtures):
         self.assertEqual(
             self.labelled(fetched["dates"], "date"), {"death-year": "2020-01-01"})
 
+    def test_add_url_keeps_existing_urls_through_the_fallback(self):
+        """🛑 The fallback writes the whole multivalue at once.
+
+        A replace can ignore what was there; an append must read it back first.
+        This is the path where getting that wrong deletes the values it was meant
+        to keep.
+        """
+        noted = self.noted("NoteAppend", "--url", "work:https://a.example.invalid",
+                           "--url", "blog:https://b.example.invalid")
+        self.edit(noted["id"], "--add-url", "wiki:https://c.example.invalid")
+        self.assertEqual(
+            self.labelled(self.get(noted["id"])["urls"], "url"),
+            {"work": "https://a.example.invalid",
+             "blog": "https://b.example.invalid",
+             "wiki": "https://c.example.invalid"})
+        self.assertEqual(note_of(noted["id"]), self.NOTE)
+
+    def test_add_email_and_phone_through_the_fallback(self):
+        noted = self.noted("NoteAppend2", "--email", "work:a@x.invalid",
+                           "--phone", "work:+15550000001")
+        self.edit(noted["id"], "--add-email", "home:b@x.invalid",
+                  "--add-phone", "mobile:+15550000002")
+        fetched = self.get(noted["id"])
+        self.assertEqual(len(fetched["emails"]), 2)
+        self.assertEqual(len(fetched["phones"]), 2)
+
     def test_a_note_bearing_contact_cannot_be_moved_and_says_why(self):
         """The one thing the note wall genuinely blocks rather than routes around.
 
@@ -1479,3 +1505,254 @@ class UrlSchemeParsing(GroupFixtures):
         self.edit(created["id"], "--email", "work:a@x.invalid")
         self.assertEqual(self.labelled(self.get(created["id"])["emails"], "address"),
                          {"work": "a@x.invalid"})
+
+
+class AppendingMultiValues(GroupFixtures):
+    """`--add-email` / `--add-phone` / `--add-url` / `--add-address`.
+
+    🛑 **The plain flags REPLACE the whole field, silently.** `edit --url X`
+    reads as "set the URL" and means "delete every URL, then set X". The command
+    prints `Updated '<name>'` either way, and names nothing it removed.
+
+    ⚠️ **Agents are the caller this hurts most.** One told to "add the school
+    website" has no reason to read the card first. A peer session nearly
+    destroyed a real contact's URLs that way — the card happened to hold exactly
+    one, so the replace was indistinguishable from an update.
+
+    The plain flags keep replacing, so nothing that relied on them breaks.
+    """
+
+    def seeded(self, suffix):
+        return self.add(
+            suffix,
+            "--url", "work:https://a.example.invalid",
+            "--url", "blog:https://b.example.invalid",
+            "--email", "work:a@x.invalid",
+            "--email", "home:b@x.invalid",
+            "--phone", "work:+15550000001",
+            "--phone", "mobile:+15550000002",
+        )
+
+    def test_adding_a_url_keeps_the_others(self):
+        created = self.seeded("AppendUrl")
+        self.edit(created["id"], "--add-url", "wiki:https://c.example.invalid")
+        self.assertEqual(
+            self.labelled(self.get(created["id"])["urls"], "url"),
+            {"work": "https://a.example.invalid",
+             "blog": "https://b.example.invalid",
+             "wiki": "https://c.example.invalid"})
+
+    def test_adding_one_field_leaves_the_others_alone(self):
+        created = self.seeded("AppendIsolated")
+        self.edit(created["id"], "--add-url", "wiki:https://c.example.invalid")
+        fetched = self.get(created["id"])
+        self.assertEqual(len(fetched["emails"]), 2)
+        self.assertEqual(len(fetched["phones"]), 2)
+
+    def test_add_email_and_add_phone_append_too(self):
+        created = self.seeded("AppendMore")
+        self.edit(created["id"],
+                  "--add-email", "school:c@x.invalid",
+                  "--add-phone", "cabin:+15550000003")
+        fetched = self.get(created["id"])
+        self.assertEqual(len(fetched["emails"]), 3)
+        self.assertEqual(len(fetched["phones"]), 3)
+
+    def test_add_address_appends(self):
+        created = self.add("AppendAddr",
+                           "--address", "home:500 W Madison St, Chicago, IL 60661")
+        self.edit(created["id"],
+                  "--add-address", "work:1 Main St, Boulder, CO 80301")
+        self.assertEqual(
+            {a["label"] for a in self.get(created["id"])["addresses"]},
+            {"home", "work"})
+
+    def test_the_plain_flag_still_replaces(self):
+        """🛑 Existing behaviour is deliberately unchanged. Nothing breaks."""
+        created = self.seeded("AppendReplace")
+        self.edit(created["id"], "--url", "only:https://d.example.invalid")
+        self.assertEqual(self.labelled(self.get(created["id"])["urls"], "url"),
+                         {"only": "https://d.example.invalid"})
+
+    # MARK: duplicates
+
+    def test_re_adding_the_same_value_is_a_no_op(self):
+        """⚠️ Same shape `link` and `groups add` use — no duplicate row."""
+        created = self.seeded("AppendDup")
+        self.edit(created["id"], "--add-email", "work:a@x.invalid")
+        self.assertEqual(len(self.get(created["id"])["emails"]), 2)
+
+    def test_the_same_number_punctuated_differently_is_a_no_op(self):
+        """⚠️ Compared on digits, matching the post-write check."""
+        created = self.add("AppendPhone", "--phone", "work:+1 (555) 000-0001")
+        self.edit(created["id"], "--add-phone", "work:+15550000001")
+        self.assertEqual(len(self.get(created["id"])["phones"]), 1)
+
+    def test_the_same_value_under_a_different_label_is_a_new_entry(self):
+        created = self.add("AppendRelabel", "--email", "work:a@x.invalid")
+        self.edit(created["id"], "--add-email", "home:a@x.invalid")
+        self.assertEqual(
+            self.labelled(self.get(created["id"])["emails"], "address"),
+            {"work": "a@x.invalid", "home": "a@x.invalid"})
+
+    # MARK: refusals
+
+    def test_mixing_the_two_styles_is_refused(self):
+        """⚠️ Ambiguous, so refused rather than resolved one way.
+
+        `apple reminders` refuses `--tag` alongside `--add-tag` for the same
+        reason.
+        """
+        created = self.seeded("AppendMix")
+        for flag, add in [("--email", "--add-email"), ("--phone", "--add-phone"),
+                          ("--url", "--add-url"), ("--address", "--add-address")]:
+            code, _, err = run("edit", created["id"],
+                               flag, "work:https://q.example.invalid",
+                               add, "home:https://r.example.invalid", check=False)
+            self.assertNotEqual(code, 0, f"{flag} with {add} should be refused")
+            self.assertIn(add, err)
+        # Nothing was written by any of the four refusals.
+        self.assertEqual(len(self.get(created["id"])["urls"]), 2)
+
+    def test_adding_on_create_works_like_the_plain_flag(self):
+        """There is nothing to append to yet, so it just sets the value."""
+        created = self.add("AppendOnCreate", "--add-url", "work:https://a.example.invalid")
+        self.assertEqual(self.labelled(created["urls"], "url"),
+                         {"work": "https://a.example.invalid"})
+
+
+
+class RemovingMultiValues(GroupFixtures):
+    """`--remove-email` / `--remove-phone` / `--remove-url` / `--remove-address`.
+
+    🛑 **There was no way to delete ONE value.** The only route was the plain
+    flag: read the card, then re-pass every value except the one to drop. That
+    makes the caller reconstruct each remaining label exactly, so one typo turns
+    a deletion into a silent loss of something else.
+
+    ⚠️ Matching mirrors `unlink`: the VALUE identifies the entry and a label only
+    narrows it.
+    """
+
+    def seeded(self, suffix):
+        return self.add(
+            suffix,
+            "--url", "work:https://a.example.invalid",
+            "--url", "blog:https://b.example.invalid",
+            "--email", "work:a@x.invalid",
+            "--email", "home:a@x.invalid",
+            "--phone", "work:+1 (555) 000-0001",
+        )
+
+    def test_removing_by_value_takes_it_whatever_the_label(self):
+        created = self.seeded("RmValue")
+        self.edit(created["id"], "--remove-url", "https://b.example.invalid")
+        self.assertEqual(self.labelled(self.get(created["id"])["urls"], "url"),
+                         {"work": "https://a.example.invalid"})
+
+    def test_a_label_narrows_it(self):
+        """Two emails share one address, so the value alone is not enough."""
+        created = self.seeded("RmLabel")
+        self.edit(created["id"], "--remove-email", "home:a@x.invalid")
+        self.assertEqual(self.labelled(self.get(created["id"])["emails"], "address"),
+                         {"work": "a@x.invalid"})
+
+    def test_a_phone_matches_on_digits(self):
+        """⚠️ How a number is punctuated is the store's business."""
+        created = self.seeded("RmPhone")
+        self.edit(created["id"], "--remove-phone", "+15550000001")
+        self.assertIsNone(self.get(created["id"]).get("phones"))
+
+    def test_removing_an_address(self):
+        created = self.add("RmAddr",
+                           "--address", "home:500 W Madison St, Chicago, IL 60661",
+                           "--address", "work:1 Main St, Boulder, CO 80301")
+        self.edit(created["id"], "--remove-address", "work:1 Main St")
+        self.assertEqual([a["label"] for a in self.get(created["id"])["addresses"]],
+                         ["home"])
+
+    def test_other_fields_are_untouched(self):
+        created = self.seeded("RmIsolated")
+        self.edit(created["id"], "--remove-url", "https://b.example.invalid")
+        fetched = self.get(created["id"])
+        self.assertEqual(len(fetched["emails"]), 2)
+        self.assertEqual(len(fetched["phones"]), 1)
+
+    # MARK: refusals
+
+    def test_removing_something_absent_is_an_error(self):
+        """🛑 A no-op would let a typo read as done.
+
+        Deliberately the opposite of `--add-*`, where re-adding a value already
+        present achieves the intent.
+        """
+        created = self.seeded("RmMissing")
+        code, _, err = run("edit", created["id"],
+                           "--remove-email", "nobody@x.invalid", check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("matches nothing", err)
+        # ⚠️ It names what IS there, so the caller can see the near-miss.
+        self.assertIn("a@x.invalid", err)
+        self.assertEqual(len(self.get(created["id"])["emails"]), 2)
+
+    def test_a_wrong_label_matches_nothing(self):
+        created = self.seeded("RmWrongLabel")
+        code, _, err = run("edit", created["id"],
+                           "--remove-url", "school:https://a.example.invalid",
+                           check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("matches nothing", err)
+
+    def test_mixing_with_the_plain_flag_is_refused(self):
+        created = self.seeded("RmMix")
+        code, _, err = run("edit", created["id"],
+                           "--url", "x:https://q.example.invalid",
+                           "--remove-url", "https://a.example.invalid", check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("--remove-url", err)
+
+    def test_remove_runs_before_add(self):
+        """⚠️ `--remove-x A --add-x A` ends with A present.
+
+        The other order would delete what was just added, which nobody means.
+        """
+        created = self.seeded("RmThenAdd")
+        self.edit(created["id"],
+                  "--remove-url", "https://b.example.invalid",
+                  "--add-url", "blog:https://b.example.invalid")
+        self.assertEqual(self.labelled(self.get(created["id"])["urls"], "url"),
+                         {"work": "https://a.example.invalid",
+                          "blog": "https://b.example.invalid"})
+
+
+class ReplaceWarnsWhatItDiscards(GroupFixtures):
+    """The plain flags still replace, and now say what they destroyed.
+
+    ⚠️ Behaviour is unchanged, so nothing depending on a replace breaks. The loss
+    is simply no longer invisible.
+    """
+
+    def test_a_replace_names_what_it_discards(self):
+        created = self.add("WarnReplace",
+                           "--url", "work:https://a.example.invalid",
+                           "--url", "blog:https://b.example.invalid")
+        _, _, err = run("edit", created["id"], "--url", "only:https://d.example.invalid")
+        self.assertIn("warning:", err)
+        self.assertIn("Discarding 2", err)
+        self.assertIn("work", err)
+        self.assertIn("blog", err)
+        self.assertIn("--add-url", err, "the warning must name the way out")
+        # It still replaced.
+        self.assertEqual(self.labelled(self.get(created["id"])["urls"], "url"),
+                         {"only": "https://d.example.invalid"})
+
+    def test_appending_does_not_warn(self):
+        created = self.add("WarnQuiet", "--url", "work:https://a.example.invalid")
+        _, _, err = run("edit", created["id"], "--add-url", "b:https://b.example.invalid")
+        self.assertNotIn("warning:", err)
+
+    def test_an_empty_field_does_not_warn(self):
+        """Nothing is discarded, so there is nothing to say."""
+        created = self.add("WarnEmpty")
+        _, _, err = run("edit", created["id"], "--phone", "work:+15550001111")
+        self.assertNotIn("warning:", err)

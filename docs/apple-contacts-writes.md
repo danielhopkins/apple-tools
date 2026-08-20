@@ -316,3 +316,18 @@ exports. Verified by round-tripping a real 514-character note byte-for-byte.
 mark a death with a dagger (`†`) in the note. That marker is **never the record
 and never makes anyone deceased** — it is reported only because the tool cannot
 write a note, so it can never resolve such a card itself.
+
+## Reading the AddressBook store
+
+🛑 **Never open the AddressBook stores with `immutable=1`.** Contacts leaves a 3 MB
+write-ahead log, and `immutable=1` does not replay it — so a contact added minutes
+ago is invisible. The handle count also moved 1367 → 1365 once the log was
+replayed, because it carries deletions too: the immutable snapshot was stale in
+*both* directions. Plain read-only open first, `immutable=1` only as a fallback.
+
+`Notes.swift` in `AppleContacts` did exactly this until 26.812.8, and the latency
+was not theoretical: it could not see a note written seconds earlier, so `contacts
+move`'s "this contact has a note" refusal never fired. Fixed the same way, which
+also means `get --json` now reports a fresher note. `apple phone` hit the same trap
+in its caller resolver — see
+[`apple-phone-store.md`](apple-phone-store.md).
