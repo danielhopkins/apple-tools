@@ -1417,6 +1417,32 @@ account's address is a delegated calendar; `self_identity_email` is the user's o
 address on every row and distinguishes nothing. 7 of 9 enabled calDAV calendars
 here are delegated. Writing to one syncs fine.
 
+🛑 **EventKit clamps one fetch to four years from the start, silently.**
+`predicateForEvents` does not error, does not warn, and returns a result that
+reads as complete. Measured on 26.819.0:
+
+| asked | returned |
+|---|---|
+| 2022-01-01 → 2026-01-01 | 2022-01-01 → 2025-12-31 (full, exactly 4y) |
+| 2021-12-31 → 2026-01-01 | 2021-12-31 → **2025-12-30** |
+| 2008-01-01 → 2026-12-31 | 2008-01-05 → **2011-12-31**, 1,138 of 14,616 events |
+
+That last row is how it was found: an 18-year search for a wedding came back
+empty and looked like an answer. ⚠️ **A caller cannot detect the clamp**, because
+an empty tail is indistinguishable from a quiet stretch of calendar.
+
+`events` now splits the range into four-year windows and reports the count on
+stderr (`note: EventKit caps one fetch at 4 years; this range was read in N
+windows`). Nothing else needed it — every other predicate here spans a day or two
+years.
+
+- 🛑 **The de-duplication key is `(identifier, start, calendar)`.** Windows
+  overlap, so an event is returned by each one it touches. `eventIdentifier`
+  alone is not unique twice over: every occurrence of a series shares it, **and
+  one event visible through two calendars comes back once per calendar with the
+  same identifier and start**. Keying on identifier plus start alone dropped 6 of
+  4,755 events on a range that needed no paging at all — a fix worse than the bug.
+
 Dates accept natural language (`tomorrow 2pm`) or `YYYY-MM-DD [HH:MM]`. Default
 event length is 1 hour.
 

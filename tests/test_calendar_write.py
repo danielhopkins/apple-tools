@@ -6,10 +6,12 @@ model. Run with ./tests/run-tests.
 
 import calendar as calendar_module
 import datetime
+import json
 
 from harness import (
     near_future,
     near_window,
+    TEST_PREFIX,
     TEST_YEAR,
     LiveCalendarTest,
     find_test_events,
@@ -937,3 +939,60 @@ class TestInvitationsAreReadOnly(LiveCalendarTest):
         run("edit", event["id"], "--title", self.title("guard-noop-renamed"))
         self.assertTrue(
             self.get(event["id"])["title"].endswith("guard-noop-renamed"))
+
+
+class LongRangeQueries(LiveCalendarTest):
+    """Ranges longer than four years.
+
+    🛑 **`predicateForEvents` clamps the end to exactly four years after the
+    start, and says nothing.** No error, no warning, and a result that reads as
+    complete. Measured on 26.819.0: `events --from 2008-01-01 --to 2026-12-31`
+    returned 1,138 events and stopped in 2011.
+
+    That is how it was found — an 18-year search for a wedding came back empty
+    and looked like an answer. `events` now pages the range into windows EventKit
+    will honour.
+    """
+
+    def test_a_range_over_four_years_reaches_the_far_end(self):
+        """The fixture sits in the fifth year, which the clamp would cut off."""
+        created = self.add("longrange", "--start", f"{TEST_YEAR}-06-15 09:00",
+                           "--no-confirm-sync")
+        _, out, _ = run("events",
+                        "--from", f"{TEST_YEAR - 5}-01-01",
+                        "--to", f"{TEST_YEAR}-12-31", "--json")
+        titles = [e["title"] for e in json.loads(out)]
+        self.assertIn(created["title"], titles,
+                      "an event in the fifth year was lost to the four-year clamp")
+
+    def test_it_says_when_it_paged(self):
+        _, _, err = run("events",
+                        "--from", f"{TEST_YEAR - 5}-01-01",
+                        "--to", f"{TEST_YEAR}-12-31", "--json")
+        self.assertIn("4 years", err)
+        self.assertIn("windows", err)
+
+    def test_a_short_range_is_not_paged_and_says_nothing(self):
+        """⚠️ The note must not appear for a range that never needed splitting."""
+        _, _, err = run("events",
+                        "--from", f"{TEST_YEAR}-01-01",
+                        "--to", f"{TEST_YEAR}-12-31", "--json")
+        self.assertNotIn("windows", err)
+
+    def test_paging_does_not_change_what_a_short_range_returns(self):
+        """🛑 The guard that caught a real regression.
+
+        The first version keyed its de-duplication on identifier plus start, and
+        dropped 6 of 4,755 events on a range that needed no paging at all. One
+        event visible through two calendars comes back once per calendar with the
+        SAME identifier and start, so the calendar belongs in the key.
+        """
+        # ⚠️ --no-confirm-sync: these fixtures exist to be read back, and the
+        # suite outruns what one Exchange calendar confirms in 30s.
+        self.add("dedup-a", "--start", f"{TEST_YEAR}-04-01 09:00", "--no-confirm-sync")
+        self.add("dedup-b", "--start", f"{TEST_YEAR}-04-01 09:00", "--no-confirm-sync")
+        _, out, _ = run("events",
+                        "--from", f"{TEST_YEAR}-04-01",
+                        "--to", f"{TEST_YEAR}-04-02", "--json")
+        mine = [e for e in json.loads(out) if e["title"].startswith(TEST_PREFIX)]
+        self.assertEqual(len(mine), 2, "two distinct events must not collapse into one")

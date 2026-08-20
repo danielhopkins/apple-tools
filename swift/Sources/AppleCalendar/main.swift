@@ -544,6 +544,70 @@ struct Calendars: ParsableCommand {
     }
 }
 
+/// Fetch events over a range of any length, in windows EventKit will honour.
+///
+/// 🛑 **`predicateForEvents` CLAMPS the end to exactly four years after the
+/// start, and says nothing.** It does not error, does not warn, and returns a
+/// result that looks complete. Measured on 26.819.0:
+///
+/// | asked | returned |
+/// |---|---|
+/// | 2022-01-01 → 2026-01-01 | 2022-01-01 → 2025-12-31 (full, exactly 4y) |
+/// | 2021-12-31 → 2026-01-01 | 2021-12-31 → **2025-12-30** |
+/// | 2021-06-01 → 2026-01-01 | 2021-06-01 → **2025-05-31** |
+/// | 2008-01-01 → 2026-12-31 | 2008-01-05 → **2011-12-31** |
+///
+/// The last row is how this was found: an 18-year search for a wedding returned
+/// 1,138 events, stopped in 2011, and read as "no such event exists".
+///
+/// ⚠️ **A caller cannot detect the clamp from the result.** An empty tail is
+/// indistinguishable from a quiet stretch of calendar, which is exactly why this
+/// pages rather than warns.
+///
+/// The window is four years minus a day, so no single query can sit on the
+/// boundary whatever Apple does with leap years.
+private func eventsSpanning(
+    from start: Date, to end: Date, calendars: [EKCalendar]?, in store: EKEventStore
+) -> (events: [EKEvent], windows: Int) {
+    let cal = Foundation.Calendar.current
+    var collected: [EKEvent] = []
+    // 🛑 Windows overlap at their edges and a multi-day event is returned by
+    // every window it touches, so the same occurrence arrives more than once.
+    //
+    // ⚠️ **`eventIdentifier` alone is NOT unique**, twice over. Every occurrence
+    // of a recurring series shares it, so the start date is needed to separate
+    // them. And one event visible through two calendars is returned once per
+    // calendar with the SAME identifier and start — measured here on a shared
+    // birthday that sits on both "Family" and "Steph's calendar".
+    //
+    // 🛑 The calendar therefore belongs in the key. Without it this dropped 6 of
+    // 4,755 events on a range that needed no paging at all, which would have
+    // made the fix worse than the bug it repairs.
+    var seen = Set<String>()
+    var windows = 0
+    var cursor = start
+
+    while cursor < end {
+        let fourYears = cal.date(byAdding: .year, value: 4, to: cursor) ?? end
+        let limit = cal.date(byAdding: .day, value: -1, to: fourYears) ?? end
+        let stop = min(limit, end)
+        windows += 1
+
+        for event in store.events(matching: store.predicateForEvents(
+            withStart: cursor, end: stop, calendars: calendars))
+        {
+            let key = (event.eventIdentifier ?? "-")
+                + "|" + String(event.startDate?.timeIntervalSinceReferenceDate ?? 0)
+                + "|" + (event.calendar?.calendarIdentifier ?? "-")
+            if seen.insert(key).inserted { collected.append(event) }
+        }
+
+        guard stop > cursor else { break }   // never loop on a zero-width window
+        cursor = stop
+    }
+    return (collected, windows)
+}
+
 struct Events: ParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "List events in a date range (defaults to the next 7 days)",
@@ -600,10 +664,17 @@ struct Events: ParsableCommand {
         }
 
         let targets = try calendars(named: calendar)
-        let predicate = store.predicateForEvents(
-            withStart: start, end: end, calendars: targets.isEmpty ? nil : targets)
-
-        var found = store.events(matching: predicate)
+        let fetched = eventsSpanning(
+            from: start, to: end,
+            calendars: targets.isEmpty ? nil : targets, in: store)
+        // Say so, the way `mail search` reports its scan depth. A multi-year
+        // range is slower for a reason the caller should be able to see.
+        if fetched.windows > 1 {
+            FileHandle.standardError.write(Data(
+                ("note: EventKit caps one fetch at 4 years; this range was read in "
+                 + "\(fetched.windows) windows\n").utf8))
+        }
+        var found = fetched.events
         if let search {
             let needle = search.lowercased()
             found = found.filter { event in
