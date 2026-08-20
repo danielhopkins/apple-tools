@@ -1385,12 +1385,28 @@ deleted."` on stderr was the only hint. ⚠️ A non-recurring `add` was never
 affected, which is why it survived a release. `add` now re-reads a fresh store
 before printing, the way `edit` has since 26.812.x.
 
-⚠️ **The live suite trips the sync wait about three times per run, and the tool
-is right to say so.** 67 tests in ~322s against one Exchange calendar outruns
-what the server will confirm in 30s; the same write by hand syncs in 6s. The
-failing tests differ every run, which is how you tell this from a defect. Raise
-`--sync-timeout` or pin a quieter calendar with
-`APPLE_CALENDAR_TEST_CALENDAR` if it gets in the way.
+⚠️ **The live suite outruns what one calendar will confirm, and the tool is
+right to say so.** A lone write syncs in 5–6s on both Exchange and calDAV here.
+Writing ~70 in a burst is a different regime, and the numbers moved a long way in
+one day:
+
+| run | `--sync-timeout` | writes not confirmed |
+|---|---|---|
+| 71 tests in 322s | 30s | 3 |
+| 71 tests in 928s | 30s | **26** |
+| 71 tests in 1064s | 120s | 7 |
+
+🛑 **Every one of those writes reached the server.** `unsynced` reported
+"Everything has reached its server" straight afterwards, and no fixture leaked.
+So the failure is always *this caller could not confirm it in time*, never *the
+write failed* — and the failing tests differ every run, which is how you tell it
+from a defect.
+
+`tests/harness.py` now passes `--sync-timeout 120` to `add`, `edit` and `resync`,
+which cut it from 26 to 7. **The tool's own default stays at 30s**, because a
+person writing one event should not wait two minutes to be told something went
+wrong. Override with `APPLE_CALENDAR_TEST_SYNC_TIMEOUT`, or pin a quieter
+calendar with `APPLE_CALENDAR_TEST_CALENDAR`.
 
 ⚠️ **`Error` rows are transient.** The table is empty on this machine, yet
 `sqlite_sequence` puts its high-water mark at **1304** — they are written and

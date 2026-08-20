@@ -63,6 +63,38 @@ def calendar_bin():
     return CALENDAR
 
 
+# Subcommands that carry SyncConfirmationOptions. Anything else rejects the flag.
+_SYNC_AWARE = {"add", "edit", "resync"}
+
+# ⚠️ **The suite outruns what one Exchange calendar will confirm in 30s.**
+# The tool's own default is 30, and for a person writing one event that is
+# generous: six timed trials put create-to-`external_id` at 4 seconds, and a
+# single write by hand still syncs in 6.
+#
+# 🛑 A burst is a different regime, and the numbers moved a long way in one day:
+#
+#   322s run, 71 tests   ->  3 writes timed out
+#   928s run, 71 tests   -> 26 writes timed out
+#
+# Every one of those 26 was a healthy write the server simply had not confirmed
+# yet, so the suite reported 26 failures for a tool that was working. Raising the
+# wait here — not the tool's default — keeps the interactive experience unchanged
+# while letting the suite give a clean signal.
+#
+# ⚠️ This does NOT weaken the sync-confirmation tests. They still assert that a
+# write reaches the server; they simply get longer to find out.
+SYNC_TIMEOUT = os.environ.get("APPLE_CALENDAR_TEST_SYNC_TIMEOUT", "120")
+
+
+def _with_sync_timeout(args):
+    """Give sync-aware subcommands a longer deadline, unless the caller set one."""
+    if not args or args[0] not in _SYNC_AWARE:
+        return args
+    if any(a in ("--sync-timeout", "--no-confirm-sync") for a in args):
+        return args
+    return (*args, "--sync-timeout", SYNC_TIMEOUT)
+
+
 def run(*args, check=True, env=None):
     """Invoke apple-calendar and return (returncode, stdout, stderr).
 
@@ -73,6 +105,7 @@ def run(*args, check=True, env=None):
     environment = None
     if env:
         environment = {**os.environ, **env}
+    args = _with_sync_timeout(args)
     proc = subprocess.run(
         [calendar_bin(), *args],
         capture_output=True,

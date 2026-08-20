@@ -222,10 +222,25 @@ enum SyncConfirmation {
 
     /// Polls until the server takes the event, refuses it, or the deadline passes.
     ///
-    /// ⚠️ **30 seconds is generous, not tight.** Six timed trials on this
-    /// machine put create-to-`external_id` at **4 seconds every time**, with and
-    /// without a manual `reload calendars`. So something still pending at 30s is
-    /// a real problem rather than a slow network.
+    /// ⚠️ **30 seconds is generous for ONE write, and not for a burst.** Six
+    /// timed trials on this machine put create-to-`external_id` at **4 seconds
+    /// every time**, with and without a manual `reload calendars`. A single
+    /// write by hand still syncs in 6.
+    ///
+    /// 🛑 **Under load that number moves a long way, and an earlier version of
+    /// this comment claimed otherwise.** The live suite writes ~70 events to one
+    /// Exchange calendar in a burst, and the server throttles:
+    ///
+    /// | run | timed out at 30s |
+    /// |---|---|
+    /// | 71 tests in 322s | 3 |
+    /// | 71 tests in 928s | **26** |
+    ///
+    /// Every one of those was a healthy write the server had not yet confirmed.
+    /// So "still pending at 30s" means *this caller could not confirm it*, never
+    /// *the write failed*. The test harness raises its own deadline for that
+    /// reason; the default here stays at 30, because a person writing one event
+    /// should not wait two minutes to be told something went wrong.
     ///
     /// ⚠️ **`reload calendars` does not help.** It exits 0, does not need
     /// Calendar.app running, does not wipe pending writes — and does not speed
