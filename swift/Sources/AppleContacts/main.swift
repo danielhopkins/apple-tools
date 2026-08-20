@@ -1230,21 +1230,130 @@ struct ContactFields: ParsableArguments {
     /// because it is one of the schemes that never does (`mailto:`, `tel:`).
     /// The cost is that those words cannot be used as labels, which is a trade
     /// nobody will notice.
+    /// 🛑 **Only the CONSERVATIVE scheme test belongs here.** This runs for
+    /// every labelled flag, and most of them are not URLs. `--relation
+    /// "father:Robert"` must give the label `father`: `father` matches the
+    /// scheme grammar and `Robert` is one unbroken token, so the fuller rule
+    /// `splitURL` uses would read it as a scheme and destroy the relation.
+    ///
+    /// ⚠️ The short allowlist stays because `--email "mailto:a@x.com"` and
+    /// `--phone "tel:+1555…"` are supported inputs, pinned by a test. A first
+    /// attempt at this fix moved the whole scheme test into `splitURL` and broke
+    /// both.
     private func split(_ input: String) -> (label: String?, value: String) {
-        guard let separator = input.firstIndex(of: ":") else { return (nil, input) }
+        guard let separator = input.firstIndex(of: ":") else {
+            return (nil, input.trimmingCharacters(in: .whitespaces))
+        }
         let label = String(input[input.startIndex..<separator])
+            .trimmingCharacters(in: .whitespaces)
+        // ⚠️ Trimmed. `--url "Note: https://x"` stored a value with a leading
+        // space, and the URL then failed to resolve.
         let value = String(input[input.index(after: separator)...])
+            .trimmingCharacters(in: .whitespaces)
+
         let looksLikeScheme = Self.isURIScheme(label)
             && (value.hasPrefix("//") || Self.schemesWithoutSlashes.contains(label.lowercased()))
-        if looksLikeScheme { return (nil, input) }
+        if looksLikeScheme { return (nil, input.trimmingCharacters(in: .whitespaces)) }
+
         return (label.isEmpty ? nil : label, value)
     }
 
     /// Schemes whose value does not begin `//`, so the `//` test alone cannot
-    /// recognise them. Kept deliberately short: every entry is a word that can
-    /// no longer be used as a label.
+    /// recognise them. ⚠️ Kept short on purpose: every entry is a word that can
+    /// no longer be a label on ANY flag, not just `--url`.
     private static let schemesWithoutSlashes: Set<String> = [
         "mailto", "tel", "sms", "callto", "facetime", "facetime-audio", "skype", "xmpp",
+    ]
+
+    /// The same split, for a value that may itself be a URL carrying a scheme.
+    ///
+    /// 🛑 **The first colon is not always a label separator.** A bare
+    /// `https://example.com` has one, and cutting there stored `//example.com`
+    /// under a label of `https`. `--url` is documented as *optionally*
+    /// labelled, so a bare URL is a supported input and has to survive.
+    ///
+    /// 🛑 **An allowlist of schemes was the wrong shape and lost data
+    /// silently.** The old rule took the prefix as a scheme only when the rest
+    /// began `//`, or when the prefix was one of eight hard-coded words. Every
+    /// other scheme legitimately written without `//` fell through and was
+    /// stored as a label, with the scheme stripped off the URL and a zero exit
+    /// code. Measured on 26.820.1:
+    ///
+    /// | input | stored |
+    /// |---|---|
+    /// | `webcal:cal.example.com/f.ics` | label `webcal`, url `cal.example.com/f.ics` |
+    /// | `ftps:files.example.com` | label `ftps` |
+    /// | `matrix:r/x` | label `matrix` |
+    /// | `https:lower.example.com` | label `https` |
+    ///
+    /// ⚠️ **It was never a case problem**, though it looked like one. The
+    /// allowlist already lowercased, so `MAILTO:` worked and `https:` failed —
+    /// the missing `//` was the whole cause.
+    ///
+    /// The rule now asks what follows the colon instead of consulting a list:
+    ///
+    /// 1. A **known label** wins outright, so `work:example.com` stays a label.
+    /// 2. Otherwise a prefix matching the RFC 3986 scheme grammar is a scheme
+    ///    when the rest starts `//`, **or** the rest is one unbroken token that
+    ///    carries no scheme of its own.
+    /// 3. Anything else is a label.
+    ///
+    /// 🛑 Step 2's second half is what keeps `LinkedIn:https://x.com` a label:
+    /// the rest already has a scheme, so the prefix cannot be one too.
+    ///
+    /// ⚠️ **`LinkedIn:example.com` stays genuinely ambiguous** — a valid scheme
+    /// grammar followed by a bare host. It is read as a URL and warned about,
+    /// because no rule can distinguish it from `matrix:r/x`.
+    private func splitURL(_ input: String) -> (label: String?, value: String) {
+        let (label, value) = split(input)
+        guard let label, !value.isEmpty else { return (label, value) }
+
+        if Labels.isKnownURLLabel(label) { return (label, value) }
+        guard Self.isURIScheme(label) else { return (label, value) }
+
+        if value.hasPrefix("//") { return (nil, input) }
+
+        let unbroken = !value.contains(where: \.isWhitespace)
+        guard unbroken, !Self.carriesOwnScheme(value) else { return (label, value) }
+
+        return (nil, input)
+    }
+
+    /// The `--url` inputs read as a scheme where a label was also plausible.
+    ///
+    /// ⚠️ **Reported from `validate()`, not from the parser.** `urls` is a
+    /// computed property and every caller re-runs it — validate, apply, and the
+    /// read-back check — so warning inside the split printed the same line three
+    /// times for one flag.
+    var ambiguousURLs: [(input: String, label: String)] {
+        url.compactMap { raw in
+            let (label, value) = split(raw)
+            guard let label, !value.isEmpty,
+                  !Labels.isKnownURLLabel(label),
+                  Self.isURIScheme(label),
+                  !value.hasPrefix("//"),
+                  !value.contains(where: \.isWhitespace),
+                  !Self.carriesOwnScheme(value),
+                  !Self.wellKnownSchemes.contains(label.lowercased())
+            else { return nil }
+            return (raw, label)
+        }
+    }
+
+    /// Does this text begin with its own `scheme:`?
+    private static func carriesOwnScheme(_ text: String) -> Bool {
+        guard let colon = text.firstIndex(of: ":") else { return false }
+        return isURIScheme(String(text[text.startIndex..<colon]))
+    }
+
+    /// Schemes common enough that reading one as a scheme needs no comment.
+    /// ⚠️ Not an allowlist — an unlisted scheme still parses as a scheme. This
+    /// only decides whether to mention it, which is why being wrong here costs
+    /// a line of stderr rather than a mangled URL.
+    private static let wellKnownSchemes: Set<String> = [
+        "http", "https", "mailto", "tel", "sms", "callto", "facetime",
+        "facetime-audio", "skype", "xmpp", "webcal", "ftp", "ftps", "file",
+        "irc", "news", "nntp", "sip", "sips", "ssh", "data", "im",
     ]
 
     /// RFC 3986 §3.1: `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`.
@@ -1280,6 +1389,17 @@ struct ContactFields: ParsableArguments {
             throw ValidationError(
                 "--clear-dates cannot be combined with --date or --anniversary. "
                 + "--date already replaces the whole set; use it alone to set one.")
+        }
+        // ⚠️ A note, not a refusal. The reading is defensible either way, and
+        // refusing would break a URL whose scheme simply is not well known.
+        for case let (input, label) in ambiguousURLs {
+            let value = split(input).value
+            FileHandle.standardError.write(Data("""
+                note: read '\(input)' as a URL whose scheme is '\(label)', not as a label.
+                      For a label, give the value its own scheme: \
+                --url "\(label):https://\(value)"
+
+                """.utf8))
         }
         // 🛑 Validated BEFORE any Apple Event, like every other field here.
         if let died {
@@ -1539,7 +1659,12 @@ struct ContactFields: ParsableArguments {
 
     var emails: [(label: String?, value: String)] { parse(email, Labels.email) }
     var phones: [(label: String?, value: String)] { parse(phone, Labels.phone) }
-    var urls: [(label: String?, value: String)] { parse(url, Labels.url) }
+    var urls: [(label: String?, value: String)] {
+        url.map { raw in
+            let (label, value) = splitURL(raw)
+            return (label.map(Labels.url), value)
+        }
+    }
     var relations: [(label: String?, value: String)] { parse(relation, Labels.relation) }
 
     /// ⚠️ Parsed here rather than in `apply`, so a bad address is caught by

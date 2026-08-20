@@ -1804,20 +1804,25 @@ touch becomes detached.
 
 ### contacts — `apple contacts`
 
-Swift + Contacts framework (`CNContactStore`). Full CRUD.
+Swift + Contacts framework (`CNContactStore`). Full CRUD. The measurements,
+failure histories and framework traps behind every rule below are in
+[`docs/apple-contacts-writes.md`](docs/apple-contacts-writes.md); moving a
+contact between accounts is in
+[`docs/apple-contacts-move.md`](docs/apple-contacts-move.md).
 
 ```
 apple contacts search TERM [--limit N] [--plain]   # default limit 25
 apple contacts get ID [--plain]
 apple contacts list [--limit N] [--plain]          # default limit 100
 apple contacts add [FIELDS] [--container NAME] [--json]
-apple contacts edit ID [FIELDS] [--json]
+apple contacts edit ID [FIELDS] [--clear-dates] [--json]
 apple contacts move ID --to CONTAINER [--dry-run] [--json]
 apple contacts delete ID
-apple contacts export ID... [--group GROUP] [-o FILE]   # vCard 3.0
+apple contacts export ID... [--group GROUP] [-o FILE]   # vCard 3.0, notes included
 apple contacts deceased [--json]                   # everyone recorded as having died
 apple contacts relations ID [--json]               # who this contact links to, resolved
-apple contacts link A B --relation LABEL [--inverse LABEL] [--no-inverse] [--dry-run]
+apple contacts link A B --relation LABEL [--inverse LABEL] [--no-inverse]
+                        [--name-only] [--dry-run]
 apple contacts unlink A B [--relation LABEL] [--no-inverse] [--dry-run]
 apple contacts containers [--json]                 # accounts, and which is default
 apple contacts status [--json]                     # permission state, never prompts
@@ -1849,27 +1854,39 @@ FIELDS, shared by `add` and `edit`:
 --date     LABEL:DATE        repeatable
 ```
 
-Labels are friendly names: `home`, `work`, `school`, `other`, plus `mobile`,
-`iphone`, `main`, `pager`, `applewatch` for phones, `icloud` for email and
-`homepage` for URLs. `--email work:a@b.com`. Unlabelled values are accepted for
-email/phone/url.
+⚠️ **Multi-value flags replace, they don't append.** Passing `--email` on `edit`
+replaces *every* existing email on that contact. Read the contact first and
+re-pass the ones to keep. `--clear-dates` empties the labelled-date set (the
+birthday is a separate field and survives); it is refused alongside
+`--date`/`--anniversary`, allowed alongside `--died`.
 
-**Any other label is kept as a custom label**, exactly as Contacts.app stores
-one the user typed, and **with its case** — `--url "LinkedIn:https://…"` reads
-back as `LinkedIn`, not `linkedin`. This is what makes the documented "read it
-first, re-pass what you want to keep" workflow safe: **`get` → `edit` → `get` is
-a no-op** for every multi-value field, pinned by a test.
-
-⚠️ **A bare URL is fine; the scheme is not read as a label.** `--url
-"https://x.com"` stores the whole thing — the split is on the first colon, but a
-prefix that parses as a URI scheme followed by `//`, or one of `mailto` `tel`
-`sms` `callto` `facetime` `facetime-audio` `skype` `xmpp`, is treated as part of
-the value. The cost is that those words cannot be used as labels.
+⚠️ **`--MM-DD` needs `=`.** `--birthday --04-13` fails, because the parser reads
+the value as the next flag. Write `--birthday=--04-13`, and likewise for
+`--anniversary`, `--date` and `--died`.
 
 **Every write is read back and checked.** `add` and `edit` re-read the contact
 and confirm each labelled value asked for is really there, failing loudly
 otherwise. It is a subset check, because `get` returns the unified contact and a
 linked card can contribute values this edit never mentioned.
+
+⚠️ **`delete` is permanent.** Unlike Notes there is no Recently Deleted, and the
+deletion syncs everywhere. Always confirm with the user first. Deleting a
+*group* keeps its contacts; removing a member keeps the contact too.
+
+**Labels.** Friendly names: `home`, `work`, `school`, `other`, plus `mobile`,
+`iphone`, `main`, `pager`, `applewatch` for phones, `icloud` for email and
+`homepage` for URLs. Unlabelled values are accepted for email/phone/url. **Any
+other label is kept as a custom label, with its case** — `--url
+"LinkedIn:https://…"` reads back as `LinkedIn`. That is what makes the "read it
+first, re-pass what you want to keep" workflow safe: **`get` → `edit` → `get` is
+a no-op** for every multi-value field, pinned by a test.
+
+⚠️ **`--url` splits on the first colon and has to decide whether the prefix is a
+label or a scheme.** A built-in label wins; otherwise a prefix is a scheme when
+the rest starts `//` or is one unbroken token with no scheme of its own.
+`LinkedIn:https://x.com` stays a label, `webcal:cal.example.com/f.ics` is a URL,
+and the genuinely ambiguous `LinkedIn:example.com` is read as a URL with a note
+on stderr. 🛑 The older allowlist stripped schemes silently.
 
 **Postal addresses.** `--address` takes free text or exact fields:
 
@@ -1878,34 +1895,11 @@ apple contacts edit ID --address "home:500 W Madison St, Chicago, IL 60661"
 apple contacts edit ID --address "home:street=500 W Madison St;city=Chicago;state=IL;zip=60661"
 ```
 
-Labels are the four generic ones — `home`, `work`, `school`, `other`. There is no
-address-specific constant in the SDK, unlike email's `icloud`.
-
 ⚠️ **Free text is a guess, and the tool prints what it decided** on stderr before
 writing. It knows one shape, `street, city, STATE ZIP, country`, and nothing
 about any other country's conventions. When it gets one wrong, use the
 `key=value` form; `zip` and `postalCode` are both accepted, so what `get` prints
-can be passed straight back.
-
-🛑 **Three parse bugs were found by probing real addresses, and every one was
-silent.** They are pinned by tests in `swift/Tests/ContactsTests/`:
-
-| input | wrong result | why |
-|---|---|---|
-| `…, Cupertino, CA` | `country=CA` | a state abbreviation has no digits either |
-| `SW1A 2AA` | `state=SW1A;zip=2AA` | a UK postcode is one token pair, not two fields |
-| `ON M5H 2N2` | `state=ON M5H;zip=2N2` | a Canadian postcode is two tokens after a province |
-
-🛑 **A typo'd key is an error, not a dropped field.** `citty=Chicago` used to
-fall through to the free-text parser and land as a *street* reading
-`citty=Chicago`, with exit 0 — the same silent-drop failure the label encoders
-were fixed for. Anything of the form `word=` now goes to the structured parser,
-where an unknown key is refused naming the valid ones.
-
-🛑 **Never probe this parser by running `add`.** Seventeen contacts were created
-in the user's real iCloud to see how strings parsed, and they synced to every
-device before being deleted. `PostalAddress` lives in its own `ContactsLibrary`
-target so every such question is answered offline.
+can be passed straight back. A typo'd key is a hard error, not a dropped field.
 
 **Deaths.** `--died` on `add`/`edit` writes one, `deceased` lists them.
 
@@ -1913,101 +1907,24 @@ target so every such question is answered offline.
 apple contacts edit <id> --died 2020-04-30     # a full date
 apple contacts edit <id> --died 2020           # only the year is known
 apple contacts edit <id> --died=--04-30        # the day, but not the year
-apple contacts deceased --json
 ```
 
-🛑 **Apple defines no death field anywhere.** Measured across all three layers a
-contact can be written through:
+🛑 **Apple defines no death field**, so it is a custom date label — `death`, or
+`death-year` when only the year is known. Contacts refuses a date with no month
+and day, so **a year-only death stores a placeholder `2020-01-01`** and the label
+is the only disclosure.
 
-| Layer | Date labels it defines | Death? |
-|---|---|---|
-| `CNContact` | `CNLabelDateAnniversary`, and nothing else | none |
-| legacy `AddressBook` | `kABAnniversaryLabel`, and nothing else | none |
-| `AddressBook-v22.abcddb` | `ZABCDCONTACTDATE.ZLABEL`, free text | no column |
-
-So a custom label on `dates` is the only route. `DeathDate` in `ContactsLibrary`
-is the one place that decides how it is spelled: **`death`** for a full date,
-**`death-year`** when only the year is known.
-
-🛑 **A labelled date REQUIRES a month and a day; only the year is optional** —
-the exact inverse of what "died in 2020" needs. Measured against a real store,
-with fixtures deleted afterwards:
-
-| Written | Result |
-|---|---|
-| `2020` | refused — `CNErrorDomain 302`, key paths `dates.value.month`, `dates.value.day` |
-| `2020-04` | refused — `CNErrorDomain 302`, key path `dates.value.day` |
-| `--04-30` | accepted |
-| `2020-04-30` | accepted |
-
-`--birthday 2020` fails the same way, so the rule belongs to Contacts and not to
-one key path.
-
-🛑 **A year-only death therefore stores a day it never had, and `died` must never
-report it.** The card holds `2020-01-01`; `died` says `2020`. Nothing else can
-carry that fact — `CNContact` has no free-text field but the note, and the note
-needs `com.apple.developer.contacts.notes`, which no CLI can hold. So the
-*label* is the disclosure.
-
-- **Read `died`, never the raw `dates` array.** `dates` still shows
-  `2020-01-01`, unchanged, because that really is what the card holds and
-  `get` → `edit` → `get` has to stay a no-op.
-- **`died_precision`** is `date`, `year`, or `day-only`, and says how much of
-  `died` is real.
+- **Read `died`, never the raw `dates` array**, which still shows the
+  placeholder. **`died_precision`** is `date`, `year` or `day-only`.
 - **`deceased` is absent, never `false`**, like every other optional key here.
-- 🛑 **`2020-04` is refused rather than padded.** Contacts rejects it anyway, and
-  inventing a day would record a month as though it were exact — with no label
-  left to disclose it.
+- 🛑 **`--died` merges; `--date` replaces.** That is the whole reason it is its
+  own flag. Restating `--died` at a different precision replaces the old entry.
+- **`marked_without_date`** lists cards whose *note* carries a dagger (`†`).
+  That marker is never the record and never makes anyone deceased.
 
-🛑 **`--died` merges; `--date` replaces.** That is the whole reason it is its own
-flag, the same way `link` exists alongside `edit --relation`. Getting a death
-onto a card with `--date` alone means re-passing every other date it holds, and
-forgetting one deletes it silently. Restating `--died` at a different precision
-**replaces** the old entry, so a card never ends up holding both a `death` and a
-`death-year`.
-
-⚠️ **The AddressBook fallback is the NORMAL path for a death, not the
-exception.** All four cards recorded as deceased on this store carry a note — an
-obituary link, or the marker — and a note blocks every `CNContactStore` write to
-the card. So `--died` reaches the legacy framework far more often than it reaches
-Contacts, and both paths are pinned by live tests.
-
-⚠️ **Matching a label ignores case, writing never does.** A card written by hand
-may say `Death`, and a person who died is not a thing to miss over one letter.
-Writes always use the lowercase spelling. 🛑 The **whole** label must match: a
-prefix test would make `death-year` match `death` and report its placeholder day
-as real.
-
-⚠️ **`--MM-DD` needs `=`.** `--died --04-30` fails, because the parser reads the
-value as the next flag. Write `--died=--04-30`, the same as `--birthday`.
-
-**`marked_without_date` is the second half of `deceased`.** Some address books
-mark a death with a dagger (`†`) in the note. That marker is **never the record
-and never makes anyone deceased** — it is reported only because the tool cannot
-write a note, so it can never resolve such a card itself. It is always present in
-the JSON, `[]` when empty.
-
-**Relations.** `--relation father:"Robert Hopkins"`. All 216 relation labels the
-Contacts SDK defines are accepted — `father`, `mother`, `son`, `daughter`,
-`brother`, `sister`, `spouse`, `partner`, `grandfather`, `niece`, `colleague`,
-and so on, including in-law and step variants. Matching ignores case, spaces and
-hyphens, so `younger-sister` and `youngerSister` both work. An unrecognised
-label is still stored, as a custom label, with a note on stderr suggesting near
-matches — so a typo like `fathr` is visible rather than silent.
-
-**Dates.** `--birthday` and `--anniversary` are the two Contacts models
-natively. Everything else is a labelled date: `--date death:2020-05-01`,
-`--date graduation:--06-15`. There is no death-date constant in the SDK — only
-`anniversary` — so a death date is stored as a custom label, which is what
-Contacts.app does for user-created date labels too. `--MM-DD` records a day with
-no year.
-
-Search matches first/middle/last/nickname/company/department/job title/full name,
-email addresses, and phone numbers (digits only, so `7205551234` finds
-`+1 (720) 555-1234`). **JSON is the default**; pass `--plain` for human output.
-
-**Relationships between contacts.** `relations` reads them, `link` and `unlink`
-write them.
+**Relations.** `--relation father:"Robert Hopkins"`. All 216 SDK relation labels
+are accepted; matching ignores case, spaces and hyphens. An unrecognised label is
+still stored, as a custom label, with near matches on stderr.
 
 ```
 apple contacts relations <id>                       # both directions
@@ -2017,143 +1934,39 @@ apple contacts link A "David M. Merritt" --relation spouse --name-only
 apple contacts unlink A B --relation friend
 ```
 
-🛑 **A relation stores a NAME, not a reference.** Contacts.app renders one as a
-tappable link, which reads as though it holds the other card's id. It does not.
-Measured: all 54 relation rows here carry a `ZUNIQUEID`, all 54 values are
-distinct, and **none** matches any `ZABCDRECORD.ZUNIQUEID` — that column is the
-relation row's own sync id. Three consequences:
-
-- **Renaming a contact silently breaks every link to it.** Nothing updates.
-- **A relation can name nobody.** Two do on this store, and that is not corruption.
-- **A relation can name several people**, when two cards share a name. `matches`
-  in the JSON says which of the three you have.
-
-**`relations` reports both directions**, and the reverse half is the one people
-want. `related_from` is a scan of every card for anyone naming this contact —
-Contacts has no reverse index, so there is no cheaper way. 1.1s over 679
-contacts. On this store Dan lists three brothers and **none of them lists him
-back**; only his parents do.
-
-🛑 **`link` appends; `edit --relation` replaces.** That is the whole reason
-`link` exists. Adding one relation through `edit` means reading every existing
-one and re-passing it, and forgetting one deletes it silently.
-
-⚠️ **`link` writes the other card too, so it states a fact about someone else.**
-
-🛑 **A gendered label inverts to the NEUTRAL term, and that is not a guess.**
-`father` gives the other card `child`, `brother` gives `sibling`, `grandmother`
-gives `grandchild`. An earlier version refused these, reasoning that the other
-side is "son or daughter" and Contacts records no gender. That was wrong: `child`
-is exactly the term for "son or daughter", the SDK defines it, and writing it
-states nothing untrue. Pass `--inverse son` when you want the specific term.
-
-⚠️ **`husband` and `wife` are NOT symmetric.** If B is A's husband, A is B's wife
-*or* husband, so both invert to `spouse`.
-
-⚠️ **The inverse generalises; it does not round-trip.** `father` → `child`, and
-`child` → `parent`, not back to `father`. Correct — the child's card never
-recorded the parent's gender.
-
-🛑 **`ParentsSibling` and `SiblingsChild` are the SDK's neutral terms for
-aunt/uncle and nephew/niece.** An earlier version refused all four, claiming no
-such term existed. That came from searching for an obvious English word instead
-of reading the generated list. The table now covers **every everyday English
-label**: spouse, partner, boyfriend/girlfriend, the whole parent/child/sibling
-tree, grandparents, great-grandparents, step-family, birth order
-(`elderbrother` → `youngersibling`), and manager/assistant.
-
-**Seven labels are genuinely refused**, each checked against the label list
-rather than assumed: `stepbrother`/`stepsister` (no `Stepsibling`),
-`grandaunt`/`granduncle` and `grandnephew`/`grandniece` (no neutral either way),
-and `teacher` (the SDK defines no `Student`). The refusal names what to pass, and
-`--no-inverse` writes one side only.
-
-⚠️ **The remaining ~150 labels are specific kinship paths** —
-`AuntFathersElderBrothersWife` and the like — deliberately unmapped. They refuse
-cleanly and `--inverse` still works. `RelationCoverageTests` audits the table
-against the generated vocabulary, so a rule naming a label the SDK does not
-define fails the suite.
-
-🛑 **Relation labels are stored in two spellings, and both are live here.** One
-card holds `_$!<Father>!$_` and another a plain `Sibling`, and `Labels.decode`
-passes an unrecognised bare word through unchanged, capitals and all. Comparing
-raw labels misses real matches: `link` reported "would add" for a relation the
-contact already had, and a second run would have written a duplicate. Compare
-through `sameRelationLabel`, never on the raw string.
-
-🛑 **`--name-only` is how you name somebody who has no card.** A relation stores
-a name, so a card can legitimately name a person the address book has never held
-— a spouse who died before it existed, a relative nobody has details for. Before
-this flag the only route was `edit --relation`, which **replaces the whole set**,
-so adding one meant re-passing every existing relation and forgetting one deleted
-it silently. That is the exact trap `link` exists to close, and it stayed open for
-this one case.
-
-- 🛑 **It is opt-in, and that is the point.** Falling back to a plain name
-  whenever the second argument fails to resolve would turn a typo in a real
-  contact's name into a dangling relation, **silently** — the opposite of the
-  rule every other name lookup here follows. Without the flag an unmatched name
-  is still refused.
-- **One side only.** `--inverse` is refused, since there is no card to write it
-  onto, and the plain output says `no contact is named '…'` so the next reader
-  does not mistake it for a failure.
-- `unlink --name-only` removes one again. `relations` reports it as
-  `(no contact with that name)`.
-
-⚠️ **`--clear-dates` on `edit` empties the labelled-date set**, which nothing
-could do before: `--date` replaces the set but cannot empty it, so a date written
-by mistake was permanent. The **birthday is a separate field and is kept**.
-Refused alongside `--date`/`--anniversary`, because "clear then set" and "set
-then clear" differ and one reading loses the value; allowed alongside `--died`,
-which means only one thing.
-
-🛑 **`unlink` used to confirm nothing.** Every other write here re-reads a fresh
-store, because `CNSaveRequest` reporting success is not evidence — `groups
-remove` saves without error and changes nothing at all on an iCloud group. A
-removal had the same exposure and no guard until 26.818.3.
-
-- 🛑 **`unlink --relation L` matches the other card on L's INVERSE.** Filtering
-  both sides on the same label removed `parent` from one card and left `child`
-  on the other, while reporting that it had removed both. When the inverse
-  cannot be inferred, the other card is **left alone** and the command says so —
-  it never clears a relation it had to guess at.
-- **The label describes the SECOND contact.** `link A B --relation manager`
-  reads "B is A's manager", and gives B an `assistant` relation naming A.
+- 🛑 **A relation stores a NAME, not a reference.** Renaming a contact silently
+  breaks every link to it, a relation can name nobody, and a relation can name
+  several people. `matches` in the JSON says which you have.
+- 🛑 **`link` appends; `edit --relation` replaces.** Adding one relation through
+  `edit` means re-passing every existing one, and forgetting one deletes it.
+- ⚠️ **`link` writes the other card too**, so it states a fact about someone else.
+  **The label describes the SECOND contact**: `link A B --relation manager` reads
+  "B is A's manager", and gives B an `assistant` relation naming A.
+- 🛑 **A gendered label inverts to the neutral term** — `father` → `child`,
+  `brother` → `sibling`. Pass `--inverse son` for the specific one. Seven labels
+  have no neutral inverse and refuse, naming what to pass instead.
+- 🛑 **`--name-only` is the one way to name somebody who has no card**, and it is
+  opt-in so a typo in a real name is still refused.
 - **Both arguments take an id or a name.** An ambiguous name is refused listing
-  the candidates; an exact full-name match beats a partial one.
-- **Re-linking is a reported no-op**, not an error and not a duplicate row —
-  the same shape `groups add` uses. Read `changed`, not the exit code.
-- **Every write is confirmed against a fresh store** and fails loudly otherwise.
-- `--dry-run` resolves and prints the plan without writing.
+  the candidates. Re-linking is a reported no-op, not a duplicate. Every write is
+  confirmed against a fresh store. `--dry-run` prints the plan without writing.
 
-**Exporting.** `export` writes vCard 3.0 — what Contacts.app and every other
-address book imports. Takes any number of ids, `--group NAME` for a whole group,
-or both (a contact named twice is written once). Goes to stdout unless `-o`.
+**Dates.** `--birthday` and `--anniversary` are the two Contacts models natively.
+Everything else is a labelled date: `--date graduation:--06-15`.
 
-Unlike a plain Contacts-framework export it **includes notes**, read from the
-AddressBook store and spliced in as a folded, escaped `NOTE` property — so it
-needs Full Disk Access for that one field, and without it everything else still
-exports. Verified by round-tripping a real 514-character note byte-for-byte.
+**Search** matches first/middle/last/nickname/company/department/job title/full
+name, email addresses, and phone numbers (digits only, so `7205551234` finds
+`+1 (720) 555-1234`). **JSON is the default**; pass `--plain` for human output.
 
 **Output shapes.** `get`, `add` and `edit` return a single JSON **object**;
 `search`, `list` and `groups members` return **arrays**. An unlabelled email,
-phone or URL omits the `label` key rather than emitting `null`. The JSON keys
-for the name affixes are `prefix` and `suffix`, though the flags are
-`--name-prefix` / `--name-suffix`.
+phone or URL omits the `label` key rather than emitting `null`. The JSON keys for
+the name affixes are `prefix` and `suffix`, though the flags are `--name-prefix`
+/ `--name-suffix`.
 
-⚠️ **`--MM-DD` needs `=`.** `--birthday --04-13` fails, because the parser reads
-the value as the next flag. Write `--birthday=--04-13`, and likewise for
-`--anniversary` and `--date`.
-
-🛑 **A contact can only join a group in its own account, and nothing in the API
-says which account anything is in.** One `CNSaveRequest` cannot span two
-containers: adding a contact from account A to a group in account B fails with
-Core Data's `NSPersistentStoreIncompleteSaveError` (**`NSCocoaErrorDomain
-134040`**, "one or more of the stores returned an error"), which names neither
-store. The contact is simply in the wrong account, permanently — retrying, waiting
-for sync, and deleting-and-recreating all change nothing.
-
-`groups add` now detects this before saving and names both sides:
+**Groups, and the account rule.** 🛑 **A contact can only join a group in its own
+account**, and one save cannot span two containers. `groups add` detects the
+mismatch before saving, names both accounts, and points at `move`:
 
 ```
 Error: cannot add 'Kyle Zehner' to 'Recruiters': they are in different accounts,
@@ -2164,184 +1977,48 @@ Move the contact into the group's account, then retry:
   apple contacts move <id> --to "_local:ABAccount" --dry-run
 ```
 
-**`move` is the way out of that, and it keeps the identifier.** There is no
-public move — `CNSaveRequest`'s entire mutation surface is add / update / delete
-for contacts and groups plus add / remove member, the container is fixed at
-`addContact:toContainerWithIdentifier:`, and `updateContact:` cannot change it.
-Copy-then-delete would mint a **new identifier** and **drop the note**, so it was
-not shipped. The legacy AddressBook framework's
-`importPeople:intoAccount:createNewUIDs:` with `createNewUIDs: false` copies the
-record **keeping its unique id**, and `recordForUniqueId:inAccount:` then names
-the original precisely enough to remove it.
+- ⚠️ **`changed` is the field to read on `groups add`/`groups remove`, not the
+  exit code.** Both return `{group, contact_id, member, changed}`: `member` is
+  the state after the call, re-read to confirm it; `changed` says whether *this*
+  invocation did it. Both fail loudly if a save reports success without taking
+  effect.
+- 🛑 **`groups remove` silently does nothing on an iCloud group** through
+  `CNSaveRequest`, and falls back to the legacy AddressBook framework.
+- 🛑 **A contact has two identifiers**, unified and container-backed, and a
+  membership check must accept both. Never hand `addMember` a *unified* contact.
+- ⚠️ **An unrecognised `--container` is a hard error**, not a silent default.
+  Names work as well as ids: `--container "On My Mac"`.
+
+**`move` changes a contact's account and keeps its identifier.** There is no
+public API for it; the legacy `importPeople:intoAccount:createNewUIDs:false` is
+the only route that preserves the id and the note.
 
 ```
 apple contacts move ID --to CONTAINER [--dry-run] [--json]
 ```
 
-- 🛑 **`ABRecord.nts_MoveIntoAddressBook:account:error:` is the obvious call and
-  it lies.** It returned `YES`, `save` returned `YES`, and the record was still
-  in the source store on disk. Third API in this repo to report success for a
-  write that never happened. So `move` re-reads the container from a fresh store
-  and exits non-zero on a mismatch.
-- 🛑 **Between the import and the removal the contact exists twice under one
-  id.** The removal is therefore resolved *by account* and the record's own
-  account re-checked immediately before deleting — a lookup that fell through to
-  the new copy would destroy the contact while reporting a successful move.
-- ⚠️ **A move always drops every group membership in the account it leaves**, and
-  that is inherent: a group belongs to one account. `--dry-run` lists the groups
-  it will empty before anything is written, and the result carries `groups_left`
-  either way.
-- 🛑 **A contact that carries a note cannot be moved.** `importPeople:` copies the
-  note, copying it faults it, and Core Data **raises** an uncaught
-  `NSInternalInconsistencyException` there rather than returning — which in a
-  two-step import-then-delete is how a contact ends up existing twice. Refused up
-  front, and the private calls are additionally wrapped in an ObjC exception
-  guard (`Sources/ObjCExceptions`) so an unforeseen raise is a clean refusal
-  rather than a crash. Move those in Contacts.app.
-- **Everything else survives**: the identifier, and every field (swept by a test,
-  since a different framework carries the record across).
-- If the removal fails, the import is **rolled back**. If the rollback cannot
-  name the copy precisely, nothing is deleted and the duplicate is reported —
-  two copies are recoverable in Contacts.app, zero are not.
-- ⚠️ Only `local` ↔ `cardDAV` has been exercised; Exchange should behave the same
-  way, but that is an expectation, not a measurement. The **"me" card** is not
-  treated specially and moving it is untested.
+- 🛑 **The obvious private call lies.** `nts_MoveIntoAddressBook:account:error:`
+  returned `YES` for a record still in the source store. So `move` re-reads the
+  container from a fresh store and exits non-zero on a mismatch.
+- 🛑 **A contact that carries a note cannot be moved** — copying the note faults
+  it, and Core Data *raises* there rather than returning. Refused up front. Move
+  those in Contacts.app.
+- ⚠️ **A move always drops every group membership in the account it leaves.**
+  `--dry-run` lists them first; the result carries `groups_left` either way.
+- If the removal fails, the import is **rolled back**; if the copy cannot be
+  named precisely, nothing is deleted and the duplicate is reported.
+- ⚠️ Only `local` ↔ `cardDAV` has been exercised. The **"me" card** is untested.
 
-Full record in [`docs/apple-contacts-move.md`](docs/apple-contacts-move.md).
-
-⚠️ **`apple contacts containers` is how you find a valid `--container`**, and
-`get`, `groups` and `add` all report a `container` now. `add` prints where it
-landed, because the default is not always the account you expect — that is how a
-contact ends up somewhere that can never join your groups.
-
-⚠️ **An unrecognised `--container` used to be silently ignored.**
-`add(_:toContainerWithIdentifier:)` treats an unknown identifier as nil and files
-the record in the default container, reporting success. It is now a hard error
-listing the valid containers. Names work as well as ids: `--container "On My Mac"`.
-
-⚠️ **`groups remove` depends on which account the group lives in.**
-`CNSaveRequest.removeMember` saves without error and changes *nothing* for a
-**CardDAV-backed (iCloud) group**, while working correctly for a **local ("On My
-Mac") group**. Same code, same objects — only the container differs, and nothing
-at the call site distinguishes them:
-
-| Container | Type | Member removed |
-|-----------|------|----------------|
-| `On My Mac` | local | yes |
-| an iCloud account | cardDAV | **no, silently** |
-
-So `groups remove` tries `CNSaveRequest` first and, when the membership
-survives, falls back to the **legacy `AddressBook` framework**, which removes
-iCloud members correctly. That framework is deprecated but still present, uses
-the same `UUID:ABPerson` / `UUID:ABGroup` identifiers, and needs no permission
-beyond the Contacts access the tool already has — so this costs nothing extra:
-no Automation grant, no Contacts.app, no AppleScript.
-
-Because the fallback is deprecated API that could eventually stop working, the
-command re-reads the membership afterwards and fails loudly if the contact is
-still in the group rather than trusting either call's return value. Don't report
-a removal as done without that confirmation.
-
-🛑 **A contact has two identifiers, and mixing them silently answers "no".**
-The unified id (`BD00169D-…`) and the container-backed id (`D065726A-…:ABPerson`)
-name the same person. Group membership work must use the backing record, so any
-membership *check* has to accept both spellings — comparing a backing id against
-a `unifiedContacts` fetch of the group made a **successful** add report *"the save
-reported success but X is not in the group"*, and made `container` come back null
-for exactly the linked contacts that need it. `memberIdentifiers(of:)` unions a
-unified fetch with a non-unified enumeration for this reason.
-
-⚠️ **`add` can return an identifier the store does not use.** Creating a contact
-with an explicit `--container` handed back a bare `BD00169D-…` while the record
-in the store was `D065726A-…:ABPerson`. Both resolve through `get`, so the id is
-usable — but do not assume the string you got back is the one in the address
-book, and never build a comparison on that assumption.
-
-🛑 **Group membership must never be handed a *unified* contact.** This is what
-made `groups add` fail for freshly created contacts with nothing but
-`Save operation could not be completed.`. `unifiedContact(withIdentifier:)`
-returns a synthetic merge of every linked record, and `CNSaveRequest.addMember`
-needs the **container-backed** record — so both `groups add` and `groups remove`
-fetch with `unifyResults = false`.
-
-It presents as intermittent, which is the trap: a brand-new contact is usually
-unlinked, so its unified form is indistinguishable from its backing record and
-the add works. Once macOS links it to another card, the unified contact's
-`identifier` can belong to a *different* linked record, the save is refused, and
-it stays refused — through delete-and-recreate, because the linking happens
-again. So "it worked the first time" is not evidence the path is sound.
-
-⚠️ **`changed` is the field to read on `groups add` / `groups remove`, not the
-exit code.** Both accept `--json` and return
-`{group, contact_id, member, changed}`: `member` is the membership state after
-the call, re-read to confirm it; `changed` says whether *this* invocation did
-it. Adding someone already in the group, or removing someone who was never in
-it, is a no-op the framework accepts silently and both used to report as an
-action. Both also now fail loudly if the save reports success without taking
-effect, rather than trusting the exit code.
-
-⚠️ **A `CNSaveRequest` failure says only "Save operation could not be
-completed."** That is `CNError`'s entire `localizedDescription` for every
-failure mode. Everything diagnostic is in `userInfo` —
-`CNErrorUserInfoKeyPathsKey`, `CNErrorUserInfoAffectedRecordIdentifiersKey`,
-`CNErrorUserInfoValidationErrorsKey`, `NSUnderlyingErrorKey` — so the group
-commands print all of it. If you add a new write path, do the same; the generic
-string alone costs hours.
-
-⚠️ **Multi-value flags replace, they don't append.** Passing `--email` on `edit`
-replaces *every* existing email on that contact. Read the contact first and
-re-pass the ones to keep.
-
-⚠️ **`--note` is not writable, by construction.** Reading a note works, but
-writing needs the `com.apple.developer.contacts.notes` entitlement, which Apple
-grants only to signed apps on request — no CLI can hold it. Notes are read
-straight from the AddressBook SQLite store instead. Note edits must happen in
+🛑 **A note blocks *every* `CNContactStore` write to that contact**, not just the
+note, and it fails as a bare `NSCocoaErrorDomain 134092` naming nothing. **52 of
+669 contacts here carry one.** `edit`, `groups add`, `link` and `unlink` catch it
+and rewrite through the legacy AddressBook framework, which needs no extra grant.
+⚠️ **`--note` is not writable by either path** — writing one needs
+`com.apple.developer.contacts.notes`, which no CLI can hold. Note edits happen in
 Contacts.app.
-
-🛑 **A note blocks *every* `CNContactStore` write to that contact, not just the
-note.** The save faults the whole record, faulting reads the note attribute, and
-reading it hits the same entitlement — so an unrelated `--company` change is
-collateral damage. It fails as a bare `NSCocoaErrorDomain 134092` with an empty
-`userInfo`, naming neither the contact nor the note, plus a raw `CoreData:
-error: Unhandled error occurred during faulting` on stderr. **52 of 669 contacts
-here carry a note**, so this was ~8% of a real address book that could not be
-edited or added to a group at all.
-
-`edit`, `groups add`, `link` and `unlink` now catch it and rewrite through the
-**legacy `AddressBook` framework**, which writes the same records under the same
-`UUID:ABPerson` identifiers, needs no permission beyond the Contacts access the
-tool already has, and is not subject to the note wall for other properties.
-Consequences worth knowing:
-
-- 🛑 **`link` and `unlink` were left out of this until 26.818.2**, and they are
-  the commands most likely to meet a note: relations are what you write when you
-  are filling in a family. `writeRelations` is their shared writer and had no
-  fallback, so every link touching one of the 52 note-bearing contacts here
-  failed with the bare 134092 above. ⚠️ `link` writes its **first** argument
-  first, so the failure left **neither** card written rather than half of a pair
-  — the one merciful part of it. Pinned by three tests in
-  `tests/test_contacts_write.py::NoteBearingContacts`, all three of which fail
-  against the code before the fix.
-- ⚠️ **AddressBook's first save always fails and the second one works.**
-  Faulting trips the wall once; afterwards the pending changes commit. So a lone
-  failure means nothing there, and the write is confirmed by re-reading rather
-  than by any return value.
-- The fallback writes `kABBirthdayComponentsProperty` and
-  `kABOtherDateComponentsProperty`, not the plain `NSDate` ones, because those
-  cannot express a year-less `--MM-DD`.
-- The note itself still cannot be written by either path, and is left untouched.
-- The raw CoreData dump is suppressed (`com.apple.CoreData.Logging.stderr`, in
-  the in-memory registration domain) since the tool now explains the failure
-  itself. If the fallback also fails, the error names the contact, the note, and
-  Contacts.app.
-
-⚠️ **`delete` is permanent.** Unlike Notes there is no Recently Deleted, and the
-deletion syncs everywhere. Always confirm with the user first. Deleting a
-*group* keeps its contacts; removing a member keeps the contact too.
 
 `get` reports a contact's `groups`; `search` and `list` don't, because Contacts
 has no reverse lookup and it would mean scanning every group per contact.
-
 ## Layout
 
 ```

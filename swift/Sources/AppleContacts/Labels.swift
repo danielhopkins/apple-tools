@@ -100,6 +100,15 @@ enum Labels {
     static func phone(_ name: String) -> String { phoneLabels[normalize(name)] ?? name }
     static func url(_ name: String) -> String { urlLabels[normalize(name)] ?? name }
 
+    /// Is this one of the built-in URL labels?
+    ///
+    /// 🛑 Used to settle `work:example.com`, where the prefix is both a valid
+    /// URI scheme by grammar and an obvious label. A built-in label wins, so
+    /// `work:`, `home:` and `school:` never turn into schemes.
+    static func isKnownURLLabel(_ name: String) -> Bool {
+        urlLabels[normalize(name)] != nil
+    }
+
     /// Postal addresses take only the four generic labels. There is no
     /// address-specific constant in the SDK, unlike email's `icloud` or URL's
     /// `homepage`, so this table is deliberately the short one.

@@ -1351,3 +1351,131 @@ class ClearDates(GroupFixtures):
         self.assertIn("--clear-dates", err)
         # Nothing was touched.
         self.assertEqual(len(self.get(created["id"])["dates"]), 1)
+
+
+class UrlSchemeParsing(GroupFixtures):
+    """`--url` accepts an optional `label:` prefix, and a URL has a colon too.
+
+    🛑 **An allowlist of schemes was the wrong shape and lost data silently.**
+    The old rule took the prefix as a scheme only when the rest began `//`, or
+    when the prefix was one of eight hard-coded words. Every other scheme written
+    without `//` fell through, was stored as a label, and the URL lost its scheme
+    with a zero exit code.
+
+    Reported by a peer session that hit it setting a school website. Reproduced
+    on 26.820.1 before the fix:
+
+        webcal:cal.example.com/f.ics  ->  label webcal, url cal.example.com/f.ics
+        ftps:files.example.com        ->  label ftps
+        matrix:r/x                    ->  label matrix
+        https:lower.example.com       ->  label https
+
+    ⚠️ **It was never a case problem**, though it looked like one. The allowlist
+    already lowercased, so `MAILTO:` worked and `https:` failed. The missing `//`
+    was the whole cause.
+    """
+
+    def one_url(self, value):
+        created = self.add("url" + str(abs(hash(value)) % 10000))
+        self.edit(created["id"], "--url", value)
+        entry = self.get(created["id"])["urls"][0]
+        return entry.get("label"), entry["url"]
+
+    # MARK: schemes that were being eaten
+
+    def test_a_scheme_without_slashes_survives(self):
+        for value in ["webcal:cal.example.invalid/f.ics",
+                      "ftps:files.example.invalid",
+                      "matrix:r/x",
+                      "https:lower.example.invalid"]:
+            label, url = self.one_url(value)
+            self.assertIsNone(label, f"{value} was split into a label")
+            self.assertEqual(url, value)
+
+    def test_case_does_not_decide_anything(self):
+        """`MAILTO:` always worked and `https:` never did — the cause was `//`."""
+        for value in ["HTTPS:UPPER.example.invalid", "MAILTO:a@x.invalid",
+                      "HTTPS://UPPER.example.invalid"]:
+            label, url = self.one_url(value)
+            self.assertIsNone(label, f"{value} was split into a label")
+            self.assertEqual(url, value)
+
+    # MARK: labels that must keep working
+
+    def test_a_label_before_a_real_url_still_wins(self):
+        """🛑 The rest already carries a scheme, so the prefix cannot be one."""
+        self.assertEqual(self.one_url("LinkedIn:https://x.example.invalid"),
+                         ("LinkedIn", "https://x.example.invalid"))
+
+    def test_a_built_in_label_wins_over_the_scheme_grammar(self):
+        """`work` is a valid scheme by grammar and an obvious label."""
+        self.assertEqual(self.one_url("work:example.invalid"),
+                         ("work", "example.invalid"))
+
+    def test_a_label_with_a_space_is_never_a_scheme(self):
+        self.assertEqual(self.one_url("School site:https://coe.example.invalid"),
+                         ("School site", "https://coe.example.invalid"))
+
+    def test_a_bare_url_survives(self):
+        for value in ["https://a.example.invalid", "mailto:a@x.invalid",
+                      "webcal://c.example.invalid/f.ics", "tel:+15551234567"]:
+            label, url = self.one_url(value)
+            self.assertIsNone(label)
+            self.assertEqual(url, value)
+
+    # MARK: the value is trimmed
+
+    def test_the_value_is_trimmed(self):
+        """⚠️ A leading space was kept, and the stored URL stopped resolving."""
+        label, url = self.one_url("Note: see-site:https://x.example.invalid")
+        self.assertEqual(label, "Note")
+        self.assertEqual(url, "see-site:https://x.example.invalid")
+
+    # MARK: the ambiguous case
+
+    def test_an_ambiguous_prefix_is_read_as_a_scheme_and_warned_about(self):
+        """⚠️ `LinkedIn:example.invalid` cannot be told apart from `matrix:r/x`.
+
+        Both are a valid scheme grammar followed by a bare token. It is read as a
+        URL, and the note says how to force the other reading.
+        """
+        created = self.add("urlambig")
+        _, _, err = run("edit", created["id"], "--url", "LinkedIn:example.invalid")
+        self.assertIn("note: read", err)
+        self.assertIn("LinkedIn", err)
+        entry = self.get(created["id"])["urls"][0]
+        self.assertIsNone(entry.get("label"))
+        self.assertEqual(entry["url"], "LinkedIn:example.invalid")
+
+    def test_a_well_known_scheme_is_not_warned_about(self):
+        created = self.add("urlquiet")
+        _, _, err = run("edit", created["id"], "--url", "webcal:cal.example.invalid/f.ics")
+        self.assertNotIn("note: read", err)
+
+    def test_the_warning_is_printed_once(self):
+        """⚠️ `urls` is recomputed by validate, apply and the read-back check.
+
+        Warning inside the parser printed the same line three times per flag.
+        """
+        created = self.add("urlonce")
+        _, _, err = run("edit", created["id"], "--url", "Zoiks:example.invalid")
+        self.assertEqual(err.count("note: read"), 1)
+
+    # MARK: other flags must not have learned about URLs
+
+    def test_a_relation_is_not_parsed_as_a_url(self):
+        """🛑 `split` runs for every labelled flag, and a relation is not a URL.
+
+        `father` matches the scheme grammar and `Robert` is one unbroken token,
+        so URL logic in the shared splitter would read `father:` as a scheme.
+        """
+        created = self.add("urlrel")
+        self.edit(created["id"], "--relation", "father:Robert")
+        self.assertEqual(self.labelled(self.get(created["id"])["relations"], "name"),
+                         {"father": "Robert"})
+
+    def test_an_email_label_is_untouched(self):
+        created = self.add("urlmail")
+        self.edit(created["id"], "--email", "work:a@x.invalid")
+        self.assertEqual(self.labelled(self.get(created["id"])["emails"], "address"),
+                         {"work": "a@x.invalid"})
