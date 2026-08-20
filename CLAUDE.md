@@ -1405,8 +1405,19 @@ from a defect.
 `tests/harness.py` now passes `--sync-timeout 120` to `add`, `edit` and `resync`,
 which cut it from 26 to 7. **The tool's own default stays at 30s**, because a
 person writing one event should not wait two minutes to be told something went
-wrong. Override with `APPLE_CALENDAR_TEST_SYNC_TIMEOUT`, or pin a quieter
-calendar with `APPLE_CALENDAR_TEST_CALENDAR`.
+wrong. Override with `APPLE_CALENDAR_TEST_SYNC_TIMEOUT`.
+
+🛑 **The remaining 7 are a steady rate limit, not a passing throttle, and an
+earlier version of this note said the opposite.** Two runs a day apart, at 120s,
+both returned **exactly 7** — and the *failing tests* differed almost completely,
+sharing one of seven. So about one write in ten exceeds 120s whatever else is
+true, and waiting a day changes nothing. Raising the deadline further trades wall
+clock for a signal that is already unambiguous: the writes all land, and
+`unsynced` says so immediately afterwards.
+
+**Pin a quieter calendar with `APPLE_CALENDAR_TEST_CALENDAR` if you need a clean
+run.** `Personal` is calDAV here and a lone write syncs there in 5s. That path is
+untested against the full suite.
 
 ⚠️ **`Error` rows are transient.** The table is empty on this machine, yet
 `sqlite_sequence` puts its high-water mark at **1304** — they are written and
