@@ -996,3 +996,74 @@ class LongRangeQueries(LiveCalendarTest):
                         "--to", f"{TEST_YEAR}-04-02", "--json")
         mine = [e for e in json.loads(out) if e["title"].startswith(TEST_PREFIX)]
         self.assertEqual(len(mine), 2, "two distinct events must not collapse into one")
+
+
+class UnconfirmedIsNotAFailure(LiveCalendarTest):
+    """A write the server has not confirmed, versus one it refused.
+
+    🛑 **These are different answers and the tool used to report both as
+    failure.** The confirmation exists for a write a server REFUSES — Google
+    answering 403, EventKit recording an `Error` row and never retrying. A write
+    that is merely slow to confirm is not that.
+
+    Measured: two full suite runs a day apart, both at a 120s deadline, each left
+    7 of 71 writes unconfirmed — and `unsynced` reported "Everything has reached
+    its server" straight afterwards, every time.
+
+    ⚠️ Not a test-only condition. One `edit` on a real shared calendar hit it
+    during ordinary use, printed a failure, and the change was already live.
+
+    `--sync-timeout 0` forces the path deterministically. There is no way to make
+    a healthy server slow on purpose.
+
+    🛑 **These use `add`, never `edit`, and that is not arbitrary.** On Exchange
+    an edit records nothing locally, so it resolves to `unknown` rather than
+    `pending` and takes a different branch entirely — exit 0 with a note. A first
+    draft of this class used `edit` and failed on exactly that.
+    """
+
+    def slow_add(self, suffix, *extra):
+        """An add whose confirmation cannot possibly finish."""
+        return run("add", self.title(suffix), "--calendar", self.calendar,
+                   "--start", f"{TEST_YEAR}-08-01 09:00",
+                   "--sync-timeout", "0", *extra, check=False)
+
+    def test_an_unconfirmed_write_exits_75_not_64(self):
+        """⚠️ 75 is EX_TEMPFAIL. 64 is EX_USAGE and claimed the command was
+        typed wrong, which printed a usage block under a server problem."""
+        code, _, _ = self.slow_add("tempfail")
+        self.assertEqual(code, 75)
+
+    def test_it_still_prints_the_event(self):
+        """🛑 The concrete defect. A --json caller got a usage block and no id.
+
+        With nothing printed there is no identifier to pass to `sync-status`, so
+        the caller could not even find out whether the write landed.
+        """
+        _, out, _ = self.slow_add("tempfail-json", "--json")
+        event = json.loads(out)
+        self.assertTrue(event["id"])
+        self.assertEqual(event["sync"]["state"], "pending")
+
+    def test_the_message_does_not_claim_the_server_refused_it(self):
+        _, _, err = self.slow_add("tempfail-words")
+        self.assertIn("could not confirm", err)
+        self.assertIn("sync-status", err, "the reader needs the command to check with")
+        self.assertNotIn("has not accepted", err)
+        # ⚠️ Nothing was typed wrong, so no usage block.
+        self.assertNotIn("Usage:", err)
+
+    def test_the_local_write_really_did_happen(self):
+        """Exit 75 says nothing about the server, and everything about EventKit."""
+        _, out, _ = self.slow_add("tempfail-local", "--json")
+        created = json.loads(out)
+        self.assertEqual(run_json("show", created["id"])["title"], created["title"])
+
+    def test_a_confirmed_write_still_exits_zero(self):
+        """The ordinary path must not have moved."""
+        code, out, _ = run("add", self.title("tempfail-ok"),
+                           "--calendar", self.calendar,
+                           "--start", f"{TEST_YEAR}-08-05 09:00", "--json")
+        self.assertEqual(code, 0)
+        self.assertIn(json.loads(out)["sync"]["state"],
+                      ("synced", "notApplicable", "unknown"))

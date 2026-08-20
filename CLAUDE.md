@@ -1298,9 +1298,25 @@ On by default. Measured round trip: **4.2s on calDAV, 3.1s on Exchange.**
 the answer costs a SQLite lookup per event.
 
 - **Read `confirmed`… read `sync.state`.** `synced` means the server has it.
-  `pending` at the deadline exits non-zero. `notApplicable` means there is no
-  server to reach. `unknown` means the tool could not check, which is **never**
-  reported as a failure.
+  `notApplicable` means there is no server to reach. `unknown` means the tool
+  could not check, which is **never** reported as a failure.
+- 🛑 **`pending` at the deadline exits 75, and that is not a failure.**
+  `EX_TEMPFAIL` — the write is saved, the event record is still printed, and
+  `unsynced` has reported "Everything has reached its server" on every occasion
+  it has been checked. A **refusal** — the server answering 403 or 400, EventKit
+  recording an `Error` row — still exits 1. The two need opposite responses.
+  ⚠️ Until 26.820.1 both threw `ValidationError`: exit 64, a usage block, and
+  **no event printed at all**, so a `--json` caller was left with no id to check
+  with. That is what turned a rate-limited account into 26 red tests.
+  ⚠️ **`resync` is the exception and still stops on `pending`**, because its next
+  step deletes the original. Two copies are recoverable in Calendar.app; zero are
+  not.
+- 🛑 **On Exchange an unconfirmable EDIT is `unknown`, not `pending`.** Exchange
+  records nothing locally when an edit reaches the server, so there is no signal
+  to poll and the wait never enters `pending` at all — exit 0 with a note, not
+  exit 75. Only `add` produces `pending` on both backends. Anything testing the
+  timeout path must use `add`; a first draft used `edit` and failed on exactly
+  this.
 - ⚠️ **These four commands read `Calendar.sqlitedb`, which needs Full Disk
   Access** — a different grant from the Calendar one everything else uses. Without
   it the answer is `unknown`, and a good write must not be called broken.

@@ -218,6 +218,13 @@ struct SyncConfirmationOptions: ParsableArguments {
     var syncTimeout: Double = 30
 }
 
+/// A failure that is not the caller's fault, so it must not print a usage block.
+struct CalendarRuntimeError: Error, LocalizedError {
+    let message: String
+    init(_ message: String) { self.message = message }
+    var errorDescription: String? { message }
+}
+
 enum SyncConfirmation {
 
     /// Polls until the server takes the event, refuses it, or the deadline passes.
@@ -338,17 +345,75 @@ enum SyncConfirmation {
             return status
 
         case .pending:
-            // 🛑 The whole point. Do not report success for a write the server
-            // has not taken.
+            // 🛑 **"Refused" and "not confirmed yet" are different answers, and
+            // reporting both as failure was wrong.**
+            //
+            // The confirmation exists for the write a server REFUSES — Google
+            // answering HTTP 403, EventKit recording an `Error` row and never
+            // retrying. That case is real, unrecoverable, and still fails here.
+            //
+            // A write the server has simply not confirmed in time is not that.
+            // Measured on this machine: two full suite runs a day apart, both at
+            // a 120s deadline, each left 7 of 71 writes unconfirmed — and
+            // `unsynced` reported "Everything has reached its server" straight
+            // afterwards, every time. The account rate-limits sustained writes;
+            // the writes land.
+            //
+            // ⚠️ It is not a test-only condition. One `edit` on the Family
+            // calendar hit it during ordinary use, printed a failure, and the
+            // title had already changed on the server.
+            let newErrors = snapshot.map { snap in status.errors.filter(snap.isNew) }
+                ?? status.errors
+
+            guard newErrors.isEmpty else {
+                return try refused(status, errors: newErrors)
+            }
+
+            // Nothing was refused. Say what is actually known, print the event,
+            // and leave the exit code to `finish`.
+            FileHandle.standardError.write(Data("""
+                note: could not confirm this reached the server within \
+                \(Int(options.syncTimeout))s.
+                      The event IS saved and is very likely on its way. Nothing was \
+                refused —
+                      no error was recorded against it.
+
+                      Confirm with:  apple calendar sync-status <id>
+                      Or sweep all:  apple calendar unsynced
+                      Skip this wait with --no-confirm-sync.
+
+                """.utf8))
+            return status
+        }
+    }
+
+    /// The exit code for a write whose confirmation did not complete.
+    ///
+    /// 🛑 **Call this AFTER printing the event, never before.** The old code
+    /// threw from `check`, so a `--json` caller got a usage block and no event
+    /// record at all — no id to look up, nothing to retry with. That is what
+    /// turned a slow server into 26 test failures.
+    ///
+    /// ⚠️ **Exit 75, not 0 and not 64.** `EX_TEMPFAIL` is the sysexits code for
+    /// exactly this: the operation was not completed, try again later. 0 would
+    /// claim the server has it. 64 is `EX_USAGE` and claims the command was
+    /// typed wrong, which is what ArgumentParser's `ValidationError` produced.
+    static func finish(_ status: SyncStore.Status?) throws {
+        guard status?.state == .pending else { return }
+        throw ExitCode(75)
+    }
+
+    private static func refused(
+        _ status: SyncStore.Status, errors: [SyncStore.Failure]
+    ) throws -> SyncStore.Status {
             var lines = [
-                "the event was saved locally but the server has not accepted it.",
+                "the event was saved locally and the server REFUSED it.",
                 "",
             ]
             // Name only an error this write produced. A row that predates
             // the save explains nothing about it, and printing it sends the
             // reader after the wrong event.
-            let blame = snapshot.map { snap in status.errors.filter(snap.isNew) }
-                ?? status.errors
+            let blame = errors
             if let failure = blame.first {
                 let http = failure.httpStatus.map { "HTTP \($0)" } ?? "no HTTP status"
                 lines.append("  \(http) \(failure.domain ?? "") (scope: \(failure.scope))")
@@ -363,8 +428,10 @@ enum SyncConfirmation {
             lines.append("")
             lines.append("Check with:  apple calendar unsynced")
             lines.append("Skip this wait with --no-confirm-sync.")
-            throw ValidationError(lines.joined(separator: "\n"))
-        }
+            // ⚠️ Not a ValidationError. Nothing was typed wrong, and a usage
+            // block under a server refusal sends the reader after the wrong
+            // thing entirely.
+            throw CalendarRuntimeError(lines.joined(separator: "\n"))
     }
 }
 
@@ -543,6 +610,24 @@ struct Resync: ParsableCommand {
 
         let after = try SyncConfirmation.check(event: copy, options: sync,
                                                since: errorsBefore)
+
+        // 🛑 **`resync` is the one command where "unconfirmed" must still stop.**
+        // Everywhere else the write is benign and the event is on the calendar
+        // either way. Here the next step DELETES the original, so proceeding on
+        // an unconfirmed copy risks leaving the user with neither a working
+        // event nor the stuck one they started with. Two copies are recoverable
+        // in Calendar.app; zero are not.
+        if after?.state == .pending {
+            throw CalendarRuntimeError("""
+                the rebuilt copy is not confirmed on the server, so the stuck \
+                original was NOT deleted.
+                Nothing was lost. There are two copies of '\(title)' right now:
+                  original: \(id)
+                  rebuilt:  \(copy.eventIdentifier ?? "?")
+                Check with `apple calendar sync-status`, then delete whichever \
+                one the server does not have.
+                """)
+        }
 
         // Only now is the original safe to remove.
         do {

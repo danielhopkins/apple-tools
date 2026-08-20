@@ -968,6 +968,10 @@ struct Add: ParsableCommand {
                 print(Style.warning("Invitations are sent by the server — this is not undoable."))
             }
         }
+
+        // 🛑 AFTER printing. An unconfirmed write still has to hand the caller
+        // the event, or there is no id to check with.
+        try SyncConfirmation.finish(syncStatus)
     }
 }
 
@@ -1190,6 +1194,8 @@ struct Edit: ParsableCommand {
                 print("Repeats: no longer repeats")
             }
         }
+
+        try SyncConfirmation.finish(syncStatus)
     }
 }
 

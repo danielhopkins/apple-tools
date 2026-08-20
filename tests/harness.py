@@ -112,6 +112,16 @@ def run(*args, check=True, env=None):
         text=True,
         env=environment,
     )
+    # 🛑 **75 is EX_TEMPFAIL, not a failure.** `add`/`edit` exit 75 when the
+    # server did not confirm inside the deadline. The write IS saved, the event
+    # record IS printed, and `unsynced` reports "Everything has reached its
+    # server" straight afterwards every time it has been checked. Treating it as
+    # a failure is what turned a rate-limited account into 26 red tests.
+    #
+    # ⚠️ A genuine refusal — the server answering 403 or 400, EventKit recording
+    # an Error row — still exits 1 and still fails here.
+    if proc.returncode == 75 and args and args[0] in _SYNC_AWARE:
+        return proc.returncode, proc.stdout, proc.stderr
     if check and proc.returncode != 0:
         raise AssertionError(
             f"apple-calendar {' '.join(args)} failed ({proc.returncode})\n"

@@ -141,6 +141,26 @@ apple contacts move <id> --to "iCloud" --dry-run  # between accounts; keeps the 
 apple contacts containers --json               # accounts; which is default
 ```
 
+**🛑 Exit 75 from `add` or `edit` does NOT mean the write failed.** It means the
+server did not confirm inside the deadline. The event is saved, the JSON record
+is still printed, and on every occasion checked so far the write had already
+landed. Never tell the user their event was not created.
+
+```
+apple calendar sync-status <id>     # says synced / pending / notApplicable
+apple calendar unsynced             # everything the server never took
+```
+
+Read exit 75 as "saved, not yet confirmed". Read a non-zero exit **other than
+75** as a real refusal — the server answered 403 or 400 and EventKit recorded an
+error it will never retry. Those two need opposite responses, so check the code
+before reporting anything.
+
+⚠️ A busy account rate-limits sustained writes. Measured here: 7 of 71 writes in
+one burst went unconfirmed at a 120s deadline, and all 7 had reached the server.
+A single write syncs in 5–6s. If you are making many writes, pass
+`--no-confirm-sync` and sweep once at the end with `apple calendar unsynced`.
+
 ## Did that calendar write actually reach the server?
 
 🛑 **`add` and `edit` used to say yes when the answer was no.** EventKit saving
