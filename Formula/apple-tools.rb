@@ -1,8 +1,8 @@
 class AppleTools < Formula
   desc "Local CLIs for Notes, Mail, Messages, Phone, Maps, Reminders, Calendar, Contacts"
   homepage "https://github.com/danielhopkins/apple-tools"
-  url "https://github.com/danielhopkins/apple-tools/releases/download/v26.821.0/apple-tools-26.821.0.tar.gz"
-  sha256 "f97bb29910f0bc3076a1ca6dbba6d67762d0c34af3f0b4de9f3b8491e505c183"
+  url "https://github.com/danielhopkins/apple-tools/releases/download/v26.821.1/apple-tools-26.821.1.tar.gz"
+  sha256 "a918abc702828efa76f7136aa1c52e8bbc3bb4b965eced0b5d0d5ecd800b175f"
   license "MIT"
 
   depends_on :macos
@@ -157,6 +157,16 @@ class AppleTools < Formula
     assert_match "unsynced", calendar_help
     assert_match "sync-errors", calendar_help
     assert_match "resync", calendar_help
+
+    # The recurrence parts EventKit will hold. `--months` is the only way to
+    # say "yearly, but only these months" (FREQ=YEARLY;BYMONTH); without it the
+    # substitute is a bounded monthly series that expires, which is what lapsed
+    # three times before 26.821.1. Both flags refuse the frequencies EventKit
+    # would ignore them on, so a missing flag is not a smaller feature — it is
+    # a rule the user cannot write at all.
+    calendar_add_help = shell_output("#{bin}/apple-calendar add --help")
+    assert_match "on-the", calendar_add_help
+    assert_match "months", calendar_add_help
 
     # `move` is the one mail command that writes to real mailboxes, and an
     # unregistered subcommand fails silently: apple-mail prints root help and
