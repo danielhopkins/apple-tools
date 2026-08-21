@@ -632,6 +632,14 @@ class TestRecurrence(LiveCalendarTest):
             (["--repeat", "weekly", "--repeat-count", "0"], "must be >= 1"),
             (["--repeat", "weekly", "--on-the", "4th monday"], "needs --repeat monthly"),
             (["--repeat", "monthly", "--on-the", "banana"], "is not a day of the month"),
+            # 🛑 EventKit carries a bare day number on monthly rules only, and
+            # *ignores* it on a yearly one. Silently dropping it would give back
+            # a rule that fires on the start date's day number every year.
+            (["--repeat", "yearly", "--on-the", "15"], "needs --repeat monthly"),
+            (["--repeat", "monthly", "--months", "1,2"], "needs --repeat yearly"),
+            (["--repeat", "yearly", "--months", "banana"], "is not a month"),
+            (["--repeat", "yearly", "--months", "13"], "is not a month"),
+            (["--months", "1,2"], "needs --repeat yearly"),
         ]
         for extra, expected in cases:
             with self.subTest(flags=" ".join(extra)):
@@ -642,6 +650,168 @@ class TestRecurrence(LiveCalendarTest):
             [e for e in find_test_events(self.calendar)
              if e["title"].endswith("recur-invalid")],
             [], "a rejected recurrence still created the event")
+
+
+class TestYearlyMonthsFilter(LiveCalendarTest):
+    """`FREQ=YEARLY;BYMONTH=1,2,3,4;BYDAY=4MO` — the committee that sits in the
+    first four months of every year and not for the rest of it.
+
+    🛑 **Until --months existed this rule was not expressible**, and the only
+    substitute was a *bounded* monthly series that expires. One real series on
+    this calendar was rebuilt and left to lapse three times — 2021, 2023 and
+    2025 — for exactly that reason.
+
+    ⚠️ Google Calendar's own web editor cannot build this rule either, so a
+    round trip through calDAV is worth asserting rather than assuming.
+    """
+
+    # Far enough out that the whole first-year run is inside near_window(), and
+    # close enough that EventKit still expands the series (see near_window).
+    YEAR = datetime.date.today().year + 1
+
+    def occurrences(self, needle):
+        start, end = near_window()
+        found = run_json("events", "--from", start, "--to", end, "--search", needle)
+        return sorted(datetime.datetime.fromisoformat(e["start"]) for e in found)
+
+    def test_yearly_fourth_monday_in_four_months(self):
+        start = _nth_weekday(self.YEAR, 1, weekday=0, nth=4)
+        event = self.add(
+            "recur-yearly-bymonth",
+            "--start", f"{start.isoformat()} 18:30",
+            "--repeat", "yearly", "--on-the", "4th monday", "--months", "1,2,3,4",
+        )
+        self.assertEqual(event["recurrence"]["frequency"], "yearly")
+        self.assertEqual(event["recurrence"]["on_the"], "the 4th Monday")
+        self.assertEqual(event["recurrence"]["months"], [1, 2, 3, 4])
+        # Open-ended is the point — a bounded rule is what kept lapsing.
+        self.assertIsNone(event["recurrence"].get("until"))
+        self.assertIsNone(event["recurrence"].get("count"))
+
+        starts = self.occurrences("recur-yearly-bymonth")
+        self.assertGreaterEqual(
+            len(starts), 4, "the yearly series did not project forward"
+        )
+        for moment in starts:
+            self.assertEqual(moment.weekday(), 0, f"{moment} is not a Monday")
+            self.assertEqual(
+                (moment.day - 1) // 7 + 1, 4, f"{moment} is not the 4th Monday"
+            )
+            self.assertIn(moment.month, (1, 2, 3, 4), f"{moment} is outside --months")
+
+        # The months really filter: four a year, not twelve.
+        by_year = {}
+        for moment in starts:
+            by_year.setdefault(moment.year, []).append(moment)
+        for year, moments in by_year.items():
+            self.assertLessEqual(
+                len(moments), 4, f"{year} has {len(moments)} occurrences, not four"
+            )
+
+    def test_month_names_and_numbers_mean_the_same_rule(self):
+        start = _nth_weekday(self.YEAR, 2, weekday=1, nth=1)
+        by_name = self.add(
+            "recur-months-names",
+            "--start", f"{start.isoformat()} 09:00",
+            "--repeat", "yearly", "--on-the", "1st tuesday",
+            "--months", "feb,MAR", "--months", "April",
+        )
+        self.assertEqual(by_name["recurrence"]["months"], [2, 3, 4])
+
+    def test_months_alone_needs_no_day_pattern(self):
+        event = self.add(
+            "recur-months-only",
+            "--start", f"{self.YEAR}-03-09 09:00",
+            "--repeat", "yearly", "--months", "3,9",
+        )
+        self.assertEqual(event["recurrence"]["months"], [3, 9])
+        self.assertIsNone(event["recurrence"].get("on_the"))
+
+    def test_a_plain_yearly_rule_reports_no_months(self):
+        event = self.add(
+            "recur-yearly-plain",
+            "--start", f"{self.YEAR}-03-09 09:00",
+            "--repeat", "yearly",
+        )
+        # Absent, never [] — the rule for every optional key in this tool.
+        self.assertIsNone(event["recurrence"].get("months"))
+
+    def test_a_start_month_outside_months_warns(self):
+        code, _, err = run(
+            "add", self.title("recur-months-mismatch"),
+            "--calendar", self.calendar,
+            "--start", f"{self.YEAR}-07-06 09:00",
+            "--repeat", "yearly", "--months", "1,2,3,4",
+        )
+        self.assertEqual(code, 0, "the mismatch should warn, not fail")
+        self.assertIn("--months", err)
+        self.assertIn("Jan, Feb, Mar, Apr", err)
+
+    def test_editing_a_series_onto_a_months_filter(self):
+        start = _nth_weekday(self.YEAR, 1, weekday=0, nth=4)
+        event = self.add(
+            "recur-months-edit",
+            "--start", f"{start.isoformat()} 18:30",
+            "--repeat", "monthly", "--on-the", "4th monday",
+        )
+        updated = run_json(
+            "edit", event["id"], "--series",
+            "--repeat", "yearly", "--on-the", "4th monday", "--months", "1,2,3,4",
+        )
+        self.assertEqual(updated["recurrence"]["frequency"], "yearly")
+        self.assertEqual(updated["recurrence"]["months"], [1, 2, 3, 4])
+        for moment in self.occurrences("recur-months-edit")[1:]:
+            self.assertIn(moment.month, (1, 2, 3, 4), f"{moment} is outside --months")
+
+
+class TestSeriesTimeEdit(LiveCalendarTest):
+    """🛑 A bare `--start`/`--end` time means the event's own day, not today.
+
+    `--series` resolves to the series *master* — the first occurrence, which can
+    be years back. A bare time parsed as a date lands on TODAY, so
+    `edit <series> --series --end "20:30"` silently dragged the anchor of a
+    series anchored in 2023 forward three years. Nothing errored.
+    """
+
+    def test_a_bare_time_keeps_the_series_anchor_day(self):
+        event = self.add(
+            "series-bare-time",
+            "--start", f"{BASE:%Y-%m}-04 09:00",
+            "--repeat", "weekly",
+        )
+        anchor = datetime.datetime.fromisoformat(event["start"]).date()
+
+        code, out, err = run("edit", event["id"], "--series", "--start", "11:30",
+                             "--end", "13:00", "--json")
+        self.assertIn(code, (0, 75), err)
+        updated = json.loads(out)
+
+        start = datetime.datetime.fromisoformat(updated["start"])
+        end = datetime.datetime.fromisoformat(updated["end"])
+        self.assertEqual(start.date(), anchor, "a bare time moved the series anchor")
+        self.assertEqual((start.hour, start.minute), (11, 30))
+        self.assertEqual(end.date(), anchor)
+        self.assertEqual((end.hour, end.minute), (13, 0))
+        self.assertNotEqual(
+            start.date(), datetime.date.today(), "the bare time was read as today"
+        )
+        # The re-anchoring is announced; it is not something to discover later.
+        self.assertIn("--start named a time and no date", err)
+
+    def test_a_full_date_still_moves_the_anchor(self):
+        event = self.add(
+            "series-full-date",
+            "--start", f"{BASE:%Y-%m}-04 09:00",
+            "--repeat", "weekly",
+        )
+        moved = f"{BASE:%Y-%m}-11"
+        updated = run_json(
+            "edit", event["id"], "--series",
+            "--start", f"{moved} 14:00", "--end", f"{moved} 15:00",
+        )
+        start = datetime.datetime.fromisoformat(updated["start"])
+        self.assertEqual(start.date().isoformat(), moved)
+        self.assertEqual((start.hour, start.minute), (14, 0))
 
 
 class TestMovingOneOccurrence(LiveCalendarTest):

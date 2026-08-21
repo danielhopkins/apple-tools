@@ -90,9 +90,53 @@ func requireCalendarAccess() throws {
 struct DateArg: ExpressibleByArgument {
     let date: Date
 
+    /// 🛑 **A bare time is a date too, and it means TODAY.** NSDataDetector reads
+    /// "20:30" as 20:30 this evening, so `edit <series> --series --end "20:30"`
+    /// silently moved a series anchored in 2023 to today. Nothing errored.
+    ///
+    /// So the time is kept alongside the resolved date, and `edit` re-hangs it
+    /// on the event's own day rather than on today. `add` does not: a new event
+    /// has no day to hang it on, and today is the right reading there.
+    let timeOfDay: DateComponents?
+
     init?(argument: String) {
         guard let parsed = DateArg.parse(argument) else { return nil }
         self.date = parsed
+        self.timeOfDay = DateArg.timeOnly(argument)
+    }
+
+    /// The hour and minute, when the argument named a time and no date at all.
+    /// Deliberately an explicit format list rather than NSDataDetector: the
+    /// question here is "did the caller omit the date", and a lenient parser
+    /// cannot answer it.
+    static func timeOnly(_ string: String) -> DateComponents? {
+        let trimmed = string.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return nil }
+        let formats = ["HH:mm", "H:mm", "h:mma", "h:mm a", "ha", "h a", "hh:mma", "hh:mm a"]
+        for format in formats {
+            let formatter = DateFormatter()
+            formatter.dateFormat = format
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            guard let date = formatter.date(from: trimmed) else { continue }
+            // The formatter anchors a time-only parse to 1 Jan 2000, which is
+            // exactly why only the hour and minute are kept.
+            return Foundation.Calendar.current.dateComponents([.hour, .minute], from: date)
+        }
+        return nil
+    }
+
+    /// The same clock time, moved onto `day`. Used by `edit` so a bare `--start`
+    /// or `--end` changes the time of the event in front of the caller rather
+    /// than moving it to today.
+    func on(_ day: Date) -> Date {
+        guard let timeOfDay, let hour = timeOfDay.hour, let minute = timeOfDay.minute
+        else { return date }
+        let calendar = Foundation.Calendar.current
+        var parts = calendar.dateComponents([.year, .month, .day], from: day)
+        parts.hour = hour
+        parts.minute = minute
+        parts.second = 0
+        return calendar.date(from: parts) ?? date
     }
 
     static func parse(_ string: String) -> Date? {
@@ -890,7 +934,7 @@ struct Add: ParsableCommand {
             event.url = change.value
         }
 
-        if let rule = recurrence.rule() {
+        if let rule = try recurrence.rule() {
             event.recurrenceRules = [rule]
             if let warning = recurrence.startDateWarning(start: start.date) {
                 FileHandle.standardError.write(Data((warning + "\n").utf8))
@@ -984,10 +1028,13 @@ struct Edit: ParsableCommand {
     @Option(name: .long, help: "New title")
     var title: String?
 
-    @Option(name: .long, help: "New start time")
+    @Option(name: .long, help: """
+        New start time. A bare time like '18:30' keeps the event's own day, \
+        so with --series it moves the anchor occurrence's time and nothing else.
+        """)
     var start: DateArg?
 
-    @Option(name: .long, help: "New end time")
+    @Option(name: .long, help: "New end time. A bare time like '20:30' keeps the event's own day.")
     var end: DateArg?
 
     @Option(name: .long, help: "New location text, written verbatim and never geocoded")
@@ -1004,7 +1051,12 @@ struct Edit: ParsableCommand {
     @Option(name: .long, help: "Which occurrence to edit (its \"occurrence\" field from `events --json`)")
     var occurrence: DateArg?
 
-    @Flag(name: .long, help: "Target the recurring series itself rather than one occurrence")
+    @Flag(name: .long, help: """
+        Target the recurring series itself rather than one occurrence. \
+        --start/--end here are measured against the SERIES ANCHOR — the first \
+        occurrence, often years back — not against the next one you can see. \
+        Pass a bare time to change the time and leave the anchor day alone.
+        """)
     var series = false
 
     @Flag(name: .long, help: "Apply to this and all future occurrences of a recurring event")
@@ -1072,20 +1124,46 @@ struct Edit: ParsableCommand {
         // applies exactly the same change rather than asking Maps twice.
         let resolvedPin = try pin.resolve()
 
+        // Built once for the same reason: the retry has to apply the identical
+        // rule, and `apply` below is non-throwing.
+        let resolvedRule = try recurrence.rule()
+
+        // 🛑 A bare `--start`/`--end` time is re-hung on THIS event's own day.
+        //
+        // `--series` resolves to the series *master* — the first occurrence,
+        // often years back — so its dates are the anchor a rule is measured
+        // from. Passing an upcoming occurrence's date there moves the whole
+        // series to that date. Passing a bare time is worse: it silently means
+        // today. Measured in the field on a series anchored 2023-06-12, where
+        // `--end "20:30"` would have moved the anchor forward three years.
+        //
+        // The date is redundant when only the time is changing, and it is the
+        // part callers get wrong, so a bare time is taken as "same day, new
+        // time" and the day it landed on is reported.
+        let resolvedStart = start.map { $0.on(match.startDate ?? $0.date) }
+        let resolvedEnd = end.map { $0.on(match.endDate ?? $0.date) }
+        for (flag, arg, resolved) in [("--start", start, resolvedStart), ("--end", end, resolvedEnd)] {
+            guard let arg, arg.timeOfDay != nil, let resolved else { continue }
+            let note = "note: \(flag) named a time and no date, so it is read as "
+                + "\(humanFormatter.string(from: resolved))"
+                + (series ? ", the series anchor day." : ".")
+            FileHandle.standardError.write(Data((note + "\n").utf8))
+        }
+
         // Applied to the retry target too, so both attempts are identical.
         func apply(to event: EKEvent, warn: Bool) {
             if let title { event.title = title }
-            if let start { event.startDate = start.date }
-            if let end { event.endDate = end.date }
+            if let resolvedStart { event.startDate = resolvedStart }
+            if let resolvedEnd { event.endDate = resolvedEnd }
             if let location { event.location = location }
             pin.apply(resolvedPin, to: event)
             if let notes { event.notes = notes }
             if let urlChange { event.url = urlChange.value }
 
             guard recurrence.wasSpecified else { return }
-            if let rule = recurrence.rule() {
+            if let rule = resolvedRule {
                 event.recurrenceRules = [rule]
-                let effectiveStart = start?.date ?? event.startDate
+                let effectiveStart = resolvedStart ?? event.startDate
                 if warn, let effectiveStart,
                    let warning = recurrence.startDateWarning(start: effectiveStart) {
                     FileHandle.standardError.write(Data((warning + "\n").utf8))
@@ -1131,10 +1209,10 @@ struct Edit: ParsableCommand {
         // just mutated — describes the *request*, so it can never fail. The
         // answer has to come from the store.
         let want = IntendedChange(
-            start: start?.date, end: end?.date, title: title,
+            start: resolvedStart, end: resolvedEnd, title: title,
             location: location, notes: notes, url: urlChange,
             recurs: recurrence.wasSpecified ? recurrence.isRecurring : nil)
-        let intendedStart = start?.date ?? match.startDate
+        let intendedStart = resolvedStart ?? match.startDate
 
         func readBack() -> EKEvent? {
             WriteConfirmation.locate(

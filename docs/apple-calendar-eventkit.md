@@ -223,6 +223,81 @@ per-occurrence: `invite ID --occurrence DATE --add …` never touches the master
 so nothing can be rebuilt. Verified: it changed only that occurrence and left a
 pre-existing exception intact.
 
+### Which `BY*` parts each frequency actually honours
+
+🛑 **EventKit ignores a `BY*` part on a frequency that does not carry it. It does
+not error.** The rule comes back apparently saved and repeats on the start date's
+day number instead, so the flag disappears without a word. `EKRecurrenceRule.h`
+is explicit, and these are the three that matter here:
+
+| Initializer parameter | iCalendar | Valid on | `apple calendar` flag |
+|---|---|---|---|
+| `daysOfTheWeek` (with `weekNumber`) | `BYDAY=4MO` | weekly, monthly, yearly | `--on-the "4th monday"` |
+| `daysOfTheMonth` | `BYMONTHDAY=15` | **monthly only** | `--on-the 15` |
+| `monthsOfTheYear` | `BYMONTH=1,2,3,4` | **yearly only** | `--months 1,2,3,4` |
+
+Consequence, and it is not symmetric: **`--on-the "4th monday"` works on a yearly
+rule and `--on-the 15` does not.** `DayPattern.frequencies` in `Recurrence.swift`
+carries that split, and `validate()` refuses the combinations EventKit would
+drop. Silence is the failure mode here, so the refusal is the feature.
+
+### `FREQ=YEARLY;BYMONTH=1,2,3,4;BYDAY=4MO`
+
+🛑 **A yearly rule restricted to some months was not expressible before
+`--months`**, and the only substitute — a monthly series bounded with
+`--repeat-until` — expires and has to be recreated by hand every year.
+
+That cost is measured, not hypothetical. One committee series on this calendar
+meets the 4th Monday of January through April. It was rebuilt as a bounded
+monthly series and allowed to lapse three separate times: 2021, 2023 and 2025.
+
+```
+apple calendar add "LEC Meeting" \
+  --start "2027-01-25 18:30" --end "2027-01-25 20:30" \
+  --repeat yearly --on-the "4th monday" --months 1,2,3,4
+```
+
+⚠️ **Google Calendar's own web editor cannot build this rule**, but Google honours
+it over calDAV and on an imported ICS. So the CLI is strictly more capable than
+the web interface here, and a round trip through the server is worth asserting
+rather than assuming.
+
+`--months` takes numbers or names, in any case, comma-separated or repeated:
+`--months 1,2,3,4`, `--months jan,feb --months March`. It is sorted and
+de-duplicated on the way in, and reported back as `recurrence.months` — an array
+of integers, **absent rather than `[]`** when the rule has no filter.
+
+⚠️ **A `--start` whose month is outside `--months` is a warning, not an error**,
+the same rule `--on-the` already followed. The first occurrence sits on the start
+date and every later one obeys the filter.
+
+**There is deliberately no `--rrule` escape hatch.** A raw RRULE string would
+hand EventKit combinations it silently drops, which is exactly the failure this
+whole section exists to prevent. Every part the tool exposes is refused when it
+would be ignored.
+
+### A `--series` edit is measured against the series anchor
+
+🛑 **`--series` resolves to the series master — the first occurrence, often years
+back — so `--start`/`--end` there mean the anchor's date, not the next occurrence
+you can see.** Passing an upcoming occurrence's date moves the whole series to
+that date.
+
+A bare time was worse. `NSDataDetector` reads `20:30` as 20:30 **today**, so
+`edit <id> --series --end "20:30"` on a series anchored 2023-06-12 would have
+dragged the anchor forward three years, with nothing printed.
+
+So `DateArg` keeps the hour and minute when the argument named a time and no
+date, and `edit` re-hangs it on the event's own day:
+
+```
+apple calendar edit <id> --series --start "18:30" --end "20:30"
+```
+
+The day it landed on is printed on stderr, because a re-anchoring is not
+something to discover afterwards. ⚠️ **`add` deliberately does not do this** — a
+new event has no day to hang a time on, and today is the right reading there.
+
 ## Map pins
 
 Measured on 2026-08-16, across 517 real events: 166 carry location text, all 166

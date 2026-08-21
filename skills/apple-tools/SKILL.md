@@ -121,7 +121,11 @@ apple calendar add "Dentist" --start "tomorrow 2pm" --duration 45
 apple calendar unsynced                   # did anything fail to reach the server
 apple calendar add "Board" --start "2026-09-28 10:00" \
     --repeat monthly --on-the "4th monday"   # same --repeat flags as reminders
+apple calendar add "LEC" --start "2027-01-25 18:30" \
+    --repeat yearly --on-the "4th monday" --months 1,2,3,4   # only Jan-Apr, forever
 apple calendar edit <id> --series --repeat weekly    # rule changes need --series
+apple calendar edit <id> --series --start 18:30 --end 20:30  # a bare time keeps
+                                                    # the anchor day; a full date moves it
 apple calendar edit <id> --url ""                   # clear a stale meeting link
 apple calendar invitees <id>                        # read-only: who is invited
 apple calendar invite <id> --add a@b.com --dry-run   # ALWAYS dry-run first

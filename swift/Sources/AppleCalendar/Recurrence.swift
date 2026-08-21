@@ -34,7 +34,7 @@ enum RepeatFrequency: String, ExpressibleByArgument, CaseIterable {
 
 // MARK: - "the 4th monday of each month"
 
-/// Which day within the month a monthly series lands on.
+/// Which day within the month a monthly or yearly series lands on.
 ///
 /// ⚠️ **`--repeat monthly` alone cannot express this**, and that is not a gap in
 /// the flag surface — it is what `EKRecurrenceRule`'s simple initializer means.
@@ -43,9 +43,17 @@ enum RepeatFrequency: String, ExpressibleByArgument, CaseIterable {
 /// coincide for exactly one month and then diverge silently, which is the kind
 /// of wrong nobody notices until someone misses a meeting.
 ///
+/// 🛑 **The two cases are NOT valid on the same set of frequencies**, and the
+/// SDK header is explicit about it. `daysOfTheWeek` — the `.weekday` case — is
+/// "valid for all recurrence types except daily". `daysOfTheMonth` — the
+/// `.dayOfMonth` case — is "valid only for monthly recurrences. **Ignored**
+/// otherwise." So `--on-the "4th monday"` works on a yearly rule and
+/// `--on-the 15` does not, and the second one fails by being dropped rather
+/// than by erroring. `frequencies` below is what keeps that from shipping.
+///
 /// Reminders has no equivalent, so this is the one place the two tools' flag
 /// surfaces deliberately differ.
-enum MonthlyPattern: Equatable {
+enum DayPattern: Equatable {
   /// "4th monday", "last friday" — an ordinal weekday. `-1` is last.
   case weekday(EKWeekday, ordinal: Int)
   /// "15", "last" — a day number. `-1` is the last day of the month.
@@ -66,7 +74,7 @@ enum MonthlyPattern: Equatable {
     "4th": 4, "fourth": 4, "5th": 5, "fifth": 5, "last": -1,
   ]
 
-  static func parse(_ raw: String) -> MonthlyPattern? {
+  static func parse(_ raw: String) -> DayPattern? {
     let text = raw.trimmingCharacters(in: .whitespaces).lowercased()
     guard !text.isEmpty else { return nil }
 
@@ -111,6 +119,16 @@ enum MonthlyPattern: Equatable {
     }
   }
 
+  /// Which `--repeat` frequencies EventKit actually honours this case on.
+  /// Anything else is *ignored* by the framework, never rejected, so the CLI
+  /// has to refuse it here or the flag disappears without a word.
+  var frequencies: [RepeatFrequency] {
+    switch self {
+    case .weekday: return [.monthly, .yearly]
+    case .dayOfMonth: return [.monthly]
+    }
+  }
+
   var describe: String {
     switch self {
     case .weekday(let day, let ordinal):
@@ -122,6 +140,68 @@ enum MonthlyPattern: Equatable {
     case .dayOfMonth(let number):
       return number == -1 ? "the last day" : "day \(number)"
     }
+  }
+}
+
+// MARK: - "every year, but only in January through April"
+
+/// The months a yearly rule is restricted to — `BYMONTH` in iCalendar,
+/// `monthsOfTheYear` in EventKit.
+///
+/// 🛑 **Without this a yearly rule cannot say "only some months of the year"**,
+/// and the only expressible substitute is a *bounded* monthly series that has
+/// to be recreated by hand every year. That is not a hypothetical cost: one
+/// committee series on this calendar was rebuilt and allowed to lapse three
+/// separate times, in 2021, 2023 and 2025, for exactly this reason.
+///
+/// ⚠️ **`monthsOfTheYear` is "valid only for yearly recurrences. Ignored
+/// otherwise"** per the SDK header, so `--months` on any other frequency is
+/// refused rather than dropped.
+enum MonthSet {
+  private static let names: [String: Int] = [
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6,
+    "jul": 7, "july": 7, "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9, "oct": 10, "october": 10,
+    "nov": 11, "november": 11, "dec": 12, "december": 12,
+  ]
+
+  /// Parses one token: a number 1-12, or a month name in any case.
+  /// Nil means "not a month", which the caller turns into an error naming it.
+  static func parse(_ raw: String) -> Int? {
+    let text = raw.trimmingCharacters(in: .whitespaces).lowercased()
+    guard !text.isEmpty else { return nil }
+    if let number = Int(text) { return (1...12).contains(number) ? number : nil }
+    return names[text]
+  }
+
+  /// Parses the whole flag. `--months` is repeatable *and* comma-separated, so
+  /// `--months 1,2 --months apr` and `--months 1,2,4` mean the same thing.
+  /// Sorted and de-duplicated, because a rule listing March twice is the same
+  /// rule and reading it back should not suggest otherwise.
+  static func parseAll(_ raw: [String]) throws -> [Int]? {
+    let tokens = raw
+      .flatMap { $0.split(separator: ",") }
+      .map { String($0).trimmingCharacters(in: .whitespaces) }
+      .filter { !$0.isEmpty }
+    guard !tokens.isEmpty else { return nil }
+    var months: Set<Int> = []
+    for token in tokens {
+      guard let month = parse(token) else {
+        throw ValidationError(
+          "--months '\(token)' is not a month. Use a number 1-12 or a name like "
+            + "'jan' or 'january'.")
+      }
+      months.insert(month)
+    }
+    return months.sorted()
+  }
+
+  private static let short = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+  static func describe(_ months: [Int]) -> String {
+    months.map { short[$0] }.joined(separator: ", ")
   }
 }
 
@@ -147,8 +227,19 @@ struct RecurrenceOptions: ParsableArguments {
 
   @Option(
     name: .customLong("on-the"),
-    help: "Which day of the month, e.g. '4th monday', 'last friday', '15'. Needs --repeat monthly.")
+    help: """
+      Which day of the month, e.g. '4th monday', 'last friday', '15'. \
+      Needs --repeat monthly, or --repeat yearly for the weekday forms.
+      """)
   var onThe: String?
+
+  @Option(
+    name: .customLong("months"),
+    help: """
+      Restrict a yearly rule to these months: '1,2,3,4' or 'jan,feb,mar,apr'. \
+      Repeatable. Needs --repeat yearly.
+      """)
+  var months: [String] = []
 
   /// True when the caller asked for recurrence at all. `--repeat none` is
   /// *specified* but not recurring, which is what makes removal expressible.
@@ -158,11 +249,16 @@ struct RecurrenceOptions: ParsableArguments {
   /// Distinguishes "leave the rule alone" from "remove the rule" on `edit`.
   var wasSpecified: Bool {
     repeatFrequency != nil || repeatInterval != nil || repeatUntil != nil
-      || repeatCount != nil || onThe != nil
+      || repeatCount != nil || onThe != nil || !months.isEmpty
   }
 
-  var monthlyPattern: MonthlyPattern? {
-    onThe.flatMap(MonthlyPattern.parse)
+  var dayPattern: DayPattern? {
+    onThe.flatMap(DayPattern.parse)
+  }
+
+  /// Nil when `--months` was not passed. Throws when a token is not a month.
+  func monthsOfTheYear() throws -> [Int]? {
+    try MonthSet.parseAll(months)
   }
 
   /// Same rules and same wording as `apple reminders`, so an error learned in
@@ -183,24 +279,53 @@ struct RecurrenceOptions: ParsableArguments {
       throw ValidationError("--repeat-count must be >= 1")
     }
     if let onThe {
-      guard MonthlyPattern.parse(onThe) != nil else {
+      guard let pattern = DayPattern.parse(onThe) else {
         throw ValidationError(
           "--on-the '\(onThe)' is not a day of the month. Use '4th monday', 'last friday', "
             + "a bare weekday like 'monday', a day number like '15', or 'last'.")
       }
-      // EventKit accepts an ordinal weekday only on a monthly (or yearly) rule;
-      // attaching one to a daily or weekly rule produces a series that ignores
-      // it, so refuse rather than silently dropping the flag.
-      guard repeatFrequency == .monthly else {
+      // 🛑 EventKit *ignores* a day pattern on a frequency that does not carry
+      // it — no error, and the series comes back repeating on the start date's
+      // day number instead. So the refusal has to happen here, and it has to be
+      // per-case: an ordinal weekday is valid monthly and yearly, a bare day
+      // number only monthly.
+      let allowed = pattern.frequencies
+      guard let repeatFrequency, allowed.contains(repeatFrequency) else {
+        let want = allowed.map { "--repeat \($0.rawValue)" }.joined(separator: " or ")
+        let got = repeatFrequency.map { "--repeat \($0.rawValue)" } ?? "no --repeat"
+        var message = "--on-the '\(onThe)' needs \(want) (got \(got))."
+        if case .dayOfMonth = pattern, repeatFrequency == .yearly {
+          message += """
+             EventKit carries a day number on monthly rules only, and ignores it \
+            on a yearly one. For a yearly rule use a weekday form like '4th monday', \
+            or pin the day with --start and --months.
+            """
+        }
+        throw ValidationError(message)
+      }
+    }
+
+    // ⚠️ `monthsOfTheYear` is "valid only for yearly recurrences. Ignored
+    // otherwise" (EKRecurrenceRule.h). Silently dropping --months would give
+    // back a rule that fires all twelve months, which is the failure this flag
+    // exists to prevent.
+    if let months = try monthsOfTheYear(), !months.isEmpty {
+      guard repeatFrequency == .yearly else {
         throw ValidationError(
-          "--on-the needs --repeat monthly (got "
-            + (repeatFrequency.map { "--repeat \($0.rawValue)" } ?? "no --repeat") + ").")
+          "--months needs --repeat yearly (got "
+            + (repeatFrequency.map { "--repeat \($0.rawValue)" } ?? "no --repeat")
+            + "). A rule that fires in some months of every year is FREQ=YEARLY;BYMONTH=…; "
+            + "--repeat monthly already means every month.")
       }
     }
   }
 
   /// Nil when the event should not recur.
-  func rule() -> EKRecurrenceRule? {
+  ///
+  /// Throws only for a `--months` token `validate()` would already have
+  /// rejected; the parse is repeated here rather than cached so there is one
+  /// definition of what the flag means.
+  func rule() throws -> EKRecurrenceRule? {
     guard let frequency = repeatFrequency?.ekFrequency else { return nil }
     let end: EKRecurrenceEnd?
     if let until = repeatUntil {
@@ -211,19 +336,25 @@ struct RecurrenceOptions: ParsableArguments {
       end = nil
     }
 
-    guard let pattern = monthlyPattern else {
+    let months = try monthsOfTheYear()
+
+    guard dayPattern != nil || months != nil else {
       return EKRecurrenceRule(
         recurrenceWith: frequency, interval: repeatInterval ?? 1, end: end)
     }
 
-    // The long initializer is the only one that can express a positional day.
+    // The long initializer is the only one that can express a positional day or
+    // a months filter. It is also the only one that can express both at once,
+    // which is the whole point: FREQ=YEARLY;BYMONTH=1,2,3,4;BYDAY=4MO.
     var daysOfTheWeek: [EKRecurrenceDayOfWeek]?
     var daysOfTheMonth: [NSNumber]?
-    switch pattern {
+    switch dayPattern {
     case .weekday(let day, let ordinal):
       daysOfTheWeek = [EKRecurrenceDayOfWeek(dayOfTheWeek: day, weekNumber: ordinal)]
     case .dayOfMonth(let number):
       daysOfTheMonth = [NSNumber(value: number)]
+    case nil:
+      break
     }
 
     return EKRecurrenceRule(
@@ -231,7 +362,7 @@ struct RecurrenceOptions: ParsableArguments {
       interval: repeatInterval ?? 1,
       daysOfTheWeek: daysOfTheWeek,
       daysOfTheMonth: daysOfTheMonth,
-      monthsOfTheYear: nil,
+      monthsOfTheYear: months?.map { NSNumber(value: $0) },
       weeksOfTheYear: nil,
       daysOfTheYear: nil,
       setPositions: nil,
@@ -242,14 +373,30 @@ struct RecurrenceOptions: ParsableArguments {
   /// starting on a day the pattern does not describe has a first occurrence
   /// that is the odd one out — and nothing errors. Warn instead of guessing.
   func startDateWarning(start: Date) -> String? {
-    guard let pattern = monthlyPattern, !pattern.matches(start) else { return nil }
     let formatter = DateFormatter()
     formatter.dateFormat = "EEEE, MMM d yyyy"
-    return """
-      note: --start is \(formatter.string(from: start)), which is not \(pattern.describe) \
-      of that month. The first occurrence will sit on the start date and later ones will \
-      follow \(pattern.describe).
-      """
+    var notes: [String] = []
+
+    if let pattern = dayPattern, !pattern.matches(start) {
+      notes.append("""
+        note: --start is \(formatter.string(from: start)), which is not \(pattern.describe) \
+        of that month. The first occurrence will sit on the start date and later ones will \
+        follow \(pattern.describe).
+        """)
+    }
+
+    // Same trap, one level up: a start month outside --months makes the first
+    // occurrence the odd one out and every later one follow the filter.
+    let month = Foundation.Calendar.current.component(.month, from: start)
+    if let months = try? monthsOfTheYear(), !months.contains(month) {
+      notes.append("""
+        note: --start is \(formatter.string(from: start)), whose month is not in \
+        --months \(MonthSet.describe(months)). The first occurrence will sit on the start \
+        date and later ones will fall in \(MonthSet.describe(months)) only.
+        """)
+    }
+
+    return notes.isEmpty ? nil : notes.joined(separator: "\n")
   }
 }
 
@@ -264,11 +411,14 @@ struct RecurrenceInfo: Encodable {
   let interval: Int
   let until: String?
   let count: Int?
-  /// "the 4th Monday" — present only for a positional monthly rule.
+  /// "the 4th Monday" — present only for a positional monthly or yearly rule.
   let onThe: String?
+  /// `[1, 2, 3, 4]` — present only on a yearly rule restricted by --months.
+  /// Absent, never `[]`, matching every other optional key in this tool.
+  let months: [Int]?
 
   enum CodingKeys: String, CodingKey {
-    case frequency, interval, until, count
+    case frequency, interval, until, count, months
     case onThe = "on_the"
   }
 
@@ -276,12 +426,14 @@ struct RecurrenceInfo: Encodable {
     guard let rule else { return nil }
 
     if let day = rule.daysOfTheWeek?.first, day.weekNumber != 0 {
-      onThe = MonthlyPattern.weekday(day.dayOfTheWeek, ordinal: day.weekNumber).describe
+      onThe = DayPattern.weekday(day.dayOfTheWeek, ordinal: day.weekNumber).describe
     } else if let day = rule.daysOfTheMonth?.first {
-      onThe = MonthlyPattern.dayOfMonth(day.intValue).describe
+      onThe = DayPattern.dayOfMonth(day.intValue).describe
     } else {
       onThe = nil
     }
+    let monthNumbers = rule.monthsOfTheYear?.map { $0.intValue }.sorted()
+    months = (monthNumbers?.isEmpty ?? true) ? nil : monthNumbers
     switch rule.frequency {
     case .daily: frequency = "daily"
     case .weekly: frequency = "weekly"
@@ -309,6 +461,7 @@ struct RecurrenceInfo: Encodable {
     }
     var text = interval == 1 ? "every \(unit)" : "every \(interval) \(unit)"
     if let onThe { text += " on \(onThe)" }
+    if let months { text += " in \(MonthSet.describe(months))" }
     if let until, let date = ISO8601DateFormatter().date(from: until) {
       let formatter = DateFormatter()
       formatter.dateFormat = "MMM d, yyyy"

@@ -59,6 +59,8 @@ installed via `make install`.
 | This week's events | `apple calendar events --days 7 --json` |
 | Add an event | `apple calendar add "Dentist" --start "tomorrow 2pm" --duration 45` |
 | Recurring meeting | `apple calendar add "Board" --start … --repeat monthly --on-the "4th monday"` |
+| ...only some months of the year | `apple calendar add "LEC" … --repeat yearly --on-the "4th monday" --months 1,2,3,4` |
+| Change a series' time, not its date | `apple calendar edit <id> --series --start 18:30 --end 20:30` |
 | Fix a stale meeting link | `apple calendar edit <id> --url ""` |
 | See who is invited | `apple calendar events --days 7 --json` → `attendees`, `organizer`, `my_status` |
 | Did that write reach the server | `apple calendar sync-status <id>` |
@@ -902,7 +904,8 @@ apple calendar events [--from DATE] [--to DATE | --days N] [--calendar NAME]
 apple calendar show ID [--occurrence DATE] [--json]
 apple calendar add "TITLE" --start DATE [--end DATE | --duration MINUTES]
                           [--calendar NAME] [--all-day] [--location TEXT]
-                          [--at PLACE] [--notes TEXT] [--url URL] [--invitee ADDR]... [--json]
+                          [--at PLACE] [--notes TEXT] [--url URL] [--invitee ADDR]...
+                          [-r FREQ] [--on-the "4th monday"] [--months 1,2,3,4] [--json]
 apple calendar edit ID [--title T] [--start DATE] [--end DATE] [--location L]
                        [--notes N] [--url URL|""] [--occurrence DATE | --series] [--future] [--json]
 apple calendar invitees ID [--occurrence DATE | --series] [--json]   # read-only
@@ -987,7 +990,8 @@ saw — EventKit resolves it to the first occurrence, often years earlier. So:
 **Recurrence flags** match `apple reminders`: `--repeat
 none|daily|weekly|monthly|yearly` (`-r`), `--repeat-interval N`,
 `--repeat-until DATE`, `--repeat-count N`. `events --json` reports a
-`recurrence` object (`frequency`, `interval`, `until`, `count`, `on_the`).
+`recurrence` object (`frequency`, `interval`, `until`, `count`, `on_the`,
+`months`).
 
 **`--on-the` is the one flag reminders has no equivalent for**, because
 `--repeat monthly` alone cannot say "the 4th Monday": a plain monthly rule
@@ -1000,10 +1004,51 @@ apple calendar add "Board" --start "2026-09-28 10:00" \
 ```
 
 Takes `4th monday`, `last friday`, a bare weekday (means the first), a day number
-like `15`, or `last`. Requires `--repeat monthly`. ⚠️ A `--start` that does not
-match the pattern is a **warning, not an error**. **Changing how an event repeats
-requires `--series`**, since a rule belongs to the series; `--repeat none`
-removes recurrence entirely.
+like `15`, or `last`. ⚠️ A `--start` that does not match the pattern is a
+**warning, not an error**. **Changing how an event repeats requires `--series`**,
+since a rule belongs to the series; `--repeat none` removes recurrence entirely.
+
+🛑 **`--on-the` is not valid on the same frequencies in both forms, because
+EventKit is not.** A weekday form works on `--repeat monthly` **and `--repeat
+yearly`**; a bare day number works on `monthly` only. EventKit *ignores* the part
+it cannot carry rather than refusing it, so the CLI refuses instead.
+
+**`--months` restricts a yearly rule to a set of months** — `BYMONTH`, which
+EventKit honours only on a yearly rule.
+
+```
+apple calendar add "LEC Meeting" --start "2027-01-25 18:30" \
+    --repeat yearly --on-the "4th monday" --months 1,2,3,4
+```
+
+That is "the 4th Monday of January through April, every year, forever". Without
+it the only expressible substitute is a **bounded** monthly series, which expires
+and has to be recreated by hand. One real series here lapsed three times — 2021,
+2023, 2025 — for exactly that reason.
+
+- Takes numbers or names, in any case, comma-separated or repeated: `1,2,3,4`,
+  `jan,feb --months March`. Sorted and de-duplicated.
+- Reported as `recurrence.months`, an array of integers, **absent rather than
+  `[]`** when the rule has no filter.
+- ⚠️ A `--start` in a month outside `--months` is a **warning, not an error**.
+- **There is no `--rrule` escape hatch and there will not be one.** A raw RRULE
+  hands EventKit combinations it drops in silence, which is what every refusal
+  here exists to prevent.
+
+🛑 **A `--series` edit is measured against the SERIES ANCHOR** — the first
+occurrence, often years back — not against the next occurrence you can see. So
+`--start`/`--end` with a full date move the whole series to that date. **Pass a
+bare time to change the time and leave the anchor day alone:**
+
+```
+apple calendar edit <id> --series --start "18:30" --end "20:30"
+```
+
+⚠️ **A bare time used to mean *today*.** `NSDataDetector` reads `20:30` as this
+evening, so a series anchored in 2023 would have jumped three years with nothing
+printed. `edit` now re-hangs a bare time on the event's own day and says on
+stderr which day that was. **`add` does not** — a new event has no day to hang a
+time on, and today is the right reading there.
 
 🛑 **`--location` is text and gets no map pin; `--at` is the flag that does.**
 EventKit keeps the coordinate on a separate `EKStructuredLocation`, and only that
