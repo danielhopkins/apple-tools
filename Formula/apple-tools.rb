@@ -1,8 +1,8 @@
 class AppleTools < Formula
   desc "Local CLIs for Notes, Mail, Messages, Phone, Maps, Reminders, Calendar, Contacts"
   homepage "https://github.com/danielhopkins/apple-tools"
-  url "https://github.com/danielhopkins/apple-tools/releases/download/v26.821.1/apple-tools-26.821.1.tar.gz"
-  sha256 "a918abc702828efa76f7136aa1c52e8bbc3bb4b965eced0b5d0d5ecd800b175f"
+  url "https://github.com/danielhopkins/apple-tools/releases/download/v26.821.2/apple-tools-26.821.2.tar.gz"
+  sha256 "0c4e60303de72f0b4b0f3cabbfb4d93036e66eb4256f5a020214b5f04aef23e1"
   license "MIT"
 
   depends_on :macos
@@ -167,6 +167,12 @@ class AppleTools < Formula
     calendar_add_help = shell_output("#{bin}/apple-calendar add --help")
     assert_match "on-the", calendar_add_help
     assert_match "months", calendar_add_help
+
+    # A Google 403 is a rate limit far more often than a refusal: 16 of 16 such
+    # writes synced ~156s later, while `add` called them REFUSED and exited 1.
+    # --throttle-timeout is what lets the wait outlast the throttle window, so
+    # losing the flag restores a hard failure on writes that succeed.
+    assert_match "throttle-timeout", calendar_add_help
 
     # `move` is the one mail command that writes to real mailboxes, and an
     # unregistered subcommand fails silently: apple-mail prints root help and
