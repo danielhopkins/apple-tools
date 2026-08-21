@@ -132,11 +132,13 @@ def _contacts_applescript(script):
 def set_note(contact_id, text):
     """Put a note on a fixture contact. True if it took.
 
-    apple-contacts cannot do this and never will — writing a note needs the
-    com.apple.developer.contacts.notes entitlement — but a note is exactly what
-    stops CNContactStore saving anything *else* about a contact, so the
-    regression for that needs one. AppleScript is not subject to the
-    entitlement, which is how the bug was originally reproduced.
+    ⚠️ **Deliberately not `apple-contacts edit --note`, even though that now
+    works.** A note is exactly what stops CNContactStore saving anything *else*
+    about a contact, and `NoteBearingContacts` exists to pin the fallback that
+    routes around it. Planting the fixture with the tool's own note writer would
+    make that whole suite skip — rather than fail — whenever the note writer
+    broke. This path is independent of everything it is used to test, which is
+    how the bug was originally reproduced.
     """
     escaped = text.replace("\\", "\\\\").replace('"', '\\"')
     result = _contacts_applescript(
@@ -150,9 +152,12 @@ def set_note(contact_id, text):
 def note_of(contact_id):
     """The note Contacts.app holds, read back the same way it was written.
 
-    Not `get --json`: that reads the AddressBook SQLite store, which lags a
-    write made through another process, so it would make this flaky for a
-    reason that has nothing to do with what is being tested.
+    ⚠️ **The lag this once avoided is gone.** `get --json` reads the AddressBook
+    SQLite store, which used to trail a write made by another process — until
+    `NoteStore` stopped opening with `immutable=1` in 26.812.8. Measured after
+    that fix: five writes, five immediate reads, no delay and no miss. This
+    stays on AppleScript for the same reason `set_note` does, not because the
+    store is stale.
     """
     return _contacts_applescript(
         f'return note of (first person whose id is "{contact_id}")'

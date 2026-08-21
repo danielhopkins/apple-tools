@@ -194,7 +194,12 @@ META = {
     "maps":      ("Full Disk Access",    "terminal"),
     "reminders": ("Reminders",           "tool"),
     "calendar":  ("Calendars",           "tool"),
-    "contacts":  ("Contacts",            "tool"),
+    # Two grants for two halves, like mail. Contacts covers every field; the
+    # NOTE goes through Contacts.app, because CNContactNoteKey needs an
+    # entitlement no CLI can hold — so writing one needs Automation as well.
+    # 🛑 `granted_to` describes the Contacts grant, which follows the binary.
+    # The Automation half does NOT: it belongs to the calling terminal.
+    "contacts":  ("Contacts + Automation", "tool"),
 }
 
 records = []

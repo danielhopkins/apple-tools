@@ -664,9 +664,17 @@ private func isNotePropertyFault(_ error: Error) -> Bool {
 /// The way past `notePropertyFaultCode`. AddressBook writes the same records
 /// under the same `UUID:ABPerson` identifiers, needs no permission beyond the
 /// Contacts access this process already holds, and — unlike `CNContactStore` —
-/// is not blocked from saving a record that has a note, as long as it is not
-/// the note itself being written. It is already the fallback that removes
-/// members from iCloud groups, so nothing new is being taken on.
+/// is not blocked from saving a record that has a note. It is already the
+/// fallback that removes members from iCloud groups, so nothing new is being
+/// taken on.
+///
+/// 🛑 **This gets past the wall; it does not get through it.** An earlier
+/// version of this comment guessed that AddressBook could write the note too,
+/// "as long as it is not the note itself being written". Measured on 683 real
+/// contacts: `ABPerson.value(forProperty: kABNoteProperty)` read **zero** of
+/// the 52 notes and raised `NSCocoaErrorDomain 134092` on every one. `ABPerson`
+/// is a shim over the same Core Data store and hits the same entitlement. The
+/// note is written through Contacts.app instead — see `NoteWriter`.
 ///
 /// ⚠️ **The first save fails and the second one works.** Faulting the record
 /// trips the note wall once; afterwards the fault is settled and the pending
@@ -910,10 +918,9 @@ struct Deceased: ParsableCommand {
           nothing places it in time.
 
           `marked_without_date` lists cards whose note carries a dagger and which
-          record no date. That marker is never the record and never makes anyone
-          deceased; it is reported because the tool cannot write a note, so it
-          can never resolve such a card itself. Add the date in `edit --died`, or
-          the note in Contacts.app.
+          record no death date. That marker is never the record and never makes
+          anyone deceased. Resolve one with `edit --died`: it writes the date,
+          and leaves the marker that is already there alone.
           """)
 
     @Flag(name: .long, help: "Output as JSON")
@@ -1049,15 +1056,27 @@ struct Status: ParsableCommand {
             }
         }()
 
+        // ⚠️ **Two grants, for two different jobs.** Contacts covers everything
+        // except the note; writing a note goes through Contacts.app and needs
+        // Automation. So `usable` stays keyed to the Contacts grant alone — a
+        // missing Automation grant costs one field, not the tool.
+        let (automation, automationOK, automationAdvice) = NoteWriter.automationState()
+
         if json {
-            var payload: [String: Any] = ["status": name, "usable": usable]
+            var payload: [String: Any] = [
+                "status": name, "usable": usable,
+                "automation": automation, "note_writes": automationOK,
+            ]
             if let advice { payload["advice"] = advice }
+            if let automationAdvice { payload["automation_advice"] = automationAdvice }
             let data = try? JSONSerialization.data(
                 withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
             print(data.flatMap { String(data: $0, encoding: .utf8) } ?? "{}")
         } else {
             print("Contacts access: \(name)\(usable ? "" : "  (cannot read contacts)")")
             if let advice { print(advice) }
+            print("Note writes (Automation → Contacts): \(automation)")
+            if let automationAdvice { print(automationAdvice) }
         }
     }
 }
@@ -1249,8 +1268,30 @@ struct ContactFields: ParsableArguments {
         help: "Remove every labelled date. The birthday is a separate field and is kept.")
     var clearDates = false
 
-    @Option(name: .long, help: "Not supported — see the error text for why")
+    // 🛑 **The note is the one field that does NOT go through the Contacts
+    // framework.** `CNContactNoteKey` needs an entitlement no CLI can hold, and
+    // the legacy AddressBook framework hits the same wall — measured, 0 notes
+    // readable across 683 contacts. So a note change is collected here and
+    // applied separately, through Contacts.app. See `NoteWriter`.
+    @Option(
+        name: .long,
+        help: "Note text. REPLACES the whole note; use --append-note to keep what is there.")
     var note: String?
+
+    @Option(name: .long, help: "Text to add to the end of the note, on its own line.")
+    var appendNote: String?
+
+    @Flag(name: .long, help: "Delete the note.")
+    var clearNote = false
+
+    // ⚠️ **`--died` marks the note by default**, because on this address book
+    // recording a death and marking the card are one act, done by hand four
+    // times before the tool could do either. `--no-mark` is the opt-out, and it
+    // is also the escape hatch when Automation → Contacts is unavailable: the
+    // date is the record and must not become unwritable because a second grant
+    // is missing.
+    @Flag(name: .long, help: "With --died, do not add the «†» marker to the note.")
+    var noMark = false
 
     var isEmpty: Bool {
         first == nil && middle == nil && last == nil && namePrefix == nil
@@ -1265,6 +1306,28 @@ struct ContactFields: ParsableArguments {
             && url.isEmpty && relation.isEmpty && date.isEmpty
             && address.isEmpty
     }
+
+    /// What the caller asked to do to the note, if anything.
+    ///
+    /// 🛑 **Deliberately NOT part of `isEmpty`.** `isEmpty` means "no
+    /// Contacts-framework field changed", and the callers use it to decide
+    /// whether to run a `CNSaveRequest` at all. A note-only edit must skip that
+    /// save entirely: it would change nothing, and on a contact that already
+    /// carries a note it would trip the note wall and fall through to the
+    /// AddressBook path for no reason.
+    var noteRequest: NoteWriter.Request? {
+        let change: NoteWriter.Change? = {
+            if clearNote { return .clear }
+            if let note { return .set(note) }
+            if let appendNote { return .append(appendNote) }
+            return nil
+        }()
+        let mark = died != nil && !noMark
+        guard change != nil || mark else { return nil }
+        return NoteWriter.Request(change: change, markDeceased: mark)
+    }
+
+    var hasNoteChange: Bool { noteRequest != nil }
 
     /// Splits "father:Robert Hopkins" on the FIRST colon only, so values that
     /// contain colons (URLs, times) survive intact.
@@ -1416,13 +1479,30 @@ struct ContactFields: ParsableArguments {
     }
 
     func validate() throws {
-        if note != nil {
-            throw ValidationError("""
-                --note is not supported. Reading a contact note works, but writing one \
-                needs the com.apple.developer.contacts.notes entitlement, which Apple \
-                grants only to signed apps by request — a command-line tool cannot hold \
-                it. Edit the note in Contacts.app.
-                """)
+        // ⚠️ Refused rather than resolved, the same rule `--email` /
+        // `--add-email` and `--clear-dates` / `--date` already follow. "Replace
+        // the note, then append to it" and "append to what was just set" are
+        // different, and one reading silently loses text the caller wrote.
+        if note != nil && appendNote != nil {
+            throw ValidationError(
+                "--note and --append-note do the same job two ways. --note replaces the "
+                + "whole note; --append-note keeps it and adds a line. Pass one.")
+        }
+        if clearNote && (note != nil || appendNote != nil) {
+            throw ValidationError(
+                "--clear-note deletes the note, so it cannot be combined with "
+                + "--note or --append-note.")
+        }
+        // "Empty the note" and "put the marker in the note" cannot both be
+        // meant. Refused rather than resolved, since either reading throws away
+        // half of what was asked for.
+        if clearNote && died != nil && !noMark {
+            throw ValidationError(
+                "--clear-note empties the note, but --died puts the «†» marker in it. "
+                + "Add --no-mark to record the date without the marker, or drop --clear-note.")
+        }
+        if noMark && died == nil {
+            throw ValidationError("--no-mark only means anything alongside --died.")
         }
         if let birthday, ContactDate.parse(birthday) == nil {
             throw ValidationError("could not parse --birthday '\(birthday)'; use YYYY-MM-DD or --MM-DD")
@@ -1617,6 +1697,21 @@ struct ContactFields: ParsableArguments {
         warnReplacing(!phone.isEmpty, "phone", storedPhones)
         warnReplacing(!url.isEmpty, "url", storedUrls)
         warnReplacing(!address.isEmpty, "address", storedAddresses)
+
+        // ⚠️ A note is free text, so nothing about the new value hints at how
+        // much of the old one it destroys. The longest note on a real store is
+        // 514 characters, and 11 of the 52 span several lines — losing one to a
+        // flag that reads like "set the note" is exactly the `--url` mistake.
+        if note != nil, let existing = NoteStore.allNotes()[existing.identifier],
+           !existing.isEmpty {
+            let lines = existing.split(separator: "\n", omittingEmptySubsequences: false).count
+            FileHandle.standardError.write(Data("""
+                warning: --note replaces the whole note on this contact. \
+                Discarding \(existing.count) characters over \(lines) line\(lines == 1 ? "" : "s").
+                         Use --append-note to keep it. `export` writes it to a vCard first.
+
+                """.utf8))
+        }
     }
 
     /// A removal request: the value to drop, and a label if one narrows it.
@@ -2040,8 +2135,17 @@ struct Add: ParsableCommand {
     func run() throws {
         try requireContactsAccess()
 
-        guard !fields.isEmpty else {
+        guard !fields.isEmpty || fields.hasNoteChange else {
             throw ValidationError("nothing to create; pass at least one field, e.g. --first / --last")
+        }
+        // A note has nowhere to go until the record exists, and a card with
+        // nothing but a note is not a contact anyone can find again.
+        if fields.isEmpty {
+            throw ValidationError(
+                "a note needs a contact to sit on; pass a name too, e.g. --first / --last")
+        }
+        if fields.clearNote {
+            throw ValidationError("--clear-note has nothing to clear on a new contact.")
         }
 
         // Named to avoid shadowing the global contact(withId:) lookup.
@@ -2068,6 +2172,35 @@ struct Add: ParsableCommand {
         // own container, and the default is not always the one you expect — the
         // whole cross-container trap starts with this being invisible.
         let landedIn = targetContainer ?? store.defaultContainerIdentifier()
+
+        // 🛑 **A note is a SECOND write, through a different application, and
+        // the contact already exists by the time it can fail.** So read a
+        // failure here as "created, but the note did not land" — never as
+        // "nothing happened". `apple reminders` reports a failed tag the same
+        // way, for the same reason.
+        if let request = fields.noteRequest {
+            let backing = (try? containerContact(withId: draft.identifier))?.identifier
+                ?? draft.identifier
+            // A brand-new contact has no note, so what it should end up holding
+            // is fully determined here — no read of the store is involved.
+            let wanted = request.applied(to: nil)
+            do {
+                let written = try NoteWriter.apply(request, toContactId: backing)
+                guard written == wanted else {
+                    throw RuntimeError(
+                        "Contacts.app saved \(written.count) characters where "
+                        + "\(wanted.count) were asked for.")
+                }
+            } catch {
+                throw RuntimeError(
+                    """
+                    Created '\(displayName(draft))' (id: \(draft.identifier)), but the note \
+                    did not land: \(error.localizedDescription)
+                    The contact exists. Add the note with `apple-contacts edit \
+                    \(draft.identifier) --note ...`.
+                    """)
+            }
+        }
 
         // Re-read so both the check and the output reflect what the store
         // actually saved, rather than the draft we hoped it would.
@@ -2109,7 +2242,7 @@ struct Edit: ParsableCommand {
     func run() throws {
         try requireContactsAccess()
 
-        guard !fields.isEmpty else {
+        guard !fields.isEmpty || fields.hasNoteChange else {
             throw ValidationError(
                 "nothing to change; pass at least one field, e.g. --company or --email")
         }
@@ -2118,6 +2251,69 @@ struct Edit: ParsableCommand {
         // 🛑 Before any write. A removal that matches nothing is a typo, and a
         // replace that discards values should say what it is about to destroy.
         try fields.preflight(against: existing)
+
+        // A note-only edit skips the Contacts save entirely. Running it would
+        // change nothing, and on a contact that already carries a note it would
+        // trip the note wall and take the AddressBook fallback for no reason.
+        if !fields.isEmpty {
+            try saveFields(on: existing)
+        }
+
+        // 🛑 **After the fields, never before.** The note write launches
+        // Contacts.app, which then holds the same records open; doing it first
+        // made the ordinary save race a live editor. This order also means a
+        // failed note write leaves the field changes in place, which is what the
+        // error says.
+        if let request = fields.noteRequest {
+            try writeNote(request, on: existing)
+        }
+
+        let refreshed = try contact(withId: id)
+        try confirmWritten(fields, on: refreshed, name: displayName(refreshed))
+        if json {
+            printJSON(info(refreshed, notes: NoteStore.allNotes()))
+        } else {
+            print("Updated '\(displayName(refreshed))'")
+        }
+    }
+
+    /// Apply the note change through Contacts.app, then confirm it landed.
+    ///
+    /// ⚠️ **Confirmed twice, from two different readers.** Contacts.app returns
+    /// what it wrote, and `NoteStore` re-reads the AddressBook SQLite store.
+    /// Measured on both a local and an iCloud contact: the store is current the
+    /// instant the write returns, five writes out of five with no delay. That
+    /// only holds because `NoteStore` stopped opening with `immutable=1` in
+    /// 26.812.8 — before that fix it could not see a note written seconds
+    /// earlier, and this check would have been a coin flip.
+    private func writeNote(_ request: NoteWriter.Request, on existing: CNContact) throws {
+        // The container-backed id, not whatever was passed: AppleScript
+        // addresses the AddressBook record, which has none under a unified
+        // identifier. Same rule `editViaAddressBook` follows.
+        let backing = (try? containerContact(withId: id))?.identifier ?? id
+        let wanted = request.applied(to: NoteStore.allNotes()[existing.identifier])
+
+        let written = try NoteWriter.apply(request, toContactId: backing)
+        guard written == wanted else {
+            throw RuntimeError(
+                "Contacts.app saved a different note than asked for on "
+                + "'\(displayName(existing))': wanted \(wanted.count) characters, "
+                + "it holds \(written.count).")
+        }
+
+        let stored = NoteStore.allNotes()[existing.identifier] ?? ""
+        guard stored == wanted else {
+            throw RuntimeError(
+                """
+                Contacts.app reported the note write on '\(displayName(existing))', but the \
+                AddressBook store holds \(stored.count) characters where \(wanted.count) were \
+                asked for. The write may not have committed. Check the contact in Contacts.app.
+                """)
+        }
+    }
+
+    /// The ordinary field save, with the note wall's AddressBook fallback.
+    private func saveFields(on existing: CNContact) throws {
         guard let mutable = existing.mutableCopy() as? CNMutableContact else {
             throw ValidationError("could not prepare '\(id)' for editing")
         }
@@ -2152,14 +2348,6 @@ struct Edit: ParsableCommand {
         } catch {
             throw RuntimeError(
                 "could not update '\(displayName(existing))': \(saveFailureDetail(error))")
-        }
-
-        let refreshed = try contact(withId: id)
-        try confirmWritten(fields, on: refreshed, name: displayName(refreshed))
-        if json {
-            printJSON(info(refreshed, notes: NoteStore.allNotes()))
-        } else {
-            print("Updated '\(displayName(refreshed))'")
         }
     }
 }

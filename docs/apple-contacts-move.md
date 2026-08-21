@@ -35,9 +35,11 @@ So the only public implementation is copy-then-delete, and it is lossy twice:
 
 - the copy gets a **new identifier**, breaking every stored reference to the
   old one and every group membership keyed to it
-- it **drops the note**, because writing a note needs
-  `com.apple.developer.contacts.notes`, which Apple grants only to signed apps
-  on request
+- it **drops the note**. `CNContactVCardSerialization` cannot even read one
+  without `com.apple.developer.contacts.notes`, so the copy is made without it.
+  ⚠️ `--note` can restore a note afterwards, through Contacts.app — but only if
+  the caller saved the text first, and a move that quietly needs a second
+  command to be lossless is still a trap under the word "move"
 
 Shipping that under the word "move" would be its own trap. It was not shipped.
 

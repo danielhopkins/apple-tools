@@ -314,12 +314,107 @@ class Search(LiveContactsTest):
 
 
 class Notes(LiveContactsTest):
-    def test_note_is_rejected_with_an_explanation(self):
+    """Writing a contact note, which goes through Contacts.app.
+
+    🛑 The note is the ONE field that does not take the Contacts-framework
+    path. `CNContactNoteKey` needs an entitlement no CLI can hold, and the
+    legacy AddressBook framework hits the same wall — measured, 0 of 52 notes
+    readable across 683 contacts, raising 134092 on every one. Contacts.app
+    holds the entitlement and AppleScript is not subject to it, so the note
+    goes there.
+
+    Every test here needs Automation → Contacts for the terminal running it.
+    """
+
+    # 🛑 Every trap that has ever mangled a note in one string: a newline
+    # (11 of the 52 notes on a real store span lines), a tab, a double quote
+    # and a backslash (what the old hand-rolled escaping had to double), a
+    # non-BMP emoji, and the dagger `deceased` looks for.
+    AWKWARD = 'line one\ntab\there "q" \\ 🎹\nline three †'
+
+    def note_of_contact(self, contact_id):
+        return self.get(contact_id).get("note")
+
+    def test_add_creates_a_contact_with_a_note(self):
+        created = self.add("NoteAdd", "--note", "created with a note")
+        self.assertEqual(self.note_of_contact(created["id"]), "created with a note")
+
+    def test_edit_sets_a_note(self):
+        created = self.add("NoteSet")
+        self.edit(created["id"], "--note", "set later")
+        self.assertEqual(self.note_of_contact(created["id"]), "set later")
+
+    def test_a_note_survives_every_awkward_character(self):
+        """Byte-for-byte, or the escaping is wrong somewhere in the chain."""
+        created = self.add("NoteAwkward", "--note", self.AWKWARD)
+        self.assertEqual(self.note_of_contact(created["id"]), self.AWKWARD)
+
+    def test_append_keeps_what_is_there(self):
+        created = self.add("NoteAppend", "--note", "first")
+        self.edit(created["id"], "--append-note", "second")
+        self.assertEqual(self.note_of_contact(created["id"]), "first\nsecond")
+
+    def test_append_onto_no_note_leaves_no_leading_blank_line(self):
+        created = self.add("NoteAppendEmpty")
+        self.edit(created["id"], "--append-note", "only line")
+        self.assertEqual(self.note_of_contact(created["id"]), "only line")
+
+    def test_clear_removes_the_note_key_entirely(self):
+        """Absent, never empty — the rule every optional key here follows."""
+        created = self.add("NoteClear", "--note", "goes away")
+        self.edit(created["id"], "--clear-note")
+        self.assertNotIn("note", self.get(created["id"]))
+
+    def test_clearing_twice_is_not_an_error(self):
+        created = self.add("NoteClearTwice", "--note", "gone")
+        self.edit(created["id"], "--clear-note")
+        code, _, _ = run("edit", created["id"], "--clear-note", check=False)
+        self.assertEqual(code, 0)
+
+    def test_replacing_warns_about_what_it_discards(self):
+        """The --url lesson: a replace that reads as an update must say so."""
+        created = self.add("NoteWarn", "--note", "one\ntwo")
+        _, _, err = run("edit", created["id"], "--note", "replacement")
+        self.assertIn("--note replaces", err)
+        self.assertIn("--append-note", err)
+
+    def test_a_field_and_a_note_change_in_one_command(self):
+        """Two writes through two frameworks; both have to land."""
+        created = self.add("NoteBoth", "--note", "before")
+        self.edit(created["id"], "--company", "Acme", "--append-note", "after")
+        saved = self.get(created["id"])
+        self.assertEqual(saved["company"], "Acme")
+        self.assertEqual(saved["note"], "before\nafter")
+
+    def test_export_carries_a_note_written_here(self):
+        created = self.add("NoteExport", "--note", "exported")
+        _, out, _ = run("export", created["id"])
+        self.assertIn("NOTE:exported", out)
+
+    # --- refusals, all before any write ---
+
+    def test_note_and_append_note_together_are_refused(self):
         code, _, err = run(
-            "add", "--first", TEST_PREFIX, "--last", "Noted",
-            "--note", "should not work", check=False)
+            "edit", "fake", "--note", "a", "--append-note", "b", check=False)
         self.assertNotEqual(code, 0)
-        self.assertIn("entitlement", err.lower())
+        self.assertIn("--note and --append-note", err)
+
+    def test_clear_note_with_a_value_is_refused(self):
+        code, _, err = run("edit", "fake", "--clear-note", "--note", "a", check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("--clear-note", err)
+
+    def test_add_with_only_a_note_is_refused(self):
+        """A card with nothing but a note is one nobody can find again."""
+        code, _, err = run("add", "--note", "orphan", check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("needs a contact", err)
+
+    def test_add_with_clear_note_is_refused(self):
+        code, _, err = run(
+            "add", "--first", TEST_PREFIX, "--last", "X", "--clear-note", check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("nothing to clear", err)
 
 
 class GroupFixtures(LiveContactsTest):
@@ -881,6 +976,17 @@ class NoteBearingContacts(GroupFixtures):
         self.assertTrue(fetched["deceased"])
         self.assertEqual(fetched["died"], "2020-04-30")
         self.assertEqual(fetched["died_precision"], "date")
+        # ⚠️ `--died` marks the note as well as writing the date, so the note
+        # is expected to CHANGE here. What must survive is the text that was
+        # already on it: the fallback runs on the same card, and losing the
+        # note it works around is the failure this test exists for.
+        self.assertEqual(note_of(noted["id"]), "«†»\n\n" + self.NOTE)
+
+    def test_no_mark_leaves_a_note_bearing_card_untouched(self):
+        """The opt-out, on the path where the note matters most."""
+        noted = self.noted("NoteDiedNoMark")
+        self.edit(noted["id"], "--died", "2020-04-30", "--no-mark")
+        self.assertEqual(self.get(noted["id"])["died"], "2020-04-30")
         self.assertEqual(note_of(noted["id"]), self.NOTE)
 
     def test_a_year_only_death_survives_the_fallback(self):
@@ -1116,6 +1222,78 @@ class MoveBetweenContainers(GroupFixtures):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeathMarker(LiveContactsTest):
+    """`--died` marks the note with `«†»`, unless `--no-mark` says otherwise.
+
+    ⚠️ On this address book, recording a death and marking the card are one
+    act — four cards were marked by hand before the tool could do either. So the
+    marker is on by default and `--no-mark` is the opt-out.
+
+    🛑 Written as `«†»`, detected as a bare `†`. A card marked elsewhere counts
+    as marked and must never be marked twice.
+    """
+
+    MARKER = "«†»"
+
+    def note_of_contact(self, contact_id):
+        return self.get(contact_id).get("note")
+
+    def test_died_marks_an_empty_note(self):
+        created = self.add("MarkEmpty")
+        self.edit(created["id"], "--died", "2020-04-30")
+        self.assertEqual(self.note_of_contact(created["id"]), self.MARKER)
+
+    def test_the_marker_goes_on_top_with_a_blank_line(self):
+        created = self.add("MarkExisting", "--note", "Jack")
+        self.edit(created["id"], "--died", "2020-04-30")
+        self.assertEqual(self.note_of_contact(created["id"]), self.MARKER + "\n\nJack")
+
+    def test_recording_the_death_again_does_not_stack_a_second_marker(self):
+        """🛑 Correcting the precision of a death is a normal thing to do."""
+        created = self.add("MarkTwice")
+        self.edit(created["id"], "--died", "2020-04-30")
+        self.edit(created["id"], "--died", "2020")
+        saved = self.get(created["id"])
+        self.assertEqual(saved["note"], self.MARKER)
+        self.assertEqual(saved["died"], "2020")
+
+    def test_a_card_marked_by_hand_is_not_marked_again(self):
+        """A bare dagger counts, even though the tool writes the guillemet form."""
+        created = self.add("MarkBare", "--note", "†")
+        self.edit(created["id"], "--died", "2020-04-30")
+        self.assertEqual(self.note_of_contact(created["id"]), "†")
+
+    def test_no_mark_records_the_date_alone(self):
+        created = self.add("MarkOptOut")
+        self.edit(created["id"], "--died", "2020-04-30", "--no-mark")
+        saved = self.get(created["id"])
+        self.assertEqual(saved["died"], "2020-04-30")
+        self.assertNotIn("note", saved)
+
+    def test_a_replaced_note_still_gets_the_marker(self):
+        """🛑 The text change lands first, then the marker."""
+        created = self.add("MarkAfterReplace", "--note", "old")
+        self.edit(created["id"], "--died", "2020-04-30", "--note", "new")
+        self.assertEqual(self.note_of_contact(created["id"]), self.MARKER + "\n\nnew")
+
+    def test_add_records_the_death_and_the_marker_together(self):
+        created = self.add("MarkOnAdd", "--died", "2020-04-30")
+        saved = self.get(created["id"])
+        self.assertEqual(saved["died"], "2020-04-30")
+        self.assertEqual(saved["note"], self.MARKER)
+
+    def test_clear_note_with_a_marking_died_is_refused(self):
+        code, _, err = run(
+            "edit", "fake", "--died", "2020", "--clear-note", check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("--no-mark", err)
+
+    def test_no_mark_without_died_is_refused(self):
+        code, _, err = run("edit", "fake", "--no-mark", check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("--no-mark", err)
 
 
 class DeathDates(GroupFixtures):

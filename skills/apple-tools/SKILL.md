@@ -24,7 +24,7 @@ these tools is that the edge cases are already handled.
 | `apple maps` | visited places with coordinates, visits, saved guides | no, and never |
 | `apple reminders` | lists, items, due dates | **yes** |
 | `apple calendar` | calendars, events, **invitees with RSVP status** | **yes** — and `invite` **emails real people** |
-| `apple contacts` | names, emails, phones, addresses, notes | **yes** (except notes) |
+| `apple contacts` | names, emails, phones, addresses, notes | **yes** |
 
 ## Rules
 
@@ -134,6 +134,7 @@ apple contacts link <id> <id> --relation daughter --dry-run  # writes BOTH cards
 apple contacts relations <id>                  # who they link to, both directions
 apple contacts edit <id> --died 2020-04-30     # a death; merges, keeps other dates
 apple contacts edit <id> --died 2020           # when only the year is known
+apple contacts edit <id> --died 2020 --no-mark # ...without the «†» note marker
 apple contacts deceased --json                 # everyone recorded as having died
 apple contacts groups                          # list groups with counts
 apple contacts groups add "Family" <contact-id>
@@ -572,9 +573,14 @@ the tool writes a labelled date and owns the spelling.
 - **Read `died`, never the raw `dates` array.** `died` reports what is known —
   `2020` — while `dates` still shows the stored `2020-01-01`. `died_precision`
   is `date`, `year` or `day-only`. `deceased` is absent, never `false`.
+- 🛑 **`--died` also writes `«†»` into the note**, because on this address book
+  recording a death and marking the card are one act. `--no-mark` records the
+  date alone. Re-running `--died` never stacks a second marker, and a card
+  already marked by hand is left as it is.
+- ⚠️ **The marker means `--died` needs Automation → Contacts.** If that grant is
+  missing, use `--died ... --no-mark` so the date still lands.
 - `apple contacts deceased` lists everyone, and reports separately any card whose
-  note carries a dagger with no date recorded. The tool cannot write a note, so
-  it can never resolve one of those itself.
+  note carries a dagger with no date recorded. Resolve one with `edit --died`.
 
 **`edit --clear-dates` empties the labelled-date set.** `--date` replaces the set
 but cannot empty it, so a date written by mistake was otherwise permanent. The
@@ -672,9 +678,23 @@ prints can be passed straight back, since `zip` and `postalCode` both work.
 ⚠️ **Like every multi-value flag here, `--address` replaces the whole set.** Read
 the contact first and re-pass the addresses you want to keep.
 
-**Contact notes cannot be written.** They are readable, but writing needs an
-Apple-granted entitlement no CLI can hold, so `--note` is rejected. Tell the user
-to edit the note in Contacts.app rather than trying another route.
+**Contact notes are writable, through a different route from every other
+field.** `CNContactNoteKey` needs an Apple-granted entitlement no CLI can hold,
+so `--note` goes through Contacts.app over AppleScript.
+
+```
+apple contacts edit <id> --note "text"          # replaces the whole note
+apple contacts edit <id> --append-note "line"   # keeps it, adds a line
+apple contacts edit <id> --clear-note           # deletes it
+```
+
+- 🛑 **`--note` replaces the WHOLE note.** Prefer `--append-note` unless the user
+  asked to rewrite it. The command warns on stderr naming what it discards, but
+  the note is gone by then.
+- ⚠️ **A note write needs Automation → Contacts and launches Contacts.app.**
+  Reads need neither. Check `note_writes` in `apple contacts status --json`.
+- ⚠️ **On `add`, the note is a second write.** If it fails, the contact still
+  exists. Read the error as "created but un-noted", and finish with `edit`.
 
 ## Permission errors
 

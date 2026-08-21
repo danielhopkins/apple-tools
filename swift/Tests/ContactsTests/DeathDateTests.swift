@@ -212,3 +212,38 @@ final class DeathNoteMarkerTests: XCTestCase {
         XCTAssertFalse(DeathDate.noteMarksDeath("‡"))
     }
 }
+
+final class DeathMarkerTests: XCTestCase {
+    func testTheMarkerIsTheGuillemetForm() {
+        XCTAssertEqual(DeathDate.marker, "«†»")
+        XCTAssertTrue(DeathDate.noteMarksDeath(DeathDate.marker))
+    }
+
+    func testMarkingAnEmptyNoteGivesJustTheMarker() {
+        XCTAssertEqual(DeathDate.noteWithMarker(nil), "«†»")
+        XCTAssertEqual(DeathDate.noteWithMarker(""), "«†»")
+    }
+
+    func testTheMarkerGoesOnTopWithABlankLine() {
+        XCTAssertEqual(DeathDate.noteWithMarker("Jack"), "«†»\n\nJack")
+    }
+
+    /// 🛑 Re-recording a death at a corrected precision is normal, and must not
+    /// stack a second marker.
+    func testAnAlreadyMarkedNoteIsLeftAlone() {
+        XCTAssertNil(DeathDate.noteWithMarker("«†»"))
+        XCTAssertNil(DeathDate.noteWithMarker("«†»\n\nhttps://example.invalid"))
+    }
+
+    /// ⚠️ Written as `«†»`, detected as a bare `†`. A card marked by hand or on
+    /// another device counts, and must not be marked twice.
+    func testABareDaggerAlsoCountsAsMarked() {
+        XCTAssertNil(DeathDate.noteWithMarker("†"))
+        XCTAssertNil(DeathDate.noteWithMarker("ralph@dosser.org\n\n«†»\nhttps://x.invalid"))
+    }
+
+    func testAnUnmarkedNoteKeepsEveryLine() {
+        let existing = "line one\nline two\n\nline four"
+        XCTAssertEqual(DeathDate.noteWithMarker(existing), "«†»\n\n" + existing)
+    }
+}

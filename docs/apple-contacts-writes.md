@@ -220,9 +220,10 @@ with fixtures deleted afterwards:
 one key path.
 
 🛑 **A year-only death therefore stores a day it never had.** The card holds
-`2020-01-01`; `died` says `2020`. Nothing else can carry that fact — `CNContact`
-has no free-text field but the note, and the note needs an entitlement no CLI can
-hold. So the *label* is the disclosure.
+`2020-01-01`; `died` says `2020`. So the *label* is the disclosure. `CNContact`
+has no free-text field but the note, and although `--note` can now write one, a
+note is prose that nothing parses — it could not carry the precision as a fact
+even if the date field did not have to hold something.
 
 🛑 **`2020-04` is refused rather than padded.** Contacts rejects it anyway, and
 inventing a day would record a month as though it were exact — with no label left
@@ -302,10 +303,164 @@ inferred, the other card is **left alone** and the command says so.
 
 ## Notes on the note field
 
-⚠️ **`--note` is not writable, by construction.** Reading a note works, but
-writing needs `com.apple.developer.contacts.notes`, which Apple grants only to
-signed apps on request. Notes are read straight from the AddressBook SQLite store
-instead. Note edits must happen in Contacts.app.
+**`--note` writes, and it is the only field that leaves the Contacts framework
+to do it.** Everything else goes through `CNContactStore`, or the legacy
+AddressBook fallback when a note blocks that. The note itself goes through
+Contacts.app.
+
+### Why every in-process route is closed
+
+🛑 **`CNContactNoteKey` needs `com.apple.developer.contacts.notes`**, which Apple
+grants only to signed apps on request. An ad-hoc-signed CLI can never hold it.
+
+🛑 **The legacy AddressBook framework is NOT a way around this, and the code once
+claimed it was.** The doc comment on `editViaAddressBook` said AddressBook "is
+not blocked from saving a record that has a note, as long as it is not the note
+itself being written" — the second half was a guess. Measured on this store:
+
+```
+people: 683
+with a readable note: 0
+```
+
+Every `ABPerson.value(forProperty: kABNoteProperty)` raised `NSCocoaErrorDomain
+134092`, the same note wall, on all 683 records — while `apple contacts get`
+reported 52 notes off the SQLite store at the same moment. `ABPerson` is a shim
+over the same Core Data store, so it inherits the same entitlement check. The
+first half of that comment still holds: AddressBook gets **past** the wall for
+every other field, which is what `editViaAddressBook` exists for. It does not
+get **through** it.
+
+🛑 **A direct write to `AddressBook-v22.abcddb` is not a route either.** CloudKit
+mirrors that store and Core Data triggers maintain state on it, so a write behind
+both would fight the sync engine. That is the same reason nothing in `apple maps`
+writes.
+
+**Contacts.app has no `Metadata.appintents` bundle**, so the Shortcuts route that
+solved the Notes write path does not exist here.
+
+### The route that works
+
+Contacts.app holds the entitlement, and AppleScript is not subject to it. The
+sdef declares `note` on `person` with **no `access="r"`**, so it is read/write.
+`NoteWriter` drives it through `osascript`.
+
+```
+apple contacts edit <id> --note "text"          # replaces the whole note
+apple contacts edit <id> --append-note "line"   # keeps it, adds a line
+apple contacts edit <id> --clear-note           # deletes it
+apple contacts add --first Ada --note "text"    # create, then write the note
+```
+
+- 🛑 **The text is passed as an `argv` item, never interpolated into the
+  script.** The escaping this replaces doubled backslashes and quotes and still
+  had no answer for a newline: an AppleScript string literal cannot contain a raw
+  one, and **11 of the 52 notes here are multi-line**. `on run argv` sidesteps
+  all of it. A note carrying a newline, a tab, `"`, `\`, a non-BMP emoji and a
+  dagger round-tripped byte-identical.
+- **Address the CONTAINER-BACKED id**, the same rule `editViaAddressBook`
+  follows. AppleScript addresses the AddressBook record, which has none under a
+  unified identifier. Both forms read `UUID:ABPerson`, so a wrong one fails as
+  "can't get person", not as a write to the wrong card.
+- ⚠️ **This launches Contacts.app**, the same trade `apple notes delete` makes.
+  Reads never do; they come off SQLite via `NoteStore`.
+- ⚠️ **It needs Automation → Contacts**, a second grant, and that one belongs to
+  the calling terminal rather than to the binary. `apple contacts status` reports
+  it as `automation` / `note_writes`, and `usable` stays keyed to the Contacts
+  grant alone — a missing Automation grant costs one field, not the tool.
+- ⚠️ **`claimOwnTCCIdentity` skips the re-exec when Contacts already works**, so
+  in normal use `osascript` inherits the terminal's grant. On a machine where the
+  Contacts grant is not yet established, `apple-contacts` re-execs disclaimed
+  first, and the Automation prompt then names `apple-contacts` instead of the
+  terminal. Both work; only the System Settings entry differs. Untested.
+
+### The write order, and what each failure means
+
+**Fields first, then the note.** The note write launches Contacts.app, which then
+holds the same records open. Doing it first made the ordinary save race a live
+editor. So a failed note write leaves the field changes in place, and the error
+says so.
+
+🛑 **On `add`, the note is a SECOND write and the contact already exists by the
+time it can fail.** Read "the note did not land" as *created but un-noted*, never
+as "nothing happened" — the same rule `apple reminders` follows for a failed tag.
+The error names the id and the `edit` command that finishes the job.
+
+**A note-only edit skips the `CNSaveRequest` entirely.** Running it would change
+nothing, and on a contact that already carries a note it would trip the note wall
+and take the AddressBook fallback for no reason.
+
+### Confirmed twice, from two readers
+
+Contacts.app returns the note it wrote, and `NoteStore` re-reads the AddressBook
+SQLite store. Both must match what was asked for.
+
+⚠️ **The lag that would have made the second check a coin flip is gone.**
+`NoteStore` stopped opening with `immutable=1` in 26.812.8. Measured after that
+fix, on a local contact and an iCloud one: five writes, five immediate reads, no
+delay and no miss. Before it, a note written seconds earlier was invisible.
+
+### Replace, append, clear
+
+⚠️ **`--note` replaces the whole note and says what it discards**, naming the
+character and line count. A note is free text, so nothing about the new value
+hints at how much of the old one it destroys — the same trap `--url` had, on a
+field where the longest real value here is 514 characters.
+
+- **`--note` with `--append-note` is refused**, and so is `--clear-note` with
+  either. "Replace then append" and "append to what was set" differ, and one
+  reading silently loses text. Same rule as `--email` / `--add-email`.
+- **`--append-note` joins with a newline**, and adds no leading blank line when
+  the note is empty.
+- **`--clear-note` is idempotent**, like `--clear-dates`. It leaves a
+  `ZABCDNOTE` row with an empty `ZTEXT`; `NoteStore` filters that, so `get` omits
+  the `note` key rather than reporting `""`.
+- **`add --note` with no name is refused.** A card holding nothing but a note is
+  one nobody can find again.
+
+### `--died` marks the note
+
+**Recording a death and marking the card are one act on this address book**, done
+by hand four times before the tool could do either. So `--died` writes the date
+*and* puts the marker in the note. `--no-mark` records the date alone.
+
+🛑 **The marker is `«†»` — a dagger in guillemets — and detection is looser than
+writing.** All four hand-marked cards here spell it `«†»`, so that is what gets
+written. `noteMarksDeath` still tests for a bare `†`, because a card marked on
+another device or under an older convention must count as marked and must never
+be marked twice.
+
+⚠️ **The marker goes on top, then a blank line.** Three of the four cards here
+are written that way. The fourth has it after an email address, which no rule can
+be inferred from.
+
+| Before | `--died 2020-04-30` writes |
+|---|---|
+| (no note) | `«†»` |
+| `Jack` | `«†»`, blank line, `Jack` |
+| `«†»` | unchanged — already marked |
+| `ralph@…\n\n«†»\nhttps://…` | unchanged — already marked |
+
+- 🛑 **Re-recording a death must not stack a second marker**, and `--died` at a
+  corrected precision is a normal thing to do. The idempotence check runs inside
+  the AppleScript, against the live note, so it cannot race a stale read.
+- 🛑 **The text change lands first, then the marker.** `--died` with `--note`
+  means "this is the new note, and the person died", so the marker has to survive
+  the replacement.
+- **`--clear-note` with a marking `--died` is refused.** "Empty the note" and
+  "put the marker in the note" cannot both be meant, and either reading throws
+  away half the request. Pass `--no-mark`.
+- ⚠️ **`--no-mark` is also the escape hatch when Automation is unavailable.** The
+  date is the record, and it must not become unwritable because a second grant is
+  missing.
+- **`--no-mark` without `--died` is refused**, since it would mean nothing.
+
+### What this unblocks
+
+**`deceased`'s `marked_without_date`** lists cards whose note carries a dagger and
+which record no death date. That list existed because the tool could not write a
+note, so it could never resolve such a card itself. It can now: read the note and
+write the date with `--died`.
 
 **`export` includes notes**, unlike a plain Contacts-framework export — read from
 the AddressBook store and spliced in as a folded, escaped `NOTE` property. So it

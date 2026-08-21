@@ -30,9 +30,10 @@ import Foundation
 ///
 /// ⚠️ **A year-only death therefore stores a day that is not true.** The day is a
 /// placeholder and the *label* is what says so. Nothing else can carry that
-/// fact: `CNContact` has no free-text field but the note, and the note needs
-/// `com.apple.developer.contacts.notes`, an entitlement no command-line tool can
-/// hold. Two consequences that everything reading this must respect:
+/// fact. `CNContact` has no free-text field but the note, and although `--note`
+/// can now write one through Contacts.app, a note is prose that nothing parses —
+/// it cannot carry the precision as a fact. Two consequences that everything
+/// reading this must respect:
 ///
 /// - **`died` reports what is KNOWN, never what is stored.** A year-only death
 ///   reads back as `2020`, never as `2020-01-01`. A caller shown the placeholder
@@ -220,14 +221,42 @@ public enum DeathDate {
 
     // MARK: The note marker
 
+    /// The marker this address book writes: a dagger in guillemets.
+    ///
+    /// 🛑 **Written as `«†»`, detected as a bare `†`.** The four marked cards on
+    /// this store all spell it `«†»`, so that is what `--died` writes. Detection
+    /// stays looser on purpose: a card marked by hand, on another device, or by
+    /// an older convention still counts, and a marker that is present must never
+    /// be duplicated because it was spelled differently.
+    public static let marker = "«\u{2020}»"
+
+    /// The dagger itself. Detection tests for this, never for `marker`.
+    public static let daggerScalar = "\u{2020}"   // †  DAGGER
+
     /// A dagger in the note, which some address books use to mark a death.
     ///
     /// ⚠️ **This is never the record and never makes anyone deceased.** The death
-    /// date is the record. This exists only so `deceased` can report a card that
-    /// carries the mark and no date, which is otherwise invisible. The tool
-    /// cannot write a note at all, so it can never resolve such a card itself.
+    /// date is the record. `deceased` reports a card carrying the mark and no
+    /// date separately, because that combination is otherwise invisible.
     public static func noteMarksDeath(_ note: String?) -> Bool {
         guard let note else { return false }
-        return note.contains("\u{2020}")   // †  DAGGER
+        return note.contains(daggerScalar)
+    }
+
+    /// The note this contact should hold once the marker is on it.
+    ///
+    /// `nil` when nothing needs to change, which is the whole reason this is a
+    /// function rather than a concatenation: **re-recording a death must not
+    /// stack a second marker**, and `--died` at a corrected precision is a
+    /// normal thing to do.
+    ///
+    /// ⚠️ **The marker goes on TOP, then a blank line.** Three of the four
+    /// marked cards here are written that way; the fourth has it after an email
+    /// address, which nothing can infer a rule from. Top is also the position
+    /// that survives a long note without scrolling.
+    public static func noteWithMarker(_ existing: String?) -> String? {
+        let current = existing ?? ""
+        if noteMarksDeath(current) { return nil }
+        return current.isEmpty ? marker : marker + "\n\n" + current
     }
 }

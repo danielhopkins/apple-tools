@@ -68,6 +68,8 @@ installed via `make install`.
 | Move one occurrence | `apple calendar edit <id> --occurrence 2026-09-21 --start "2026-09-21 14:00"` |
 | Find a person | `apple contacts search "smith" --json` |
 | Update a contact | `apple contacts edit <id> --company "New Co"` |
+| Write a contact note | `apple contacts edit <id> --note "text"` |
+| ...without losing the old one | `apple contacts edit <id> --append-note "line"` |
 | Record a death | `apple contacts edit <id> --died 2020-04-30` |
 | ...when only the year is known | `apple contacts edit <id> --died 2020` |
 | Who has died | `apple contacts deceased --json` |
@@ -1140,6 +1142,7 @@ FIELDS, shared by `add` and `edit`:
 --address  [LABEL:]ADDRESS   repeatable
 --relation LABEL:NAME        repeatable
 --date     LABEL:DATE        repeatable
+--note TEXT | --append-note TEXT | --clear-note
 ```
 
 🛑 **Multi-value flags replace; `--add-*` appends.** Passing `--email` on `edit`
@@ -1259,8 +1262,17 @@ is the only disclosure.
 - **`deceased` is absent, never `false`**, like every other optional key here.
 - 🛑 **`--died` merges; `--date` replaces.** That is the whole reason it is its
   own flag. Restating `--died` at a different precision replaces the old entry.
-- **`marked_without_date`** lists cards whose *note* carries a dagger (`†`).
-  That marker is never the record and never makes anyone deceased.
+- 🛑 **`--died` also marks the note with `«†»`**, because on this address book
+  recording a death and marking the card are one act. `--no-mark` records the
+  date alone, and is the escape hatch when Automation → Contacts is missing.
+- ⚠️ **Written as `«†»`, detected as a bare `†`.** A card marked by hand or on
+  another device counts as marked and is never marked twice. The marker goes on
+  top, then a blank line, then whatever the note already held.
+- **`--clear-note` with a marking `--died` is refused**, and so is `--no-mark`
+  on its own. Neither combination has one meaning.
+- **`marked_without_date`** lists cards whose *note* carries a dagger and which
+  record no date. That marker is never the record and never makes anyone
+  deceased. Resolve one with `edit --died`.
 
 **Relations.** `--relation father:"Robert Hopkins"`. All 216 SDK relation labels
 are accepted; matching ignores case, spaces and hyphens. An unrecognised label is
@@ -1353,9 +1365,38 @@ apple contacts move ID --to CONTAINER [--dry-run] [--json]
 note, and it fails as a bare `NSCocoaErrorDomain 134092` naming nothing. **52 of
 669 contacts here carry one.** `edit`, `groups add`, `link` and `unlink` catch it
 and rewrite through the legacy AddressBook framework, which needs no extra grant.
-⚠️ **`--note` is not writable by either path** — writing one needs
-`com.apple.developer.contacts.notes`, which no CLI can hold. Note edits happen in
-Contacts.app.
+
+**Writing the note is the one thing that leaves the Contacts framework.**
+`CNContactNoteKey` needs `com.apple.developer.contacts.notes`, which no CLI can
+hold, so `--note` goes through Contacts.app over AppleScript. Full record in
+[`docs/apple-contacts-writes.md`](docs/apple-contacts-writes.md).
+
+```
+apple contacts edit <id> --note "text"          # replaces the whole note
+apple contacts edit <id> --append-note "line"   # keeps it, adds a line
+apple contacts edit <id> --clear-note           # deletes it
+```
+
+- 🛑 **The legacy AddressBook framework is NOT a second route, despite being the
+  fallback for every other field.** Measured: `ABPerson` + `kABNoteProperty` read
+  **0 notes across 683 contacts**, raising the same 134092 on every one, while
+  `get` reported 52 off SQLite at that moment. It gets *past* the wall, not
+  *through* it.
+- ⚠️ **`--note` replaces the whole note**, and warns naming the characters and
+  lines it discards. **`--append-note` keeps it** and adds a line. Mixing the two
+  is refused, as is `--clear-note` with either. Same rule as `--email` /
+  `--add-email`.
+- ⚠️ **A note write needs Automation → Contacts and launches Contacts.app.**
+  Reads need neither. `apple contacts status` reports it as `automation` /
+  `note_writes`; `usable` stays keyed to the Contacts grant, so a missing
+  Automation grant costs one field rather than the tool.
+- 🛑 **On `add` the note is a second write**, and the contact exists before it can
+  fail. Read "the note did not land" as *created but un-noted*.
+- **Every write is confirmed twice**: Contacts.app returns what it wrote, and
+  `NoteStore` re-reads the SQLite store. Multi-line notes, emoji, quotes,
+  backslashes and tabs all round-trip byte-identical.
+- ⚠️ **`--clear-note` is idempotent** and makes `get` omit the `note` key
+  entirely, never report `""`.
 
 `get` reports a contact's `groups`; `search` and `list` don't, because Contacts
 has no reverse lookup and it would mean scanning every group per contact.
@@ -1384,6 +1425,9 @@ swift/                    one Swift package, seven binaries
                           cannot say whether a write reached the server. Its own
                           target so it can be tested against a synthetic store
   Sources/AppleContacts/  + Notes.swift (SQLite note reader),
+                          NoteWriter.swift (🛑 the one write that leaves the
+                          Contacts framework — a note needs an entitlement no
+                          CLI can hold, so it goes through Contacts.app),
                           Move.swift (the private cross-account move)
   Sources/ContactsLibrary/  PostalAddress.swift — the --address parser,
                           RelationGraph.swift — which relation labels invert and
@@ -1545,7 +1589,7 @@ Each tool needs a one-time TCC grant, prompted on first run **from a terminal**:
 | messages | Full Disk Access for the calling terminal (reads chat.db directly) |
 | phone | Full Disk Access for the calling terminal (reads CallHistory + AddressBook) |
 | maps | Full Disk Access for the calling terminal (reads MapsSync) |
-| contacts | Privacy & Security → Contacts |
+| contacts | Privacy & Security → Contacts; Automation → Contacts to write a note |
 | notes | Full Disk Access for the calling terminal (reads sqlite directly) |
 
 `mail` needs **two grants for two halves**. Full Disk Access covers `search`,

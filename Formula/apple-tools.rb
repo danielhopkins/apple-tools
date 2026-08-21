@@ -108,6 +108,16 @@ class AppleTools < Formula
       apple-contacts also reads that store for contact notes, which the Contacts
       framework cannot expose without an Apple-granted entitlement.
 
+      Writing a note is the one contacts command that needs a second grant.
+      It goes through Contacts.app over AppleScript, because that entitlement is
+      granted only to signed apps by request. So `apple contacts edit --note`
+      needs Automation -> Contacts for your terminal, and it launches
+      Contacts.app. Every other field, and every read, needs neither.
+      `apple contacts status` reports both grants.
+
+      Note that `--died` writes the marker into the note as well as the date, so
+      it needs that grant too. Pass --no-mark to record the date alone.
+
       Writing to Notes needs one extra step. AppleScript cannot create a
       checklist and its only body write destroys every attachment on the note,
       so writes go through Notes' own Shortcuts actions instead. Install them
@@ -164,7 +174,19 @@ class AppleTools < Formula
     # `get` returned an addresses array that `edit` could not write until
     # 26.818.1, and the skill claimed otherwise. An unregistered flag is a
     # silent regression back to that.
-    assert_match "address", shell_output("#{bin}/apple-contacts edit --help")
+    contacts_edit_help = shell_output("#{bin}/apple-contacts edit --help")
+    assert_match "address", contacts_edit_help
+
+    # Contact notes were unwritable before 26.821.0: --note was refused,
+    # because CNContactNoteKey needs an entitlement no CLI can hold. The write
+    # goes through Contacts.app instead, so a flag going missing here is the
+    # difference between writing a note and refusing to write one.
+    assert_match "append-note", contacts_edit_help
+    assert_match "clear-note", contacts_edit_help
+
+    # --died also marks the note. --no-mark is the opt-out, and it is the only
+    # way to record a death when Automation -> Contacts is unavailable.
+    assert_match "no-mark", contacts_edit_help
 
     # Relationship helpers. `link` appends where `edit --relation` replaces, so
     # losing it silently sends callers back to a command that deletes relations.
