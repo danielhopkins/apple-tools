@@ -67,10 +67,20 @@ struct SyncErrors: ParsableCommand {
             if let calendar = failure.calendar { print("  calendar: \(calendar)") }
             if let store = failure.store { print("  account:  \(store)") }
             print("  error_code \(failure.errorCode), error_type \(failure.errorType)")
+            let outlook = failure.retryable
+                ? "retryable — EventKit may still land this one"
+                : "terminal — the server will answer the same way again"
+            print("  \(outlook)")
         }
         print("")
-        print("\(failures.count) error\(failures.count == 1 ? "" : "s"). "
-              + "EventKit stops retrying an item once it records one.")
+        // 🛑 This line used to read "EventKit stops retrying an item once it
+        // records one", flatly. Measured false: of 16 items that recorded an
+        // HTTP 403 in one burst, 16 synced and EventKit cleared 15 of the rows.
+        // A row here is a report, not a verdict.
+        let stuck = failures.filter { !$0.retryable }.count
+        print("\(failures.count) error\(failures.count == 1 ? "" : "s"), "
+              + "\(stuck) terminal. A retryable row often clears itself;")
+        print("run `apple calendar unsynced` to see what is actually still missing.")
     }
 }
 
@@ -216,6 +226,24 @@ struct SyncConfirmationOptions: ParsableArguments {
 
     @Option(name: .long, help: "Seconds to wait for the server (default: 30)")
     var syncTimeout: Double = 30
+
+    /// 🛑 **The deadline extends itself once the server says it is throttling.**
+    /// 30s is right for a healthy write and hopeless for a throttled one, and
+    /// picking one number for both was the whole problem. Measured on a Google
+    /// calendar, three bursts on 2026-08-21:
+    ///
+    /// | burst | recorded a 403 | median sync | over 30s |
+    /// |---|---|---|---|
+    /// | 20 adds, no edits | 0 | 19s | 5 of 20 |
+    /// | 30 add+edit pairs | **16** | **156s** | 19 of 30 |
+    /// | 30 add+edit pairs, repeat | 0 | 30s | 11 of 30 |
+    ///
+    /// So the tool waits 30s by default, and stretches to this only once it has
+    /// evidence a wait will help. A caller who sets `--sync-timeout` higher
+    /// keeps their number; this never shortens a deadline.
+    @Option(name: .long,
+            help: "Seconds to keep waiting once the server reports throttling (default: 180)")
+    var throttleTimeout: Double = 180
 }
 
 /// A failure that is not the caller's fault, so it must not print a usage block.
@@ -253,7 +281,7 @@ enum SyncConfirmation {
     /// Calendar.app running, does not wipe pending writes — and does not speed
     /// anything up. Measured across the same six trials. So nothing here calls
     /// it.
-    static func wait(event: EKEvent, timeout: Double,
+    static func wait(event: EKEvent, timeout: Double, throttleTimeout: Double = 180,
                      against baseline: SyncStore.Baseline? = nil,
                      since snapshot: SyncStore.ErrorSnapshot? = nil) -> SyncStore.Status {
         guard let calendarIdentifier = event.calendar?.calendarIdentifier,
@@ -267,8 +295,11 @@ enum SyncConfirmation {
                              against: baseline)
         }
 
-        let deadline = Date().addingTimeInterval(max(0, timeout))
+        let start = Date()
+        var deadline = start.addingTimeInterval(max(0, timeout))
+        var announcedThrottle = false
         var status = look()
+
         while status.state == .pending && Date() < deadline {
             // 🛑 **Only an error recorded AFTER the save can stop the wait.**
             // A fresh create has no `external_id` at t=0, so the first look is
@@ -276,7 +307,26 @@ enum SyncConfirmation {
             // stale row on the calendar failed every write that followed it.
             // With no snapshot the store was unreadable, so nothing is known
             // to be old — poll to the deadline instead of guessing.
-            if let snapshot, status.errors.contains(where: snapshot.isNew) { break }
+            let fresh = snapshot.map { snap in status.errors.filter(snap.isNew) }
+                ?? []
+
+            // 🛑 **A retryable error is not a reason to stop waiting.** Breaking
+            // here on any error at all is what turned a Google rate limit into
+            // "the server REFUSED it", on 16 of 30 writes that then synced. See
+            // `Failure.retryable` for the measurement.
+            if !fresh.isEmpty && fresh.contains(where: { !$0.retryable }) { break }
+
+            if !fresh.isEmpty && !announcedThrottle {
+                announcedThrottle = true
+                // The deadline only ever grows. A caller who asked for longer
+                // than the throttle budget keeps their own number.
+                let budget = max(timeout, throttleTimeout)
+                deadline = max(deadline, start.addingTimeInterval(budget))
+                let note = SyncStore.Message.throttling(
+                    status: fresh.first?.httpStatus, waitingUpTo: Int(budget))
+                FileHandle.standardError.write(Data((note + "\n\n").utf8))
+            }
+
             Thread.sleep(forTimeInterval: 1)
             status = look()
         }
@@ -312,6 +362,7 @@ enum SyncConfirmation {
         guard options.confirmSync else { return nil }
 
         let status = wait(event: event, timeout: options.syncTimeout,
+                          throttleTimeout: options.throttleTimeout,
                           against: baseline, since: snapshot)
 
         switch status.state {
@@ -365,24 +416,23 @@ enum SyncConfirmation {
             let newErrors = snapshot.map { snap in status.errors.filter(snap.isNew) }
                 ?? status.errors
 
-            guard newErrors.isEmpty else {
-                return try refused(status, errors: newErrors)
+            // 🛑 **Only a TERMINAL error is a refusal.** Every new error being
+            // retryable means the server is throttling, and EventKit is still
+            // trying — measured, 16 of 16 such writes landed. Calling that
+            // "REFUSED" and exiting 1 was wrong about a write that succeeded
+            // two minutes later. See `Failure.retryable`.
+            let terminal = newErrors.filter { !$0.retryable }
+            guard terminal.isEmpty else {
+                return try refused(status, errors: terminal)
             }
 
-            // Nothing was refused. Say what is actually known, print the event,
-            // and leave the exit code to `finish`.
-            FileHandle.standardError.write(Data("""
-                note: could not confirm this reached the server within \
-                \(Int(options.syncTimeout))s.
-                      The event IS saved and is very likely on its way. Nothing was \
-                refused —
-                      no error was recorded against it.
-
-                      Confirm with:  apple calendar sync-status <id>
-                      Or sweep all:  apple calendar unsynced
-                      Skip this wait with --no-confirm-sync.
-
-                """.utf8))
+            let waited = Int(newErrors.isEmpty
+                             ? options.syncTimeout
+                             : max(options.syncTimeout, options.throttleTimeout))
+            let note = SyncStore.Message.unconfirmed(
+                afterSeconds: waited,
+                httpStatus: newErrors.compactMap(\.httpStatus).first)
+            FileHandle.standardError.write(Data((note + "\n\n").utf8))
             return status
         }
     }
@@ -418,9 +468,14 @@ enum SyncConfirmation {
                 let http = failure.httpStatus.map { "HTTP \($0)" } ?? "no HTTP status"
                 lines.append("  \(http) \(failure.domain ?? "") (scope: \(failure.scope))")
                 lines.append("")
-                lines.append("EventKit records an error once and then stops retrying that item,")
-                lines.append("so this will not fix itself. The local copy stays visible in")
-                lines.append("Calendar.app and in `events` while the server does not have it.")
+                // ⚠️ Reached only for a TERMINAL status now. A retryable one —
+                // 403, 429, 5xx — waits instead, because EventKit does retry
+                // those and the old wording claimed it never retries anything.
+                lines.append("This status is one the server will give again, so the write will")
+                lines.append("not fix itself. The local copy stays visible in Calendar.app and")
+                lines.append("in `events` while the server does not have it.")
+                lines.append("")
+                lines.append("Rebuild it with:  apple calendar resync <id>")
             } else {
                 lines.append("No error was recorded, so it may still be in flight — but a")
                 lines.append("healthy write on this machine syncs in about 4 seconds.")

@@ -762,3 +762,126 @@ final class ResyncGuardTests: XCTestCase {
         XCTAssertEqual(pending.map(\.uniqueIdentifier), ["u-a"])
     }
 }
+
+// MARK: - Which errors are worth waiting through
+
+/// 🛑 **The tool called every `Error` row a permanent refusal, and exited 1.**
+///
+/// Measured on 2026-08-21, one burst of 30 add+edit pairs on a Google CalDAV
+/// calendar: 16 items recorded an HTTP 403, and **all 16 synced anyway**, about
+/// 156 seconds later, together. EventKit cleared 15 of the 16 rows itself. So
+/// "EventKit stops retrying an item once it records one" is false for a 403,
+/// and every one of those writes was reported as refused while succeeding.
+///
+/// ⚠️ **A retryable status is not a promise the write landed.** The incident in
+/// `docs/apple-calendar-caldav-403.md` was a 403 that never cleared. CoreDAV
+/// cannot tell a Google rate limit from a real denial. These tests pin the
+/// classification only: retryable means *keep waiting*, never *it worked*.
+final class RetryableErrorTests: XCTestCase {
+
+    private func failure(http: Int?) -> SyncStore.Failure {
+        SyncStore.Failure(
+            rowid: 1, itemRowid: 500, scope: "item", errorCode: 3, errorType: 1,
+            httpStatus: http, domain: "CoreDAVHTTPStatusErrorDomain",
+            item: "event", calendar: "Personal", store: "Google", chain: [])
+    }
+
+    /// The measured one. A 403 here is Google throttling far more often than
+    /// Google refusing, and treating it as terminal is what this fixes.
+    func testA403IsRetryable() {
+        XCTAssertTrue(failure(http: 403).retryable)
+    }
+
+    func testRateLimitAndServerErrorsAreRetryable() {
+        for status in [408, 429, 500, 502, 503, 504, 599] {
+            XCTAssertTrue(failure(http: status).retryable, "HTTP \(status)")
+        }
+    }
+
+    /// 🛑 A 400 is the one that really is terminal, and it must stay that way.
+    /// It was a counter-proposed Outlook invite Google will refuse every time.
+    func testClientErrorsAreTerminal() {
+        for status in [400, 401, 404, 405, 409, 412] {
+            XCTAssertFalse(failure(http: status).retryable, "HTTP \(status)")
+        }
+    }
+
+    /// ⚠️ **No HTTP status means nothing said the server refused anything.**
+    /// Calling that terminal would invent a refusal out of a row that carries
+    /// no evidence of one.
+    func testNoHTTPStatusIsRetryable() {
+        XCTAssertTrue(failure(http: nil).retryable)
+    }
+
+    /// The flag is in the JSON, so a caller does not re-implement the table.
+    func testRetryableIsEncoded() throws {
+        let data = try JSONEncoder().encode(failure(http: 403))
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(object["retryable"] as? Bool, true)
+        XCTAssertEqual(object["http_status"] as? Int, 403)
+
+        let terminal = try JSONEncoder().encode(failure(http: 400))
+        let decoded = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: terminal) as? [String: Any])
+        XCTAssertEqual(decoded["retryable"] as? Bool, false)
+    }
+
+    // MARK: - What the caller actually reads
+    //
+    // 🛑 A real Google throttle cannot be provoked on demand — three bursts on
+    // one afternoon produced 16 errors, then 0, then 0 — so the wording a
+    // throttled caller sees is unreachable from a live run. These pin it.
+
+    /// ⚠️ **The note must name the status.** A caller who cannot tell a
+    /// throttled account from a slow one cannot choose what to do next.
+    func testTheThrottleNoteNamesTheStatusAndTheBudget() {
+        let note = SyncStore.Message.throttling(status: 403, waitingUpTo: 180)
+        XCTAssertTrue(note.contains("HTTP 403"), note)
+        XCTAssertTrue(note.contains("180s"), note)
+        XCTAssertTrue(note.contains("retrying"), note)
+        // 🛑 It must not read as a refusal. That is the whole change.
+        XCTAssertFalse(note.contains("REFUSED"), note)
+    }
+
+    /// A row with no HTTP status still gets a note, without inventing one.
+    func testTheThrottleNoteSurvivesAMissingStatus() {
+        let note = SyncStore.Message.throttling(status: nil, waitingUpTo: 90)
+        XCTAssertTrue(note.contains("an error"), note)
+        XCTAssertFalse(note.contains("HTTP"), note)
+    }
+
+    /// 🛑 The timeout message must say the event is SAVED. A caller reading it
+    /// as a failure deletes or rewrites an event that is on its way.
+    func testTheUnconfirmedNoteWithAThrottleSaysTheEventIsSaved() {
+        let note = SyncStore.Message.unconfirmed(afterSeconds: 180, httpStatus: 403)
+        XCTAssertTrue(note.contains("HTTP 403"), note)
+        XCTAssertTrue(note.contains("rate limiting"), note)
+        XCTAssertTrue(note.contains("event IS saved"), note)
+        XCTAssertTrue(note.contains("180s"), note)
+        XCTAssertFalse(note.contains("REFUSED"), note)
+        // Both repair routes, because neither alone answers "is it missing".
+        XCTAssertTrue(note.contains("sync-status"), note)
+        XCTAssertTrue(note.contains("unsynced"), note)
+    }
+
+    /// ⚠️ No error at all is a different sentence, and it must stay different:
+    /// "nothing was refused" is only true when nothing was recorded.
+    func testTheUnconfirmedNoteWithNoErrorSaysNothingWasRefused() {
+        let note = SyncStore.Message.unconfirmed(afterSeconds: 30, httpStatus: nil)
+        XCTAssertTrue(note.contains("Nothing was refused"), note)
+        XCTAssertFalse(note.contains("HTTP"), note)
+        XCTAssertFalse(note.contains("rate limiting"), note)
+        XCTAssertTrue(note.contains("30s"), note)
+    }
+
+    /// ⚠️ A row with no HTTP status must still encode, with the key absent
+    /// rather than null — the rule every optional key in this tool follows.
+    func testAnAbsentStatusOmitsTheKey() throws {
+        let data = try JSONEncoder().encode(failure(http: nil))
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertNil(object["http_status"])
+        XCTAssertEqual(object["retryable"] as? Bool, true)
+    }
+}

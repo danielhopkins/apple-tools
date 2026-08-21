@@ -1,5 +1,15 @@
 # `add` reports success for a write the server rejected
 
+> 🛑 **CORRECTION, 2026-08-21 (26.821.2).** The sentence this file repeats
+> throughout — *"EventKit records an error once and then stops retrying that
+> item, so this will not fix itself"* — **is false for an HTTP 403.** It was
+> inferred from one stuck event in the original incident and generalised to
+> every 403. Measured since: EventKit does retry a throttled item, and it clears
+> its own `Error` row when the item lands. See
+> [**The 403 is usually a rate limit**](#the-403-is-usually-a-rate-limit-and-it-clears-itself)
+> at the end of this file. The two failure modes below are still real; what
+> changed is what a 403 *predicts*.
+
 **Status:** addressed in 26.818.0. `add` and `edit` now confirm the server took
 the write before reporting success, and four commands expose the sync state:
 `sync-status`, `unsynced`, `sync-errors`, `resync`. See the calendar section of
@@ -496,3 +506,104 @@ were deleted afterwards.
 
 Pinned offline by six tests in `swift/Tests/CalendarSyncTests/`; three of them
 fail against the code before this fix.
+
+
+---
+
+# The 403 is usually a rate limit, and it clears itself
+
+**Measured 2026-08-21. Changed the behaviour in 26.821.2.**
+
+Everything above treats an HTTP 403 as a permanent refusal: `add` exited 1, and
+the message said the write would never fix itself. That is what the original
+incident looked like, from one stuck event.
+
+**It is wrong most of the time.** A 403 from Google CalDAV is a rate limit far
+more often than a denial, and EventKit retries it.
+
+## The measurement
+
+Three bursts on the same Google calendar (`Personal`), one afternoon, using the
+release binary.
+
+| burst | items recording an `Error` row | **later synced** | never synced | median sync |
+|---|---|---|---|---|
+| 20 adds, `--no-confirm-sync` | 0 | — | — | 19s |
+| **30 add+edit pairs** | **16** (all HTTP 403) | **16** | **0** | **156s** |
+| 30 add+edit pairs, repeat | 0 | — | — | 30s |
+
+The 16 landed **together**, between t=136s and t=157s, which is what a throttle
+window expiring looks like rather than 16 independent recoveries.
+
+**EventKit cleared 15 of the 16 `Error` rows itself** when the items synced. One
+stale row survived on an item that had synced at 31s.
+
+Two account-scoped rows (`error_code` 4, HTTP 403, on two different calendars)
+appeared after a later burst and **cleared inside 45 seconds** with no
+intervention. Those are the rows Calendar.app shows as a modal.
+
+⚠️ **The same pattern was visible in the live test suite and misread as a bug.**
+A full 84-test run reported 16 failures, every one an HTTP 403 on a plain `add`.
+Re-running the same tests against unmodified code failed the same way, which
+ruled out the change under test — but the writes had also *landed*, and nothing
+looked.
+
+## Why the old reading survived so long
+
+🛑 **Nothing ever waited long enough to find out.** `--sync-timeout` defaults to
+30s, and the wait loop **broke out on the first new `Error` row**. So the tool
+gave up 126 seconds before the answer arrived, every time, and then printed a
+sentence asserting the answer it had not waited for.
+
+⚠️ **The 4-second round trip recorded above is an idle-account number.** Under
+load the median was 30s and 156s in the two burst runs, so **11 to 19 of every
+30 writes miss a 30s deadline** even when nothing errors at all.
+
+## What 26.821.2 does
+
+**`SyncStore.Failure.retryable`** classifies the status:
+
+| retryable | terminal |
+|---|---|
+| 403, 408, 429, 5xx | 400, 401, 404, 405, 409, 412 |
+| **no HTTP status at all** | |
+
+An absent status is retryable on purpose: nothing in that row says the server
+refused anything, and calling it terminal invents a refusal out of no evidence.
+
+1. **The wait no longer stops on a retryable error.** It keeps polling. It stops
+   immediately on a terminal one, which is what the break was for.
+2. **The deadline extends itself.** On the first retryable error the wait grows
+   to `--throttle-timeout` (default 180s) and says so once on stderr. Fast when
+   healthy, patient only with evidence that waiting helps. It never *shortens* a
+   deadline a caller set.
+3. **A throttle reports `pending` and exit 75**, not `REFUSED` and exit 1. The
+   HTTP status is still named — hiding it leaves a caller unable to tell a
+   throttled account from a slow one, and the two need different responses.
+4. **`refused()` fires only on a terminal status**, and points at `resync`.
+5. **`sync-errors` labels every row** retryable or terminal, and no longer claims
+   EventKit gives up.
+
+## What has NOT changed
+
+🛑 **A retryable status is not a promise the write landed.** The incident at the
+top of this file was a 403 that never cleared. CoreDAV returns a bare 403 for
+both a throttle and a denial, and nothing local can tell them apart. The change
+means the tool **waits instead of announcing a refusal it cannot support** — it
+does not mean a 403 is safe to ignore.
+
+⚠️ **So `unsynced` is still the command that answers "is anything missing".**
+`sync-errors` reports what Calendar recorded; only `unsynced` reports what the
+server does not have.
+
+⚠️ **Do not reach for `resync` on a retryable 403.** Rebuilding mints a new
+identifier for an event that was about to sync on its own. It is for a terminal
+error, or for an event `unsynced` still lists long after the fact.
+
+## Pinned by
+
+Six offline tests in `swift/Tests/CalendarSyncTests/CalendarSyncTests.swift`
+(`RetryableErrorTests`) cover the classification and the JSON key. The burst
+measurement itself is not automated: provoking a real throttle means writing
+tens of events to a live account, which is not something a test suite should do
+to somebody's calendar.

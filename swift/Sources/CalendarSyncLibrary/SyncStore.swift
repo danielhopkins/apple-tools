@@ -131,10 +131,126 @@ public enum SyncStore {
         public let chain: [ErrorLink]
 
         enum CodingKeys: String, CodingKey {
-            case scope, domain, item, calendar, store, chain
+            case scope, domain, item, calendar, store, chain, retryable
             case errorCode = "error_code"
             case errorType = "error_type"
             case httpStatus = "http_status"
+        }
+
+        /// Hand-written because `retryable` is computed, and a caller reading
+        /// this JSON needs it: it is the difference between "wait" and "rebuild
+        /// the event", and re-deriving it from `http_status` means every caller
+        /// re-implementing the table in `retryable`.
+        public func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(scope, forKey: .scope)
+            try c.encode(errorCode, forKey: .errorCode)
+            try c.encode(errorType, forKey: .errorType)
+            try c.encodeIfPresent(httpStatus, forKey: .httpStatus)
+            try c.encodeIfPresent(domain, forKey: .domain)
+            try c.encodeIfPresent(item, forKey: .item)
+            try c.encodeIfPresent(calendar, forKey: .calendar)
+            try c.encodeIfPresent(store, forKey: .store)
+            try c.encode(chain, forKey: .chain)
+            try c.encode(retryable, forKey: .retryable)
+        }
+
+        /// Will EventKit keep trying this one, or has the server said no?
+        ///
+        /// 🛑 **A 403 from Google CalDAV is usually a RATE LIMIT, and it clears
+        /// itself.** The tool called every 403 a permanent refusal and exited 1.
+        /// Measured on 2026-08-21, one burst of 30 add+edit pairs on a Google
+        /// calendar:
+        ///
+        /// | | count |
+        /// |---|---|
+        /// | items that recorded an `Error` row, all HTTP 403 | **16 of 30** |
+        /// | ...that later synced anyway | **16 of 16** |
+        /// | ...that never synced | **0** |
+        ///
+        /// They landed at ~156s, together, which is what a throttle window
+        /// expiring looks like. EventKit **did** retry, and it cleared 15 of the
+        /// 16 rows when they landed. So "EventKit stops retrying an item once it
+        /// records one" — which this tool printed for two years — is false for
+        /// this status.
+        ///
+        /// ⚠️ **It is not false for every 403.** The incident in
+        /// `docs/apple-calendar-caldav-403.md` was a 403 that never cleared.
+        /// CoreDAV cannot tell a throttle from a denial, and neither can this.
+        /// So a retryable status is not a promise the write landed — it means
+        /// the tool must keep waiting instead of announcing a refusal it cannot
+        /// support.
+        ///
+        /// A status this does NOT list is terminal: 400 malformed, 401/405/409
+        /// and the rest are answers the server will give again.
+        public var retryable: Bool {
+            guard let httpStatus else {
+                // No HTTP status at all. Nothing says the server refused
+                // anything, so do not claim it did.
+                return true
+            }
+            switch httpStatus {
+            case 403,               // Google CalDAV rate limit, measured above
+                 408,               // request timeout
+                 429,               // explicit rate limit
+                 500...599:         // the server is unwell, not unwilling
+                return true
+            default:
+                return false
+            }
+        }
+    }
+
+    /// What a caller is told while, and after, a wait.
+    ///
+    /// 🛑 **These live here, in the tested library, rather than inline in the
+    /// command.** Provoking a real Google throttle means writing tens of events
+    /// to somebody's live calendar, and it does not reproduce on demand: three
+    /// bursts on one afternoon produced 16 errors, 0, and 0. So the wording a
+    /// throttled caller sees cannot be checked by running the tool, and inline
+    /// string building would ship untested.
+    public enum Message {
+
+        /// Printed once, the moment a retryable error appears and the wait
+        /// decides to keep going.
+        ///
+        /// ⚠️ **It names the HTTP status on purpose.** Hiding it leaves a caller
+        /// unable to tell a throttled account from a merely slow one, and the
+        /// two need different responses.
+        public static func throttling(status: Int?, waitingUpTo seconds: Int) -> String {
+            let http = status.map { "HTTP \($0)" } ?? "an error"
+            return """
+                note: the server answered \(http) and EventKit is retrying.                 This is usually
+                      rate limiting, not a refusal — waiting up to \(seconds)s.
+                """
+        }
+
+        /// Printed when the deadline passes with the write still unconfirmed.
+        ///
+        /// 🛑 **This is NOT a refusal, and it must never read like one.** A
+        /// retryable error means the tool stopped waiting, not that the server
+        /// said no — measured, 16 of 16 such writes landed at ~156s. The exit
+        /// code alongside it is 75, `EX_TEMPFAIL`.
+        public static func unconfirmed(afterSeconds seconds: Int,
+                                       httpStatus: Int?) -> String {
+            var lines = [
+                "note: could not confirm this reached the server within \(seconds)s.",
+            ]
+            if let httpStatus {
+                lines.append("      The server answered HTTP \(httpStatus), which is "
+                             + "rate limiting far more often")
+                lines.append("      than refusal, and EventKit keeps retrying. The "
+                             + "event IS saved.")
+            } else {
+                lines.append("      The event IS saved and is very likely on its "
+                             + "way. Nothing was refused —")
+                lines.append("      no error was recorded against it.")
+            }
+            lines.append("")
+            lines.append("      Confirm with:  apple calendar sync-status <id>")
+            lines.append("      Or sweep all:  apple calendar unsynced")
+            lines.append("      Skip this wait with --no-confirm-sync.")
+            return lines.joined(separator: "\n")
         }
     }
 

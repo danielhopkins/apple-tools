@@ -935,8 +935,14 @@ persisted, and a local save says nothing about the server — `add` once returne
 exit 0 and a full event record for a write Google CalDAV refused with **HTTP
 403**. So `edit` re-reads and compares each field it changed, retrying once and
 exiting non-zero naming any mismatch; both commands then wait for the push.
-Measured round trip: **4.2s on calDAV, 3.1s on Exchange.** `--no-confirm-sync`
-opts out, `--sync-timeout` defaults to 30s.
+Measured round trip on an idle account: **4.2s on calDAV, 3.1s on Exchange.**
+`--no-confirm-sync` opts out, `--sync-timeout` defaults to 30s.
+
+⚠️ **Those numbers are for ONE write, and a burst is a different regime.** Three
+bursts on a Google calendar, 2026-08-21: a run of 20 adds had a median of 19s, a
+run of 30 add+edit pairs had a median of **156s**, and a repeat of that run had
+30s. 11 to 19 of every 30 writes miss a 30s deadline under load. So read a
+timeout as "this caller could not confirm it", never "the write failed".
 
 - **Read `sync.state`.** `synced` means the server has it. `notApplicable` means
   there is no server. `unknown` means the tool could not check, which is **never**
@@ -944,10 +950,26 @@ opts out, `--sync-timeout` defaults to 30s.
   nothing locally when an edit lands.
 - 🛑 **`pending` at the deadline exits 75, and that is not a failure.**
   `EX_TEMPFAIL` — the write is saved and the event record is still printed. A
-  **refusal** — the server answering 403 or 400, EventKit recording an `Error`
-  row — still exits 1. The two need opposite responses. ⚠️ Until 26.820.1 both
-  threw `ValidationError`: exit 64, and **no event printed at all**, so a `--json`
-  caller had no id to check with.
+  **refusal** — a *terminal* status such as 400, with EventKit recording an
+  `Error` row — still exits 1. The two need opposite responses. ⚠️ Until 26.820.1
+  both threw `ValidationError`: exit 64, and **no event printed at all**, so a
+  `--json` caller had no id to check with.
+- 🛑 **An HTTP 403 from Google is a RATE LIMIT far more often than a refusal, and
+  treating it as terminal was wrong.** Measured in one burst of 30 add+edit
+  pairs: **16 items recorded a 403, and all 16 synced anyway**, together at
+  ~156s. EventKit retried and cleared 15 of the 16 rows itself. So a 403 no
+  longer exits 1. The wait keeps polling and **extends its own deadline** to
+  `--throttle-timeout` (default 180s) once a retryable error appears, saying so
+  once on stderr. At that deadline it reports `pending` and exit 75, naming the
+  status.
+  - **Read `errors[].retryable` in the JSON**, never `http_status` yourself.
+    403, 408, 429 and 5xx are retryable; 400, 401, 404, 405, 409 and 412 are
+    terminal; **no status at all is retryable**, because nothing said the server
+    refused anything.
+  - ⚠️ **Retryable is not a promise the write landed.** The 2026-08-18 incident
+    was a 403 that never cleared. CoreDAV cannot tell a throttle from a denial,
+    and neither can this tool — so it waits rather than announcing a refusal it
+    cannot support.
 - ⚠️ **`sync-status`, `unsynced`, `sync-errors` and `resync` read
   `Calendar.sqlitedb`, which needs Full Disk Access** — a different grant from the
   Calendar one. Without it the answer is `unknown`, and a good write must not be
@@ -956,10 +978,15 @@ opts out, `--sync-timeout` defaults to 30s.
   matched on `CalendarItem.ROWID`, and only rows created *since* the save count —
   a stale row once made a healthy calendar fail every write. See
   [`docs/apple-calendar-caldav-403.md`](docs/apple-calendar-caldav-403.md).
-- **`resync` rebuilds an event the server never accepted**, because EventKit
-  stops retrying once it records an `Error` row. It creates the copy **before**
-  deleting the original, refuses a recurring event even with `--force`, refuses
-  one with invitees without `--force`, and mints a new identifier.
+- **`resync` rebuilds an event the server never accepted.** ⚠️ **Reach for it
+  only after a *terminal* error**, or after `unsynced` still lists the event long
+  after the fact. A retryable 403 does not need it, and rebuilding mints a new
+  identifier for an event that was about to sync on its own. It creates the copy
+  **before** deleting the original, refuses a recurring event even with
+  `--force`, refuses one with invitees without `--force`.
+- **`sync-errors` labels each row `retryable` or `terminal`.** ⚠️ **A row there is
+  a report, not a verdict** — EventKit clears a retryable one when the item
+  lands. `unsynced` is the command that says what is actually still missing.
 
 🛑 **EventKit clamps one fetch to four years from the start, silently** — no
 error, no warning, and an empty tail reads exactly like a quiet stretch of

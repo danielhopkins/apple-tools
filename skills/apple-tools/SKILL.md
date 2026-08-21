@@ -157,14 +157,22 @@ apple calendar unsynced             # everything the server never took
 ```
 
 Read exit 75 as "saved, not yet confirmed". Read a non-zero exit **other than
-75** as a real refusal — the server answered 403 or 400 and EventKit recorded an
-error it will never retry. Those two need opposite responses, so check the code
-before reporting anything.
+75** as a real refusal — the server gave a *terminal* status such as 400. Those
+two need opposite responses, so check the code before reporting anything.
 
-⚠️ A busy account rate-limits sustained writes. Measured here: 7 of 71 writes in
-one burst went unconfirmed at a 120s deadline, and all 7 had reached the server.
-A single write syncs in 5–6s. If you are making many writes, pass
-`--no-confirm-sync` and sweep once at the end with `apple calendar unsynced`.
+🛑 **An HTTP 403 from Google is a rate limit far more often than a refusal.**
+Measured in one burst of 30 add+edit pairs: 16 items recorded a 403, and **all 16
+synced anyway**, together at ~156s. EventKit retried and cleared 15 of the 16
+rows itself. So a 403 exits **75**, not 1, and the tool waits longer instead of
+declaring a refusal. ⚠️ **Do not tell the user a 403 means their event was
+rejected**, and do not reach for `resync` on one.
+
+⚠️ A busy account rate-limits sustained writes, and 30s is not enough under load.
+Measured across three bursts: medians of 19s, **156s** and 30s, with 11 to 19 of
+every 30 writes missing a 30s deadline. The wait now extends itself to
+`--throttle-timeout` (default 180s) once it sees a retryable error. If you are
+making many writes, pass `--no-confirm-sync` and sweep once at the end with
+`apple calendar unsynced`.
 
 ## Did that calendar write actually reach the server?
 
@@ -201,6 +209,10 @@ apple calendar sync-errors         # what Calendar recorded and hid
 
 🛑 **`sync-errors` printing nothing is not proof everything synced.** One of the
 two known failure modes leaves no error row at all. Run `unsynced` too.
+
+⚠️ **A row in `sync-errors` is a report, not a verdict.** Each is labelled
+`retryable` or `terminal`, and EventKit clears a retryable one when the item
+lands. **`unsynced` is the only command that says what is actually missing.**
 
 **`apple calendar resync <id>` rebuilds a stuck event.** EventKit stops retrying
 an item once it records an error, so nothing fixes itself. Ask the user first:
