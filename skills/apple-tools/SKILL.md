@@ -101,6 +101,7 @@ apple maps places --json                         # where they go, most-visited f
 apple maps places --min-visits 5 --json          # the regular places only
 apple maps places --search "costco" --json       # when were they last there
 apple maps visits --since 14 --json              # individual arrivals, newest first
+apple maps visits --limit 100000 --json          # 🛑 --limit defaults to 50; use this to COUNT
 apple maps guides --json                         # saved guides with place counts
 apple maps guides "Boulder Playgrounds" --json   # the places in one guide
 apple maps geocode "costco" --json               # coordinate; local first, then network
@@ -341,7 +342,25 @@ otherwise. `--dry-run` shows the URL without dialing.
 substring terms across name, address, city and category — the same rule mail and
 messages use.
 
-⚠️ **Four things to get right when reporting Maps data:**
+🛑 **`--limit` DEFAULTS LOW, so counting the rows you get back gives a wrong
+answer.** `places` defaults to 40 and `visits` to **50**, against 197 and 450 on
+a real store. Both print `showing 50 of 450 visits` on **stderr** when they cut,
+and say nothing when they do not.
+
+⚠️ **Measured: "how many times did we go to the Elks Lodge this summer"
+answered `1`. The true answer was `4`.** The listing sorts newest-first, so the
+tail it drops is the older half of the answer, and every row returned was
+correct. **Pass `--limit 100000` whenever you intend to count anything**, and
+read stderr when you do not.
+
+🛑 **A counting question needs BOTH maps and calendar, and they disagree.** That
+same question gets **4** from `apple maps visits` and **7** from calendar events
+at that address, with only two dates in common. A calendar event is a plan, not
+an attendance record. Visited Places is a heuristic that misses arrivals.
+**Report the range and name both sources; never pick one and call it the
+answer.**
+
+⚠️ **Five things to get right when reporting Maps data:**
 
 - **This is Maps' "Visited Places", not Significant Locations.** Significant
   Locations belongs to `routined` and no unprivileged process can read it. Never
