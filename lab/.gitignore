@@ -1,0 +1,7 @@
+index.db
+index.db-wal
+index.db-shm
+vec/.build/
+__pycache__/
+*.log
+bin/apple-index.local

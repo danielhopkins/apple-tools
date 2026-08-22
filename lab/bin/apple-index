@@ -1,0 +1,14 @@
+#!/bin/bash
+# apple-index — the semantic index over the apple tools.
+#
+# A thin wrapper so the command works from any directory. The real program is
+# lab/index.py, which is stdlib-only Python; the embedding half needs PyTorch
+# and runs through `uv`, so `uv` must be on PATH for `embed` and `daemon`.
+set -u
+LAB="$(cd "$(dirname "$(readlink "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")")/.." && pwd)"
+[ -f "$LAB/index.py" ] || LAB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ ! -f "$LAB/index.py" ]; then
+  echo "apple-index: cannot find index.py (looked in $LAB)" >&2
+  exit 1
+fi
+exec /usr/bin/python3 "$LAB/index.py" "$@"

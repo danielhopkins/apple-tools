@@ -1649,6 +1649,41 @@ the tool: it plants its fixture note through **Contacts.app AppleScript**,
 because writing a note is exactly what the tool cannot do. Without Automation →
 Contacts for the calling terminal it skips rather than fails.
 
+## lab/ — a semantic index across every source (experimental)
+
+🛑 **Not part of the shipped tool.** `lab/` is excluded from `make build`,
+`make test` and `make dist`. It exists to answer one thing the tools above
+cannot: **searching when you do not know which app holds the answer.**
+
+```
+apple-index search "the greenhouse budget"     # one query across all five sources
+```
+
+It builds one SQLite index over mail, messages, notes, calendar and contacts,
+and searches it with FTS5 plus an `e5-small-v2` embedding. A query takes 70 to
+300 ms against 239,000 chunks. Full detail in
+[`lab/README.md`](lab/README.md); the model comparison is in
+[`lab/MODELS.md`](lab/MODELS.md) and the per-source change signals in
+[`lab/INCREMENTAL.md`](lab/INCREMENTAL.md).
+
+Four rules at the call site:
+
+1. 🛑 **The index stores ids. Read the record back through the `apple` tool.**
+   A hit gives `tool` and a native `id`; the indexed copy can lag and its
+   snippets are truncated. `apple-index search … --json` then
+   `apple notes export <id>`.
+2. ⚠️ **`apple-index refresh` only works from a terminal, and nothing runs it
+   for you.** A launchd agent has **no Full Disk Access**, measured: `apple
+   mail`, `apple notes` and `apple messages` all fail from one. The background
+   agent serves searches and cannot ingest. Refresh costs ~8s.
+3. 🛑 **The index holds the plaintext of every email** — ~105 MB of decoded
+   bodies in one unencrypted file, protected by neither Full Disk Access nor
+   the 0700 directories its sources sit behind. Never copy results anywhere
+   that leaves the machine. See [`lab/SECURITY.md`](lab/SECURITY.md).
+4. **It is read-only.** It never writes to Notes, Mail, Calendar or Contacts.
+
+Install with `cd lab && make install install-agent install-skill`.
+
 ## Permissions
 
 Each tool needs a one-time TCC grant, prompted on first run **from a terminal**:

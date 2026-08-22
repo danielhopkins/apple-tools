@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.boulderhopkins.apple-index</string>
+
+  <!-- uv resolves the PyTorch environment; launchd's PATH is minimal, so it
+       is spelled out here rather than inherited. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>@UV@</string>
+    <string>run</string>
+    <string>--quiet</string>
+    <string>@LAB@/daemon.py</string>
+    <string>serve</string>
+    <string>--model</string><string>e5-small</string>
+    <!-- 🛑 refresh 0: the agent SERVES but does not INGEST. A launchd agent
+         has no Full Disk Access, so `apple mail`, `apple notes` and
+         `apple messages` all fail from here. Measured, all three. Serving needs
+         no grant, because the index file is not TCC-protected. Refresh from a
+         terminal instead:  apple-index refresh -->
+    <string>--refresh</string><string>0</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>@PATH@</string>
+    <key>HOME</key><string>@HOME@</string>
+  </dict>
+
+  <key>WorkingDirectory</key><string>@LAB@</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+
+  <!-- It polls every 5 minutes and holds 661 MB. Keep it out of the way of
+       anything the user is actually doing. -->
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>5</integer>
+
+  <key>StandardOutPath</key><string>@LOGDIR@/daemon.log</string>
+  <key>StandardErrorPath</key><string>@LOGDIR@/daemon.log</string>
+</dict>
+</plist>
