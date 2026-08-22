@@ -1925,18 +1925,40 @@ def cmd_near(opts):
         found = geocode_place(opts.place, opts.local_only)
     lat, lon, label, source = found
 
-    out = []
+    # 🛑 COLLAPSE BEFORE THE LIMIT, or the limit hides everything further away.
+    # A weekly class is one calendar event per occurrence at ONE coordinate, and
+    # a maps place plus its visits are more records at that same coordinate.
+    # Measured: `near "Ocean First" --radius 1` filled all 50 result slots with
+    # identical "Swim lessons" events at 0.000 km, and dropped two real
+    # neighbours 0.585 km and 0.705 km away. The bug was invisible in the output
+    # — 50 rows came back and every one of them was true.
+    kept = {}
     for row in placed_rows(db, opts.tool, opts.since, past=opts.past):
         km = haversine(lat, lon, row["latitude"], row["longitude"])
         if km > opts.radius:
             continue
+        key = (row["tool"], (row["title"] or "").strip())
+        best = kept.get(key)
+        if best is None:
+            kept[key] = {"row": row, "km": km, "count": 1}
+        else:
+            best["count"] += 1
+            # Keep the NEWEST of a repeated title. "when was I last there" is
+            # the question a repeated place is usually asked about.
+            if (row["occurred"] or 0) > (best["row"]["occurred"] or 0):
+                best["row"], best["km"] = row, km
+
+    out = []
+    for entry in kept.values():
+        row = entry["row"]
         out.append({
             "uid": row["uid"], "tool": row["tool"], "kind": row["kind"],
             "id": row["native_id"], "title": row["title"],
             "container": row["container"],
+            "count": entry["count"],
             "date": (datetime.fromtimestamp(row["occurred"], timezone.utc).isoformat()
                      if row["occurred"] else None),
-            "km": round(km, 3),
+            "km": round(entry["km"], 3),
             "latitude": row["latitude"], "longitude": row["longitude"],
         })
     out.sort(key=lambda r: r["km"])
@@ -1955,8 +1977,9 @@ def cmd_near(opts):
     print("within %g km — searching %d of %d records that carry a coordinate\n"
           % (opts.radius, placed, total))
     for r in out:
-        print("%-9s %6.2f km  %-10s %s"
-              % (r["tool"], r["km"], (r["date"] or "")[:10], r["title"]))
+        tail = "  (x%d)" % r["count"] if r["count"] > 1 else ""
+        print("%-9s %6.2f km  %-10s %s%s"
+              % (r["tool"], r["km"], (r["date"] or "")[:10], r["title"], tail))
     if not out:
         print("nothing placed within %g km." % opts.radius)
 

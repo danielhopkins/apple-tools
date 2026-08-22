@@ -117,6 +117,20 @@ with visits that do not carry the address the question asks for. The place
 record answers every text question; a visit carries a date and a coordinate,
 which `near` and `nearby` read off the record directly.
 
+🛑 **`near` collapsed nothing, so `--limit` hid the real neighbours.** A field
+tester computed the separations independently and asked for
+`near "Ocean First" --radius 1`. It returned 50 rows, every one of them true,
+and **dropped two places 0.585 km and 0.705 km away** — because 50 occurrences
+of one weekly class sit at 0.000 km and filled every slot. **The output looked
+correct.** `near` now collapses on (tool, title) BEFORE applying the limit and
+prints `(xN)`.
+
+⚠️ **A shared street address is not a shared coordinate.** "Village Shopping
+Center Boulder" and "Epic Mountain Gear" both read `2525 Arapahoe Avenue`, and
+Apple pins them **110 m apart**. A test written from the addresses expected them
+inside `--radius 0.1` and they are not. Trust the coordinate, never the address
+string.
+
 ⚠️ **A visit has a start time and NOTHING ELSE.** There is no end time in the
 store, so this index cannot say how long the user stayed anywhere.
 
@@ -284,6 +298,16 @@ Recorded here so nobody re-derives them.
   code plainly, at rank 1, and the eval scored it a MISS. This is the second
   time a wrong label made a correct answer look like a failure. The locator now
   accepts any of the 7 records that state it.
+- 🛑 **`--min-chunk` fixes the case it was built for and loses overall.** A bare
+  calendar title "Hair cut" scores 0.869 against "where do I get my hair cut",
+  beating "Welcome Stranger Barber Shop" at 0.848 — and the calendar events
+  carry no location, so they do not answer the question. Scaling short chunks
+  down fixes that one case. Measured on 29 cases: MRR **0.586 -> 0.530** at 20,
+  0.540 at 60, 0.459 at 100. Shipped at 0, with the sweep left in `eval.py`.
+- 🛑 **A source that is 0.17% of the index gets buried, however well it
+  matches.** `maps` is 394 chunks of 237,971. "where do I get my hair cut" puts
+  the right barber shop at semantic rank **1 within maps** and **outside the
+  global top 60**. `--tool maps` finds it instantly. Nothing else does.
 - ⚠️ **A case was WITHDRAWN, not re-anchored**: "did I send anyone my home
   address". The address appears in dozens of messages, so the query has no
   single correct answer and MRR against it measures nothing. Deleting a bad
