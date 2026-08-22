@@ -369,6 +369,7 @@ func commandSearch(_ args: Args) {
     let db = DB(path: args.req("db"), readOnly: true)
     let query = args.req("query")
     let limit = args.int("limit", 50)
+    let tool = args.str("tool")
 
     let embedder = Embedder(args.str("model") ?? "sentence")
     guard let q = embedder.encodeQuery(query) else { fail("the query produced no tokens") }
@@ -382,8 +383,19 @@ func commandSearch(_ args: Args) {
 
     // 🛑 Filter on the model. Two models do not share a vector space, so
     // scoring across both returns confident nonsense.
+    // 🛑 A tool filter belongs HERE, not after fusion. Applied afterwards it
+    // does not search one source: it keeps whichever records of that source
+    // survived a GLOBAL ranking, which on a 68%-mail index is very few. A
+    // field test asked for `--tool notes --limit 30` and got 4 rows back.
+    var scope = ""
+    if let tool = tool {
+        let safe = tool.replacingOccurrences(of: "'", with: "''")
+        scope = " AND cid IN (SELECT c.cid FROM chunk c "
+              + "JOIN record r ON r.rid = c.rid WHERE r.tool = '\(safe)')"
+    }
     let stmt = db.prepare(
-        "SELECT cid, v FROM vector WHERE dim = \(dim) AND model = '\(embedder.name)'")
+        "SELECT cid, v FROM vector WHERE dim = \(dim) AND model = '\(embedder.name)'"
+        + scope)
     var scanned = 0
     let started = Date()
     while sqlite3_step(stmt) == SQLITE_ROW {
@@ -450,7 +462,7 @@ default:
           usage: vec <command> [--flag value]
 
             embed  --db PATH [--model sentence|contextual] [--batch 500] [--limit N]
-            search --db PATH --query TEXT [--model sentence|contextual] [--limit 50]
+            search --db PATH --query TEXT [--model sentence|contextual] [--limit 50] [--tool NAME]
             status --db PATH                             chunk and vector counts
             assets                                       download the model if missing
           """)

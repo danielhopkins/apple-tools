@@ -62,6 +62,9 @@ class Warm:
         self.lock = threading.Lock()
         self.cids = np.zeros(0, dtype=np.int64)
         self.matrix = np.zeros((0, self.dim), dtype=np.int8)
+        # cid -> tool, parallel to `cids`, so a --tool search masks the matrix
+        # rather than filtering results after the fact.
+        self.tools = np.zeros(0, dtype=object)
         self.fingerprint = None
         self.reload()
 
@@ -77,8 +80,12 @@ class Warm:
         """Read every vector for this model into memory."""
         t0 = time.time()
         db = self.connect()
-        rows = db.execute("SELECT cid, v FROM vector WHERE model = ? AND dim = ?",
-                          (self.vector_model, self.dim)).fetchall()
+        rows = db.execute("""
+            SELECT v.cid, v.v, r.tool FROM vector v
+            JOIN chunk c ON c.cid = v.cid
+            JOIN record r ON r.rid = c.rid
+            WHERE v.model = ? AND v.dim = ?""",
+            (self.vector_model, self.dim)).fetchall()
         fingerprint = idx.index_fingerprint(db)
         db.close()
         if not rows:
@@ -87,10 +94,18 @@ class Warm:
         cids = np.fromiter((r["cid"] for r in rows), dtype=np.int64, count=len(rows))
         matrix = np.frombuffer(b"".join(r["v"] for r in rows),
                                dtype=np.int8).reshape(len(rows), self.dim)
+        tools = np.array([r["tool"] for r in rows], dtype=object)
         with self.lock:
             self.cids, self.matrix, self.fingerprint = cids, matrix, fingerprint
+            self.tools = tools
         log("%d vectors warm (%.0f MB) in %.1fs  index=%s"
             % (len(rows), matrix.nbytes / 1e6, time.time() - t0, fingerprint))
+
+    def live_chunks(self):
+        db = self.connect()
+        n = db.execute("SELECT COUNT(*) FROM chunk").fetchone()[0]
+        db.close()
+        return n
 
     def stale(self):
         db = self.connect()
@@ -98,11 +113,18 @@ class Warm:
         db.close()
         return current != self.fingerprint
 
-    def score(self, query, limit):
+    def score(self, query, limit, tool=None):
         vector = self.model.encode(self.query_prefix + query, convert_to_numpy=True)
         vector = vector / (np.linalg.norm(vector) or 1.0)
         with self.lock:
-            cids, matrix = self.cids, self.matrix
+            cids, matrix, tools = self.cids, self.matrix, self.tools
+        # 🛑 Mask BEFORE scoring. A tool filter applied to the results instead
+        # keeps whichever records of that source survived a global ranking,
+        # which on a 68%-mail index is very few. Measured in a field test:
+        # `--tool notes --limit 30` returned 4 rows.
+        if tool and len(tools) == len(cids):
+            keep = tools == tool
+            cids, matrix = cids[keep], matrix[keep]
         if not len(cids):
             return []
         scores = matrix.astype(np.float32) @ vector.astype(np.float32) / 127.0
@@ -126,6 +148,26 @@ class Health:
         self.last_ok = None
         self.last_error = None
         self.failures = 0
+
+
+def reload_loop(warm, interval):
+    """Notice when the index changes, and reload the vectors.
+
+    🛑 This is SEPARATE from refresh_loop on purpose. Reloading reads only the
+    index file, which is not TCC-protected, so it works under launchd. Ingesting
+    needs Full Disk Access and does not. Putting the reload inside the refresh
+    loop meant `--refresh 0` disabled BOTH, and the daemon then served vectors
+    for chunks that no longer existed. Measured: it held 239,483 warm against a
+    table of 237,564 during a re-embed, and would never have noticed.
+    """
+    while True:
+        time.sleep(interval)
+        try:
+            if warm.stale():
+                log("index changed; reloading vectors")
+                warm.reload()
+        except Exception:
+            log("reload check failed:\n%s" % traceback.format_exc())
 
 
 def refresh_loop(warm, interval, sources, health):
@@ -180,6 +222,10 @@ def refresh_loop(warm, interval, sources, health):
 def serve(opts):
     warm = Warm(opts.db, opts.model)
     health = Health()
+    if opts.reload_every:
+        threading.Thread(target=reload_loop, args=(warm, opts.reload_every),
+                         daemon=True).start()
+        log("checking for index changes every %ds" % opts.reload_every)
     if opts.refresh:
         threading.Thread(target=refresh_loop,
                          args=(warm, opts.refresh, list(SOURCE_ARGS), health),
@@ -219,7 +265,9 @@ def serve(opts):
                          "refresh_last_run": health.last_run,
                          "refresh_last_ok": health.last_ok,
                          "refresh_failures": health.failures,
-                         "refresh_error": health.last_error}
+                         "refresh_error": health.last_error,
+                         "reload_enabled": bool(opts.reload_every),
+                         "chunks": warm.live_chunks()}
             elif op == "search":
                 # 🛑 The daemon serves ONE model. A client asking for another
                 # must be refused, not quietly answered from the wrong vector
@@ -234,7 +282,8 @@ def serve(opts):
                     conn.close()
                     continue
                 t0 = time.time()
-                hits = warm.score(request["query"], int(request.get("limit", 100)))
+                hits = warm.score(request["query"], int(request.get("limit", 100)),
+                                  tool=request.get("tool"))
                 reply = {"ok": True, "hits": hits,
                          "elapsed_ms": round((time.time() - t0) * 1000, 1)}
             elif op == "reload":
@@ -259,6 +308,9 @@ def main():
     s.add_argument("--db", default=idx.DEFAULT_DB)
     s.add_argument("--socket", default=idx.DEFAULT_SOCKET)
     s.add_argument("--model", default="e5-small", choices=sorted(MODELS))
+    s.add_argument("--reload-every", type=int, default=60, dest="reload_every",
+                   help="seconds between index-change checks; 0 disables. Needs "
+                        "no Full Disk Access, so it works under launchd.")
     s.add_argument("--refresh", type=int, default=300,
                    help="seconds between change sweeps; 0 disables")
     s.set_defaults(func=serve)

@@ -60,6 +60,64 @@ CASES = [
                                                "3015 Bluff St",                    "descriptive"),
     ("which optical systems company does my contact work for",
                                                "Jenoptik Optical Systems, LLC",    "descriptive"),
+
+    # 🛑 Recency cases, added after a field test during a real board meeting.
+    # Both correct answers are days old and use generic vocabulary, which is
+    # the shape that loses to years-old records on wording alone. The first
+    # returned a 2020 market commentary at rank 1 with no recency arm.
+    ("Michelle July financial statements uploaded",
+                                               "uploaded the July financial statements", "recent"),
+    ("who filed the health and safety report for the board",
+                                               "Report - Health, Wellness & Safety.docx", "recent"),
+
+    # 🛑 Twelve cases contributed by a field session, 2026-08-22, and they are
+    # the most valuable ones here for a reason about METHOD. Every one was
+    # chosen by starting from a record already verified through the `apple`
+    # tools, then writing the query a person would type. NONE was chosen by
+    # running a search and keeping what came back.
+    #
+    # ⚠️ That is the bias that put a WRONG label in the gymnastics case for
+    # several runs, where the harness punished the right answer. Ten of these
+    # twelve were untested against the index when they were written, so they
+    # cannot have been selected for passing.
+    #
+    # ⚠️ The spread is deliberate. This index is 68% mail by record count, so a
+    # mail-heavy set keeps reporting that mail is fine. Eight of the twelve sit
+    # outside mail. Four (marked `no-overlap`) share NO content word with their
+    # correct record, which is the only shape where the semantic arm has to
+    # earn its weight — and none of them was in the sweep that chose 4:1.
+    ("where is the October board meeting",      "3475 Holly Street",          "recent"),
+    ("which Hope Center is it, Holly or Elizabeth",
+                                                "or the one on Elizabeth Street", "descriptive"),
+    ("did Michelle upload the July financials",
+                                 "I have uploaded the July financial statements", "recent"),
+    ("why is the finance chair missing the board meeting",
+                                 "I will be at my mom\u2019s memorial service", "no-overlap"),
+    ("where do the kids swim",                  "Ocean First",                "no-overlap"),
+    # ⚠️ "4877 Hopkins Pl" is the user's own address and matches 1,615
+    # records. Anchored on the event title, which is unique to it.
+    ("where is the piano lesson",   "Weekly Dan/Margot Piano with Elizabeth", "descriptive"),
+    ("when is the PTA fundraiser at the ice cream place",
+                                                "Sweet Cow, 2628 Broadway",   "no-overlap"),
+    ("who is my new doctor",                    "Boulder Medical Center",     "no-overlap"),
+    # ⚠️ Anchored on the surrounding phrase, NOT the code itself, so a live
+    # door code never lands in a checked-in eval file.
+    # 🛑 THIS QUERY HAS SEVERAL CORRECT ANSWERS, and the first anchor named only
+    # one of them. It pointed at a 2026 message where the code is incidental to
+    # a request about the bins. A field test then scored a genuine rank-1 hit as
+    # a miss: the retrieved record was a 2022 message that states the code
+    # plainly, which answers the question BETTER than the anchor did. This is
+    # the same failure as the gymnastics label. The locator now accepts any of
+    # the 7 records that state it.
+    ("what is the garage door code",            "garage code is",             "descriptive"),
+    # ⚠️ A case was REMOVED here: "did I send anyone my home address", anchored
+    # on "My address is 4877 Hopkins Pl". The address appears in dozens of
+    # messages, so the query has no single correct answer and MRR against it
+    # measures nothing. Withdrawn rather than re-anchored. Write a replacement
+    # only if it has one unambiguous answer.
+    ("how many people are on the COPTA board",
+                                 "Board of 26 people, but now we\u2019re down to 14", "descriptive"),
+    ("who do I know at MIT Technology Review",  "MIT Technology Review",      "descriptive"),
 ]
 
 
@@ -121,11 +179,19 @@ def score(extra, cases, verbose=False):
 # default leak into the comparison, which once relabelled a 3:1 run as "1:1".
 # ⚠️ Every strategy states BOTH weights. Leaving one out lets the current
 # default leak into the comparison, which once relabelled a 3:1 run as "1:1".
-W = ["--w-lexical", "3.0", "--w-semantic", "1.0"]
+W = ["--w-recency", "0", "--w-lexical", "4", "--w-semantic", "1"]
 STRATEGIES = {
-    "e5-base 3:1":           W + ["--model", "e5-base"],
-    "e5-base semantic only": ["--w-lexical", "0", "--w-semantic", "1",
-                              "--model", "e5-base"],
+    "adaptive off":     W + ["--no-adaptive"],
+    "t=2":              W + ["--adaptive-threshold", "2"],
+    "t=3":              W + ["--adaptive-threshold", "3"],
+    "t=4":              W + ["--adaptive-threshold", "4"],
+    "t=5":              W + ["--adaptive-threshold", "5"],
+    "t=3  refuse 0:1":  W + ["--adaptive-threshold", "3", "--adaptive-lexical", "0"],
+    "t=4  refuse 0:1":  W + ["--adaptive-threshold", "4", "--adaptive-lexical", "0"],
+    "t=4  refuse 1:3":  W + ["--adaptive-threshold", "4", "--adaptive-semantic", "3"],
+    "3:1":              ["--w-recency", "0", "--w-lexical", "3", "--w-semantic", "1"],
+    "2:1":              ["--w-recency", "0", "--w-lexical", "2", "--w-semantic", "1"],
+    "1:1":              ["--w-recency", "0", "--w-lexical", "1", "--w-semantic", "1"],
 }
 
 

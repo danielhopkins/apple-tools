@@ -100,6 +100,7 @@ BUDGET_SECONDS = {
     "mail": 5,        # measured 0.9s — one call returns every header
     "contacts": 10,   # measured 1.5s — AddressBook.ZMODIFICATIONDATE
     "calendar": 10,   # measured 3.1s — one call returns every event
+    "maps": 5,        # measured 0.1s — 647 records, two calls read all of them
 }
 
 # Sources with no cheap change signal. Empty, and that is the finding: an
@@ -113,6 +114,9 @@ SOURCE_ARGS = {
     "messages": ["--chat-limit", "1331", "--limit", "2000", "--message-block", "10"],
     "notes":    [],
     "contacts": ["--limit", "100000"],
+    # ⚠️ maps takes no --since here on purpose. The whole store is 647 records,
+    # so a bounded window would leave the convergence test blind to the tail.
+    "maps":     [],
 }
 
 

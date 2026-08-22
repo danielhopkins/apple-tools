@@ -15,10 +15,16 @@ Measured on macOS 27.0 (26A5416b) against a real store: 59,000 records,
 | mail | full headers from one call | **0.9s** | 38 min | 2500× |
 | contacts | `AddressBook.ZMODIFICATIONDATE` | **1.5s** | 331s | 220× |
 | calendar | full records from one call | **3.1s** | — | — |
+| maps | full records from one call | **0.1s** | — | — |
 
 **Every source has a reliable, cheap change signal.** An earlier version of this
 file said contacts had none. That was wrong, and the correction is the most
 useful thing in here.
+
+⚠️ **`maps` needs no watermark, and that is not a virtue.** The whole store is
+647 records here, so one `apple maps places` call plus one `apple maps visits`
+call reads all of it in 0.1s. A source this small does not need a change
+signal. A source that grows will.
 
 ## 🛑 The mistake: `immutable=1` does not replay the write-ahead log
 

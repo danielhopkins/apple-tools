@@ -76,8 +76,53 @@ make build                                  # build vec
 
 `make demo` runs exactly that.
 
-Sources: `notes`, `mail`, `messages`, `calendar`, `contacts`. Pass several with
-`--source notes,calendar`.
+Sources: `notes`, `mail`, `messages`, `calendar`, `contacts`, `maps`. Pass
+several with `--source notes,calendar`.
+
+## Geography
+
+Two commands ask where things happened, rather than what they say.
+
+```
+./index.py near "Costco" --radius 2 --past
+./index.py nearby --since 8 --past --radius 0.3
+```
+
+`near` lists everything within a radius of a place. `nearby` groups records
+that sit close to each other. The value is the join across sources: a maps
+visit says the user went to Stem Ciders on 16 August, and the calendar says
+"Chad bday dinner" was that evening. Neither tool alone puts those together.
+
+🛑 **Only a record that already carries a coordinate can be placed, and nothing
+geocodes a location string after the fact.** Not this index, not EventKit, not
+Calendar.app. That is why `apple calendar --at` exists: it resolves the place
+at WRITE time, because nothing can do it later.
+
+| Source | Records | Placeable |
+|---|---|---|
+| maps places | 197 | 197 |
+| maps visits | 450 | 450 |
+| calendar events | 11,379 | **617 (5%)** |
+| mail, messages, notes, contacts | 47,852 | 0 |
+
+⚠️ **So "nothing near X" means "nothing indexed with a coordinate is near X".**
+It is never evidence the user was not there. Both commands print the gap, and
+`--json` carries `placed_records` and `total_records`.
+
+🛑 **A maps VISIT is deliberately not chunked, and this was measured.** Its
+title and body are copied from the place it is a visit to, so 37 arrivals at
+one gym become 37 identical chunks. Adding maps to the index sent the eval case
+"Frequent Flyers address" from rank 1 to a miss, because the top ten filled
+with visits that do not carry the address the question asks for. The place
+record answers every text question; a visit carries a date and a coordinate,
+which `near` and `nearby` read off the record directly.
+
+⚠️ **A visit has a start time and NOTHING ELSE.** There is no end time in the
+store, so this index cannot say how long the user stayed anywhere.
+
+⚠️ **This is Maps' "Visited Places", not Significant Locations.** Significant
+Locations belongs to `routined` under `/var/db/locationd/`, which no
+unprivileged process can read. Never report one as the other.
 
 ## Measurements
 
@@ -218,6 +263,31 @@ Recorded here so nobody re-derives them.
 - 🛑 **`cmd_search` discarded the embedder's stderr on success**, so `--verbose`
   showed nothing and a failing vector arm would have looked like "no semantic
   matches". Fixed.
+- 🛑 **`--tool` was a POST-FILTER, so it did not search one source.** It ran
+  after fusion, over candidates ranked globally, so `--tool notes --limit 30`
+  returned **4 rows** out of 681 notes. On an index that is 68% mail, one
+  source's records barely survive a global ranking. The filter now runs inside
+  **both** arms: the lexical arm joins `record` in SQL, and the vector arm
+  masks the matrix before scoring. The same query now returns 30. ⚠️ The
+  post-filter is still there as a backstop, because an OLDER daemon ignores the
+  `tool` key and answers globally.
+- 🛑 **Widening the candidate pool fixes nothing, and I predicted it would.** I
+  told a field tester that three failing cases would be fixed by a deeper pool.
+  Measured across pools of 60, 120, 200, 300 and 500: **hit@1, hit@3, hit@10
+  and MRR are identical at every size.** The correct records already sat at
+  global semantic ranks 16, 4 and 1. They lose at FUSION, not at retrieval
+  depth. `--pool` exists now so the next person can re-measure this in one
+  command instead of believing me.
+- ⚠️ **A query with several correct answers cannot be anchored on one of
+  them.** "what is the garage door code" was anchored on a 2026 message where
+  the code is incidental. A field test retrieved a 2022 message that states the
+  code plainly, at rank 1, and the eval scored it a MISS. This is the second
+  time a wrong label made a correct answer look like a failure. The locator now
+  accepts any of the 7 records that state it.
+- ⚠️ **A case was WITHDRAWN, not re-anchored**: "did I send anyone my home
+  address". The address appears in dozens of messages, so the query has no
+  single correct answer and MRR against it measures nothing. Deleting a bad
+  case is better than averaging over it.
 - **Embedding runs faster than the paragraph benchmark on real data**: 58 to 83
   chunks/sec across notes, mail, calendar and messages, against 41 on a
   180-word paragraph. Short chunks are cheap.

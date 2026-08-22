@@ -13,7 +13,7 @@ score like a weak one, which is the same class of error that put Apple's
 feature-layer embedding into this index in the first place.
 
   uv run embed_oss.py embed  --db PATH [--model e5-base] [--batch 256]
-  uv run embed_oss.py search --db PATH --query TEXT [--limit 50]
+  uv run embed_oss.py search --db PATH --query TEXT [--limit 50] [--tool NAME]
 """
 import argparse, json, sqlite3, sys, time
 import numpy as np
@@ -92,8 +92,20 @@ def cmd_search(opts):
     repo, query_prefix, _, dim = MODELS[opts.model]
     name = "%s-v1" % opts.model
     db = connect(opts.db, read_only=True)
-    rows = db.execute("SELECT cid, v FROM vector WHERE model = ? AND dim = ?",
-                      (name, dim)).fetchall()
+    # 🛑 A tool filter belongs HERE, not after fusion. Applied afterwards it
+    # does not search one source: it keeps whichever records of that source
+    # survived a GLOBAL ranking. A field test asked for `--tool notes
+    # --limit 30` and got 4 rows back.
+    if opts.tool:
+        rows = db.execute("""
+            SELECT v.cid, v.v FROM vector v
+            JOIN chunk c ON c.cid = v.cid
+            JOIN record r ON r.rid = c.rid
+            WHERE v.model = ? AND v.dim = ? AND r.tool = ?""",
+            (name, dim, opts.tool)).fetchall()
+    else:
+        rows = db.execute("SELECT cid, v FROM vector WHERE model = ? AND dim = ?",
+                          (name, dim)).fetchall()
     if not rows:
         print("[]")
         return
@@ -127,6 +139,7 @@ def main():
         else:
             q.add_argument("--query", required=True)
             q.add_argument("--limit", type=int, default=50)
+            q.add_argument("--tool", help="restrict the scan to one source")
             q.set_defaults(func=cmd_search)
     opts = p.parse_args()
     opts.func(opts)
