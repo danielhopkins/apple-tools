@@ -83,7 +83,31 @@ public final class VisitStore {
   /// so they look like ordinary places and inflate any count taken off that
   /// table. Counting rows there reports 314 places where the honest answer is
   /// 191. A place is a row that has a visit; nothing else is.
+  /// A listing, and how many rows matched before `--limit` cut it.
+  ///
+  /// 🛑 A truncated listing that says nothing about being truncated reads as a
+  /// complete answer. Measured: `apple maps visits` defaults to 50 rows against
+  /// 450 in the store, and a question about one place got the answer **1** when
+  /// the true answer was **4** — the older arrivals sat past the cut. Nothing in
+  /// the output distinguished that from "you went there once".
+  public struct Listing<Item> {
+    public let items: [Item]
+    /// Rows that matched every filter, ignoring `--limit`.
+    public let matched: Int
+    public var truncated: Bool { items.count < matched }
+    public init(items: [Item], matched: Int) {
+      self.items = items
+      self.matched = matched
+    }
+  }
+
   public func places(_ request: VisitsRequest = VisitsRequest()) throws -> [Place] {
+    try placeListing(request).items
+  }
+
+  public func placeListing(_ request: VisitsRequest = VisitsRequest())
+    throws -> Listing<Place>
+  {
     var sql = """
       SELECT l.Z_PK, l.ZIDENTIFIER, l.ZMAPITEMNAME, l.ZMAPITEMADDRESS, l.ZMAPITEMCITY,
              l.ZMAPITEMCATEGORY, l.ZMAPITEMTOPLEVELCATEGORY, l.ZLATITUDE, l.ZLONGITUDE, l.ZMUID,
@@ -105,10 +129,13 @@ public final class VisitStore {
 
     var places = try database.query(sql, binds).map(Self.place)
     places = Self.filter(places, search: request.search)
+    // ⚠️ Count AFTER every filter and BEFORE the limit. That is the only point
+    // where "how many matched" and "how many I am returning" are both known.
+    let matched = places.count
     if let limit = request.limit, places.count > limit {
       places = Array(places.prefix(limit))
     }
-    return places
+    return Listing(items: places, matched: matched)
   }
 
   // MARK: - Visits
@@ -119,6 +146,12 @@ public final class VisitStore {
   /// nothing else time-shaped, so this store cannot say how long you stayed
   /// anywhere. Do not report a duration from it.
   public func visits(_ request: VisitsRequest = VisitsRequest()) throws -> [Visit] {
+    try visitListing(request).items
+  }
+
+  public func visitListing(_ request: VisitsRequest = VisitsRequest())
+    throws -> Listing<Visit>
+  {
     var sql = """
       SELECT v.Z_PK AS visit_id, v.ZSTARTDATE, v.ZVISITCLASSIFICATION,
              l.Z_PK, l.ZIDENTIFIER, l.ZMAPITEMNAME, l.ZMAPITEMADDRESS, l.ZMAPITEMCITY,
@@ -144,10 +177,11 @@ public final class VisitStore {
     if let terms = Self.terms(request.search) {
       visits = visits.filter { containsAllTerms($0.place.haystack, terms) }
     }
+    let matched = visits.count
     if let limit = request.limit, visits.count > limit {
       visits = Array(visits.prefix(limit))
     }
-    return visits
+    return Listing(items: visits, matched: matched)
   }
 
   /// The window the store actually covers, so a caller never presents a

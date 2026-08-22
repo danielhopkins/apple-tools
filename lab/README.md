@@ -125,6 +125,19 @@ of one weekly class sit at 0.000 km and filled every slot. **The output looked
 correct.** `near` now collapses on (tool, title) BEFORE applying the limit and
 prints `(xN)`.
 
+🛑 **A count on a collapsed line counts occurrences, not records.** A maps
+**place** row summarises other rows, so counting it inflates every visit tally
+by exactly one. The Elks Lodge printed `(x5)` from 4 visits plus 1 place record
+and read as five trips. `near` and `nearby` now exclude it and label the number:
+`(4 visits)` for maps, `(x105)` for a recurring event. Verified against
+`apple maps places`: Ocean First 30, Deli Zone 2, Elks Lodge 4.
+
+🛑 **A counting question needs both sources, and they disagree.** "How many
+times did we go to the Elks Lodge this summer" gets **4** from maps arrivals and
+**7** from calendar events at that address. Only two dates appear in both. A
+calendar event is a plan, not an attendance record; Visited Places is a
+heuristic that misses arrivals. Report the range and name both sources.
+
 ⚠️ **A shared street address is not a shared coordinate.** "Village Shopping
 Center Boulder" and "Epic Mountain Gear" both read `2525 Arapahoe Avenue`, and
 Apple pins them **110 m apart**. A test written from the addresses expected them

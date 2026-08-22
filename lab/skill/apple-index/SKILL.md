@@ -57,6 +57,36 @@ Quote that gap rather than reporting an empty result as an answer.
 recurring events years ahead. Add `--past` whenever the question is about what
 the user DID.
 
+🛑 **A count on a collapsed line counts OCCURRENCES, not records.** `near` and
+`nearby` collapse repeats and print `(4 visits)` for maps or `(x105)` for a
+recurring event. A maps **place** record is a summary row, not an arrival, so it
+is excluded from the count. Before that exclusion the Elks Lodge printed
+`(x5)` from 4 visits plus 1 place record, and read as five trips. ⚠️ The count
+obeys `--since` / `--past`, so it is "visits in this window", never a lifetime
+total. `apple maps places` reports the lifetime figure.
+
+🛑 **A COUNTING QUESTION NEEDS BOTH SOURCES, AND THEY DISAGREE.** "How many
+times did we go to the Elks Lodge this summer" has two answers here:
+
+```
+apple maps visits --limit 100000 --json   # 4 arrivals: Jun 1, Jun 15, Jun 22, Jul 20
+apple calendar events --from … --json     # 7 events at that address
+```
+
+Only **two dates appear in both**. Maps has two arrivals with no event, and the
+calendar has five dates Maps never recorded.
+
+- ⚠️ **A calendar event is a plan, not an attendance record.** Nothing says the
+  user went.
+- ⚠️ **Visited Places is not a complete log either.** It is a heuristic and it
+  misses arrivals.
+- 🛑 **`near` will not surface the calendar side**, because those events carry
+  their address as text with no coordinate. Search for the place name as well
+  as asking `near`.
+
+**Report the range and name both sources.** Do not pick one and call it the
+answer.
+
 ⚠️ **`nearby` groups by single link**, so a group can be wider than the radius
 through a chain of overlapping pairs. Read `span_km` for the real width.
 

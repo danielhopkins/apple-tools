@@ -715,6 +715,15 @@ apple maps status [--json]
 `places` is the default subcommand, so `apple maps` alone lists where the user
 goes, most-visited first. `visits` is the same data one arrival at a time.
 
+🛑 **`--limit` DEFAULTS LOW, and counting the rows you get back is how you get a
+wrong answer.** `places` defaults to 40 against 197, and `visits` to **50
+against 450**. Both now print `showing 50 of 450 visits` on **stderr** when they
+cut, and stay silent when they do not. ⚠️ **Before the warning existed, "how
+many times did we go to the Elks Lodge this summer" answered `1`. The true
+answer was `4`**, and the three older arrivals sat past the cut. Nothing in the
+output distinguished that from "you went there once". **Pass `--limit 100000`
+whenever you intend to count anything**, and read stderr when you do not.
+
 ⚠️ **This is Maps' "Visited Places", not Significant Locations.** Significant
 Locations belongs to `routined`, under `/var/db/locationd/`, which no unprivileged
 process can read. They are different features with different retention. **Never
