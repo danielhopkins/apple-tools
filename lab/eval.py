@@ -118,6 +118,22 @@ CASES = [
     ("how many people are on the COPTA board",
                                  "Board of 26 people, but now we\u2019re down to 14", "descriptive"),
     ("who do I know at MIT Technology Review",  "MIT Technology Review",      "descriptive"),
+
+    # Replacements for the two cases a field tester and I got wrong, written by
+    # the field tester and anchor-checked before being added. Each resolves to
+    # EXACTLY ONE record — the check that both withdrawn cases failed.
+    #
+    # ⚠️ The rejection list matters more than the cases. Anchors turned down for
+    # naming too many records: "Wellington Lake" (56), "Frequent Flyers" (49),
+    # "Wegmans" (33), "Kathmandu Restaurant" (22), "Epic Mountain Gear" (12),
+    # "Rayback Collective" (9). Anything above about 5 is a case waiting to be
+    # withdrawn. Count before you write:
+    #     apple-index search "<anchor>" --limit 60 --json
+    ("where did I take the car for service",
+                            "Dan drop the car off at Hoshi Motors",        "descriptive"),
+    # 🛑 The first case anchored on `maps`. NO-OVERLAP: the query says "hair
+    # cut" and the record says "Barber Shop", category "Beauty Service".
+    ("where do I get my hair cut",              "Welcome Stranger Barber Shop", "no-overlap"),
 ]
 
 
@@ -180,17 +196,27 @@ def score(extra, cases, verbose=False):
 # ⚠️ Every strategy states BOTH weights. Leaving one out lets the current
 # default leak into the comparison, which once relabelled a 3:1 run as "1:1".
 W = ["--w-recency", "0", "--w-lexical", "4", "--w-semantic", "1"]
+# 🛑 EVERY ROW HERE WAS MEASURED, INCLUDING THE ONES THAT LOST. Run
+# `./eval.py --compare` to reproduce. Two dead ends are kept in the table on
+# purpose, because both looked obviously right beforehand:
+#
+#   --pool     widening the candidate pool. 60, 120, 200, 300 and 500 give
+#              IDENTICAL hit@1, hit@3, hit@10 and MRR. Three failing cases had
+#              their correct record at global semantic ranks 16, 4 and 1
+#              already. They lose at fusion, not at retrieval depth.
+#   --min-chunk  scaling down very short chunks, so a bare calendar title
+#              "Hair cut" stops outranking the barber shop that answers "where
+#              do I get my hair cut". It DOES fix that case, and it costs more
+#              elsewhere than it gains: MRR 0.586 -> 0.530 at 20, 0.540 at 60,
+#              0.459 at 100. Shipped at 0.
 STRATEGIES = {
+    "default":          W + ["--adaptive-threshold", "4"],
     "adaptive off":     W + ["--no-adaptive"],
-    "t=2":              W + ["--adaptive-threshold", "2"],
     "t=3":              W + ["--adaptive-threshold", "3"],
-    "t=4":              W + ["--adaptive-threshold", "4"],
     "t=5":              W + ["--adaptive-threshold", "5"],
-    "t=3  refuse 0:1":  W + ["--adaptive-threshold", "3", "--adaptive-lexical", "0"],
-    "t=4  refuse 0:1":  W + ["--adaptive-threshold", "4", "--adaptive-lexical", "0"],
-    "t=4  refuse 1:3":  W + ["--adaptive-threshold", "4", "--adaptive-semantic", "3"],
+    "pool 300":         W + ["--adaptive-threshold", "4", "--pool", "300"],
+    "min-chunk 60":     W + ["--adaptive-threshold", "4", "--min-chunk", "60"],
     "3:1":              ["--w-recency", "0", "--w-lexical", "3", "--w-semantic", "1"],
-    "2:1":              ["--w-recency", "0", "--w-lexical", "2", "--w-semantic", "1"],
     "1:1":              ["--w-recency", "0", "--w-lexical", "1", "--w-semantic", "1"],
 }
 
