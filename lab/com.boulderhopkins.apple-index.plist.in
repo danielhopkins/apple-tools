@@ -20,6 +20,7 @@
          `apple messages` all fail from here. Measured, all three. Serving needs
          no grant, because the index file is not TCC-protected. Refresh from a
          terminal instead:  apple-index refresh -->
+    <string>--reload-every</string><string>60</string>
     <string>--refresh</string><string>0</string>
   </array>
 

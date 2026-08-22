@@ -25,6 +25,7 @@ ranked list.
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -76,12 +77,16 @@ OSS_MODELS = ("e5-base", "e5-small", "minilm")
 ALL_MODELS = APPLE_MODELS + OSS_MODELS
 
 
-def vector_search_cmd(model, db, query, limit):
+def vector_search_cmd(model, db, query, limit, tool=None):
     if model in OSS_MODELS:
-        return ["uv", "run", "--quiet", OSS, "search", "--db", db,
-                "--model", model, "--query", query, "--limit", str(limit)]
-    return [VEC, "search", "--db", db, "--query", query,
-            "--model", model, "--limit", str(limit)]
+        cmd = ["uv", "run", "--quiet", OSS, "search", "--db", db,
+               "--model", model, "--query", query, "--limit", str(limit)]
+    else:
+        cmd = [VEC, "search", "--db", db, "--query", query,
+               "--model", model, "--limit", str(limit)]
+    if tool:
+        cmd += ["--tool", tool]
+    return cmd
 
 # 🛑 WHERE THIS FILE LIVES IS A SECURITY DECISION, not a tidiness one.
 #
@@ -152,7 +157,7 @@ STOPWORDS = {
     "her", "its", "have", "has", "had", "get", "got", "any", "all", "some",
 }
 
-SOURCES = ["notes", "mail", "messages", "calendar", "contacts"]
+SOURCES = ["notes", "mail", "messages", "calendar", "contacts", "maps"]
 
 
 # --------------------------------------------------------------------------
@@ -179,7 +184,14 @@ CREATE TABLE IF NOT EXISTS record (
   people_text TEXT,                    -- the same names, flattened for FTS
   body      TEXT,
   rev       TEXT,                      -- source revision, for change detection
-  seen_at   REAL NOT NULL
+  seen_at   REAL NOT NULL,
+  -- 🛑 A COORDINATE, not the location text. `location` on a calendar event is
+  -- free text that may say "Zoom" or "my desk", and nothing geocodes it after
+  -- the fact. Only a record that already carries a real latitude and longitude
+  -- can answer "what was near what". EventKit keeps that on a separate
+  -- EKStructuredLocation, and `apple maps` carries one on every place.
+  latitude  REAL,
+  longitude REAL
 );
 
 CREATE INDEX IF NOT EXISTS record_tool     ON record(tool);
@@ -320,6 +332,21 @@ def connect(path, create=False):
     # on an old one. Adding query_log and result_cache without this made every
     # command fail on an existing database.
     db.executescript(SCHEMA)
+    # ⚠️ Every statement in SCHEMA is IF NOT EXISTS, so it migrates an old
+    # index for free. ADD COLUMN is the one thing with no such form, so it
+    # needs an explicit check. Do not wrap this in try/except: a silent failure
+    # leaves every coordinate null and the geo commands answering nothing.
+    have = {r["name"] for r in db.execute("PRAGMA table_info(record)")}
+    for column in ("latitude", "longitude"):
+        if column not in have:
+            db.execute("ALTER TABLE record ADD COLUMN %s REAL" % column)
+    # 🛑 AFTER the ALTER, never inside SCHEMA. SCHEMA runs first on every
+    # connect, and an index naming a column that does not exist yet fails the
+    # whole script — which locks an old index out of the migration that would
+    # have fixed it.
+    db.execute("CREATE INDEX IF NOT EXISTS record_coord "
+               "ON record(latitude, longitude)")
+    db.commit()
     return db
 
 
@@ -635,8 +662,16 @@ def ingest_calendar(opts):
         # the first run. `occurrence` is the field that separates them.
         occurrence = row.get("occurrence")
         uid = "calendar:%s@%s" % (eid, occurrence) if occurrence else "calendar:%s" % eid
+        # 🛑 `geo` is the only field that can place an event on a map.
+        # `location` is free text and may say "Zoom". `has_coordinate` is what
+        # separates a geocoded address from a typed one, so read it rather than
+        # testing `location` for emptiness.
+        geo = row.get("geo") or {}
+        lat = geo.get("latitude") if geo.get("has_coordinate") else None
+        lon = geo.get("longitude") if geo.get("has_coordinate") else None
         yield {
             "uid": uid,
+            "latitude": lat, "longitude": lon,
             "tool": "calendar", "kind": "event", "native_id": eid,
             "url": None,            # no per-event scheme works; see todo-deep-links.md
             "title": title,
@@ -645,7 +680,74 @@ def ingest_calendar(opts):
             "occurred": epoch(row.get("start")),
             "people": people,
             "body": body.strip(),
-            "rev": rev_of(title, row.get("start"), body),
+            "rev": rev_of(title, row.get("start"), body, str(lat), str(lon)),
+        }
+
+
+# --------------------------------------------------------------------------
+# maps — the one source that is ALREADY geospatial
+# --------------------------------------------------------------------------
+
+def ingest_maps(opts):
+    """Visited places and arrivals, from `apple maps`.
+
+    🛑 This is Maps' "Visited Places", NOT Significant Locations. Significant
+    Locations belongs to `routined` under /var/db/locationd/, which no
+    unprivileged process can read. They are different features with different
+    retention, and reporting one as the other is wrong.
+
+    ⚠️ A visit records a START TIME AND NOTHING ELSE. The schema has no end
+    time, so this index cannot say how long the user stayed anywhere. Never
+    report a duration from it.
+
+    Two kinds are ingested, and they answer different questions:
+
+      place  one row per location, with a visit count and a last-visit date.
+             Answers "where do I go" and "how far is X from Y".
+      visit  one row per arrival, dated. Answers "where did I go last week".
+
+    🛑 A place is a location row that HAS a visit. `apple maps places` already
+    joins through ZVISIT; the raw table overcounts by 64%. Do not go around it.
+    """
+    for row in apple("maps", "places", "--limit", opts.limit or 100000, "--json"):
+        name = row.get("name") or ""
+        parts = [name, row.get("address") or ""]
+        parts += row.get("categories") or []
+        yield {
+            "uid": "maps:place:%s" % row["identifier"],
+            "tool": "maps", "kind": "place", "native_id": str(row["id"]),
+            "url": None,
+            "title": name,
+            "container": row.get("category"),
+            "created": epoch(row.get("first_visit")),
+            "modified": None,
+            "occurred": epoch(row.get("latest_visit")),
+            "latitude": row.get("latitude"), "longitude": row.get("longitude"),
+            "people": [],
+            "body": "\n".join(x for x in parts if x),
+            "rev": rev_of(name, row.get("latest_visit"), str(row.get("visits"))),
+        }
+
+    days = opts.since or 3650
+    for row in apple("maps", "visits", "--since", days,
+                     "--limit", opts.limit or 100000, "--json"):
+        place = row.get("place") or {}
+        name = place.get("name") or ""
+        # ⚠️ `id` is the VISIT id, and the same place has many. The uid has to
+        # carry the visit, or every arrival at one place collapses into one
+        # record and the history disappears.
+        yield {
+            "uid": "maps:visit:%s" % row["id"],
+            "tool": "maps", "kind": "visit", "native_id": str(row["id"]),
+            "url": None,
+            "title": name,
+            "container": place.get("category"),
+            "created": None, "modified": None,
+            "occurred": epoch(row.get("date")),
+            "latitude": place.get("latitude"), "longitude": place.get("longitude"),
+            "people": [],
+            "body": "\n".join(x for x in [name, place.get("address") or ""] if x),
+            "rev": rev_of(name, row.get("date")),
         }
 
 
@@ -702,6 +804,7 @@ ADAPTERS = {
     "messages": ingest_messages,
     "calendar": ingest_calendar,
     "contacts": ingest_contacts,
+    "maps": ingest_maps,
 }
 
 
@@ -718,6 +821,13 @@ BARE_URL = re.compile(r"\b(?:https?|applenotes|message|addressbook|x-apple-\S*):
 
 QUOTE_LINE = re.compile(r"^\s*>+\s?")
 
+# ⚠️ Outlook and Exchange quote a reply with an underscore rule and bare
+# headers, NOT with '>'. 6,085 mail chunks (3%) carried one, and they beat the
+# real answer for the snippet because a header block is dense in query terms.
+HEADER_RULE = re.compile(r"^\s*_{6,}\s*$")
+HEADER_FIELD = re.compile(r"^\s*(From|Sent|To|Cc|Bcc|Subject|Date|Reply-To):\s",
+                          re.IGNORECASE)
+
 
 def strip_quotes(body):
     """Drop quoted reply lines from an email body.
@@ -730,7 +840,20 @@ def strip_quotes(body):
     The newest text in a reply sits above the quotes, so dropping quoted lines
     keeps what the sender actually wrote.
     """
-    kept = [line for line in body.splitlines() if not QUOTE_LINE.match(line)]
+    kept, in_header = [], False
+    for line in body.splitlines():
+        if QUOTE_LINE.match(line):
+            continue
+        if HEADER_RULE.match(line):
+            in_header = True
+            continue
+        if in_header:
+            # The header block runs until a line that is not a header field
+            # and not blank. Everything after it is the quoted message.
+            if HEADER_FIELD.match(line) or not line.strip():
+                continue
+            in_header = False
+        kept.append(line)
     text = "\n".join(kept)
     # A thread trimmed to nothing means the message was a bare forward. Keep
     # the original rather than indexing an empty record.
@@ -792,6 +915,17 @@ def chunks_for(record):
     BLOCK_TARGET. A block longer than CHUNK_CHARS still gets the sliding
     window, because a wall of prose has no structure to split on.
     """
+    # 🛑 A VISIT IS NOT SEARCHABLE TEXT, and chunking one poisons the results.
+    # Its title and body are copied verbatim from the place it is a visit to,
+    # so 37 arrivals at one gym become 37 identical chunks. Measured: adding
+    # maps to the index sent "Frequent Flyers address" from rank 1 to a miss,
+    # because the top ten filled with visits to Frequent Flyers that do not
+    # carry the address the question asks for. The PLACE record answers every
+    # text question about it; a visit exists to carry a date and a coordinate,
+    # which `near` and `nearby` read straight off the record.
+    if record.get("tool") == "maps" and record.get("kind") == "visit":
+        return []
+
     out = []
     title = (record.get("title") or "").strip()
     people = " ".join(p["name"] for p in record.get("people") or [] if p.get("name"))
@@ -975,13 +1109,15 @@ def cmd_ingest(opts):
             row = (record["uid"], record["tool"], record["kind"], record["native_id"],
                    record.get("url"), record.get("title"), record.get("container"),
                    record.get("created"), record.get("modified"), record.get("occurred"),
-                   people_json, people_text, record.get("body"), record["rev"], time.time())
+                   people_json, people_text, record.get("body"), record["rev"], time.time(),
+                   record.get("latitude"), record.get("longitude"))
 
             if existing:
                 db.execute("""
                     UPDATE record SET tool=?, kind=?, native_id=?, url=?, title=?,
                       container=?, created=?, modified=?, occurred=?, people=?,
-                      people_text=?, body=?, rev=?, seen_at=? WHERE uid=?
+                      people_text=?, body=?, rev=?, seen_at=?,
+                      latitude=?, longitude=? WHERE uid=?
                     """, row[1:] + (record["uid"],))
                 db.execute("DELETE FROM chunk WHERE rid = ?", (existing["rid"],))
                 rid = existing["rid"]
@@ -989,8 +1125,9 @@ def cmd_ingest(opts):
             else:
                 cur = db.execute("""
                     INSERT INTO record (uid, tool, kind, native_id, url, title, container,
-                      created, modified, occurred, people, people_text, body, rev, seen_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                      created, modified, occurred, people, people_text, body, rev, seen_at,
+                      latitude, longitude)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """, row)
                 rid = cur.lastrowid
                 added += 1
@@ -1050,14 +1187,19 @@ def cmd_rechunk(opts):
     for name in wanted:
         started = time.time()
         rows = db.execute(
-            "SELECT rid, title, body, people FROM record WHERE tool = ?", (name,)).fetchall()
+            "SELECT rid, kind, title, body, people FROM record WHERE tool = ?",
+            (name,)).fetchall()
         before = db.execute("SELECT COUNT(*) c FROM chunk c JOIN record r ON r.rid = c.rid "
                             "WHERE r.tool = ?", (name,)).fetchone()["c"]
         db.execute("DELETE FROM chunk WHERE rid IN (SELECT rid FROM record WHERE tool = ?)",
                    (name,))
         made = 0
         for row in rows:
+            # ⚠️ `kind` has to be here. chunks_for() refuses a maps visit, and
+            # a rechunk that omits the field silently re-creates every chunk
+            # the ingest path declines to make.
             record = {"title": row["title"], "body": row["body"], "tool": name,
+                      "kind": row["kind"],
                       "people": json.loads(row["people"] or "[]")}
             for ordinal, text in enumerate(chunks_for(record)):
                 db.execute("INSERT INTO chunk (rid, ord, text) VALUES (?,?,?)",
@@ -1149,6 +1291,8 @@ def search_settings(opts):
     return {"model": opts.model, "lexical_unit": opts.lexical_unit,
             "w_lexical": opts.w_lexical, "w_semantic": opts.w_semantic,
             "fts_mode": opts.fts_mode, "limit": opts.limit,
+            "w_recency": opts.w_recency, "adaptive": opts.adaptive,
+            "adaptive_threshold": opts.adaptive_threshold,
             "tool": opts.tool, "since": opts.since,
             "drop_stopwords": opts.drop_stopwords, "rare_only": opts.rare_only,
             "min_chunk": opts.min_chunk}
@@ -1192,7 +1336,7 @@ def cmd_search(opts):
             render(results, opts, cached=True)
             return
 
-    pool = max(opts.limit * 6, 60)
+    pool = opts.pool or max(opts.limit * 6, 60)
 
     # 1. lexical
     lexical, lexical_chunk = [], {}
@@ -1206,9 +1350,10 @@ def cmd_search(opts):
                 for row in db.execute("""
                         SELECT c.rid, c.cid, c.text FROM chunk_fts f
                         JOIN chunk c ON c.cid = f.rowid
-                        WHERE chunk_fts MATCH ?
+                        JOIN record r ON r.rid = c.rid
+                        WHERE chunk_fts MATCH ? AND (? IS NULL OR r.tool = ?)
                         ORDER BY bm25(chunk_fts)
-                        LIMIT ?""", (match, pool * 4)):
+                        LIMIT ?""", (match, opts.tool, opts.tool, pool * 4)):
                     if row["rid"] in seen:
                         continue
                     seen.add(row["rid"])
@@ -1218,10 +1363,11 @@ def cmd_search(opts):
                         break
             else:
                 lexical = [r["rid"] for r in db.execute("""
-                    SELECT rowid AS rid FROM record_fts
-                    WHERE record_fts MATCH ?
+                    SELECT f.rowid AS rid FROM record_fts f
+                    JOIN record r ON r.rid = f.rowid
+                    WHERE record_fts MATCH ? AND (? IS NULL OR r.tool = ?)
                     ORDER BY bm25(record_fts, 4.0, 1.0, 2.0)
-                    LIMIT ?""", (match, pool))]
+                    LIMIT ?""", (match, opts.tool, opts.tool, pool))]
         except sqlite3.OperationalError as e:
             die("FTS query failed: %s" % e)
 
@@ -1235,7 +1381,8 @@ def cmd_search(opts):
             # Always name the model. A daemon holding a different one must
             # decline, and the search then loads the right model itself.
             reply = daemon_request({"op": "search", "query": opts.query,
-                                    "model": opts.model, "limit": pool * 2})
+                                    "model": opts.model, "limit": pool * 2,
+                                    "tool": opts.tool})
             if reply and not reply.get("ok") and opts.verbose:
                 sys.stderr.write("daemon declined: %s\n" % reply.get("error"))
             if reply and reply.get("ok"):
@@ -1245,7 +1392,8 @@ def cmd_search(opts):
 
         if served is None:
             proc = subprocess.run(
-                vector_search_cmd(opts.model, opts.db, opts.query, pool * 2),
+                vector_search_cmd(opts.model, opts.db, opts.query, pool * 2,
+                                  tool=opts.tool),
                 capture_output=True, text=True)
             if opts.verbose:
                 sys.stderr.write(proc.stderr)
@@ -1314,11 +1462,65 @@ def cmd_search(opts):
         else:
             w_lex, w_sem = 1.5, 1.5
 
-    fused = {}
-    for rank, rid in enumerate(lexical):
-        fused[rid] = fused.get(rid, 0.0) + w_lex / (RRF_K + rank + 1)
-    for rank, rid in enumerate(semantic):
-        fused[rid] = fused.get(rid, 0.0) + w_sem / (RRF_K + rank + 1)
+    def fuse(a, b):
+        out = {}
+        for rank, rid in enumerate(lexical):
+            out[rid] = out.get(rid, 0.0) + a / (RRF_K + rank + 1)
+        for rank, rid in enumerate(semantic):
+            out[rid] = out.get(rid, 0.0) + b / (RRF_K + rank + 1)
+        return out
+
+    fused = fuse(w_lex, w_sem)
+
+    # 🛑 ADAPTIVE RE-FUSE, on a signal from a field test.
+    #
+    # At 4:1 a lexical rank-1 hit scores 4/61 = 0.0656 and a semantic rank-1
+    # hit scores 1/61 = 0.0164. A record the semantic arm matches almost
+    # perfectly cannot recover from a poor LEXICAL rank. Measured: "where do
+    # the kids swim" put the correct calendar event at 0.0164 with cosine
+    # 0.8443, beaten 4:1 by a 2009 triathlon email that shares only the word
+    # "swim" and that the semantic arm never returned at all.
+    #
+    # The cheap signal that tells the two regimes apart is how many of the top
+    # results the SEMANTIC arm never returned. Measured over 8 field queries:
+    # all four failures had 3-5 such records in the top 5, and all four wins
+    # had the semantic arm present at rank 1.
+    #
+    # ⚠️ Re-fusing is free. Both ranked lists are already in hand, so this
+    # costs no extra search and no extra model call.
+    if opts.adaptive and semantic:
+        head = sorted(fused, key=lambda r: -fused[r])[:5]
+        uncovered = sum(1 for rid in head if rid not in chunk_scores)
+        if uncovered >= opts.adaptive_threshold:
+            if opts.verbose:
+                sys.stderr.write(
+                    "adaptive: %d of %d top hits missing from the semantic arm; "
+                    "re-fusing semantic-heavy\n" % (uncovered, len(head)))
+            fused = fuse(opts.adaptive_lexical, opts.adaptive_semantic)
+
+    # 🛑 A third arm for recency, because nothing else in ranking reads a date.
+    # Field-tested during a real board meeting: "where is the October board
+    # meeting" returned 2023, 2025 and 2015, and the correct answer was 5 days
+    # old and absent entirely. `occurred` was used only as a --since filter.
+    #
+    # It ranks the CANDIDATES already retrieved, so it re-orders relevant hits
+    # rather than dragging in whatever is newest. ⚠️ A record with no date is
+    # left out of this arm rather than ranked last, so an undated note is not
+    # punished for being undated.
+    if opts.w_recency > 0:
+        # ⚠️ Only the HEAD of the list. Ranking every candidate by date gave a
+        # full recency vote to a recent record sitting at lexical rank 200, and
+        # MRR fell from 0.762 to 0.344 as the weight rose. Re-ordering the top
+        # few is the intent; re-ranking the tail is not.
+        head = sorted(fused, key=lambda r: -fused[r])[:opts.recency_head]
+        dated = []
+        for rid in head:
+            row = db.execute("SELECT occurred FROM record WHERE rid = ?", (rid,)).fetchone()
+            if row and row["occurred"]:
+                dated.append((row["occurred"], rid))
+        dated.sort(reverse=True)
+        for rank, (_, rid) in enumerate(dated):
+            fused[rid] = fused.get(rid, 0.0) + opts.w_recency / (RRF_K + rank + 1)
 
     order = sorted(fused, key=lambda r: -fused[r])
     results = []
@@ -1326,6 +1528,9 @@ def cmd_search(opts):
         row = db.execute("SELECT * FROM record WHERE rid = ?", (rid,)).fetchone()
         if not row:
             continue
+        # Both arms already filtered on tool. This stays as a backstop: an
+        # OLDER daemon ignores the `tool` key and answers globally, and the
+        # filter has to hold in that case too.
         if opts.tool and row["tool"] != opts.tool:
             continue
         if opts.since and (row["occurred"] or 0) < time.time() - opts.since * 86400:
@@ -1339,7 +1544,17 @@ def cmd_search(opts):
             "score": round(fused[rid], 6),
             "lexical": rid in lexical,
             "semantic": rid in semantic,
-            "similarity": round(chunk_scores.get(rid, 0.0), 4),
+            # 🛑 null, not 0.0, when the semantic arm never returned this
+            # record. Field-tested: 0.0 collapsed "absent from the semantic
+            # arm" and "genuine cosine near zero" into one number, and a caller
+            # could not tell them apart. There is no observed value between 0.0
+            # and 0.81 on this index, so every zero was a sentinel.
+            # ⚠️ It is NOT a confidence signal. On one real query the four
+            # WRONG hits scored 0.838-0.846 and the only correct one was
+            # absent from the semantic arm entirely. Any threshold drops it
+            # first. Read it as arm coverage, never as relevance.
+            "similarity": (round(chunk_scores[rid], 4) if rid in chunk_scores
+                           else None),
             "snippet": re.sub(r"\s+", " ",
                               matched_chunk.get(rid) or row["body"] or "")[:240],
             "from_chunk": rid in matched_chunk,
@@ -1599,6 +1814,256 @@ def cmd_cache(opts):
               % (log["n"], log["hits"] or 0, 100.0 * (log["hits"] or 0) / log["n"]))
 
 
+# --------------------------------------------------------------------------
+# geography
+#
+# 🛑 ONLY a record that already carries a real coordinate can be placed. The
+# index never geocodes a stored `location` string after the fact, and neither
+# does EventKit, the server, or Calendar.app. A calendar event has a
+# coordinate only when it was written with `apple calendar add --at`, which is
+# 617 of the 11,379 events here. Every `apple maps` record has one.
+#
+# ⚠️ So "nothing found near X" means "nothing INDEXED WITH A COORDINATE is near
+# X". It is not evidence the user was not there. Every command below reports
+# how many records it could actually place, so that gap is never silent.
+# --------------------------------------------------------------------------
+
+EARTH_KM = 6371.0088
+
+
+def haversine(lat1, lon1, lat2, lon2):
+    """Great-circle distance in kilometres.
+
+    ⚠️ Not a flat-earth approximation. A degree of longitude is 111 km at the
+    equator and 85 km at Boulder's latitude, so comparing raw degree deltas
+    stretches every east-west distance by a third here, and by more further
+    north.
+    """
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = p2 - p1
+    dl = math.radians(lon2 - lon1)
+    a = (math.sin(dp / 2) ** 2
+         + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2)
+    return 2 * EARTH_KM * math.asin(min(1.0, math.sqrt(a)))
+
+
+def resolve_place(db, text):
+    """A place name to (lat, lon, label, source).
+
+    Local first, and the local answer is usually the BETTER one: "costco"
+    means the branch the user goes to, not whichever branch Apple ranks first.
+    The index already holds every visited place with its coordinate, so this
+    normally costs no network call at all.
+
+    🛑 The fallback is `apple maps geocode`, which LEAVES THE MACHINE. It is
+    the only network call anywhere in this lab, and `--local-only` refuses it.
+    """
+    pair = re.match(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$", text)
+    if pair:
+        return float(pair.group(1)), float(pair.group(2)), text, "coordinate"
+
+    rows = db.execute("""
+        SELECT title, latitude, longitude, occurred FROM record
+        WHERE tool = 'maps' AND kind = 'place' AND latitude IS NOT NULL
+          AND lower(title) LIKE ?
+        ORDER BY occurred DESC""", ("%" + text.lower() + "%",)).fetchall()
+    if rows:
+        r = rows[0]
+        return r["latitude"], r["longitude"], r["title"], "visited-place"
+    return None
+
+
+def geocode_place(text, local_only):
+    if local_only:
+        die("'%s' is not a place you have visited, and --local-only refuses "
+            "the network." % text)
+    hits = apple("maps", "geocode", text, "--json", allow_fail=True)
+    if not hits:
+        die("could not resolve '%s' to a coordinate." % text)
+    top = hits[0]
+    return (top["latitude"], top["longitude"], top.get("name") or text,
+            top.get("source") or "maps-search")
+
+
+def placed_rows(db, tool=None, since=None, kind=None, past=False):
+    sql = ["SELECT rid, uid, tool, kind, native_id, title, container, occurred,"
+           " latitude, longitude FROM record WHERE latitude IS NOT NULL"]
+    args = []
+    if tool:
+        sql.append("AND tool = ?")
+        args.append(tool)
+    if kind:
+        sql.append("AND kind = ?")
+        args.append(kind)
+    if since:
+        sql.append("AND occurred >= ?")
+        args.append(time.time() - since * 86400)
+    # ⚠️ `--since N` alone means "from N days ago ONWARD", and a calendar holds
+    # recurring events years into the future. Asking which events the user
+    # ATTENDED is a question about the past, so it needs this as well.
+    if past:
+        sql.append("AND occurred <= ?")
+        args.append(time.time())
+    sql.append("ORDER BY occurred DESC")
+    return db.execute(" ".join(sql), args).fetchall()
+
+
+def coverage(db, tool=None):
+    """How many records of a source could be placed at all."""
+    where = "WHERE tool = ?" if tool else ""
+    args = (tool,) if tool else ()
+    row = db.execute("SELECT COUNT(*) n, SUM(latitude IS NOT NULL) c "
+                     "FROM record " + where, args).fetchone()
+    return row["c"] or 0, row["n"] or 0
+
+
+def cmd_near(opts):
+    """Everything indexed within --radius km of a place."""
+    db = connect(opts.db)
+    found = resolve_place(db, opts.place)
+    if not found:
+        found = geocode_place(opts.place, opts.local_only)
+    lat, lon, label, source = found
+
+    out = []
+    for row in placed_rows(db, opts.tool, opts.since, past=opts.past):
+        km = haversine(lat, lon, row["latitude"], row["longitude"])
+        if km > opts.radius:
+            continue
+        out.append({
+            "uid": row["uid"], "tool": row["tool"], "kind": row["kind"],
+            "id": row["native_id"], "title": row["title"],
+            "container": row["container"],
+            "date": (datetime.fromtimestamp(row["occurred"], timezone.utc).isoformat()
+                     if row["occurred"] else None),
+            "km": round(km, 3),
+            "latitude": row["latitude"], "longitude": row["longitude"],
+        })
+    out.sort(key=lambda r: r["km"])
+    out = out[:opts.limit]
+
+    placed, total = coverage(db, opts.tool)
+    if opts.json:
+        print(json.dumps({
+            "origin": {"query": opts.place, "name": label, "latitude": lat,
+                       "longitude": lon, "source": source},
+            "radius_km": opts.radius,
+            "placed_records": placed, "total_records": total,
+            "results": out}, indent=2))
+        return
+    print("%s  %.5f,%.5f  (%s)" % (label, lat, lon, source))
+    print("within %g km — searching %d of %d records that carry a coordinate\n"
+          % (opts.radius, placed, total))
+    for r in out:
+        print("%-9s %6.2f km  %-10s %s"
+              % (r["tool"], r["km"], (r["date"] or "")[:10], r["title"]))
+    if not out:
+        print("nothing placed within %g km." % opts.radius)
+
+
+def collapse(members):
+    """One line per distinct thing in a group, newest first.
+
+    ⚠️ A maps PLACE and a maps VISIT to it are two records at one coordinate,
+    and a place's date is its LATEST visit — so the same arrival appears twice
+    and reads as two separate trips. A recurring calendar event repeats the
+    same title too. Both are collapsed on (tool, title), and `count` says how
+    many records the line stands for.
+    """
+    groups = {}
+    for m in members:
+        key = (m["tool"], m["title"] or "")
+        keep = groups.get(key)
+        if keep is None or (m["occurred"] or 0) > (keep["occurred"] or 0):
+            groups[key] = dict(m)
+            groups[key]["count"] = (keep or {}).get("count", 0) + 1
+        else:
+            keep["count"] = keep.get("count", 1) + 1
+    out = [{
+        "uid": m["uid"], "tool": m["tool"], "kind": m["kind"],
+        "id": m["native_id"], "title": m["title"],
+        "count": m.get("count", 1),
+        "date": (datetime.fromtimestamp(m["occurred"], timezone.utc).isoformat()
+                 if m["occurred"] else None),
+    } for m in groups.values()]
+    out.sort(key=lambda r: (r["date"] or ""), reverse=True)
+    return out
+
+
+def cmd_nearby(opts):
+    """Group placed records that sit close to each other.
+
+    Single-link clustering: two records join the same group when they are
+    within --radius km. ⚠️ That means a group can be WIDER than the radius, a
+    chain of overlapping pairs. The reported `span_km` is the real width, so
+    read that rather than assuming the radius bounds it.
+    """
+    db = connect(opts.db)
+    rows = placed_rows(db, opts.tool, opts.since, opts.kind, past=opts.past)
+    if opts.limit:
+        rows = rows[:opts.limit]
+
+    parent = list(range(len(rows)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(rows)):
+        for j in range(i + 1, len(rows)):
+            if haversine(rows[i]["latitude"], rows[i]["longitude"],
+                         rows[j]["latitude"], rows[j]["longitude"]) <= opts.radius:
+                a, b = find(i), find(j)
+                if a != b:
+                    parent[a] = b
+
+    groups = {}
+    for i, row in enumerate(rows):
+        groups.setdefault(find(i), []).append(row)
+
+    out = []
+    for members in groups.values():
+        if len(members) < opts.min_size:
+            continue
+        span = 0.0
+        for i in range(len(members)):
+            for j in range(i + 1, len(members)):
+                span = max(span, haversine(
+                    members[i]["latitude"], members[i]["longitude"],
+                    members[j]["latitude"], members[j]["longitude"]))
+        out.append({
+            "count": len(members),
+            "span_km": round(span, 3),
+            "latitude": round(sum(m["latitude"] for m in members) / len(members), 6),
+            "longitude": round(sum(m["longitude"] for m in members) / len(members), 6),
+            "records": collapse(members),
+        })
+    out.sort(key=lambda g: -g["count"])
+
+    placed, total = coverage(db, opts.tool)
+    if opts.json:
+        print(json.dumps({"radius_km": opts.radius, "groups": out,
+                          "placed_records": placed,
+                          "total_records": total}, indent=2))
+        return
+    print("grouping %d placed records (of %d indexed) within %g km\n"
+          % (len(rows), total, opts.radius))
+    for g in out:
+        print("%d records, %.2f km across, near %.5f,%.5f"
+              % (g["count"], g["span_km"], g["latitude"], g["longitude"]))
+        for m in g["records"][:opts.show]:
+            tail = "  (x%d)" % m["count"] if m["count"] > 1 else ""
+            print("    %-9s %-10s %s%s"
+                  % (m["tool"], (m["date"] or "")[:10], m["title"], tail))
+        if len(g["records"]) > opts.show:
+            print("    ... and %d more" % (len(g["records"]) - opts.show))
+        print("")
+    if not out:
+        print("no group of %d or more within %g km." % (opts.min_size, opts.radius))
+
+
 def cmd_status(opts):
     db = connect(opts.db)
     warn_security(db, opts.db)
@@ -1631,13 +2096,17 @@ def cmd_status(opts):
         print("%d chunks, %d embedded as %s, %d pending"
               % (total, r["c"], r["model"], total - r["c"]))
     print("%.1f MB at %s" % (size, opts.db))
-    if total - vectors:
-        # Measured single-threaded on macOS 27.0: 41 chunks/sec on a 180-word
-        # paragraph, 71.9 on real note chunks. The rate tracks chunk length, so
-        # quote the slower figure and let the run beat it.
-        rate = 41.0
-        print("~%.1f min to embed the backlog at 41 chunks/sec (the slower measured rate)"
-              % ((total - vectors) / rate / 60))
+    # ⚠️ Quote the rate for the model that is actually behind. A single
+    # hardcoded 41 chunks/sec came from Apple's model and told a caller "52
+    # minutes" for an e5-small backlog that finished in 5.
+    RATES = {"e5-small-v1": 450.0, "e5-base-v1": 133.0,
+             "sentence-v1": 60.0, "contextual-v1": 60.0}
+    for r in per_model:
+        pending = total - r["c"]
+        if pending > 0:
+            rate = RATES.get(r["model"], 60.0)
+            print("~%.1f min to embed the %s backlog at ~%.0f chunks/sec"
+                  % (pending / rate / 60, r["model"], rate))
 
 
 # --------------------------------------------------------------------------
@@ -1705,8 +2174,34 @@ def main():
     # 🛑 The vector arm earns its place only as a MINORITY vote. Equal weighting
     # scores no better than ignoring it. ⚠️ 13 cases is a small set, so read the
     # 1:1 vs 3:1 gap as suggestive; the semantic-only result is decisive.
-    s.add_argument("--w-lexical", type=float, default=3.0, dest="w_lexical")
+    # Measured over eval.py's 16 cases (MRR / hit@3): 3:1 0.762/0.81,
+    # 4:1 and 5:1 both 0.771/0.88, 6:1 0.750, 12:1 0.690, lexical-only 0.674.
+    # 4:1 is the lower of the two tied best. Raised from 3:1 after a field test
+    # found multi-token verbatim queries beating a surname collision by only
+    # 0.0127.
+    s.add_argument("--w-lexical", type=float, default=4.0, dest="w_lexical")
     s.add_argument("--w-semantic", type=float, default=1.0, dest="w_semantic")
+    s.add_argument("--recency-head", type=int, default=10, dest="recency_head",
+                   help="how many top candidates the recency arm re-orders")
+    s.add_argument("--pool", type=int, default=0,
+                   help="candidates each arm retrieves before fusion "
+                        "(0 = max(limit*6, 60))")
+    s.add_argument("--w-recency", type=float, default=0.0, dest="w_recency",
+                   help="weight of a third arm ranking candidates newest first")
+    # Measured over eval.py's 28 cases (MRR / hit@10): off 0.589/0.64,
+    # threshold 2 or 3 0.602/0.71, threshold 4 0.620/0.71, threshold 5
+    # 0.607/0.64. The re-fuse target barely matters — 1:2, 1:3 and 0:1 all tie
+    # at threshold 4 — so the TRIGGER is the whole mechanism.
+    s.add_argument("--no-adaptive", action="store_false", dest="adaptive",
+                   help="do not re-fuse even when the lexical arm dominates")
+    s.add_argument("--adaptive-threshold", type=int, default=4,
+                   dest="adaptive_threshold",
+                   help="how many of the top 5 must be missing from the "
+                        "semantic arm before re-fusing")
+    s.add_argument("--adaptive-lexical", type=float, default=1.0,
+                   dest="adaptive_lexical")
+    s.add_argument("--adaptive-semantic", type=float, default=2.0,
+                   dest="adaptive_semantic")
     s.add_argument("--auto-weight", action="store_true", dest="auto_weight",
                    help="pick the weights from the query's shape")
     # Measured (MRR over eval.py's 13 cases): record-level 0.602, chunk-level
@@ -1752,6 +2247,37 @@ def main():
     pu.add_argument("--logs-only", action="store_true", dest="logs_only",
                     help="keep the index, drop query_log and result_cache")
     pu.set_defaults(func=cmd_purge)
+
+    n = sub.add_parser("near", help="everything indexed near a place")
+    n.add_argument("place", help="a place name, an address, or \"lat,lon\"")
+    n.add_argument("--radius", type=float, default=1.0,
+                   help="kilometres (default 1)")
+    n.add_argument("--tool", help="restrict to one source")
+    n.add_argument("--since", type=int, help="only records this many days back")
+    n.add_argument("--past", action="store_true",
+                   help="exclude anything dated in the future")
+    n.add_argument("--limit", type=int, default=50)
+    n.add_argument("--local-only", action="store_true", dest="local_only",
+                   help="refuse the geocoding network call")
+    n.add_argument("--json", action="store_true")
+    n.set_defaults(func=cmd_near)
+
+    nb = sub.add_parser("nearby", help="group placed records that sit close together")
+    nb.add_argument("--radius", type=float, default=1.0,
+                    help="kilometres that join two records (default 1)")
+    nb.add_argument("--tool", help="restrict to one source")
+    nb.add_argument("--kind", help="restrict to one kind (event, place, visit)")
+    nb.add_argument("--since", type=int, help="only records this many days back")
+    nb.add_argument("--past", action="store_true",
+                    help="exclude anything dated in the future")
+    nb.add_argument("--min-size", type=int, default=2, dest="min_size",
+                    help="smallest group to report (default 2)")
+    nb.add_argument("--show", type=int, default=6,
+                    help="records to print per group")
+    nb.add_argument("--limit", type=int, default=2000,
+                    help="cap the records compared; the pairing is O(n^2)")
+    nb.add_argument("--json", action="store_true")
+    nb.set_defaults(func=cmd_nearby)
 
     sub.add_parser("status", help="what is indexed").set_defaults(func=cmd_status)
 
