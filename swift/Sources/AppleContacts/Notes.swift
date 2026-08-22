@@ -110,4 +110,72 @@ enum NoteStore {
 
         return notes
     }
+
+    /// Every contact that carries a picture, by identifier.
+    ///
+    /// 🛑 **`CNContact.imageDataAvailable` is NOT the answer, and it is wrong in
+    /// the flattering direction.** It reports true only for `ZIMAGEDATA`, the
+    /// full-size copy. A card whose picture lives in `ZTHUMBNAILIMAGEDATA`
+    /// alone reads back as having no picture at all — while Contacts.app shows
+    /// the photo perfectly well.
+    ///
+    /// That is not a rare corner. Measured on this store: 444 cards carry a
+    /// picture, 341 have `ZIMAGEDATA`, and **103 are thumbnail-only**. Worse,
+    /// a card written through `--photo` lands in the full column and is moved
+    /// to the thumbnail column soon after, so a write confirmed as present
+    /// starts reporting absent minutes later. Six real contacts did exactly
+    /// that, and the write had been correct every time.
+    ///
+    /// So presence is read from the store, the same way a note is. This reads
+    /// ids only — never a blob — so it costs nothing next to the ~100 KB per
+    /// picture a `CNContactImageDataKey` fetch would pull.
+    static func contactsWithPhotos() -> Set<String> {
+        var found: Set<String> = []
+
+        for path in databases() {
+            var handle: OpaquePointer?
+            var status = sqlite3_open_v2(
+                "file:\(path)?mode=ro", &handle, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil)
+            if status != SQLITE_OK {
+                sqlite3_close(handle)
+                handle = nil
+                status = sqlite3_open_v2(
+                    "file:\(path)?immutable=1", &handle,
+                    SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil)
+            }
+            guard status == SQLITE_OK else {
+                sqlite3_close(handle)
+                continue
+            }
+            defer { sqlite3_close(handle) }
+            sqlite3_exec(handle, "PRAGMA query_only = 1", nil, nil, nil)
+
+            // `IS NOT NULL` on a blob column does not read the blob, so this
+            // stays a row scan rather than ~34 MB of pictures.
+            let sql = """
+                SELECT ZUNIQUEID FROM ZABCDRECORD
+                WHERE ZUNIQUEID IS NOT NULL
+                  AND (ZIMAGEDATA IS NOT NULL OR ZTHUMBNAILIMAGEDATA IS NOT NULL
+                       OR ZIMAGEREFERENCE IS NOT NULL)
+                """
+
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK else {
+                continue
+            }
+            defer { sqlite3_finalize(statement) }
+
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let idRaw = sqlite3_column_text(statement, 0) else { continue }
+                let uniqueId = String(cString: idRaw)
+                found.insert(uniqueId)
+                // "UUID:ABPerson" -> "UUID", which is what CNContact reports.
+                if let bare = uniqueId.split(separator: ":").first {
+                    found.insert(String(bare))
+                }
+            }
+        }
+
+        return found
+    }
 }

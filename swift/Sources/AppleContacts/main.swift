@@ -5,6 +5,7 @@ import ArgumentParser
 import Contacts
 import ContactsLibrary
 import Foundation
+import ImageIO
 import TCCResponsibility
 
 private let store = CNContactStore()
@@ -81,7 +82,28 @@ private let readKeys: [CNKeyDescriptor] = [
     CNContactJobTitleKey, CNContactEmailAddressesKey, CNContactPhoneNumbersKey,
     CNContactPostalAddressesKey, CNContactUrlAddressesKey, CNContactBirthdayKey,
     CNContactDatesKey, CNContactRelationsKey,
+    // 🛑 The AVAILABLE flag, never CNContactImageDataKey. The flag is a Bool;
+    // the blob is the whole picture, and this list is fetched for every contact
+    // by `list` and `search`. Measured on this store: 341 cards carry an image
+    // averaging ~100 KB, so putting the blob here would drag ~34 MB through
+    // every listing to answer a question nobody asked. `--photo` reads the blob
+    // for one contact, on its own.
+    CNContactImageDataAvailableKey,
 ] as [CNKeyDescriptor]
+
+/// `readKeys` plus the picture itself, for the one command that writes one.
+///
+/// 🛑 **`setImageData:` throws `CNPropertyNotFetchedException` unless
+/// `CNContactImageDataKey` was in the FETCH**, and the AVAILABLE flag does not
+/// satisfy it. This is an Objective-C exception, not a Swift error, so it
+/// terminates the process — no message the caller can act on, no partial write,
+/// just a crash dump. Measured: a `--photo` edit on a contact fetched with
+/// `readKeys` died in `-[CNMutableContact setImageData:]`.
+///
+/// So a picture edit re-fetches its contact with these keys. Only that edit
+/// pays for the blob; `list` and `search` keep the cheap key set.
+private let photoWriteKeys: [CNKeyDescriptor] =
+    readKeys + [CNContactImageDataKey as CNKeyDescriptor]
 
 // MARK: - Output
 
@@ -135,11 +157,44 @@ struct ContactInfo: Encodable {
     let dates: [DateInfo]?
     let groups: [String]?
     let note: String?
+    /// True when the card carries a picture. Absent otherwise, never `false` —
+    /// the same rule every optional key here follows.
+    let has_photo: Bool?
     let contact_url: String?
     /// Which account this contact lives in. Only `get` fills this in: finding it
     /// means scanning each container, which is fine for one contact and far too
     /// slow for `list`. It matters because group membership cannot cross accounts.
     let container: String?
+}
+
+/// Which contacts carry a picture, read once per process.
+///
+/// ⚠️ **Needs Full Disk Access, like the note reader.** Without it the set comes
+/// back empty and `has_photo` falls back to `imageDataAvailable` — which
+/// under-reports rather than lying the other way, and is the same degradation
+/// notes already take.
+private enum PhotoPresence {
+    private static var cache: Set<String>?
+
+    static var ids: Set<String> {
+        if let cache { return cache }
+        let value = NoteStore.contactsWithPhotos()
+        cache = value
+        return value
+    }
+
+    /// Drop the cache, so a read after a write sees the write.
+    static func refresh() { cache = nil }
+}
+
+/// Does this card carry a picture?
+///
+/// 🛑 **Both sources, never just one.** `imageDataAvailable` is true the moment
+/// a write lands and false once macOS moves the bytes to the thumbnail column;
+/// the store is true afterwards and lags the write by its write-ahead log. One
+/// alone is wrong at one end or the other.
+private func hasPhoto(_ contact: CNContact) -> Bool {
+    contact.imageDataAvailable || PhotoPresence.ids.contains(contact.identifier)
 }
 
 private func blankToNil(_ value: String?) -> String? {
@@ -220,6 +275,7 @@ private func info(
         dates: dates.isEmpty ? nil : dates,
         groups: groups.isEmpty ? nil : groups,
         note: notes[contact.identifier],
+        has_photo: hasPhoto(contact) ? true : nil,
         contact_url: "addressbook://\(contact.identifier)",
         container: container)
 }
@@ -690,7 +746,7 @@ private func editViaAddressBook(id: String, fields: ContactFields) throws {
     guard let person = book.record(forUniqueId: id) as? ABPerson else {
         throw RuntimeError("no contact with id '\(id)' in the AddressBook store.")
     }
-    guard fields.apply(to: person) else {
+    guard try fields.apply(to: person) else {
         throw RuntimeError("the AddressBook store refused one of the values.")
     }
 
@@ -779,6 +835,24 @@ private func confirmWritten(_ fields: ContactFields, on saved: CNContact, name: 
             var reads = "no death date"
             if let stored { reads = stored.died + " [" + stored.precision.rawValue + "]" }
             missing.append("--died \(wanted.known)  (the card reads \(reads))")
+        }
+    }
+
+    // 🛑 Confirmed on `imageDataAvailable`, not on the bytes. Contacts
+    // re-encodes what it is given and generates its own thumbnail, so the blob
+    // that comes back is NOT the blob that went in and a byte comparison would
+    // fail on every correct write. What this has to catch is a picture that
+    // never landed, and the flag says exactly that.
+    if fields.photo != nil || fields.clearPhoto {
+        // The store lags its write-ahead log, so re-read it rather than
+        // trusting a set cached before the save.
+        PhotoPresence.refresh()
+        let present = hasPhoto(saved)
+        if fields.photo != nil && !present {
+            missing.append("--photo  (the card still has no picture)")
+        }
+        if fields.clearPhoto && present {
+            missing.append("--clear-photo  (the card still has a picture)")
         }
     }
 
@@ -1293,6 +1367,62 @@ struct ContactFields: ParsableArguments {
     @Flag(name: .long, help: "With --died, do not add the «†» marker to the note.")
     var noMark = false
 
+    // The picture goes through `CNMutableContact.imageData`, which is ordinary
+    // public API and needs no grant beyond the Contacts one — unlike the note,
+    // which needs an entitlement no CLI can hold. So this is the normal path,
+    // and the AddressBook fallback carries it too for the note-bearing cards.
+    @Option(
+        name: .long,
+        help: "Picture file (jpeg, png, heic, gif, tiff). REPLACES any existing picture.")
+    var photo: String?
+
+    @Flag(name: .long, help: "Remove the contact's picture.")
+    var clearPhoto = false
+
+    /// The picture bytes, read and checked once.
+    ///
+    /// 🛑 **Checked BEFORE any Apple Event or save**, the same rule `apple mail`
+    /// applies to `--attach`: a bad path must not leave a half-written contact
+    /// behind. A file that is missing, unreadable, a directory, empty, or not a
+    /// decodable image is an error naming which, and nothing is written.
+    func photoData() throws -> Data? {
+        guard let photo else { return nil }
+        let path = (photo as NSString).expandingTildeInPath
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) else {
+            throw ValidationError("--photo: no file at '\(photo)'")
+        }
+        guard !isDirectory.boolValue else {
+            throw ValidationError("--photo: '\(photo)' is a directory, not an image file")
+        }
+        guard let data = FileManager.default.contents(atPath: path) else {
+            throw ValidationError("--photo: could not read '\(photo)'")
+        }
+        guard !data.isEmpty else {
+            throw ValidationError("--photo: '\(photo)' is empty")
+        }
+        // 🛑 Decode it, do not trust the extension. Contacts stores whatever
+        // bytes it is given and generates the thumbnail later, so a non-image
+        // saves without complaint and shows up as a broken card on every device
+        // the change syncs to.
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+            CGImageSourceGetCount(source) > 0,
+            CGImageSourceCreateImageAtIndex(source, 0, nil) != nil
+        else {
+            throw ValidationError(
+                "--photo: '\(photo)' is not an image this Mac can decode "
+                + "(jpeg, png, heic, gif and tiff all work)")
+        }
+        // A contact picture syncs to every device. Big is not an error, but it
+        // is worth saying once.
+        if data.count > 5 * 1024 * 1024 {
+            let mb = String(format: "%.1f", Double(data.count) / 1024 / 1024)
+            FileHandle.standardError.write(
+                Data("warning: --photo is \(mb) MB. It syncs to every device.\n".utf8))
+        }
+        return data
+    }
+
     var isEmpty: Bool {
         first == nil && middle == nil && last == nil && namePrefix == nil
             && nameSuffix == nil && nickname == nil && company == nil
@@ -1304,7 +1434,7 @@ struct ContactFields: ParsableArguments {
             && removeEmail.isEmpty && removePhone.isEmpty
             && removeUrl.isEmpty && removeAddress.isEmpty
             && url.isEmpty && relation.isEmpty && date.isEmpty
-            && address.isEmpty
+            && address.isEmpty && photo == nil && !clearPhoto
     }
 
     /// What the caller asked to do to the note, if anything.
@@ -1504,6 +1634,13 @@ struct ContactFields: ParsableArguments {
         if noMark && died == nil {
             throw ValidationError("--no-mark only means anything alongside --died.")
         }
+        if clearPhoto && photo != nil {
+            throw ValidationError(
+                "--clear-photo removes the picture and --photo sets one. Pass one.")
+        }
+        // Read and decode the file here, so a bad path is refused before any
+        // save runs rather than after half the fields have landed.
+        _ = try photoData()
         if let birthday, ContactDate.parse(birthday) == nil {
             throw ValidationError("could not parse --birthday '\(birthday)'; use YYYY-MM-DD or --MM-DD")
         }
@@ -1800,7 +1937,9 @@ struct ContactFields: ParsableArguments {
         return result
     }
 
-    func apply(to contact: CNMutableContact) {
+    func apply(to contact: CNMutableContact) throws {
+        if let photo = try photoData() { contact.imageData = photo }
+        if clearPhoto { contact.imageData = nil }
         if let first { contact.givenName = first }
         if let middle { contact.middleName = middle }
         if let last { contact.familyName = last }
@@ -1918,8 +2057,13 @@ struct ContactFields: ParsableArguments {
     ///
     /// Returns false if AddressBook rejected any of the writes, before the save
     /// is even attempted.
-    func apply(to person: ABPerson) -> Bool {
+    func apply(to person: ABPerson) throws -> Bool {
         var ok = true
+        // 🛑 The picture is NOT a property here. AddressBook exposes it through
+        // its own setter, so the `set(_:_:)` helper below cannot carry it and a
+        // note-bearing contact would silently keep its old picture.
+        if let photo = try photoData() { ok = person.setImageData(photo) && ok }
+        if clearPhoto { ok = person.setImageData(nil) && ok }
         func set(_ value: Any?, _ property: String) {
             ok = person.setValue(value, forProperty: property) && ok
         }
@@ -2150,7 +2294,7 @@ struct Add: ParsableCommand {
 
         // Named to avoid shadowing the global contact(withId:) lookup.
         let draft = CNMutableContact()
-        fields.apply(to: draft)
+        try fields.apply(to: draft)
 
         let request = CNSaveRequest()
         // Resolved, not passed through: an unknown identifier is silently
@@ -2314,10 +2458,19 @@ struct Edit: ParsableCommand {
 
     /// The ordinary field save, with the note wall's AddressBook fallback.
     private func saveFields(on existing: CNContact) throws {
-        guard let mutable = existing.mutableCopy() as? CNMutableContact else {
+        // 🛑 A picture write needs the picture in the fetch — see
+        // `photoWriteKeys`. Re-fetch only when one is asked for, so an ordinary
+        // edit does not drag the blob through.
+        var source = existing
+        if fields.photo != nil || fields.clearPhoto {
+            source =
+                (try? store.unifiedContact(withIdentifier: id, keysToFetch: photoWriteKeys))
+                ?? existing
+        }
+        guard let mutable = source.mutableCopy() as? CNMutableContact else {
             throw ValidationError("could not prepare '\(id)' for editing")
         }
-        fields.apply(to: mutable)
+        try fields.apply(to: mutable)
 
         let request = CNSaveRequest()
         request.update(mutable)

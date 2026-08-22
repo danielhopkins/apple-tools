@@ -71,6 +71,8 @@ installed via `make install`.
 | Find a person | `apple contacts search "smith" --json` |
 | Update a contact | `apple contacts edit <id> --company "New Co"` |
 | Write a contact note | `apple contacts edit <id> --note "text"` |
+| Set a contact's picture | `apple contacts edit <id> --photo ~/face.jpg` |
+| Who has no picture | `apple contacts list --limit 5000 --json` → `has_photo` |
 | ...without losing the old one | `apple contacts edit <id> --append-note "line"` |
 | Record a death | `apple contacts edit <id> --died 2020-04-30` |
 | ...when only the year is known | `apple contacts edit <id> --died 2020` |
@@ -1215,7 +1217,46 @@ FIELDS, shared by `add` and `edit`:
 --relation LABEL:NAME        repeatable
 --date     LABEL:DATE        repeatable
 --note TEXT | --append-note TEXT | --clear-note
+--photo FILE | --clear-photo
 ```
+
+**Pictures.** `--photo FILE` sets the contact's picture, `--clear-photo` removes
+it, and `get`/`search`/`list --json` report **`has_photo`** (present only when
+true, like every other optional key here).
+
+```
+apple contacts edit <id> --photo ~/Downloads/face.jpg
+apple contacts edit <id> --clear-photo
+```
+
+- **The file is decoded before anything is written.** A missing path, a
+  directory, an empty file, or something that is not an image exits without
+  touching the contact — the same rule `apple mail` applies to `--attach`. Over
+  5 MB gets a stderr note, not a refusal.
+- 🛑 **`setImageData:` throws `CNPropertyNotFetchedException` unless
+  `CNContactImageDataKey` was in the FETCH**, and `imageDataAvailable` does not
+  satisfy it. It is an Objective-C exception, so it **terminates the process** —
+  a crash dump, not an error a caller can act on. So a picture edit re-fetches
+  its contact with the image key, and `list`/`search` keep the cheap key set.
+  Measured here: 341 cards carry an image averaging ~100 KB, so putting the blob
+  in the read keys would drag ~34 MB through every listing.
+- 🛑 **`has_photo` does NOT come from `imageDataAvailable`, and that matters.**
+  That flag is true only for `ZIMAGEDATA`, the full-size copy. A card whose
+  picture lives in `ZTHUMBNAILIMAGEDATA` alone reads back as having **no
+  picture**, while Contacts.app shows it perfectly well. Measured: **103 of the
+  444 picture-bearing cards here are thumbnail-only.** Worse, a card written by
+  `--photo` lands in the full column and macOS moves it to the thumbnail column
+  soon after — so a write confirmed as present starts reporting absent minutes
+  later. Six real contacts did exactly that, and every write had been correct.
+  Presence is read from the AddressBook store instead: ids only, never a blob.
+- ⚠️ **That store read needs Full Disk Access**, like the note reader. Without it
+  `has_photo` falls back to `imageDataAvailable`, which under-reports rather
+  than over-reports.
+- **The write is read back and confirmed** against both sources, like every
+  other field.
+- ⚠️ **There is no flag for social-profile rows.** A LinkedIn or Facebook link
+  can live in `ZABCDSOCIALPROFILE` rather than in a URL field, and nothing here
+  reads or writes those. `--url` only touches the URL field.
 
 🛑 **Multi-value flags replace; `--add-*` appends.** Passing `--email` on `edit`
 replaces *every* existing email on that contact, and prints `Updated '<name>'`
@@ -1559,6 +1600,7 @@ tool you are changing before you change it — every claim in there was paid for
 | `apple-contacts-writes.md` | the note wall, the group/account rules, the `--url` split, the address parser, deaths, and relation inverses |
 | `apple-contacts-move.md` | no public API changes a contact's container; the private call that lies, the one that works, and what a move costs |
 | `apple-health.md` | 🛑 there is no Health data on a Mac: what was measured, why signing does not help, and the four routes off the iPhone |
+| `apple-findmy.md` | 🛑 nothing reads Find My, and people are the hardest half: the encrypted caches, the empty App Intents bundle, the four ungrantable entitlements |
 | `prior-art.md` | other projects solving this; check before building |
 | `todo-deep-links.md` | planned: a `url` on every entity, so anything we name can be opened and cross-linked |
 | `todo-offline-tests.md` | planned: move the Notes suite off live Notes.app so it can run in CI at all |
