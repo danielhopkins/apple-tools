@@ -385,7 +385,9 @@ struct Places: ParsableCommand {
     request.limit = limit
 
     let store = VisitStore(database: try openDatabase())
-    let places = try store.places(request)
+    let listing = try store.placeListing(request)
+    let places = listing.items
+    reportTruncation(listing, noun: "places", limit: limit)
 
     if json {
       try Output.json(places.map(Output.encode))
@@ -397,6 +399,24 @@ struct Places: ParsableCommand {
     }
     for place in places { Output.line(place) }
   }
+}
+
+/// 🛑 Say so on stderr when `--limit` cut the answer short.
+///
+/// A truncated listing that says nothing about being truncated reads as a
+/// complete answer, and nothing downstream can tell. Measured: `apple maps
+/// visits` defaults to 50 rows against 450 in the store. A question about one
+/// place got the answer **1** when the true answer was **4**, because the three
+/// older arrivals sat past the cut. Counting the rows that came back is exactly
+/// what a caller does, and it was wrong.
+///
+/// ⚠️ stderr, not stdout, so `--json` stays machine-readable. Same rule `apple
+/// mail search` uses to report its scan depth.
+func reportTruncation<T>(_ listing: VisitStore.Listing<T>, noun: String, limit: Int) {
+  guard listing.truncated else { return }
+  FileHandle.standardError.write(Data(
+    ("apple-maps: showing \(listing.items.count) of \(listing.matched) \(noun). "
+     + "Raise --limit (currently \(limit)) to see the rest.\n").utf8))
 }
 
 struct Visits: ParsableCommand {
@@ -424,7 +444,9 @@ struct Visits: ParsableCommand {
     request.limit = limit
 
     let store = VisitStore(database: try openDatabase())
-    let visits = try store.visits(request)
+    let listing = try store.visitListing(request)
+    let visits = listing.items
+    reportTruncation(listing, noun: "visits", limit: limit)
 
     if json {
       try Output.json(visits.map(Output.encode))

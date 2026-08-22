@@ -361,6 +361,52 @@ final class VisitStoreTests: XCTestCase {
     XCTAssertEqual(try store.visits(request).count, 1)
   }
 
+  /// 🛑 A truncated listing must say how many rows it left out.
+  ///
+  /// Without this the row count a caller gets IS the answer they report, and it
+  /// is wrong. Measured on a real store: `apple maps visits` defaults to 50 rows
+  /// against 450, and a question about one place got the answer **1** when the
+  /// true answer was **4**. The three older arrivals sat past the cut, and
+  /// nothing in the output distinguished that from "you went there once".
+  func testListingReportsWhatTheLimitCutOff() throws {
+    let fixture = try MapsFixture()
+    try fixture.run(
+      """
+      INSERT INTO ZVISITEDLOCATION (Z_PK, ZMAPITEMNAME) VALUES (1, 'Elks Lodge');
+      INSERT INTO ZVISITEDLOCATION (Z_PK, ZMAPITEMNAME) VALUES (2, 'Elsewhere');
+      INSERT INTO ZVISIT (Z_PK, ZLOCATION, ZSTARTDATE) VALUES (1, 1, \(MapsFixture.daysAgo(1)));
+      INSERT INTO ZVISIT (Z_PK, ZLOCATION, ZSTARTDATE) VALUES (2, 1, \(MapsFixture.daysAgo(2)));
+      INSERT INTO ZVISIT (Z_PK, ZLOCATION, ZSTARTDATE) VALUES (3, 1, \(MapsFixture.daysAgo(3)));
+      INSERT INTO ZVISIT (Z_PK, ZLOCATION, ZSTARTDATE) VALUES (4, 2, \(MapsFixture.daysAgo(4)));
+      """)
+
+    let store = try fixture.visits()
+
+    var capped = VisitsRequest()
+    capped.limit = 2
+    let cut = try store.visitListing(capped)
+    XCTAssertEqual(cut.items.count, 2, "the limit still applies")
+    XCTAssertEqual(cut.matched, 4, "and the caller can see what it cost")
+    XCTAssertTrue(cut.truncated)
+
+    // ⚠️ The count is taken AFTER filtering, not before. Reporting "2 of 4"
+    // for a search that only ever matched 3 would be a different lie.
+    var searched = VisitsRequest()
+    searched.search = "Elks"
+    searched.limit = 2
+    let filtered = try store.visitListing(searched)
+    XCTAssertEqual(filtered.matched, 3, "matched counts the search, not the store")
+    XCTAssertTrue(filtered.truncated)
+
+    // A listing that fits is never reported as truncated.
+    var whole = VisitsRequest()
+    whole.limit = 100
+    let full = try store.visitListing(whole)
+    XCTAssertEqual(full.matched, 4)
+    XCTAssertFalse(full.truncated)
+    XCTAssertFalse(try store.placeListing(whole).truncated)
+  }
+
   /// The classification value goes through as a number. Two values appear on a
   /// real store and nothing in the schema says what they mean, so naming them
   /// would be a guess presented as a fact.

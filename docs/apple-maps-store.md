@@ -4,6 +4,37 @@ Where Maps keeps visited places and guides, what the columns mean, and the
 traps in reading them. Everything below was measured against a real store on
 macOS 27 (2026-08-16): 440 visits, 314 location rows, 18 guides.
 
+## 🛑 A low default `--limit` is how a count comes out wrong
+
+`apple maps places` defaults to 40 rows against 197 in this store, and `apple
+maps visits` to **50 against 450**. Neither said so.
+
+Measured, on a real question: **"how many times did we go to the Elks Lodge this
+summer" answered `1`.** The true answer is **4**. `visits` had stopped at
+2026-07-04, three arrivals short, and the caller counted the rows it got.
+
+⚠️ **The failure is invisible.** Every row returned was correct. The listing was
+sorted newest-first, so the tail it dropped is exactly the older half of the
+answer, and a short result reads as a rare event rather than a truncated list.
+
+Two things caught it, and neither was the output:
+
+1. `ZVISITEDLOCATION`'s denormalised visit counter said **4** while the arrivals
+   said **1**. Core Data maintains that counter, so the two disagreeing is a
+   reliable alarm.
+2. The oldest row in a 450-row store was five weeks old.
+
+**The fix:** `VisitStore.placeListing` / `visitListing` return a `Listing` with
+`items` and `matched`, counted **after every filter and before the limit** —
+the one point where both numbers are known. The CLI prints
+`showing 50 of 450 visits` on **stderr**, so `--json` stays machine-readable.
+Pinned by `testListingReportsWhatTheLimitCutOff`.
+
+🛑 **Pass `--limit 100000` whenever you intend to count anything.** The warning
+tells you that you needed to; it does not save you from having already reported
+the wrong number.
+
+
 ## The file
 
 ```

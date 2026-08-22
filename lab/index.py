@@ -1938,24 +1938,22 @@ def cmd_near(opts):
         if km > opts.radius:
             continue
         key = (row["tool"], (row["title"] or "").strip())
-        best = kept.get(key)
-        if best is None:
-            kept[key] = {"row": row, "km": km, "count": 1}
-        else:
-            best["count"] += 1
-            # Keep the NEWEST of a repeated title. "when was I last there" is
-            # the question a repeated place is usually asked about.
-            if (row["occurred"] or 0) > (best["row"]["occurred"] or 0):
-                best["row"], best["km"] = row, km
+        entry = kept.setdefault(key, {"rows": [], "km": km})
+        entry["rows"].append(row)
+        entry["km"] = min(entry["km"], km)
 
     out = []
     for entry in kept.values():
-        row = entry["row"]
+        rows = sorted(entry["rows"], key=lambda r: r["occurred"] or 0, reverse=True)
+        # Keep the NEWEST of a repeated title. "when was I last there" is the
+        # question a repeated place is usually asked about.
+        row = rows[0]
         out.append({
             "uid": row["uid"], "tool": row["tool"], "kind": row["kind"],
             "id": row["native_id"], "title": row["title"],
             "container": row["container"],
-            "count": entry["count"],
+            "records": len(rows),
+            "count": occurrence_count(rows),
             "date": (datetime.fromtimestamp(row["occurred"], timezone.utc).isoformat()
                      if row["occurred"] else None),
             "km": round(entry["km"], 3),
@@ -1977,11 +1975,37 @@ def cmd_near(opts):
     print("within %g km — searching %d of %d records that carry a coordinate\n"
           % (opts.radius, placed, total))
     for r in out:
-        tail = "  (x%d)" % r["count"] if r["count"] > 1 else ""
         print("%-9s %6.2f km  %-10s %s%s"
-              % (r["tool"], r["km"], (r["date"] or "")[:10], r["title"], tail))
+              % (r["tool"], r["km"], (r["date"] or "")[:10], r["title"],
+                 count_label(r["tool"], r["count"])))
     if not out:
         print("nothing placed within %g km." % opts.radius)
+
+
+def occurrence_count(records):
+    """How many TIMES the thing on a collapsed line happened.
+
+    🛑 Not the number of records. A maps PLACE is a summary row, not an
+    arrival, and counting it inflates every visit tally by exactly one.
+    Measured: the Elks Lodge collapsed to `(x5)` from 4 visits plus 1 place
+    record, and read as five trips. The place row is the only record in the
+    index that summarises other records, so it is the only one excluded.
+
+    ⚠️ The count is bounded by the same --since/--past window as the listing.
+    It is "visits in this window", never a lifetime total. `apple maps places`
+    reports the lifetime figure.
+    """
+    return sum(1 for r in records
+               if not (r["tool"] == "maps" and r["kind"] == "place"))
+
+
+def count_label(tool, count):
+    """Say what the number counts. `(x4)` alone invited the wrong reading."""
+    if count <= 1:
+        return ""
+    if tool == "maps":
+        return "  (%d visits)" % count
+    return "  (x%d)" % count
 
 
 def collapse(members):
@@ -1995,20 +2019,22 @@ def collapse(members):
     """
     groups = {}
     for m in members:
-        key = (m["tool"], m["title"] or "")
-        keep = groups.get(key)
-        if keep is None or (m["occurred"] or 0) > (keep["occurred"] or 0):
-            groups[key] = dict(m)
-            groups[key]["count"] = (keep or {}).get("count", 0) + 1
-        else:
-            keep["count"] = keep.get("count", 1) + 1
-    out = [{
-        "uid": m["uid"], "tool": m["tool"], "kind": m["kind"],
-        "id": m["native_id"], "title": m["title"],
-        "count": m.get("count", 1),
-        "date": (datetime.fromtimestamp(m["occurred"], timezone.utc).isoformat()
-                 if m["occurred"] else None),
-    } for m in groups.values()]
+        groups.setdefault((m["tool"], (m["title"] or "").strip()), []).append(m)
+
+    out = []
+    for (tool, _), rows in groups.items():
+        rows.sort(key=lambda r: r["occurred"] or 0, reverse=True)
+        m = rows[0]
+        out.append({
+            "uid": m["uid"], "tool": m["tool"], "kind": m["kind"],
+            "id": m["native_id"], "title": m["title"],
+            # `records` is what collapsed; `count` is what happened. They differ
+            # for a maps place, and only `count` should ever be shown to a user.
+            "records": len(rows),
+            "count": occurrence_count(rows),
+            "date": (datetime.fromtimestamp(m["occurred"], timezone.utc).isoformat()
+                     if m["occurred"] else None),
+        })
     out.sort(key=lambda r: (r["date"] or ""), reverse=True)
     return out
 
@@ -2077,9 +2103,9 @@ def cmd_nearby(opts):
         print("%d records, %.2f km across, near %.5f,%.5f"
               % (g["count"], g["span_km"], g["latitude"], g["longitude"]))
         for m in g["records"][:opts.show]:
-            tail = "  (x%d)" % m["count"] if m["count"] > 1 else ""
             print("    %-9s %-10s %s%s"
-                  % (m["tool"], (m["date"] or "")[:10], m["title"], tail))
+                  % (m["tool"], (m["date"] or "")[:10], m["title"],
+                     count_label(m["tool"], m["count"])))
         if len(g["records"]) > opts.show:
             print("    ... and %d more" % (len(g["records"]) - opts.show))
         print("")
