@@ -55,8 +55,12 @@ stop:
 	-@pkill -x $(APP) 2>/dev/null; true
 	@sleep 1
 
+## ⚠️ Re-enable the launchd agent the app disabled. Without this,
+## uninstalling the app leaves the machine with NO search endpoint.
 uninstall: stop
 	rm -rf "/Applications/$(APP).app"
+	-launchctl enable gui/$$(id -u)/com.boulderhopkins.apple-index
+	@echo "re-enabled com.boulderhopkins.apple-index"
 
 ## Open the pane the user has to toggle by hand. No API can ask for this one.
 grant:

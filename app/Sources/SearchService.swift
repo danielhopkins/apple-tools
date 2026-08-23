@@ -43,9 +43,19 @@ final class SearchService: ObservableObject {
     /// Unload it. ⚠️ `bootout` is asynchronous: the service is still tearing
     /// down when the command returns, so the caller waits for the socket rather
     /// than binding straight away.
+    /// 🛑 BOOTOUT ALONE IS NOT ENOUGH. The plist stays in
+    /// `~/Library/LaunchAgents` with `RunAtLoad`, so the agent comes back at the
+    /// next login and the two race for the socket in whatever order they start.
+    /// `launchctl disable` is recorded in launchd's override database and
+    /// survives a reboot. It is reversible, and `make uninstall` reverses it:
+    ///
+    ///     launchctl enable gui/$(id -u)/com.boulderhopkins.apple-index
     @discardableResult
     static func evictAgent() -> Bool {
-        guard agentIsLoaded() else { return false }
+        let wasLoaded = agentIsLoaded()
+        _ = Child.run(URL(fileURLWithPath: "/bin/launchctl"),
+                      ["disable", "gui/\(getuid())/\(agentLabel)"], timeout: 20)
+        guard wasLoaded else { return false }
         _ = Child.run(URL(fileURLWithPath: "/bin/launchctl"),
                       ["bootout", "gui/\(getuid())/\(agentLabel)"], timeout: 20)
         for _ in 0..<20 {

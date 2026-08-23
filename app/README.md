@@ -91,11 +91,16 @@ inherit the grant. A full deletion sweep runs weekly, not every cycle.
 **It owns the search endpoint.** It runs `vec daemon` as a child on the same
 Unix socket, so `apple-index search` and the skill work unchanged.
 
-🛑 **It boots the launchd agent out first.** They bind the same socket path and
-the second one wins the file while the first keeps a socket nobody reaches. Two
-daemons raced this socket twice during development and one search took 10.7
-seconds. `make install` unloads `com.boulderhopkins.apple-index`, and the window
-says it did.
+🛑 **It boots the launchd agent out first, and disables it.** They bind the same
+socket path, the second one wins the file, and the first keeps a socket nobody
+reaches. Two daemons raced this socket twice during development and one search
+took 10.7 seconds.
+
+⚠️ **Bootout alone is not enough.** The plist stays in `~/Library/LaunchAgents`
+with `RunAtLoad`, so the agent returns at the next login and the two race in
+whatever order they start. `launchctl disable` is recorded in launchd's override
+database and survives a reboot. **`make uninstall` re-enables it** — without
+that, removing the app would leave the machine with no search endpoint at all.
 
 **It shows status**: per source records, chunks, last read and last error; the
 embed backlog with a rate; permission state per store; the index size; and the
