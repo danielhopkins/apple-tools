@@ -1741,6 +1741,77 @@ def warn_security(db, path, force=False):
     sys.stderr.write("\n")
 
 
+AGENT_LABEL = "com.boulderhopkins.apple-index"
+AGENT_PLIST = os.path.expanduser(
+    "~/Library/LaunchAgents/%s.plist" % AGENT_LABEL)
+
+
+def agent_template():
+    """The plist template, in either layout.
+
+    🛑 A brew install has no `make install-agent`: the lab Makefile does not
+    ship. Without this command the shipped template is a file nobody can use,
+    which is what v26.822.1 and .2 released.
+    """
+    for candidate in (os.path.join(HERE, "%s.plist.in" % AGENT_LABEL),
+                      os.path.join(os.path.dirname(HERE), "%s.plist.in" % AGENT_LABEL)):
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def cmd_agent(opts):
+    """Install or remove the launchd agent that keeps the daemon warm."""
+    if opts.action == "uninstall":
+        subprocess.run(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), AGENT_LABEL)],
+                       capture_output=True)
+        if os.path.exists(AGENT_PLIST):
+            os.remove(AGENT_PLIST)
+        print("removed %s" % AGENT_LABEL)
+        return
+
+    template = agent_template()
+    if not template:
+        die("cannot find %s.plist.in beside %s" % (AGENT_LABEL, HERE))
+    if not os.path.isfile(VEC):
+        die("cannot find the vec binary at %s" % VEC)
+
+    log_dir = os.path.dirname(opts.db)
+    secure_db_path(opts.db)
+    with open(template) as handle:
+        body = handle.read()
+    for key, value in (("@VEC@", VEC), ("@INDEXDIR@", HERE),
+                       ("@HOME@", os.path.expanduser("~")),
+                       ("@LOGDIR@", log_dir),
+                       ("@PATH@", "/usr/bin:/bin:/usr/sbin:/sbin")):
+        body = body.replace(key, value)
+    os.makedirs(os.path.dirname(AGENT_PLIST), exist_ok=True)
+    with open(AGENT_PLIST, "w") as handle:
+        handle.write(body)
+
+    # ⚠️ bootout is asynchronous. Bootstrapping straight after it fails with
+    # "Input/output error" because the old service is still tearing down.
+    subprocess.run(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), AGENT_LABEL)],
+                   capture_output=True)
+    for _ in range(10):
+        probe = subprocess.run(
+            ["launchctl", "print", "gui/%d/%s" % (os.getuid(), AGENT_LABEL)],
+            capture_output=True)
+        if probe.returncode != 0:
+            break
+        time.sleep(1)
+    result = subprocess.run(
+        ["launchctl", "bootstrap", "gui/%d" % os.getuid(), AGENT_PLIST],
+        capture_output=True, text=True)
+    if result.returncode != 0:
+        die("launchctl bootstrap failed: %s" % result.stderr.strip())
+    print("installed %s" % AGENT_LABEL)
+    print("  runs:  %s daemon" % VEC)
+    print("  log:   %s/daemon.log" % log_dir)
+    print("⚠️  The agent SERVES searches and cannot INGEST: a launchd agent has")
+    print("   no Full Disk Access. Refresh from a terminal: apple-index refresh")
+
+
 def cmd_daemon(opts):
     log_path = os.path.join(os.path.dirname(opts.db), "daemon.log")
     if opts.action == "status":
@@ -2425,6 +2496,11 @@ def main():
     d.add_argument("--refresh", type=int, default=300)
     d.add_argument("--socket", default=DEFAULT_SOCKET)
     d.set_defaults(func=cmd_daemon)
+
+    ag = sub.add_parser("agent",
+                        help="install or remove the launchd agent")
+    ag.add_argument("action", choices=["install", "uninstall"])
+    ag.set_defaults(func=cmd_agent)
 
     rf = sub.add_parser("refresh",
                         help="ingest, embed and reload — run this from a terminal")

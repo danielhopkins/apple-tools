@@ -297,8 +297,23 @@ func coremlDirectory(_ args: Args) -> URL {
 }
 
 func makeCoreMLEmbedder(_ args: Args, wantBatch: Int = 32) -> CoreMLEmbedder {
+    // 🛑 THE BACKEND DEPENDS ON THE BATCH, and the winner flips between them.
+    //
+    //   batch 32 (bulk embed): GPU 1041 chunks/sec, ANE 737. GPU wins.
+    //   batch 1  (one query):  ANE 0.9 ms, GPU 3.7-6.9 ms. ANE wins by 7x.
+    //
+    // 🛑 `.all` IS NOT THE ANE. Core ML places the model per load, and three
+    // alternating rounds gave 2.9 ms once and 6.4-6.9 ms twice for the same
+    // flag. `.cpuAndNeuralEngine` forces it and measured 0.9-1.0 ms in every
+    // round. A single run of `.all` looked like a 2x win and was noise.
+    //
+    // ⚠️ This mixes two numerics: the corpus is embedded on the GPU and a query
+    // on the ANE, which agree to about 1e-5. Differences that size have flipped
+    // the adaptive fusion rule before, so it was checked rather than assumed —
+    // `eval.py` scores MRR 0.535 on either backend.
+    let defaultUnits = wantBatch == 1 ? "cpuAndNeuralEngine" : "cpuAndGPU"
     let units: MLComputeUnits
-    switch args.str("units") ?? "cpuAndGPU" {
+    switch args.str("units") ?? defaultUnits {
     case "all": units = .all
     case "cpuOnly": units = .cpuOnly
     case "cpuAndNeuralEngine": units = .cpuAndNeuralEngine

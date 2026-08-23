@@ -9,7 +9,7 @@
        PyTorch and no virtualenv, and it holds 110 MB against 661 MB. -->
   <key>ProgramArguments</key>
   <array>
-    <string>@LAB@/vec/.build/release/vec</string>
+    <string>@VEC@</string>
     <string>daemon</string>
     <string>--db</string><string>@HOME@/Library/Application Support/apple-tools/lab-index.db</string>
     <string>--socket</string><string>@HOME@/Library/Application Support/apple-tools/index.sock</string>
@@ -27,7 +27,7 @@
     <key>HOME</key><string>@HOME@</string>
   </dict>
 
-  <key>WorkingDirectory</key><string>@LAB@</string>
+  <key>WorkingDirectory</key><string>@INDEXDIR@</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
 

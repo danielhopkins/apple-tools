@@ -377,11 +377,60 @@ socket, so `index.py` and `apple-index` cannot tell which one answered.
 
 | | `daemon.py` (PyTorch) | `vec daemon` (Core ML) |
 |---|---|---|
-| resident, idle | 661 MB | **110 MB** |
-| resident, after 3 searches | 661 MB | 218 MB |
-| search, warm | ~50 ms | **15 ms** |
-| end to end, warm | 212–296 ms | **190 ms** |
-| first search | — | 355 ms (loads the bucket) |
+| resident, idle | 661 MB | 112 MB, **474 MB warm** |
+| search, warm | ~50 ms | **5.3 ms** |
+| end to end, warm | 212–296 ms | **140 ms** |
+| first search | — | ~43 ms (loads the bucket) |
+
+⚠️ **An earlier version of this table said 15 ms, and that was a best case
+inside a burst reported as the median.** Measured properly — 12 requests
+straight to the socket, no process start — the first implementation ran at
+**52.6 ms median**. Two changes took it to 5.3 ms, and both are below.
+
+### 🛑 The scan was 238,697 separate function calls
+
+The first implementation converted one row at a time with `vDSP_vflt8` inside
+the loop. The work is 92 MFLOP over 91 MB, which no machine should need 52 ms
+for. Converting the whole matrix to `Float` once at load and running **one
+`cblas_sgemv`** cut the request from 52.6 ms to 9.1 ms.
+
+It costs memory: 366 MB of float instead of 91 MB of int8, so the daemon holds
+474 MB warm. That is still well under the 661 MB it replaces.
+
+Where a 9.1 ms request went afterwards:
+
+| step | median | share |
+|---|---|---|
+| embed the query | 6.70 ms | 74% |
+| `cblas_sgemv` over 238,697 vectors | 1.80 ms | 20% |
+| pick the top 120 | 0.40 ms | 4% |
+
+**So a GPU matrix multiply was never the answer.** It could save at most 1.8 ms
+of 9.1, and Metal dispatch would take part of that back.
+
+### 🛑 `.all` is not the Neural Engine
+
+Forcing the ANE for the single-query path took the embed from 6.7 ms to
+**0.9 ms**, and the whole request to **3.2 ms**.
+
+| round | `.cpuAndGPU` | `.all` | `.cpuAndNeuralEngine` |
+|---|---|---|---|
+| 1 | 6.80 ms | 2.90 ms | **1.00 ms** |
+| 2 | 3.70 ms | 6.40 ms | **0.90 ms** |
+| 3 | 6.90 ms | 6.90 ms | **0.90 ms** |
+
+⚠️ **`.all` lets Core ML place the model per load, and it placed it differently
+between runs.** One measurement of `.all` looked like a 2× win and was noise; a
+second run of the same flag was no faster than the GPU. `.cpuAndNeuralEngine`
+forces it and repeats.
+
+⚠️ **This mixes two numerics**: the corpus is embedded on the GPU and a query on
+the ANE, which agree to about 1e-5. Differences that size have flipped the
+adaptive fusion rule in this same tool, so it was checked: `eval.py` scores
+**MRR 0.535 on either backend**.
+
+**The rule is now: batch 32 on the GPU, batch 1 on the Neural Engine.** The
+winner flips between them, and neither is a safe default for both.
 
 🛑 **It serves and it does not ingest**, for the reason `daemon.py` learned the
 hard way: reading the index needs no grant, and reading Mail, Notes and Messages

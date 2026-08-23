@@ -284,8 +284,14 @@ run`. No PyTorch and no virtualenv in the embedding path.
   has written it compares the port to itself and always passes.
 
 **The PyTorch daemon is retired.** `vec daemon` holds the model and the vectors
-and answers the same socket: **110 MB idle against 661 MB, and 15 ms per search
-against about 50 ms.** End to end a warm search costs 190 ms.
+and answers the same socket: **5.3 ms per search against about 50 ms**, and
+474 MB warm against 661 MB. End to end a warm search costs 140 ms.
+
+⚠️ **Two measurement mistakes are worth carrying into the app.** A first version
+of this line said 15 ms, which was a best case inside a burst. And the scan
+looked like it needed a GPU until it was split: the query embedding was 74% of
+the request and the matrix multiply 20%. **Split a latency before optimising
+it.**
 
 🛑 **It serves and it does not ingest.** Reading the index needs no grant;
 reading Mail, Notes and Messages needs Full Disk Access, which a launchd agent

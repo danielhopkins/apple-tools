@@ -25,7 +25,13 @@ final class WarmIndex {
     private let lock = NSLock()
 
     private(set) var cids: [Int64] = []
-    private(set) var matrix: [Int8] = []          // row-major, `dim` per row
+    // 🛑 FLOAT, not the stored Int8. Converting one row at a time inside the
+    // scan meant 238,697 separate `vDSP_vflt8` calls, and that — not the
+    // hardware — was the whole cost: median 52.6 ms for 92 MFLOP over 91 MB.
+    // Converting once at load and running ONE `cblas_sgemv` costs 366 MB
+    // instead of 91 MB, which is still far below the 661 MB of the PyTorch
+    // daemon this replaces.
+    private(set) var matrix: [Float] = []         // row-major, `dim` per row
     private(set) var tools: [String] = []
     private(set) var fingerprint = ""
     private(set) var chunks = 0
@@ -35,7 +41,10 @@ final class WarmIndex {
     var storedModel: String { embedder.name }
     /// The name the protocol uses. See `CoreMLEmbedder.shortName`.
     var model: String { CoreMLEmbedder.shortName }
-    var megabytes: Double { Double(matrix.count) / 1e6 }
+    /// What the vectors cost as stored, so `ping` keeps reporting the index
+    /// size rather than the working copy.
+    var megabytes: Double { Double(cids.count * dim) / 1e6 }
+    var residentMegabytes: Double { Double(matrix.count * 4) / 1e6 }
 
     init(path: String, embedder: CoreMLEmbedder) {
         self.path = path
@@ -67,7 +76,7 @@ final class WarmIndex {
         let (mark, liveChunks) = Self.fingerprint(db)
 
         var freshCids: [Int64] = []
-        var freshMatrix: [Int8] = []
+        var packed: [Int8] = []
         var freshTools: [String] = []
         // The tool comes along for the ride so a --tool search masks the matrix
         // before scoring rather than filtering results afterwards.
@@ -82,11 +91,19 @@ final class WarmIndex {
                   Int(sqlite3_column_bytes(statement, 1)) == dim else { continue }
             freshCids.append(sqlite3_column_int64(statement, 0))
             let bytes = blob.assumingMemoryBound(to: Int8.self)
-            freshMatrix.append(contentsOf: UnsafeBufferPointer(start: bytes, count: dim))
+            packed.append(contentsOf: UnsafeBufferPointer(start: bytes, count: dim))
             freshTools.append(sqlite3_column_text(statement, 2)
                                 .map { String(cString: $0) } ?? "")
         }
         sqlite3_finalize(statement)
+
+        // One conversion for the whole matrix, not one per row per query.
+        var freshMatrix = [Float](repeating: 0, count: packed.count)
+        packed.withUnsafeBufferPointer { source in
+            if let base = source.baseAddress {
+                vDSP_vflt8(base, 1, &freshMatrix, 1, vDSP_Length(packed.count))
+            }
+        }
 
         lock.lock()
         cids = freshCids
@@ -96,8 +113,9 @@ final class WarmIndex {
         chunks = liveChunks
         lock.unlock()
 
-        log(String(format: "%d vectors warm (%.0f MB) in %.1fs  index=%@",
-                   freshCids.count, Double(freshMatrix.count) / 1e6,
+        log(String(format: "%d vectors warm (%.0f MB stored, %.0f MB float) in %.1fs  index=%@",
+                   freshCids.count, Double(packed.count) / 1e6,
+                   Double(freshMatrix.count * 4) / 1e6,
                    Date().timeIntervalSince(started), mark))
     }
 
@@ -109,42 +127,61 @@ final class WarmIndex {
         return mark != fingerprint
     }
 
+    /// Where a request's time goes, reported so "the scan is slow" stays a
+    /// measurement rather than a guess.
+    private(set) var lastEmbedMs = 0.0
+    private(set) var lastScanMs = 0.0
+    private(set) var lastRankMs = 0.0
+
     func search(query: String, limit: Int, tool: String?) throws -> [(Int64, Float)] {
+        let embedStarted = Date()
         let vector = try embedder.encodeQuery(query)
+        lastEmbedMs = Date().timeIntervalSince(embedStarted) * 1000
 
         lock.lock()
         let cids = self.cids, matrix = self.matrix, tools = self.tools
         lock.unlock()
         if cids.isEmpty { return [] }
 
+        // ONE matrix-vector multiply for the whole index. Accelerate picks the
+        // kernel; the work is 92 MFLOP, which is nothing next to the per-row
+        // call overhead it replaces.
+        let rows = cids.count
+        let scanStarted = Date()
+        var scores = [Float](repeating: 0, count: rows)
+        matrix.withUnsafeBufferPointer { source in
+            guard let base = source.baseAddress else { return }
+            cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                        Int32(rows), Int32(dim), 1.0 / 127.0,
+                        base, Int32(dim), vector, 1, 0.0, &scores, 1)
+        }
+
+        // 🛑 The tool filter still runs BEFORE the ranking, which is the part
+        // that matters. Skipping a row while picking the top K is the same
+        // thing as masking the matrix, because every row's score is
+        // independent. What must never happen is filtering the RESULTS of a
+        // global ranking — that returned 4 rows for `--tool notes --limit 30`.
+        lastScanMs = Date().timeIntervalSince(scanStarted) * 1000
+        let rankStarted = Date()
         var best: [(Int64, Float)] = []
-        var scratch = [Float](repeating: 0, count: dim)
-        matrix.withUnsafeBufferPointer { rows in
-            guard let base = rows.baseAddress else { return }
-            for index in 0..<cids.count {
-                // 🛑 Mask BEFORE scoring. A tool filter applied to the results
-                // keeps whichever records survived a GLOBAL ranking, which on a
-                // 68%-mail index is very few.
-                if let tool = tool, tools[index] != tool { continue }
-                vDSP_vflt8(base + index * dim, 1, &scratch, 1, vDSP_Length(dim))
-                var dot: Float = 0
-                vDSP_dotpr(vector, 1, scratch, 1, &dot, vDSP_Length(dim))
-                let score = dot / 127.0
-                if score <= 0 { continue }
-                if best.count < limit {
-                    best.append((cids[index], score))
-                    if best.count == limit { best.sort { $0.1 > $1.1 } }
-                } else if score > best[best.count - 1].1 {
-                    best[best.count - 1] = (cids[index], score)
-                    var position = best.count - 1
-                    while position > 0 && best[position].1 > best[position - 1].1 {
-                        best.swapAt(position, position - 1)
-                        position -= 1
-                    }
+        for index in 0..<rows {
+            if let tool = tool, tools[index] != tool { continue }
+            let score = scores[index]
+            if score <= 0 { continue }
+            if best.count < limit {
+                best.append((cids[index], score))
+                if best.count == limit { best.sort { $0.1 > $1.1 } }
+            } else if score > best[best.count - 1].1 {
+                best[best.count - 1] = (cids[index], score)
+                var position = best.count - 1
+                while position > 0 && best[position].1 > best[position - 1].1 {
+                    best.swapAt(position, position - 1)
+                    position -= 1
                 }
             }
         }
         if best.count < limit { best.sort { $0.1 > $1.1 } }
+        lastRankMs = Date().timeIntervalSince(rankStarted) * 1000
         return best
     }
 }
@@ -254,6 +291,7 @@ func commandDaemon(_ args: Args) {
                          "vectors": warm.cids.count,
                          "fingerprint": warm.fingerprint,
                          "megabytes": (warm.megabytes * 10).rounded() / 10,
+                         "resident_megabytes": (warm.residentMegabytes * 10).rounded() / 10,
                          "chunks": warm.chunks,
                          "refresh_enabled": false,
                          "reload_enabled": reloadEvery > 0]
@@ -285,6 +323,9 @@ func commandDaemon(_ args: Args) {
                                            tool: request["tool"] as? String)
                 reply = ["ok": true,
                          "hits": hits.map { ["cid": $0.0, "score": $0.1] },
+                         "embed_ms": (warm.lastEmbedMs * 10).rounded() / 10,
+                         "scan_ms": (warm.lastScanMs * 10).rounded() / 10,
+                         "rank_ms": (warm.lastRankMs * 10).rounded() / 10,
                          "elapsed_ms": (Date().timeIntervalSince(started) * 10000)
                                         .rounded() / 10]
             case "reload":

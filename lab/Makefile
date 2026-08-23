@@ -35,7 +35,8 @@ uninstall:
 install-agent: build
 	@test -x vec/.build/release/vec || { echo "error: run 'make build' first"; exit 1; }
 	@mkdir -p "$(HOME)/Library/LaunchAgents" "$(LOGDIR)"
-	@sed -e 's|@LAB@|$(LAB)|g' -e 's|@HOME@|$(HOME)|g' \
+	@sed -e 's|@VEC@|$(LAB)/vec/.build/release/vec|g' \
+	     -e 's|@INDEXDIR@|$(LAB)|g' -e 's|@HOME@|$(HOME)|g' \
 	     -e 's|@PATH@|/usr/bin:/bin:/usr/sbin:/sbin:$(HOME)/bin|g' \
 	     -e 's|@LOGDIR@|$(LOGDIR)|g' \
 	     $(AGENT).plist.in > "$(PLIST)"
