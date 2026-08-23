@@ -232,7 +232,6 @@ mail **without** bodies. The window says the list is a guess.
 
 - A DMG and a cask. The app itself is notarized and stapled (`make notarize`),
   and `spctl` accepts it.
-- The CLIs inside `Contents/Helpers/`, signed with the app.
 - The XPC proxy that would let a terminal borrow the app's grant.
 - Encryption at rest, the container placement probe, per-source opt-in and
   revocation detection.
@@ -251,12 +250,40 @@ DMG is stapled too.
 Then attach the DMG to a GitHub release at `v<VERSION>` and update
 `Casks/apple-tools-app.rb`.
 
-🛑 **The cask DEPENDS ON the formula; it does not conflict with it.** The design
-doc calls for `conflicts_with formula: "apple-tools"`, which will be right once
-the app carries the CLIs in `Contents/Helpers`. It does not yet: `Paths` falls
-through to `/opt/homebrew/opt/apple-tools/libexec/index` and `/opt/homebrew/bin`,
-so without the formula the app has no `apple` dispatcher, no `index.py`, no
-`vec` and no Core ML packages.
+**The app is self-contained**, 290 MB:
+
+```
+Contents/Helpers/          the 8 Mach-O CLIs and the `apple` dispatcher
+Contents/Resources/notes/  apple-notes + its stdlib-only Python modules
+Contents/Resources/index/  index.py, vec, models/, shortcuts/
+```
+
+`app/stage.sh` assembles it from the repo's own build outputs, and a build
+phase copies it in and signs it. 🛑 **Nothing falls through to Homebrew any
+more**, and `codesign --verify --deep --strict` passes.
+
+🛑 **Only EXECUTABLES may live in `Contents/Helpers`.** `codesign` treats every
+file there as CODE, so `notestore.proto` sitting beside `apple-notes` failed the
+outer verify with *"code object is not signed at all — In subcomponent:
+.../notestore.proto"*. The Notes payload moved under `Resources`, which is
+sealed as resources instead, and the app puts that directory on `PATH` so the
+dispatcher still finds `apple-notes`.
+
+🛑 **Shell scripts in `Helpers` need signing too.** The `apple` dispatcher is a
+script, and skipping it because it is not Mach-O produced the same failure.
+
+🛑 **A post-build phase breaks the outer seal.** Xcode signs the app at the end
+of the build, before the phase adds anything, so the script re-signs the wrapper
+itself — **without `--deep`**, which would strip the hardened runtime from every
+helper it had just given one.
+
+🛑 **The cask neither depends on nor conflicts with the formula.** The design
+doc calls for `conflicts_with`, and that is wrong here. The cask puts **no**
+binary on `PATH` deliberately: a tool typed into a terminal is attributed to the
+terminal, and the three disclaiming tools key their grant to the **binary
+path** — so exposing the bundled copies would ask the user to grant Calendar,
+Reminders and Contacts again, at a new path, while the formula's copies already
+hold them.
 
 🛑 **`brew zap` deletes the index AND its Keychain key.** Leaving an encrypted
 image and a key behind after an uninstall is worse than deleting them.

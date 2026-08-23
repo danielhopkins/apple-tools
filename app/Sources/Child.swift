@@ -49,8 +49,15 @@ enum Child {
         var env = ProcessInfo.processInfo.environment
         env["APPLE_TOOLS_OWN_TCC_IDENTITY"] = "1"
         env["APPLE_TOOLS_TCC_HOST"] = "app"
-        if let helpers = Paths.helpersDirectory {
-            env["PATH"] = helpers.path + ":/usr/bin:/bin:/usr/sbin:/sbin"
+        // ⚠️ The notes directory goes on PATH too. `apple-notes` and its Python
+        // modules live under Resources rather than Helpers, and the `apple`
+        // dispatcher finds a tool that is not beside it by looking at PATH.
+        var pathParts: [String] = []
+        if let helpers = Paths.helpersDirectory { pathParts.append(helpers.path) }
+        if let notes = Paths.notesDirectory { pathParts.append(notes.path) }
+        if !pathParts.isEmpty {
+            env["PATH"] = (pathParts + ["/usr/bin", "/bin", "/usr/sbin", "/sbin"])
+                .joined(separator: ":")
         }
         if let models = Paths.modelsDirectory {
             env["VEC_COREML_DIR"] = models.path

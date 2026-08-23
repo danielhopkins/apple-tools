@@ -7,16 +7,20 @@ cask "apple-tools-app" do
   desc "Menu bar app that indexes your Apple data on a schedule and serves searches"
   homepage "https://github.com/danielhopkins/apple-tools"
 
-  # 🛑 DEPENDS ON THE FORMULA, it does NOT conflict with it.
+  # 🛑 IT DOES NOT DEPEND ON THE FORMULA, AND IT DOES NOT CONFLICT WITH IT.
   #
-  # The design doc calls for `conflicts_with formula: "apple-tools"`, on the
-  # grounds that both would install an `apple` and a `reminders`. That will be
-  # right once the app carries the CLIs in `Contents/Helpers`. It does not yet:
-  # `Paths.toolsRoot` looks in the bundle first and then falls through to
-  # `/opt/homebrew/opt/apple-tools/libexec/index`, and `Paths.helpersDirectory`
-  # falls through to `/opt/homebrew/bin`. Without the formula the app has no
-  # `apple` dispatcher, no `index.py`, no `vec` and no Core ML packages.
-  depends_on formula: "apple-tools"
+  # The app carries everything it needs: the eight CLIs in `Contents/Helpers`,
+  # `apple-notes` and its Python modules in `Contents/Resources/notes`, and
+  # `index.py`, `vec` and the Core ML packages in `Contents/Resources/index`.
+  # Nothing falls through to Homebrew any more.
+  #
+  # ⚠️ It deliberately puts NO binary on PATH, which is why the design doc's
+  # `conflicts_with formula: "apple-tools"` is wrong here. A tool typed into a
+  # terminal is attributed to the TERMINAL, and the three disclaiming tools key
+  # their grant to the BINARY PATH — so exposing the bundled copies would ask
+  # the user to grant Calendar, Reminders and Contacts all over again, at a new
+  # path, while the formula's copies already hold them. Leave the formula to
+  # serve the terminal and let the app serve itself.
   depends_on macos: :sonoma
 
   app "AppleTools.app"
@@ -48,7 +52,12 @@ cask "apple-tools-app" do
       System Settings > Privacy & Security > Full Disk Access > +
 
     macOS restarts the app when you do. It then indexes every five minutes, on
-    wake and on unlock, and answers `apple-index search`.
+    wake and on unlock, and answers searches on its socket.
+
+    The app is self-contained. For the `apple` and `apple-index` commands in
+    your own terminal, install the formula as well:
+
+      brew install danielhopkins/formulae/apple-tools
 
     The index holds the decoded plaintext of your mail. It lives in an AES-256
     disk image that only this app mounts, and it is readable by anything running

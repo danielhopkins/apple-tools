@@ -76,6 +76,13 @@ targets:
         # what this app measured. Harmless if the claim is wrong.
         com.apple.security.personal-information.calendars: true
         com.apple.security.personal-information.addressbook: true
+    postBuildScripts:
+      # 🛑 A build phase, so Xcode signs the OUTER bundle afterwards. Copying
+      # helpers in from the Makefile after the build would leave the outer
+      # signature stale, and re-signing it by hand is what `--deep` is for —
+      # which is the thing not to do.
+      - script: "\"$SRCROOT/sign-helpers.sh\""
+        name: Embed and sign the CLIs
     info:
       path: Info.plist
       properties:

@@ -117,16 +117,28 @@ enum Paths {
             candidates.append(URL(fileURLWithPath:
                 NSString(string: key).expandingTildeInPath))
         }
-        if let bundled = Bundle.main.builtInPlugInsURL?
-            .deletingLastPathComponent().appendingPathComponent("Helpers", isDirectory: true) {
-            candidates.append(bundled)
-        }
+        // ⚠️ Built from `bundleURL`, NOT from `builtInPlugInsURL`. That
+        // property is nil when the bundle has no `Contents/PlugIns`, which this
+        // one does not, so the whole candidate silently disappeared and the app
+        // fell through to Homebrew even when it carried its own helpers.
+        candidates.append(Bundle.main.bundleURL
+            .appendingPathComponent("Contents/Helpers", isDirectory: true))
         candidates.append(URL(fileURLWithPath: "/opt/homebrew/bin"))
         candidates.append(URL(fileURLWithPath: "/usr/local/bin"))
         candidates.append(FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("bin"))
         return candidates.first { exists($0.appendingPathComponent("apple")) }
     }()
+
+    /// `apple-notes` and its stdlib-only Python modules, which must stay in one
+    /// directory because it imports them as siblings.
+    ///
+    /// ⚠️ Under `Resources`, not `Helpers`. See `app/stage.sh`.
+    static var notesDirectory: URL? {
+        guard let resources = Bundle.main.resourceURL else { return nil }
+        let bundled = resources.appendingPathComponent("notes", isDirectory: true)
+        return exists(bundled.appendingPathComponent("apple-notes")) ? bundled : nil
+    }
 
     static var python: URL { URL(fileURLWithPath: "/usr/bin/python3") }
 
