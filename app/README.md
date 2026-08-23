@@ -88,14 +88,34 @@ Three facts that cannot all be true of a healthy TCC:
 the user. The contacts denial was first recorded by this app's own 20s deadline
 bug (see above), and it has outlived the fix.
 
-**What has NOT been tried**, in the order worth trying:
+🛑 **A BRAND NEW BUNDLE ID GETS THE SAME THREE ANSWERS.** A copy of the app,
+re-signed under `com.boulderhopkins.apple-tools-idtest` and launched clean,
+reported reminders **already granted**, contacts **denied** and calendar
+refused — with no dialog for any of them. An identity TCC has never seen cannot
+hold a decision, so the answers come from a cache that outlives both the bundle
+id and `tccutil`.
 
-1. **Reboot.** `tccd` caches per-client decisions, and repeated
-   reset-and-relaunch cycles are exactly what poisons that cache. Free.
-2. **Restart the user `tccd`** rather than the whole machine.
-3. **Change the bundle id.** A new id is a clean TCC identity. 🛑 It costs the
-   Full Disk Access grant, which the user must then give again by hand — which
-   is why the id is called load-bearing at the top of this file.
+⚠️ **That test is not airtight.** The copy was made from the signed bundle, and
+LaunchServices may still have associated the path with the original bundle id.
+Re-register with `lsregister -f` before repeating it.
+
+**Two things are ruled out**, both measured rather than assumed:
+
+- **Notarization.** The app is notarized, stapled, and accepted by `spctl`.
+  Nothing changed.
+- **Restarting `tccd`.** System Integrity Protection refuses it:
+  `launchctl kickstart -k gui/<uid>/com.apple.tccd` returns *"Operation not
+  permitted while System Integrity Protection is engaged"*. Killing the process
+  is ignored.
+
+**What is left, in order:**
+
+1. **Reboot.** The only remaining way to restart `tccd`, and it clears the
+   LaunchServices cache as well. Untried.
+2. **Change the bundle id for real**, through `project.yml` rather than by
+   editing a signed copy. 🛑 It costs the Full Disk Access grant, which the user
+   must then give again by hand — the reason the id is called load-bearing at
+   the top of this file.
 
 ### ⚠️ How this was misdiagnosed, and how to avoid repeating it
 
