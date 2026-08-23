@@ -93,8 +93,22 @@ final class Vault: ObservableObject {
             kSecAttrService as String: keychainService,
             kSecAttrAccount as String: keychainAccount,
         ]
-        SecItemDelete(query as CFDictionary)
+        // 🛑 NO BLIND `SecItemDelete` FIRST. A delete-then-add is the usual
+        // recipe and it is the wrong shape: the query is a MATCH, not an
+        // address, and anything the attributes happen to match goes with it.
+        // Update an existing item instead, and add only when there is none.
+        var probe = query
+        probe[kSecUseDataProtectionKeychain as String] = true
+        if SecItemCopyMatching(probe as CFDictionary, nil) == errSecSuccess {
+            let update = [kSecValueData as String: key.data(using: .utf8)!]
+            let status = SecItemUpdate(probe as CFDictionary, update as CFDictionary)
+            guard status == errSecSuccess else {
+                throw Failure("cannot update the vault key: OSStatus \(status)")
+            }
+            return
+        }
         var add = query
+        add[kSecUseDataProtectionKeychain as String] = true
         add[kSecValueData as String] = key.data(using: .utf8)!
         // ⚠️ `AfterFirstUnlock`, not `WhenUnlocked`. The app refreshes the
         // index on a schedule while the screen is locked, and a key that
@@ -113,6 +127,7 @@ final class Vault: ObservableObject {
             kSecAttrAccount as String: keychainAccount,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecUseDataProtectionKeychain as String: true,
         ]
         var item: CFTypeRef?
         guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
@@ -126,6 +141,7 @@ final class Vault: ObservableObject {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: keychainService,
             kSecAttrAccount as String: keychainAccount,
+            kSecUseDataProtectionKeychain as String: true,
         ] as CFDictionary)
     }
 

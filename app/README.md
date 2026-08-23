@@ -237,3 +237,35 @@ mail **without** bodies. The window says the list is a guess.
 - Encryption at rest, the container placement probe, per-source opt-in and
   revocation detection.
 - `SMAppService.mainApp.register()` for launch at login.
+
+## Releasing the app
+
+```
+make dmg     # build, notarize the app, build the DMG, notarize and staple it
+```
+
+⚠️ **Two notarizations, and both are needed.** The app inside is one artifact
+and the DMG is another. Gatekeeper checks the one the user downloads, so the
+DMG is stapled too.
+
+Then attach the DMG to a GitHub release at `v<VERSION>` and update
+`Casks/apple-tools-app.rb`.
+
+🛑 **The cask DEPENDS ON the formula; it does not conflict with it.** The design
+doc calls for `conflicts_with formula: "apple-tools"`, which will be right once
+the app carries the CLIs in `Contents/Helpers`. It does not yet: `Paths` falls
+through to `/opt/homebrew/opt/apple-tools/libexec/index` and `/opt/homebrew/bin`,
+so without the formula the app has no `apple` dispatcher, no `index.py`, no
+`vec` and no Core ML packages.
+
+🛑 **`brew zap` deletes the index AND its Keychain key.** Leaving an encrypted
+image and a key behind after an uninstall is worse than deleting them.
+
+⚠️ **The notarytool credential is a keychain profile named `MiniMusic`**, after
+the first app it was stored for. Restore it with:
+
+```
+xcrun notarytool store-credentials "MiniMusic" \
+  --key ~/.appstoreconnect/private_keys/AuthKey_G5JB79H867.p8 \
+  --key-id G5JB79H867 --issuer <UUID from App Store Connect>
+```

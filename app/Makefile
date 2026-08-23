@@ -19,7 +19,7 @@ BUNDLE_ID  := com.boulderhopkins.apple-tools
 export APP_VERSION := $(VERSION)
 export APP_BUILD   := $(BUILD)
 
-.PHONY: generate build release run install uninstall clean stop grant logs notarize
+.PHONY: generate build release dmg run install uninstall clean stop grant logs notarize
 
 ## Regenerate the Xcode project from project.yml
 generate:
@@ -109,6 +109,27 @@ notarize: build
 	  --keychain-profile "$(PROFILE)" --wait
 	xcrun stapler staple "$(PRODUCT)"
 	spctl -a -vv "$(PRODUCT)"
+
+## Build a notarized, stapled DMG for the cask
+##
+## ⚠️ TWO notarizations, and both are needed. The app inside is notarized by
+## `notarize`; the DMG itself is a separate artifact and Gatekeeper checks the
+## one the user actually downloads. Stapling the DMG is what makes it open
+## without a network round trip.
+DMG := $(DERIVED)/$(APP)-$(VERSION).dmg
+
+dmg: notarize
+	rm -rf $(DERIVED)/dmgroot $(DMG)
+	mkdir -p $(DERIVED)/dmgroot
+	cp -R "$(PRODUCT)" $(DERIVED)/dmgroot/
+	ln -s /Applications $(DERIVED)/dmgroot/Applications
+	hdiutil create -volname "$(APP)" -srcfolder $(DERIVED)/dmgroot \
+	  -ov -format UDZO -quiet "$(DMG)"
+	xcrun notarytool submit "$(DMG)" --keychain-profile "$(PROFILE)" --wait
+	xcrun stapler staple "$(DMG)"
+	spctl -a -vv -t open --context context:primary-signature "$(DMG)"
+	@shasum -a 256 "$(DMG)"
+	@ls -lh "$(DMG)"
 
 clean:
 	rm -rf $(DERIVED) $(APP).xcodeproj
