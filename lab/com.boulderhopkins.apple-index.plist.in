@@ -31,11 +31,22 @@
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
 
-  <!-- It watches the index every 60s and holds 110 MB idle. Keep it out of the
-       way of anything the user is actually doing. -->
-  <key>ProcessType</key><string>Background</string>
+  <!-- 🛑 `Interactive`, and NOT `Background` or `Adaptive`. The QoS class
+       decides which cores this runs on, and a person is waiting at a prompt.
+       Measured with one binary and one set of flags, changing only this key:
+
+         Background   scan 17.55 ms   total 43.50 ms
+         Adaptive     scan 17.90 ms   total 21.75 ms
+         Standard     scan  2.55 ms   total  4.60 ms
+         Interactive  scan  2.10 ms   total  4.20 ms
+
+       ⚠️ `Adaptive` is documented as raising a job while it works, and it did
+       not raise this one. Measure the key rather than reading it.
+       ⚠️ The daemon is idle almost always: it watches the index every 60s and
+       holds about 470 MB warm. `LowPriorityIO` stays, because the only disk
+       work it does is that background reload. -->
+  <key>ProcessType</key><string>Interactive</string>
   <key>LowPriorityIO</key><true/>
-  <key>Nice</key><integer>5</integer>
 
   <key>StandardOutPath</key><string>@LOGDIR@/daemon.log</string>
   <key>StandardErrorPath</key><string>@LOGDIR@/daemon.log</string>

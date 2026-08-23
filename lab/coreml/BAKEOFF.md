@@ -432,6 +432,44 @@ adaptive fusion rule in this same tool, so it was checked: `eval.py` scores
 **The rule is now: batch 32 on the GPU, batch 1 on the Neural Engine.** The
 winner flips between them, and neither is a safe default for both.
 
+### 🛑 launchd's `ProcessType` was worth more than every other change
+
+The agent ran 10× slower than the same binary started by hand. One key decides
+which cores it gets. Measured with one binary and one set of flags, changing
+only this:
+
+| ProcessType | embed | scan | total |
+|---|---|---|---|
+| `Background` | 24.40 ms | 17.55 ms | 43.50 ms |
+| `Adaptive` | 2.55 ms | 17.90 ms | 21.75 ms |
+| `Standard` | 1.15 ms | 2.55 ms | 4.60 ms |
+| **`Interactive`** | **1.30 ms** | **2.10 ms** | **4.20 ms** |
+
+⚠️ **`Adaptive` is documented as raising a job while it works, and it did not
+raise this one.** Measure the key rather than reading about it.
+
+The original plist said `Background` with `Nice 5`, chosen to keep a polling
+daemon out of the way. That was right for a process that polls and wrong for
+one that answers a person waiting at a prompt.
+
+### Two numbers, because they differ by 3×
+
+| | |
+|---|---|
+| one query after a 3 second pause | **16.1 ms** |
+| the same query inside a burst | 4.6 ms |
+
+The hardware powers down between requests. **16 ms is the number a person
+actually gets**; every "4 ms" figure in this file came from a tight loop.
+
+### ⚠️ The shipped model set has no batch-1 package
+
+`models/` holds three batch-32 packages, so the daemon pads one query into a
+32-row batch: **15.8 ms of embedding instead of 0.9 ms**. Adding an `s64-b1`
+package would fix it and costs **66 MB** on a 185 MB download, to save about
+15 ms of a ~140 ms end-to-end search that is dominated by Python process start.
+Left out on purpose; the trade is written here so the next person can take it.
+
 🛑 **It serves and it does not ingest**, for the reason `daemon.py` learned the
 hard way: reading the index needs no grant, and reading Mail, Notes and Messages
 needs Full Disk Access that a launchd agent does not have. A failing ingest
