@@ -291,6 +291,12 @@ private struct Frameworks: View {
                         Button("Open Settings…") { Grants.openPane(entry.pane) }
                             .controlSize(.small)
                     }
+                    // ⚠️ Only a person may start this. Each unanswered request
+                    // costs its full deadline with the app frontmost.
+                    if entry.state == .notDetermined {
+                        Button("Ask Again") { model.grants.requestAndRead(force: true) }
+                            .controlSize(.small)
+                    }
                 }
                 .font(.system(.body, design: .monospaced))
             }

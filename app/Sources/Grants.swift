@@ -59,8 +59,17 @@ final class Grants: ObservableObject {
     /// NEVER FIRED, on the main actor and off it alike: the reminders request
     /// occupies a cooperative thread without suspending, and the timer beside
     /// it was never scheduled. A `DispatchQueue.main.asyncAfter` does not care.
-    func requestAndRead() {
+    func requestAndRead(force: Bool = false) {
         read()
+        loadAttempts()
+        // 🛑 ASK ONCE, NOT ON EVERY LAUNCH. Each unanswered request costs its
+        // full deadline, and the app is frontmost with a Dock tile for the
+        // whole of it — three of them is a minute of stolen focus at every
+        // login, for prompts that never appear. If a grant is still open the
+        // window offers a button; a person pressing it is a different thing
+        // from the app deciding to interrupt.
+        let open = entries.filter { !$0.settled }
+        guard force || open.contains(where: { attempts[$0.name] == nil }) else { return }
         // 🛑 BECOME A REAL APP FOR THE LENGTH OF THE ASK. This is LSUIElement,
         // so it runs as an accessory: never frontmost, no Dock tile, no window.
         // ⚠️ It did not help here, and it stays because it is still correct: a
@@ -205,6 +214,23 @@ final class Grants: ObservableObject {
         }
     }
 
+    /// What the last run recorded, so a second launch does not ask again.
+    private func loadAttempts() {
+        guard attempts.isEmpty,
+              let data = try? Data(contentsOf: attemptsPath),
+              let parsed = try? JSONSerialization.jsonObject(with: data)
+                as? [String: Any],
+              let last = parsed["last_request"] as? [String: String]
+        else { return }
+        // ⚠️ "asking…" means the last run was killed mid-request. That is not
+        // an answer, so it must not count as one.
+        attempts = last.filter { $0.value != asking }
+    }
+
+    private var attemptsPath: URL {
+        Paths.supportDirectory.appendingPathComponent("app-grants.json")
+    }
+
     /// 🛑 The app writes this down because a terminal cannot ask the question.
     /// `authorizationStatus` is answered for the RESPONSIBLE process, so any
     /// probe run from a shell reports the shell's grants, never the app's.
@@ -215,7 +241,7 @@ final class Grants: ObservableObject {
                 $0[$1.name] = $1.state.rawValue },
             "last_request": attempts,
         ]
-        let path = Paths.supportDirectory.appendingPathComponent("app-grants.json")
+        let path = attemptsPath
         guard let data = try? JSONSerialization.data(withJSONObject: body,
                                                      options: [.prettyPrinted, .sortedKeys])
         else { return }
