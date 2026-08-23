@@ -63,6 +63,40 @@ second one was wrong, and it caused the failure it was written to diagnose. It
 is now ten minutes, and it exists only so a request nobody will ever answer
 cannot hold the chain for the life of the process.
 
+### 🛑 Unresolved: Calendar and Contacts hold a state nothing can clear
+
+**Reminders works. Calendar and Contacts do not, and the state behind them is
+not reachable from this machine.** Measured 2026-08-23 with the notarized,
+stapled app that `spctl` accepts:
+
+```
+reminders   granted [status 0]                          -> granted
+calendar    refused [status 0]                          -> notDetermined
+contacts    CNErrorDomain 100: Access Denied [status 2]  -> denied
+```
+
+Three facts that cannot all be true of a healthy TCC:
+
+1. **`tccutil reset AddressBook <bundle-id>` prints "Successfully reset" and
+   changes nothing.** The next launch reads `status 2` again, one second later.
+2. **System Settings → Privacy & Security → Contacts does not list the app at
+   all**, so there is no switch for the user to turn on either.
+3. **Reminders returned `granted` immediately after its own reset, with no
+   dialog**, which is only possible if the reset did not take.
+
+⚠️ **So the reminders grant is real and the other two are stuck**, not denied by
+the user. The contacts denial was first recorded by this app's own 20s deadline
+bug (see above), and it has outlived the fix.
+
+**What has NOT been tried**, in the order worth trying:
+
+1. **Reboot.** `tccd` caches per-client decisions, and repeated
+   reset-and-relaunch cycles are exactly what poisons that cache. Free.
+2. **Restart the user `tccd`** rather than the whole machine.
+3. **Change the bundle id.** A new id is a clean TCC identity. 🛑 It costs the
+   Full Disk Access grant, which the user must then give again by hand — which
+   is why the id is called load-bearing at the top of this file.
+
 ### ⚠️ How this was misdiagnosed, and how to avoid repeating it
 
 The dialog belongs to **`UserNotificationCenter`, which is a BACKGROUND

@@ -61,8 +61,11 @@ final class Grants: ObservableObject {
     // against it NEVER RAN — EventKit's reminders request occupies the actor
     // without suspending, so the timer beside it never got scheduled and the
     // "deadline" was no deadline at all.
-    private nonisolated let events = EKEventStore()
-    private nonisolated let contacts = CNContactStore()
+    // ⚠️ A FRESH STORE PER REQUEST. Apple's guidance is that a store must be
+    // created after the previous request settles, and a reused one is a
+    // documented source of a request that answers without prompting.
+    private nonisolated func newEventStore() -> EKEventStore { EKEventStore() }
+    private nonisolated func newContactStore() -> CNContactStore { CNContactStore() }
 
     /// What each request actually returned, so "it did not prompt" stays a
     /// measurement rather than a guess.
@@ -102,7 +105,7 @@ final class Grants: ObservableObject {
             return askReminders()
         }
         begin("calendar") { [weak self] in self?.askReminders() }
-        events.requestFullAccessToEvents { [weak self] granted, error in
+        newEventStore().requestFullAccessToEvents { [weak self] granted, error in
             DispatchQueue.main.async {
                 self?.finish("calendar", granted: granted, error: error)
             }
@@ -115,7 +118,7 @@ final class Grants: ObservableObject {
             return askContacts()
         }
         begin("reminders") { [weak self] in self?.askContacts() }
-        events.requestFullAccessToReminders { [weak self] granted, error in
+        newEventStore().requestFullAccessToReminders { [weak self] granted, error in
             DispatchQueue.main.async {
                 self?.finish("reminders", granted: granted, error: error)
             }
@@ -128,7 +131,7 @@ final class Grants: ObservableObject {
             return done()
         }
         begin("contacts") { [weak self] in self?.done() }
-        contacts.requestAccess(for: .contacts) { [weak self] granted, error in
+        newContactStore().requestAccess(for: .contacts) { [weak self] granted, error in
             DispatchQueue.main.async {
                 self?.finish("contacts", granted: granted, error: error)
             }
@@ -169,10 +172,20 @@ final class Grants: ObservableObject {
 
     private func finish(_ name: String, granted: Bool, error: Error?) {
         guard attempts[name] == asking else { return }   // the deadline won
-        if let error {
-            attempts[name] = "error: \(error.localizedDescription)"
+        // ⚠️ Record the RAW status and the full error. `localizedDescription`
+        // alone said "Access Denied" for a request the user was never shown,
+        // which reads as a decision they made.
+        let raw: String
+        switch name {
+        case "calendar": raw = "\(EKEventStore.authorizationStatus(for: .event).rawValue)"
+        case "reminders": raw = "\(EKEventStore.authorizationStatus(for: .reminder).rawValue)"
+        default: raw = "\(CNContactStore.authorizationStatus(for: .contacts).rawValue)"
+        }
+        if let error = error as NSError? {
+            attempts[name] = "\(error.domain) \(error.code): "
+                + "\(error.localizedDescription) [status \(raw)]"
         } else {
-            attempts[name] = granted ? "granted" : "refused"
+            attempts[name] = (granted ? "granted" : "refused") + " [status \(raw)]"
         }
         read()
         advance(name)
