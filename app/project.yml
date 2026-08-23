@@ -60,6 +60,22 @@ targets:
         # Events. 🛑 Do NOT add disable-library-validation. Spawning
         # /usr/bin/python3 does not need it; only loading a foreign dylib would.
         com.apple.security.automation.apple-events: true
+        # ⚠️ TESTING A CLAIM FROM prior-art. These two read as App Sandbox
+        # entitlements, and the design doc ruled them out for that reason.
+        # `psychquant/che-ical-mcp` reports them as load-bearing for a
+        # NON-sandboxed Developer ID binary on macOS 26+, without which the
+        # Calendar and Contacts dialogs never present — which is exactly what
+        # this app measured. Harmless if the claim turns out to be wrong.
+        com.apple.security.personal-information.calendars: true
+        com.apple.security.personal-information.addressbook: true
+        # ⚠️ TESTING A CLAIM FROM prior-art. These three read as App Sandbox
+        # entitlements, and the design doc ruled them out for that reason.
+        # `psychquant/che-ical-mcp` reports them as load-bearing for a
+        # NON-sandboxed Developer ID binary on macOS 26+, without which the
+        # Calendar and Reminders dialogs never present. That matches exactly
+        # what this app measured. Harmless if the claim is wrong.
+        com.apple.security.personal-information.calendars: true
+        com.apple.security.personal-information.addressbook: true
     info:
       path: Info.plist
       properties:

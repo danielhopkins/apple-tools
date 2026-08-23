@@ -24,40 +24,31 @@ struct ChildResult {
 enum Child {
     /// The environment every child gets.
     ///
-    /// 🛑 LET `reminders`, `apple-calendar` AND `apple-contacts` KEEP
-    /// DISCLAIMING. The design doc said the opposite, and the doc was wrong.
+    /// 🛑 THE THREE DISCLAIMING TOOLS RUN AS THE APP, and that is only correct
+    /// because the app now holds Calendar, Reminders and Contacts itself.
     ///
-    /// Those three re-execute themselves disclaimed, which makes each one its
-    /// own responsible process, so TCC keys the grant to the BINARY. The
-    /// reasoning for suppressing that inside the app was that disclaiming
-    /// throws away the app's grants. It does — but only the ones the app
-    /// actually holds, and the app holds **Full Disk Access**, which those
-    /// three barely need. What they need is Calendar, Reminders and Contacts,
-    /// and each binary **already has its own grant**, given long ago from a
-    /// terminal and working right now.
+    /// `reminders`, `apple-calendar` and `apple-contacts` re-execute themselves
+    /// disclaimed, which makes each one its own responsible process. That is
+    /// right from a terminal and wrong here: it throws away the app's grants,
+    /// and a disclaimed child loses the app's **Full Disk Access** — which
+    /// costs `apple contacts` its `has_photo` column and `apple calendar` its
+    /// sync tables. `APPLE_TOOLS_OWN_TCC_IDENTITY` makes them skip the re-exec.
     ///
-    /// Measured 2026-08-23, with the marker set so they ran as the app:
+    /// 🛑 THE MARKER STOPS THE DISCLAIM, IT DOES NOT START IT. The name reads
+    /// as the opposite of what it does here.
     ///
-    ///   apple-calendar   "calendar access was not granted"
-    ///   apple-contacts   "contacts access was not granted: Access Denied"
-    ///
-    /// and the app could not obtain either grant for itself — no dialog ever
-    /// appeared, notarized or not, before or after a reboot. Meanwhile the same
-    /// two binaries answered perfectly from a terminal, under their own
-    /// identity. So the app stops fighting for a grant it cannot get and uses
-    /// the ones that exist.
-    ///
-    /// ⚠️ THE COST IS REAL AND IT IS SMALL. A disclaimed child loses the app's
-    /// Full Disk Access, so `apple contacts` cannot read `has_photo` out of the
-    /// AddressBook store and `apple calendar` cannot read the sync tables.
-    /// Neither is used by the index. The five tools that DO need Full Disk
-    /// Access — mail, notes, messages, maps, phone — never disclaim, so they
-    /// keep the app's grant.
-    ///
-    /// 🛑 Do not set `APPLE_TOOLS_OWN_TCC_IDENTITY` here. It STOPS the disclaim
-    /// rather than starting it, which reads as the opposite of what it does.
+    /// ⚠️ THIS ONLY WORKS BECAUSE OF TWO ENTITLEMENTS, and without them it
+    /// fails silently. `com.apple.security.personal-information.calendars` and
+    /// `.addressbook` read as App Sandbox entitlements and are NOT: on macOS
+    /// 26+ a non-sandboxed Developer ID app cannot obtain those grants without
+    /// them. Measured here — no dialog ever appeared, notarized or not, before
+    /// or after a reboot, and every request answered `refused` or `Access
+    /// Denied`. Adding the two entitlements granted both immediately. See
+    /// `docs/prior-art.md` for where the answer came from.
     static func environment(extra: [String: String] = [:]) -> [String: String] {
         var env = ProcessInfo.processInfo.environment
+        env["APPLE_TOOLS_OWN_TCC_IDENTITY"] = "1"
+        env["APPLE_TOOLS_TCC_HOST"] = "app"
         if let helpers = Paths.helpersDirectory {
             env["PATH"] = helpers.path + ":/usr/bin:/bin:/usr/sbin:/sbin"
         }

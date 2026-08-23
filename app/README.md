@@ -46,62 +46,60 @@ search` typed into Ghostty is attributed to Ghostty, exactly as before. Only
 children the app itself spawns inherit. Route B in the design doc — an XPC proxy
 — is the only thing that changes that, and it is not built.
 
-## 🛑 Let the disclaiming tools keep disclaiming
+## 🛑 Two entitlements decide whether this app can hold a grant at all
 
-**The app holds Full Disk Access. It does NOT hold Calendar, Reminders or
-Contacts, and it does not need to.** `apple-calendar`, `reminders` and
-`apple-contacts` each re-execute themselves **disclaimed**, which makes each one
-its own responsible process, so TCC keys the grant to the **binary**. Those
-grants already exist and already work.
+**`com.apple.security.personal-information.calendars` and `.addressbook`.**
+They read as App Sandbox entitlements. They are not. On macOS 26+ a
+**non-sandboxed, Developer ID signed, notarized** app cannot obtain Calendar or
+Contacts without them, and it fails **silently**.
 
-🛑 **The design doc said the opposite, and the doc was wrong.** It reasoned that
-disclaiming inside the app "throws away the app's grants". It does — but only
-the ones the app actually holds, and the app holds Full Disk Access, which
-those three barely need.
+Measured here, changing nothing but those two lines in `project.yml`:
 
-⚠️ **The cost is real and small.** A disclaimed child loses the app's Full Disk
-Access, so `apple contacts` cannot read `has_photo` out of the AddressBook store
-and `apple calendar` cannot read the sync tables. The index uses neither. The
-five tools that DO need Full Disk Access — mail, notes, messages, maps, phone —
-never disclaim, so they keep the app's grant.
+| | Without | With |
+|---|---|---|
+| calendar | `refused`, status stays `notDetermined` | **`granted`** |
+| contacts | `CNErrorDomain 100: Access Denied` | **`granted`** |
+| dialog shown | none, ever | none needed |
 
-**With `APPLE_TOOLS_OWN_TCC_IDENTITY` set, so the three ran as the app:**
+**The design doc ruled them out as sandbox-only, and the doc was wrong.** The
+answer came from [`psychquant/che-ical-mcp`](https://github.com/psychquant/che-ical-mcp)
+by way of `docs/prior-art.md`, which reports them as load-bearing and warns that
+"ad-hoc signed binaries cannot trigger Calendar / Reminders TCC permission
+dialogs".
+
+**With them, the app holds all four grants and every tool works as its child:**
 
 ```
-calendar   Error: calendar access was not granted
-contacts   Error: contacts access was not granted: Access Denied
+calendar  fullAccess    contacts  authorized    mail   readOnly
+reminders fullAccess    messages  authorized    notes  authorized
+maps      authorized    phone     authorized
+app Full Disk Access: True      child Full Disk Access: True
 ```
 
-**Without it:** all six sources index, `errors: NONE`.
+That is the "one TCC identity" the design set out to get.
 
-### ⚠️ The day this cost, and every wrong turn in it
+### ⚠️ What it cost to find, and the four bad checks along the way
 
-The app could not obtain Calendar or Contacts for itself. **No dialog ever
-appeared**, and each of these was measured and ruled out:
+Before the entitlements, no dialog ever appeared for Calendar or Contacts. Each
+of these was measured and ruled out first:
 
 | Suspect | Result |
 |---|---|
 | Not notarized | Notarized, stapled, `spctl` accepts. No change. |
 | Stale `tccd` cache | Rebooted. No change. SIP refuses `launchctl kickstart -k gui/<uid>/com.apple.tccd`. |
-| Stale bundle id | A fresh bundle id got the same three answers. |
+| Stale bundle id | A fresh bundle id got the same answers. |
 | Asking too early | A 5s delay after launch changed nothing. |
 | Asking in the wrong order | Reordering the chain changed nothing. |
 | A reused `EKEventStore` | A fresh store per request changed nothing. |
-| Missing Info.plist keys | Added every legacy key beside the split ones. No change. |
+| Missing legacy Info.plist keys | Added every one beside the split keys. No change. |
 
-Meanwhile `apple calendar calendars` and `apple contacts search` answered
-perfectly from a terminal, **under their own identity** — which was the answer
-the whole time.
-
-Four wrong turns are worth naming, because each was a bad check rather than a
-bad idea:
+Four of the wrong turns were bad checks rather than bad ideas:
 
 1. 🛑 **`make install` rebuilds, and a rebuild re-signs and destroys the
    notarization ticket.** The app was notarized once and every `make install`
    after it quietly installed an unnotarized build, which invalidated a whole
-   run of measurements. **`make release` is the target that notarizes, staples
-   and then installs**, and `make install` now warns when the installed bundle
-   fails `stapler validate`.
+   run of measurements. **`make release` notarizes, staples and then installs**;
+   `make install` now warns when `stapler validate` fails.
 2. ⚠️ **A TCC dialog belongs to `UserNotificationCenter`, a BACKGROUND
    process.** A check of "visible processes" does not list it, so a prompt that
    was on screen looked absent. To see one:
@@ -115,9 +113,21 @@ bad idea:
 4. 🛑 **`tccutil reset <service> <bundle-id>` prints "Successfully reset" and
    may change nothing.** Its output is not evidence.
 
-### One TCC dialog at a time, and it waits for a person
+### 🛑 The marker stops the disclaim, it does not start it
 
-The window keeps an **Ask Again** button, and it is the only thing that asks now.
+`reminders`, `apple-calendar` and `apple-contacts` re-execute themselves
+**disclaimed**, which makes each one its own responsible process. That is right
+from a terminal and wrong here: it throws away the app's grants, and a
+disclaimed child also loses the app's **Full Disk Access** — costing `apple
+contacts` its `has_photo` column and `apple calendar` its sync tables.
+`Child.environment()` sets `APPLE_TOOLS_OWN_TCC_IDENTITY` so they skip it.
+
+⚠️ **That is only correct because the app now holds the three grants.** While it
+did not, running them as the app broke calendar and contacts outright, and
+letting them disclaim was the working answer. If the entitlements ever stop
+working, that is the fallback.
+
+### One TCC dialog at a time, and it waits for a person
 
 🛑 **A permission request does not return until the user answers**, and macOS
 shows **one dialog at a time**. Asking for the next grant while a dialog is up
@@ -126,13 +136,17 @@ reminders dialog still on screen, and **TCC recorded that denial** as though the
 user had made it. That record survived `tccutil reset` and a reboot.
 
 ⚠️ **A deadline on a prompt is a person's deadline.** A 20 second one was wrong
-and caused the failure it was written to diagnose. It is ten minutes now, and it
-exists only so a request nobody will answer cannot hold the chain forever.
+and caused the failure it was written to diagnose. It is ten minutes now.
 
 🛑 **That deadline must be a plain timer.** Two versions raced the request
 against `Task.sleep`, on the main actor and off it, and **the sleep never
 fired** — the request occupies a cooperative thread without suspending.
 `DispatchQueue.main.asyncAfter` does not care.
+
+⚠️ The app switches its activation policy to `.regular` while asking, so a
+prompt belongs to a process the user can see. That was **not** what fixed
+anything here, and it is still correct — `che-ical-mcp` reached the same
+conclusion for its `--setup` flow.
 
 ### Notarization
 
@@ -186,10 +200,9 @@ doc.
 `get-task-allow`, which lets any process running as this user attach a debugger
 to an app holding Full Disk Access. Notarization rejects it as well.
 
-🛑 **Do NOT set `APPLE_TOOLS_OWN_TCC_IDENTITY` on a child.** It STOPS the
-disclaim rather than starting it, which reads as the opposite of what it does.
-Setting it made `apple-calendar` and `apple-contacts` run as the app, and the
-app has no Calendar or Contacts grant. See above.
+🛑 **`APPLE_TOOLS_OWN_TCC_IDENTITY` STOPS the disclaim, it does not start it.**
+The name reads as the opposite of what it does here. See above for why setting
+it is correct only while the app holds the three framework grants.
 
 ⚠️ **Report the whole of a failure, not its last line.** An argument parser ends
 its usage message with `See 'apple-calendar --help'`, which names nothing. A

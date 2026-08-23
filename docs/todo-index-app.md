@@ -117,40 +117,40 @@ If the claim is false, the fallback is worse but not fatal: every reader gets
 compiled into the app process, and the CLIs stay terminal-attributed forever.
 That is a rewrite of the ingest path, not a tweak.
 
-## 🛑 Step 0b was WRONG, and the app proved it
+## ✅ Step 0b holds, but ONLY with two entitlements this doc ruled out
 
-**Measured 2026-08-23: the disclaiming tools must KEEP disclaiming inside the
-app.** The section below argued the opposite, and following it broke calendar
-and contacts for a whole day.
+**Measured 2026-08-23.** The section below is right that the disclaiming tools
+must stop disclaiming inside the app. It is wrong about the entitlements, and
+that error cost a day.
 
-The argument was that disclaiming "throws away the app's grants". It does — but
-only the ones the app actually holds. The app holds **Full Disk Access**, which
-`apple-calendar` and `apple-contacts` barely need. What they need is Calendar
-and Contacts, and **each binary already has its own grant**, given long ago from
-a terminal.
+🛑 **`com.apple.security.personal-information.calendars` and `.addressbook` are
+LOAD-BEARING for a non-sandboxed app on macOS 26+.** This doc says below that a
+non-sandboxed app "needs almost none" and names only the Apple Events one.
+Without these two, `AppleTools.app` could not obtain Calendar or Contacts at
+all — **no dialog ever appeared**, notarized or not, before or after a reboot,
+and every request answered `refused` or `Access Denied`. Adding the two lines
+granted both immediately.
 
-With `APPLE_TOOLS_OWN_TCC_IDENTITY` set, so the three ran as the app:
+| | Without | With |
+|---|---|---|
+| calendar | `refused`, stays `notDetermined` | **`granted`** |
+| contacts | `CNErrorDomain 100: Access Denied` | **`granted`** |
 
-```
-calendar   Error: calendar access was not granted
-contacts   Error: contacts access was not granted: Access Denied
-```
+The answer came from [`psychquant/che-ical-mcp`](https://github.com/psychquant/che-ical-mcp),
+recorded in [`prior-art.md`](prior-art.md). ⚠️ **Check prior art before
+concluding that an Apple API cannot do something.**
 
-Without it, all six sources index and the cycle reports `errors: NONE`.
+**With them the app holds all four grants**, and every one of the eight tools
+reports `usable` as a child of the app. That is the "one TCC identity" this doc
+set out to get.
 
-🛑 **The app could not obtain those two grants for itself, and no dialog ever
-appeared.** Notarization, a reboot, a fresh bundle id, a delay, a reorder, a
-fresh store and every legacy Info.plist key were each measured and each changed
-nothing. Full record in [`app/README.md`](../app/README.md).
-
-⚠️ **The cost of disclaiming is real and small.** `apple contacts` loses
-`has_photo` and `apple calendar` loses the sync tables, because both read those
-from disk. The index uses neither. The five tools that DO need Full Disk Access
-never disclaim, so they keep the app's grant.
+⚠️ **If those entitlements ever stop working, the fallback is measured**: drop
+`APPLE_TOOLS_OWN_TCC_IDENTITY` and let the three tools disclaim. They then use
+their own long-standing grants and all six sources index — at the cost of the
+app's Full Disk Access for those two, which loses `apple contacts --photo`
+reporting and the calendar sync tables.
 
 The original section follows.
-
-### The argument as it was written
 
 ### Step 0b: the disclaiming tools must stop disclaiming inside the app
 
@@ -465,10 +465,15 @@ Per the house rule for Swift apps: **xcodegen `project.yml` + `xcodebuild
 archive` / `exportArchive`.** Keep `Package.swift` for `swift run` during
 development. Never hand-assemble the bundle or call `codesign` on parts of it.
 
-Entitlements — short, because a non-sandboxed app needs almost none:
+Entitlements — short, but ⚠️ **not as short as this doc first claimed**:
 
 ```xml
 <key>com.apple.security.automation.apple-events</key><true/>
+<!-- 🛑 NOT sandbox-only, despite the name. Without these two a non-sandboxed
+     Developer ID app on macOS 26+ cannot obtain Calendar or Contacts, and it
+     fails silently: no dialog, ever. Measured 2026-08-23. -->
+<key>com.apple.security.personal-information.calendars</key><true/>
+<key>com.apple.security.personal-information.addressbook</key><true/>
 ```
 
 🛑 **Do not add `com.apple.security.cs.disable-library-validation`** unless

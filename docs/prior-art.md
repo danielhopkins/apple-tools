@@ -19,6 +19,8 @@ whole value of this file is that it doesn't guess.
 | [BRO3886/ical](https://github.com/BRO3886/ical) | Go | 68 | 2026-02-11 | 2026-06-21 | calendar only |
 | [schappim/ekctl](https://github.com/schappim/ekctl) | Swift | 55 | 2026-01-21 | 2026-06-10 | no license |
 | [more-io/claude-apple-bridges](https://github.com/more-io/claude-apple-bridges) | Swift | 29 | 2026-02-22 | 2026-07-03 | closest peer |
+| [mattt/iMCP](https://github.com/mattt/iMCP) | Swift | — | — | — | **a menu-bar APP**, sandboxed |
+| [psychquant/che-ical-mcp](https://github.com/psychquant/che-ical-mcp) | Swift | — | — | — | **settled our TCC wall** |
 
 ## Per project
 
@@ -111,6 +113,61 @@ sharp edge. Theirs is arguably the safer default: ours means an agent that
 passes `--email` without reading the contact first silently destroys the other
 addresses. Changing it would break existing behaviour, so it needs a decision,
 not a drive-by.
+
+### che-ical-mcp — 🛑 it answered the question that cost us a day
+
+Calendar and Reminders MCP server, native Swift EventKit, Developer ID signed
+and notarized. **Read this one before touching TCC again.**
+
+🛑 **It reports two entitlements as load-bearing for a NON-sandboxed Developer
+ID binary**, `com.apple.security.personal-information.calendars` and
+`.addressbook`:
+
+> "ad-hoc signed binaries cannot trigger Calendar / Reminders TCC permission
+> dialogs" on macOS 26
+
+**We had ruled those out as sandbox-only, on the design doc's word, and the doc
+was wrong.** Without them `app/AppleTools.app` could not obtain Calendar or
+Contacts at all: no dialog ever appeared, notarized or not, before or after a
+reboot, and every request answered `refused` or `Access Denied`. Adding the two
+entitlements granted both immediately. Full record in
+[`../app/README.md`](../app/README.md).
+
+⚠️ **Its `--setup` flag is the other idea worth having.** It runs the
+authorization request "inside a foreground `NSApplication` so EventKit's
+Calendar TCC modal actually presents", for launchd, cron and SSH callers that
+cannot show a dialog. We reached the same conclusion independently and switched
+the app's activation policy to `.regular` while asking — which was **not** what
+fixed it here, but is still correct.
+
+⚠️ **It also confirms the attribution rule from the other side**: the dialog
+belongs to the parent application, so the same binary prompts under Claude
+Desktop and Terminal and stays silent under VS Code. Its workaround is editing
+VS Code's `Info.plist` and re-signing it, which it calls brittle. Our disclaim
+trick is the better answer to the same problem.
+
+### iMCP — the MCP server that IS an app
+
+Menu bar app by Matt Thompson, over Messages, Contacts, Reminders and more. The
+closest thing to `app/` in shape, and it makes the opposite call on the one
+decision that governs everything.
+
+- 🛑 **It runs in the App Sandbox.** Our design doc rules that out, because the
+  sandbox denies `~/Library/Mail`, `chat.db`, `NoteStore.sqlite` and
+  `MapsSync_0.0.1` regardless of Full Disk Access. iMCP gets at the Messages
+  database a different way: the user picks the file, and "macOS adds that file
+  to the app's sandbox". ⚠️ **That is a route we have not costed** — a
+  user-selected file plus a security-scoped bookmark, versus one Full Disk
+  Access grant. It would make a Mac App Store build conceivable.
+- **The app holds every grant and provides the UI for them**, which is the same
+  conclusion `app/` reached: "iMCP.app provides UI for configuring services
+  and — most importantly — a means of interacting with macOS system
+  permissions."
+- ⚠️ **Its transport is worth knowing and is not what we would pick.** The app
+  bundles `imcp-server`, a CLI that relays stdio to the app **over the local
+  network with Bonjour** (`_mcp._tcp`). We use a 0600 Unix socket, deliberately:
+  the index answers with the plaintext-derived vectors of every indexed
+  message, and a bad bind address would put that corpus on the network.
 
 ### mcp-server-apple-events
 

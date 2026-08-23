@@ -34,7 +34,10 @@ final class AppModel: ObservableObject {
         // those grants already work. Asking cost a stuck `denied` record for
         // Contacts and a minute of stolen focus per launch, for nothing.
         // The window keeps an "Ask Again" button for a person who wants it.
-        grants.read()
+        // ⚠️ Ask once, and only for what is still undetermined. It is cheap now
+        // that the entitlements make the grants obtainable; before them every
+        // request cost its full deadline and stole focus for nothing.
+        grants.requestAndRead()
         search.start()
         indexer.startScheduling()
         diagnostics.check()
