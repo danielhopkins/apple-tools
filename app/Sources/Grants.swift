@@ -17,7 +17,23 @@
 // source appears to work. Measured here: one cycle reported no errors that way
 // and the same build reported two failures when launched with `open`. Always
 // launch it with `open`, or from Finder.
-
+//
+// 🛑 ONE TCC DIALOG AT A TIME, AND IT WAITS FOR A PERSON. A request does not
+// return until the user answers, so these are chained: each one starts only
+// when the one before it finishes. Asking for the next while a dialog is up
+// gets the next one **denied** — measured, `Access Denied` from Contacts with
+// the reminders dialog still on screen, and TCC recorded that denial.
+//
+// ⚠️ THE DIALOG IS EASY TO MISS, AND EASY TO MISDIAGNOSE. It belongs to
+// `UserNotificationCenter`, which is a BACKGROUND process, so a check of
+// "visible processes" does not list it and the prompt looks absent. It cost a
+// wrong conclusion here — that an unnotarized app cannot get a prompt at all —
+// and a round trip through Apple's notary service to disprove. To see whether
+// one is up:
+//
+//     osascript -e 'tell application "System Events" to tell process \
+//       "UserNotificationCenter" to get value of every static text of window 1'
+//
 import AppKit
 import Contacts
 import EventKit
@@ -145,7 +161,7 @@ final class Grants: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.requestDeadline) {
             [weak self] in
             guard let self, self.attempts[name] == self.asking else { return }
-            self.attempts[name] = "no answer in \(Int(Self.requestDeadline))s"
+            self.attempts[name] = "no answer in \(Int(Self.requestDeadline / 60)) min"
             self.write()
             self.advance(name)
         }
@@ -168,7 +184,10 @@ final class Grants: ObservableObject {
         next()
     }
 
-    private let asking = "asking…"
+    /// Shown in the window while a dialog is on screen. ⚠️ It must not read as
+    /// "working": the app is waiting for a person, and the dialog can be behind
+    /// another window or on a second display.
+    let asking = "waiting for your answer to the macOS dialog"
     private var continuations: [String: () -> Void] = [:]
 
     func read() {
@@ -186,7 +205,16 @@ final class Grants: ObservableObject {
         ]
     }
 
-    private nonisolated static let requestDeadline: TimeInterval = 20
+    /// 🛑 THIS IS A PERSON'S DEADLINE, NOT A MACHINE'S. The request does not
+    /// return until the user answers the dialog, and they may be away from the
+    /// Mac. A 20s deadline was WRONG and caused the failure it was written to
+    /// diagnose: the app moved on while the reminders dialog was still on
+    /// screen, and the contacts request behind it came back `Access Denied`
+    /// because macOS shows ONE TCC dialog at a time.
+    ///
+    /// ⚠️ It exists only so a request that will never be answered cannot hold
+    /// the chain for the life of the process. Ten minutes, not twenty seconds.
+    private nonisolated static let requestDeadline: TimeInterval = 600
 
     /// ⚠️ `writeOnly` is the trap: "Add Only" looks granted and cannot read a
     /// single event, and macOS will not offer to upgrade it. Only a manual

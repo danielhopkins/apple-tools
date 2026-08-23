@@ -45,41 +45,54 @@ search` typed into Ghostty is attributed to Ghostty, exactly as before. Only
 children the app itself spawns inherit. Route B in the design doc — an XPC proxy
 — is the only thing that changes that, and it is not built.
 
-## 🛑 An unnotarized app cannot get a TCC prompt, and TCC fails closed
+## 🛑 One TCC dialog at a time, and it waits for a person
 
-**Full Disk Access works, because the user grants it by hand. The three grants
-that need a PROMPT do not.** Measured on macOS 27.0 (26A5416b), with the app
-signed `Developer ID Application`, hardened runtime, **not notarized**:
+**The app asks for Calendar, Reminders and Contacts itself.** Full Disk Access
+is the one macOS has no API for, so the window carries the reason and opens the
+pane instead.
 
-| Grant | What the request returned | State afterwards |
-|---|---|---|
-| calendar | `false`, no error, in under a second | still `notDetermined` |
-| reminders | **never returned at all** | still `notDetermined` |
-| contacts | `CNErrorDomain 100 "Access Denied"` | **`denied`** |
+🛑 **A permission request does not return until the user answers the dialog**,
+and macOS shows **one dialog at a time**. So the three requests are chained:
+each starts only when the one before it finishes. Asking for the next while a
+dialog is up gets the next one **denied** — measured, `Access Denied` from
+Contacts with the reminders dialog still on screen, and **TCC recorded that
+denial** as though the user had made it.
 
-⚠️ **No dialog appeared for any of them**, and the app was frontmost with a Dock
-tile at the time. TCC recorded a **denial the user never made** for contacts.
+⚠️ **A deadline on a prompt is a person's deadline, not a machine's.** A 20
+second one was wrong, and it caused the failure it was written to diagnose. It
+is now ten minutes, and it exists only so a request nobody will ever answer
+cannot hold the chain for the life of the process.
 
-**It is not this app's structure.** A 30-line app — regular activation policy,
-its own bundle id, the same Developer ID identity — reproduced it exactly. An
-ad-hoc signed copy was worse: neither request returned. Nothing is stale either;
-`tccutil reset Calendar/Reminders/AddressBook` and a relaunch changed nothing.
-There is no MDM and no configuration profile on this machine.
+### ⚠️ How this was misdiagnosed, and how to avoid repeating it
 
-**The remaining difference is notarization**, which every one of these builds
-lacks and which `spctl` rejects them for. That is the next thing to test, and it
-is on the roadmap anyway.
+The dialog belongs to **`UserNotificationCenter`, which is a BACKGROUND
+process**. A check of "visible processes" does not list it, so the prompt looked
+absent when it was on screen the whole time. That produced a confident wrong
+conclusion — *an unnotarized app cannot get a TCC prompt at all* — supported by
+a 30-line reproduction and a control app, and it took a round trip through
+Apple's notary service to disprove. **Notarizing changed nothing.** The dialog
+had simply been waiting, unanswered, on the other side of the screen.
 
-⚠️ **The app spun forever waiting.** `requestFullAccessToReminders` never called
-back, and the process logged `TCCAccessRequest() IPC` **every two seconds for as
-long as it ran**, while the two grants queued behind it were never asked for.
+To see whether one is up:
 
-🛑 **A deadline for it must be a plain timer.** Two versions raced the request
-against `Task.sleep`, on the main actor and off it, and **the sleep never
-fired** — the request occupies a cooperative thread without suspending, so the
-timer beside it was never scheduled. `DispatchQueue.main.asyncAfter` does not
-care. ⚠️ Losing the race cancels nothing: there is no cancel API, so the retry
-runs inside EventKit until the process exits.
+```
+osascript -e 'tell application "System Events" to tell process \
+  "UserNotificationCenter" to get value of every static text of window 1'
+```
+
+⚠️ **`pgrep -x AppleTools` does not match this app either**, and reading that as
+"the app died" wasted a second stretch of this work. Use `pgrep -f
+MacOS/AppleTools`.
+
+### Notarization, which is needed anyway
+
+`make notarize` submits the built app, staples the ticket and checks `spctl`.
+🛑 **`xcodebuild build` does not add a secure timestamp** — only `archive`
+does — so a plain build is rejected with *"The signature does not include a
+secure timestamp"*. `OTHER_CODE_SIGN_FLAGS: --timestamp` fixes it.
+
+⚠️ The notarytool keychain profile is named `MiniMusic`, after the first app it
+was stored for. It holds this developer's App Store Connect API key.
 
 ## What it does
 
@@ -155,8 +168,8 @@ mail **without** bodies. The window says the list is a guess.
 
 ## What is not built
 
-- Notarization, a DMG and a cask. `spctl` rejects the bundle today: signed with
-  Developer ID, not notarized.
+- A DMG and a cask. The app itself is notarized and stapled (`make notarize`),
+  and `spctl` accepts it.
 - The CLIs inside `Contents/Helpers/`, signed with the app.
 - The XPC proxy that would let a terminal borrow the app's grant.
 - Encryption at rest, the container placement probe, per-source opt-in and

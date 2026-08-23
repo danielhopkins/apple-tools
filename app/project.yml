@@ -31,6 +31,11 @@ settings:
     CODE_SIGN_STYLE: Manual
     CODE_SIGN_IDENTITY: "Developer ID Application"
     ENABLE_HARDENED_RUNTIME: YES
+    # 🛑 REQUIRED TO NOTARIZE, and `xcodebuild build` does not add it. Only
+    # `archive` timestamps by default, so a plain build is rejected with
+    # "The signature does not include a secure timestamp" — which cost one
+    # round trip to Apple to discover.
+    OTHER_CODE_SIGN_FLAGS: --timestamp
     # 🛑 NO. Xcode injects `get-task-allow` otherwise, which lets ANY process
     # running as this user attach a debugger to an app that holds Full Disk
     # Access — and notarization rejects the bundle for it as well.

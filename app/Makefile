@@ -9,13 +9,17 @@ BUILD      := $(shell git rev-list --count HEAD 2>/dev/null || echo 1)
 DERIVED    := $(CURDIR)/build
 PRODUCT    := $(DERIVED)/Build/Products/Release/$(APP).app
 TEAM       := 25RCAA3JLJ
+# ⚠️ The notarytool profile is named for the app it was first stored for. It
+# holds this developer's App Store Connect API key, not MiniMusic's.
+#   xcrun notarytool store-credentials NAME --key AuthKey_*.p8 --key-id ID --issuer UUID
+PROFILE    := MiniMusic
 IDENTITY   := Developer ID Application
 BUNDLE_ID  := com.boulderhopkins.apple-tools
 
 export APP_VERSION := $(VERSION)
 export APP_BUILD   := $(BUILD)
 
-.PHONY: generate build run install uninstall clean stop grant logs archive notarize
+.PHONY: generate build run install uninstall clean stop grant logs notarize
 
 ## Regenerate the Xcode project from project.yml
 generate:
@@ -71,6 +75,23 @@ logs:
 	  || echo "no search log yet"
 	@echo "--- app ---"
 	@log show --last 10m --predicate 'process == "$(APP)"' --style compact 2>/dev/null | tail -30
+
+## Notarize the built app and staple the ticket into the bundle
+##
+## 🛑 NOT OPTIONAL, and not only for distribution. Measured 2026-08-23: an
+## UNNOTARIZED app gets NO TCC prompt at all on macOS 27.0 — calendar returned
+## false without recording anything, reminders never returned, and contacts was
+## recorded as DENIED without the user ever seeing a dialog. See README.md.
+##
+## ⚠️ notarytool rejects a bundle whose helpers are not hardened-runtime signed,
+## and the summary line does not say which file. Read the JSON log.
+notarize: build
+	rm -f $(DERIVED)/$(APP).zip
+	ditto -c -k --keepParent "$(PRODUCT)" "$(DERIVED)/$(APP).zip"
+	xcrun notarytool submit "$(DERIVED)/$(APP).zip" \
+	  --keychain-profile "$(PROFILE)" --wait
+	xcrun stapler staple "$(PRODUCT)"
+	spctl -a -vv "$(PRODUCT)"
 
 clean:
 	rm -rf $(DERIVED) $(APP).xcodeproj
