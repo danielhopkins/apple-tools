@@ -1724,10 +1724,15 @@ Four rules at the call site:
    A hit gives `tool` and a native `id`; the indexed copy can lag and its
    snippets are truncated. `apple-index search … --json` then
    `apple notes export <id>`.
-2. ⚠️ **`apple-index refresh` only works from a terminal, and nothing runs it
-   for you.** A launchd agent has **no Full Disk Access**, measured twice — the
-   Swift daemon's own probe reports `full_disk_access: false` under launchd.
-   The background agent serves searches and cannot ingest. Refresh costs ~8s.
+2. ⚠️ **A launchd agent cannot refresh the index; the APP can.** An agent has
+   **no Full Disk Access**, measured twice — the Swift daemon's own probe
+   reports `full_disk_access: false` under launchd — so it serves searches and
+   cannot ingest. `apple-index refresh` from a terminal still works and costs
+   ~8s. **`app/AppleTools.app` refreshes on its own**, every 5 minutes and on
+   wake, because a child of the app inherits the app's Full Disk Access.
+   Measured 2026-08-23; see [`app/README.md`](app/README.md). The app also owns
+   the search socket and unloads the agent when it starts, so **the two never
+   both serve**.
 3. 🛑 **The index holds the plaintext of every email** — ~105 MB of decoded
    bodies in one unencrypted file, protected by neither Full Disk Access nor
    the 0700 directories its sources sit behind. Never copy results anywhere

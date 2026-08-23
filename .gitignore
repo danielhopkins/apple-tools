@@ -20,3 +20,9 @@ completions/_apple-contacts
 # rather than swift/, and .claude/ holds local agent state and worktrees.
 .build/
 .claude/
+
+# app/ — xcodegen generates the project, xcodebuild fills build/
+app/AppleTools.xcodeproj/
+app/build/
+app/Info.plist
+app/AppleTools.entitlements

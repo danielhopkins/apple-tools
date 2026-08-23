@@ -23,6 +23,7 @@ ranked list.
 """
 
 import argparse
+import fcntl
 import hashlib
 import json
 import math
@@ -271,6 +272,23 @@ STOPWORDS = {
 }
 
 SOURCES = ["notes", "mail", "messages", "calendar", "contacts", "maps"]
+
+# 🛑 ONE PLACE, because two places drift. `refresh` uses these, and so does the
+# app's scheduler, which reads them back through `index.py sources --json`
+# rather than keeping a second copy in Swift.
+#
+# ⚠️ Every source must appear here even when it takes no extra arguments. The
+# empty entries are the reason `refresh` used `[name]` on a five-key dict and
+# raised KeyError on `maps` — the LAST source, which killed the run before the
+# embed step and made every refresh embed nothing.
+REFRESH_ARGS = {
+    "notes": [],
+    "mail": ["--with-bodies"],
+    "messages": ["--chat-limit", "1331", "--limit", "2000"],
+    "calendar": ["--since", "3650"],
+    "contacts": ["--limit", "100000"],
+    "maps": [],
+}
 
 
 # --------------------------------------------------------------------------
@@ -1165,7 +1183,45 @@ def require_consent(db, opts):
     sys.stderr.write("consent recorded. This will not be asked again for this index.\n\n")
 
 
+# 🛑 ONE WRITER AT A TIME, ACROSS PROCESSES.
+#
+# The app indexes on a schedule and the user can still type `apple-index
+# refresh` in a terminal. Two `ingest` runs on one SQLite file interleave their
+# reads and writes: each decides what is new from a snapshot the other is
+# already changing, so both write, and the watermark ends up describing neither.
+#
+# ⚠️ An advisory flock, held for the whole run and released when the process
+# exits — including when it is killed, which a lock row in the database would
+# not survive. Non-blocking on purpose: a caller that cannot have the lock must
+# be TOLD, not queued behind a mail ingest that runs for twenty minutes.
+_LOCK_HANDLE = None
+
+
+def take_write_lock(db_path, what):
+    """Hold the ingest lock for the life of this process, or explain and exit."""
+    global _LOCK_HANDLE
+    path = db_path + ".lock"
+    handle = open(path, "a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.seek(0)
+        holder = handle.read().strip() or "another process"
+        die("%s is already running (%s). Wait for it, or stop it first."
+            % (holder, path))
+    handle.seek(0)
+    handle.truncate()
+    handle.write("%s pid %d since %s\n"
+                 % (what, os.getpid(), time.strftime("%Y-%m-%dT%H:%M:%S")))
+    handle.flush()
+    os.chmod(path, 0o600)
+    # ⚠️ Keep the handle alive. Closing it drops the lock, and a local variable
+    # going out of scope is exactly how that happens by accident.
+    _LOCK_HANDLE = handle
+
+
 def cmd_ingest(opts):
+    take_write_lock(opts.db, "ingest")
     db = connect(opts.db)
     require_consent(db, opts)
     warn_security(db, opts.db)
@@ -1328,6 +1384,7 @@ def cmd_rechunk(opts):
 
 
 def cmd_embed(opts):
+    take_write_lock(opts.db, "embed")
     if not os.path.exists(VEC):
         die("vec is not built. Run: make -C %s" % HERE)
     connect(opts.db).close()
@@ -1894,10 +1951,7 @@ def cmd_refresh(opts):
         # which killed the run BEFORE the embed step. Every refresh ingested
         # new records and then embedded none of them, and the traceback looked
         # like a maps problem rather than a silent embed skip.
-        extra = {"mail": ["--with-bodies"], "calendar": ["--since", "3650"],
-                 "messages": ["--chat-limit", "1331", "--limit", "2000"],
-                 "notes": [], "contacts": ["--limit", "100000"],
-                 "maps": []}.get(name, [])
+        extra = REFRESH_ARGS.get(name, [])
         # ⚠️ --db is a flag on the MAIN parser, so it must come BEFORE the
         # subcommand. Putting it after gives "unrecognized arguments".
         proc = subprocess.run([sys.executable, __file__, "--db", opts.db, "ingest",
@@ -2323,6 +2377,44 @@ def cmd_nearby(opts):
         print("no group of %d or more within %g km." % (opts.min_size, opts.radius))
 
 
+def cmd_sources(opts):
+    """What refresh runs for each source. The app reads this rather than
+    keeping a second copy of REFRESH_ARGS in Swift."""
+    print(json.dumps({name: REFRESH_ARGS.get(name, []) for name in SOURCES},
+                     indent=2))
+
+
+def cmd_consent(opts):
+    """Read, print or record the opt-in.
+
+    🛑 The app cannot use the interactive path: a GUI child has no terminal, so
+    `require_consent` would refuse. It shows this same text in its own window
+    and then records the answer here, so there is ONE consent record and one
+    wording.
+    """
+    if opts.text:
+        print(CONSENT_PROMPT)
+        return
+    db = connect(opts.db)
+    row = db.execute(
+        "SELECT granted_at, version, how FROM consent ORDER BY granted_at").fetchone()
+    if opts.accept:
+        if row:
+            print(json.dumps({"granted": True, "granted_at": row["granted_at"],
+                              "how": row["how"], "changed": False}))
+            return
+        db.execute("INSERT INTO consent (granted_at, version, how) VALUES (?,?,?)",
+                   (time.time(), CONSENT_VERSION, opts.how))
+        db.commit()
+        print(json.dumps({"granted": True, "granted_at": time.time(),
+                          "how": opts.how, "changed": True}))
+        return
+    print(json.dumps({"granted": bool(row),
+                      "granted_at": row["granted_at"] if row else None,
+                      "how": row["how"] if row else None,
+                      "changed": False}))
+
+
 def cmd_status(opts):
     warn_if_revoked(opts)
     db = connect(opts.db)
@@ -2549,6 +2641,16 @@ def main():
                     help="cap the records compared; the pairing is O(n^2)")
     nb.add_argument("--json", action="store_true")
     nb.set_defaults(func=cmd_nearby)
+
+    sub.add_parser("sources",
+                   help="the per-source arguments `refresh` uses, as JSON"
+                   ).set_defaults(func=cmd_sources)
+
+    cs = sub.add_parser("consent", help="read, print or record the opt-in")
+    cs.add_argument("--text", action="store_true", help="print the wording and stop")
+    cs.add_argument("--accept", action="store_true", help="record consent")
+    cs.add_argument("--how", default="app", help="what recorded it")
+    cs.set_defaults(func=cmd_consent)
 
     sub.add_parser("status", help="what is indexed").set_defaults(func=cmd_status)
 

@@ -1,0 +1,72 @@
+# The app that owns the grants, the index and the schedule.
+#
+# 🛑 Not wired into the root Makefile. `make build`, `make test` and `make dist`
+# at the repo root do not touch this.
+
+APP        := AppleTools
+VERSION    := $(shell cat ../VERSION)
+BUILD      := $(shell git rev-list --count HEAD 2>/dev/null || echo 1)
+DERIVED    := $(CURDIR)/build
+PRODUCT    := $(DERIVED)/Build/Products/Release/$(APP).app
+TEAM       := 25RCAA3JLJ
+IDENTITY   := Developer ID Application
+BUNDLE_ID  := com.boulderhopkins.apple-tools
+
+export APP_VERSION := $(VERSION)
+export APP_BUILD   := $(BUILD)
+
+.PHONY: generate build run install uninstall clean stop grant logs archive notarize
+
+## Regenerate the Xcode project from project.yml
+generate:
+	xcodegen generate --spec project.yml --quiet
+	@echo "generated $(APP).xcodeproj  ($(VERSION) build $(BUILD))"
+
+## Release build, signed with Developer ID
+##
+## 🛑 Developer ID even for a local build. An ad-hoc signature keys the TCC
+## grant to the cdhash, so every rebuild would drop Full Disk Access and the
+## user would approve it again by hand. A stable identity survives a rebuild.
+build: generate
+	xcodebuild -project $(APP).xcodeproj -scheme $(APP) \
+	  -configuration Release -derivedDataPath $(DERIVED) \
+	  CODE_SIGN_IDENTITY="$(IDENTITY)" DEVELOPMENT_TEAM=$(TEAM) \
+	  build | grep -Ev "^\s*$$" | tail -20
+	@echo "built $(PRODUCT)"
+	@codesign -dv "$(PRODUCT)" 2>&1 | grep -E "Identifier|Authority|flags" || true
+
+## Replace the copy in /Applications and start it
+##
+## ⚠️ macOS keeps the TCC grant against the bundle id and the signature, not the
+## path, so replacing the bundle in place does NOT drop Full Disk Access.
+install: build stop
+	rm -rf "/Applications/$(APP).app"
+	cp -R "$(PRODUCT)" /Applications/
+	@echo "installed /Applications/$(APP).app"
+	open "/Applications/$(APP).app"
+
+run: build stop
+	open "$(PRODUCT)"
+
+## 🛑 Quit it properly. `pkill -9` leaves the search endpoint bound to the
+## socket, and two daemons on one socket made a search take 10.7 seconds once.
+stop:
+	-@osascript -e 'quit app "$(APP)"' 2>/dev/null
+	-@pkill -x $(APP) 2>/dev/null; true
+	@sleep 1
+
+uninstall: stop
+	rm -rf "/Applications/$(APP).app"
+
+## Open the pane the user has to toggle by hand. No API can ask for this one.
+grant:
+	open "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles"
+
+logs:
+	@tail -n 40 "$$HOME/Library/Application Support/apple-tools/logs/search.log" 2>/dev/null \
+	  || echo "no search log yet"
+	@echo "--- app ---"
+	@log show --last 10m --predicate 'process == "$(APP)"' --style compact 2>/dev/null | tail -30
+
+clean:
+	rm -rf $(DERIVED) $(APP).xcodeproj

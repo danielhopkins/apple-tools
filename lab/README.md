@@ -385,9 +385,12 @@ These are the experiment. Change them and see what happens.
   exact duplicates, mostly recurring calendar events: "Margot Daycare" appears
   460 times. Keying vectors by a content hash instead of a chunk id would save
   18% of the embed time and storage. This is the next improvement.
-- **No daemon.** See the measurements above for why that is a deliberate order,
-  not an omission. When one is added it must be **two** processes: the
-  disclaiming tools (calendar, contacts, reminders) lose Full Disk Access, so
-  they cannot share a process with the tools that need it.
+- ~~**No daemon.**~~ `vec daemon` shipped in 26.822.1 and **the app owns it as
+  of 2026-08-23**. ⚠️ **The two-process rule this line used to state is retired.**
+  It said a daemon must be two processes, because the disclaiming tools
+  (calendar, contacts, reminders) lose Full Disk Access. Inside the app nothing
+  disclaims: `APPLE_TOOLS_OWN_TCC_IDENTITY` makes them skip the re-exec and run
+  under the app's identity, so **one process tree serves both halves**. See
+  [`../app/README.md`](../app/README.md).
 - **Mail bodies are opt-in** (`--with-bodies`) because they cost one subprocess
   per message.

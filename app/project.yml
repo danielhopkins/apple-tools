@@ -1,0 +1,82 @@
+# The app that owns the grants, the index and the schedule.
+#
+# 🛑 Generated into AppleTools.xcodeproj by `make generate`. Never edit the
+# .xcodeproj — it is not in git.
+#
+# 🛑 THE BUNDLE ID IS LOAD-BEARING AND MUST NOT CHANGE. TCC keys a grant to the
+# bundle id and the signing identity, so renaming it makes the user grant Full
+# Disk Access again by hand. The DISPLAY NAME is free to change; the id is not.
+# The product name here is a placeholder — see docs/todo-index-app.md, which
+# records why nothing public may be called "Apple ...".
+name: AppleTools
+
+options:
+  bundleIdPrefix: com.boulderhopkins
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+  groupSortPosition: none
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MARKETING_VERSION: ${APP_VERSION}
+    CURRENT_PROJECT_VERSION: ${APP_BUILD}
+    DEVELOPMENT_TEAM: 25RCAA3JLJ
+    PRODUCT_BUNDLE_IDENTIFIER: com.boulderhopkins.apple-tools
+    # 🛑 Manual, and a Developer ID identity even for a debug build. An ad-hoc
+    # signature keys TCC to the cdhash, so EVERY REBUILD would drop the Full
+    # Disk Access grant and the user would re-approve it by hand each time.
+    # A stable Developer ID signature survives a rebuild.
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "Developer ID Application"
+    ENABLE_HARDENED_RUNTIME: YES
+    # 🛑 NO. Xcode injects `get-task-allow` otherwise, which lets ANY process
+    # running as this user attach a debugger to an app that holds Full Disk
+    # Access — and notarization rejects the bundle for it as well.
+    CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+    # ⚠️ The App Sandbox denies every store this app exists to read, and Full
+    # Disk Access does not lift it. Off, permanently. See the design doc.
+    ENABLE_APP_SANDBOX: NO
+    COMBINE_HIDPI_IMAGES: YES
+    DEAD_CODE_STRIPPING: YES
+
+targets:
+  AppleTools:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources
+    entitlements:
+      path: AppleTools.entitlements
+      properties:
+        # The only entitlement a non-sandboxed app needs here: `apple mail
+        # compose`, `apple notes delete` and a contact note all send Apple
+        # Events. 🛑 Do NOT add disable-library-validation. Spawning
+        # /usr/bin/python3 does not need it; only loading a foreign dylib would.
+        com.apple.security.automation.apple-events: true
+    info:
+      path: Info.plist
+      properties:
+        CFBundleName: AppleTools
+        CFBundleDisplayName: AppleTools
+        CFBundlePackageType: APPL
+        CFBundleShortVersionString: ${APP_VERSION}
+        CFBundleVersion: ${APP_BUILD}
+        # No Dock icon. A background indexer with a Dock tile is noise.
+        LSUIElement: true
+        LSMinimumSystemVersion: "14.0"
+        NSHumanReadableCopyright: ""
+        # 🛑 There is NO usage string for Full Disk Access, and that pane shows
+        # no reason text at all. The onboarding copy in the window carries it.
+        NSAppleEventsUsageDescription: >-
+          AppleTools drives Mail, Notes and Contacts to write the things their
+          own frameworks refuse to write.
+        NSContactsUsageDescription: >-
+          AppleTools reads your contacts so `apple contacts` works and so the
+          index can find people by name.
+        NSCalendarsFullAccessUsageDescription: >-
+          AppleTools reads and writes your calendar so `apple calendar` works
+          and so the index covers your events.
+        NSRemindersFullAccessUsageDescription: >-
+          AppleTools reads and writes your reminders so `apple reminders` works.

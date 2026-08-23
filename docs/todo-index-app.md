@@ -1,6 +1,10 @@
 # Planned: a notarized app that owns the index and the grants
 
-**Status: design only. Nothing here is built.**
+**Status: phases 0, 1 and 2 are built.** The app indexes on a schedule and owns
+the search endpoint. It lives in [`app/`](../app/), and [`app/README.md`](../app/README.md)
+records what it does and the traps found building it. Phases 4 to 6 — the
+container, encryption, the CLI proxy, notarization and a cask — are still
+design only.
 
 ## What this is for
 
@@ -52,7 +56,35 @@ does not check the name, but Apple's trademark guidelines forbid it and a cask
 in a public tap is public use. `AppleTools.app` is fine on this machine and is
 the wrong name to ship. This doc writes `AppleTools.app` as a placeholder.
 
-## 🛑 Step 0: the load-bearing thing nobody has measured
+## ✅ Step 0: measured on 2026-08-23, and the answer is yes
+
+**Children DO inherit the app's TCC identity.** One Full Disk Access grant on
+the app covered `apple-notes`, `apple-mail`, `apple-messages` and `apple-maps`
+when the app spawned them. Measured in a matched pair on macOS 27.0 (26A5416b):
+one indexing cycle before the grant and one after it, nothing else changed.
+
+| Source | Before the grant | After |
+|---|---|---|
+| notes | `sqlite3.OperationalError: unable to open database file` | ✅ |
+| mail | refused to fall back to AppleScript | ✅ |
+| messages | `Cannot read chat.db … needs Full Disk Access` | ✅ |
+| maps | `Cannot read MapsSync_0.0.1 … needs Full Disk Access` | ✅ |
+
+🛑 **LAUNCHING THE APP BINARY FROM A TERMINAL MEASURES THE TERMINAL.** Running
+`AppleTools.app/Contents/MacOS/AppleTools` from a shell makes the shell the
+responsible process, so the app borrows the terminal's grants. That run reported
+**no errors at all**, including calendar and contacts, while the same build
+launched with `open` reported two failures. This is the same trap the paragraph
+below warns about, and it caught this work anyway. **Launch with `open`.**
+
+⚠️ **Calendar and Contacts are a separate question and they did NOT come free.**
+They are framework grants, not Full Disk Access, and the app has to request them
+itself. The app now does, at launch, before it spawns anything.
+
+The original text of this step follows, because the reasoning is still what
+makes the answer meaningful.
+
+### The claim as it was written
 
 Everything below rests on one claim:
 
@@ -456,9 +488,9 @@ Sized for one person, part time. The risk is front-loaded on purpose.
 
 | Phase | Work | Days |
 |---|---|---|
-| **0** | Probe TCC inheritance and the container placement. **Gate: do not proceed until this answers yes.** | 0.5 |
-| **1** | xcodegen skeleton, menu bar + status window, reading today's SQLite read-only. Signed, notarized, installed. Proves the pipeline end to end with no behaviour change. | 2–3 |
-| **2** | Move ingest inside the app: spawn helpers with the TCC-host variable, scheduler, serial queue, cancellation. Retire the launchd agent. | 3–4 |
+| **0** | ~~Probe TCC inheritance~~ **done, 2026-08-23 — yes.** Container placement still unprobed. | 0.5 |
+| **1** | ~~xcodegen skeleton, menu bar + status window, reading today's SQLite read-only~~ **done, 2026-08-23.** Signed with Developer ID; **not notarized**. | 2–3 |
+| **2** | ~~Ingest inside the app: spawn helpers with the TCC-host variable, scheduler, serial queue. Retire the launchd agent~~ **done, 2026-08-23.** | 3–4 |
 | **3** | ~~Core ML embedder, parity-checked, Swift tokenizer and runner~~ **done, 2026-08-22** — see `lab/coreml/BAKEOFF.md`. | 0 |
 | **4** | Container, encryption, onboarding consent, per-source opt-in, purge, revocation detection. | 3–4 |
 | **5** | CLI hosting: helpers on `PATH`, the XPC proxy behind a default-off setting. | 3–5 |
