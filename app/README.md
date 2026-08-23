@@ -45,6 +45,42 @@ search` typed into Ghostty is attributed to Ghostty, exactly as before. Only
 children the app itself spawns inherit. Route B in the design doc — an XPC proxy
 — is the only thing that changes that, and it is not built.
 
+## 🛑 An unnotarized app cannot get a TCC prompt, and TCC fails closed
+
+**Full Disk Access works, because the user grants it by hand. The three grants
+that need a PROMPT do not.** Measured on macOS 27.0 (26A5416b), with the app
+signed `Developer ID Application`, hardened runtime, **not notarized**:
+
+| Grant | What the request returned | State afterwards |
+|---|---|---|
+| calendar | `false`, no error, in under a second | still `notDetermined` |
+| reminders | **never returned at all** | still `notDetermined` |
+| contacts | `CNErrorDomain 100 "Access Denied"` | **`denied`** |
+
+⚠️ **No dialog appeared for any of them**, and the app was frontmost with a Dock
+tile at the time. TCC recorded a **denial the user never made** for contacts.
+
+**It is not this app's structure.** A 30-line app — regular activation policy,
+its own bundle id, the same Developer ID identity — reproduced it exactly. An
+ad-hoc signed copy was worse: neither request returned. Nothing is stale either;
+`tccutil reset Calendar/Reminders/AddressBook` and a relaunch changed nothing.
+There is no MDM and no configuration profile on this machine.
+
+**The remaining difference is notarization**, which every one of these builds
+lacks and which `spctl` rejects them for. That is the next thing to test, and it
+is on the roadmap anyway.
+
+⚠️ **The app spun forever waiting.** `requestFullAccessToReminders` never called
+back, and the process logged `TCCAccessRequest() IPC` **every two seconds for as
+long as it ran**, while the two grants queued behind it were never asked for.
+
+🛑 **A deadline for it must be a plain timer.** Two versions raced the request
+against `Task.sleep`, on the main actor and off it, and **the sleep never
+fired** — the request occupies a cooperative thread without suspending, so the
+timer beside it was never scheduled. `DispatchQueue.main.asyncAfter` does not
+care. ⚠️ Losing the race cancels nothing: there is no cancel API, so the retry
+runs inside EventKit until the process exits.
+
 ## What it does
 
 **It indexes.** `NSBackgroundActivityScheduler` every 5 minutes with 60 seconds

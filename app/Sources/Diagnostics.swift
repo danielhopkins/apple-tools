@@ -75,8 +75,13 @@ final class Diagnostics: ObservableObject {
     func check() {
         guard !busy else { return }
         busy = true
+        // Read the framework grants HERE, on the main actor, and hand them to
+        // the background work as a plain dictionary.
+        let frameworks = AppModel.shared.grants.entries
+            .reduce(into: [String: String]()) { $0[$1.name] = $1.state.rawValue }
         Task.detached(priority: .utility) {
             let result = Self.measure()
+            Self.write(result, frameworks: frameworks)
             await MainActor.run {
                 self.latest = result
                 self.busy = false
@@ -118,6 +123,37 @@ final class Diagnostics: ObservableObject {
         let answers = diagnosis.tools.filter { fileOnly.contains($0.tool) }
         diagnosis.childHasFullDiskAccess = answers.contains { $0.usable }
         return diagnosis
+    }
+
+    /// 🛑 Write it to a file, because a terminal cannot ask this question.
+    /// `authorizationStatus` and every protected read are attributed to the
+    /// RESPONSIBLE process, so running any probe from a shell reports the
+    /// shell's grants, not the app's. The only way to see what the app sees is
+    /// to have the app write it down.
+    nonisolated static func write(_ diagnosis: Diagnosis,
+                                  frameworks: [String: String]) {
+        var body: [String: Any] = [
+            "checked": ISO8601DateFormatter().string(from: diagnosis.checked ?? Date()),
+            "app_full_disk_access": diagnosis.appHasFullDiskAccess,
+            "child_full_disk_access": diagnosis.childHasFullDiskAccess,
+            "inheritance": diagnosis.inheritance.rawValue,
+            "tools": diagnosis.tools.reduce(into: [String: Any]()) { into, tool in
+                into[tool.tool] = ["status": tool.status, "usable": tool.usable,
+                                   "granted_to": tool.grantedTo, "pane": tool.pane]
+            },
+        ]
+        if let failure = diagnosis.error { body["error"] = failure }
+        // 🛑 Passed IN, never read here. This runs on a background thread and
+        // `MainActor.assumeIsolated` off the main actor is a crash, not a
+        // fallback.
+        if !frameworks.isEmpty { body["frameworks"] = frameworks }
+        let path = Paths.supportDirectory.appendingPathComponent("app-diagnostics.json")
+        guard let data = try? JSONSerialization.data(withJSONObject: body,
+                                                     options: [.prettyPrinted, .sortedKeys])
+        else { return }
+        try? data.write(to: path, options: .atomic)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600],
+                                               ofItemAtPath: path.path)
     }
 
     /// Open the pane the user has to toggle by hand. There is no API that asks.

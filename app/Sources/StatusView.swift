@@ -273,6 +273,12 @@ private struct Frameworks: View {
                  These three the app can ask for, and it asks once at launch.                  Full Disk Access above is the one macOS has no API for.
                  """)
             ForEach(model.grants.entries) { entry in
+                if let attempt = model.grants.attempts[entry.name],
+                   !entry.settled, attempt != "skipped: already decided" {
+                    Note("last request for \(entry.name): \(attempt)", tint: .red)
+                }
+            }
+            ForEach(model.grants.entries) { entry in
                 HStack(spacing: 12) {
                     Text(entry.settled ? "✓" : "✗")
                         .foregroundStyle(entry.settled ? Color.green : Color.red)
