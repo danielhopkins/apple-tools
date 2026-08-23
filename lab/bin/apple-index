@@ -6,8 +6,23 @@
 # binary using Core ML — no PyTorch, no `uv`, nothing to install.
 set -u
 self="${BASH_SOURCE[0]}"
-while [ -L "$self" ]; do self="$(readlink "$self")"; done
-here="$(cd "$(dirname "$self")" && pwd)"
+
+# 🛑 RESOLVE EACH LINK AGAINST THE DIRECTORY IT LIVES IN. `readlink` returns
+# the target verbatim, and Homebrew's `bin.install_symlink` writes a RELATIVE
+# one: ../Cellar/apple-tools/<version>/libexec/index/apple-index. Following it
+# without rejoining it to the link's own directory produced
+#   cd: ../Cellar/apple-tools/26.822.1/bin: No such file or directory
+# on every brew install, while the tarball — where this file is not a symlink —
+# worked perfectly. v26.822.1 shipped exactly that.
+while [ -L "$self" ]; do
+  link_dir="$(cd -P "$(dirname "$self")" && pwd)"
+  self="$(readlink "$self")"
+  case "$self" in
+    /*) ;;
+    *) self="$link_dir/$self" ;;
+  esac
+done
+here="$(cd -P "$(dirname "$self")" && pwd)"
 
 # Two layouts: a checkout has this in bin/ with index.py one level up; an
 # install puts them side by side.

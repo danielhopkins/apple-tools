@@ -261,6 +261,15 @@ dist: set-version completions
 		|| { echo "error: packaged apple-index cannot run"; exit 1; }
 	@test -f $(DIST)/index/models/vocab.txt \
 		|| { echo "error: no vocab.txt in the shipped models"; exit 1; }
+	@# 🛑 And exercise a RELATIVE symlink, which is what `bin.install_symlink`
+	@# writes. Running the wrapper in place proves nothing: v26.822.1 passed
+	@# that check and then failed on every brew install with
+	@#   cd: ../Cellar/apple-tools/26.822.1/bin: No such file or directory
+	@rm -rf $(DIST)/.linkcheck && mkdir -p $(DIST)/.linkcheck
+	@ln -s ../index/apple-index $(DIST)/.linkcheck/apple-index
+	@$(DIST)/.linkcheck/apple-index --help >/dev/null \
+		|| { echo "error: apple-index does not survive a relative symlink"; exit 1; }
+	@rm -rf $(DIST)/.linkcheck
 	@# Bind the embedded Info.plists. `dist` links its own universal binaries,
 	@# so the re-signing done by `build` does not apply to them — without this
 	@# the shipped tools cannot show a permission dialog at all.
