@@ -2,13 +2,19 @@
 # apple-index — the semantic index over the apple tools.
 #
 # A thin wrapper so the command works from any directory. The real program is
-# lab/index.py, which is stdlib-only Python; the embedding half needs PyTorch
-# and runs through `uv`, so `uv` must be on PATH for `embed` and `daemon`.
+# index.py, which is stdlib-only Python. The embedding half is `vec`, a Swift
+# binary using Core ML — no PyTorch, no `uv`, nothing to install.
 set -u
-LAB="$(cd "$(dirname "$(readlink "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")")/.." && pwd)"
-[ -f "$LAB/index.py" ] || LAB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-if [ ! -f "$LAB/index.py" ]; then
-  echo "apple-index: cannot find index.py (looked in $LAB)" >&2
-  exit 1
-fi
-exec /usr/bin/python3 "$LAB/index.py" "$@"
+self="${BASH_SOURCE[0]}"
+while [ -L "$self" ]; do self="$(readlink "$self")"; done
+here="$(cd "$(dirname "$self")" && pwd)"
+
+# Two layouts: a checkout has this in bin/ with index.py one level up; an
+# install puts them side by side.
+for candidate in "$here/.." "$here"; do
+  if [ -f "$candidate/index.py" ]; then
+    exec /usr/bin/python3 "$candidate/index.py" "$@"
+  fi
+done
+echo "apple-index: cannot find index.py (looked in $here and $here/..)" >&2
+exit 1

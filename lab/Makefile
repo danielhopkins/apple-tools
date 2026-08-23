@@ -10,9 +10,13 @@ UV      := $(shell command -v uv)
 .PHONY: build install uninstall install-agent uninstall-agent agent-status \
         install-skill uninstall-skill demo status test clean
 
-## Build the Swift embedder (Apple's models; the open ones need no build)
+## Build the Swift embedder (Core ML + Apple's models)
 build:
 	cd vec && swift build -c release
+
+## Build the Core ML weights that ship. Needs uv and a Hugging Face download.
+ship-models:
+	./coreml/ship-models.sh
 
 ## Symlink apple-index into ~/bin
 install: build
@@ -28,11 +32,11 @@ uninstall:
 	@echo "removed $(PREFIX)/apple-index"
 
 ## Install and load the launchd agent that keeps the daemon warm
-install-agent:
-	@test -n "$(UV)" || { echo "error: uv not found on PATH"; exit 1; }
+install-agent: build
+	@test -x vec/.build/release/vec || { echo "error: run 'make build' first"; exit 1; }
 	@mkdir -p "$(HOME)/Library/LaunchAgents" "$(LOGDIR)"
-	@sed -e 's|@UV@|$(UV)|g' -e 's|@LAB@|$(LAB)|g' -e 's|@HOME@|$(HOME)|g' \
-	     -e 's|@PATH@|$(dir $(UV)):/usr/bin:/bin:/usr/sbin:/sbin:$(HOME)/bin|g' \
+	@sed -e 's|@LAB@|$(LAB)|g' -e 's|@HOME@|$(HOME)|g' \
+	     -e 's|@PATH@|/usr/bin:/bin:/usr/sbin:/sbin:$(HOME)/bin|g' \
 	     -e 's|@LOGDIR@|$(LOGDIR)|g' \
 	     $(AGENT).plist.in > "$(PLIST)"
 	@# ⚠️ bootout is asynchronous. Bootstrapping straight after it fails with

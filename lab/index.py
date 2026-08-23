@@ -39,9 +39,17 @@ import urllib.parse
 from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VEC = os.path.join(HERE, "vec", ".build", "release", "vec")
+# ⚠️ Two layouts. In the checkout `vec` is a SwiftPM build product; in an
+# install it sits next to this file. Try the checkout first so `make dev`
+# behaviour does not change.
+VEC = next((candidate for candidate in
+            (os.path.join(HERE, "vec", ".build", "release", "vec"),
+             os.path.join(HERE, "vec"))
+            if os.path.isfile(candidate)),
+           os.path.join(HERE, "vec", ".build", "release", "vec"))
 OSS = os.path.join(HERE, "embed_oss.py")
 DAEMON = os.path.join(HERE, "daemon.py")
+COREML = os.path.join(HERE, "coreml", "coreml_embed.py")
 
 
 def daemon_request(payload, socket_path=None, timeout=30):
@@ -74,11 +82,29 @@ def daemon_request(payload, socket_path=None, timeout=30):
 # both record `model`, so a search never mixes two vector spaces.
 APPLE_MODELS = ("sentence", "contextual")
 OSS_MODELS = ("e5-base", "e5-small", "minilm")
-ALL_MODELS = APPLE_MODELS + OSS_MODELS
+# The same weights as `e5-small`, converted to Core ML and run with no PyTorch.
+# 🛑 Its vectors go in under their own name, `e5-small-coreml-v1`, because two
+# models never share a vector space — and a converted model is a second model
+# until its parity is measured. See coreml/BAKEOFF.md.
+COREML_MODELS = ("e5-small-coreml",)
+ALL_MODELS = APPLE_MODELS + OSS_MODELS + COREML_MODELS
 
 
 def vector_search_cmd(model, db, query, limit, tool=None):
-    if model in OSS_MODELS:
+    if model in COREML_MODELS:
+        # 🛑 The Swift binary, not `uv run`. The Core ML path needs no PyTorch
+        # and no virtualenv; coreml/coreml_embed.py is kept only as the
+        # reference the Swift port is measured against.
+        #
+        # ⚠️ `INDEX_COREML_PY=1` runs that reference instead, which is the only
+        # way to tell a Swift regression apart from a change in the index.
+        if os.environ.get("INDEX_COREML_PY"):
+            cmd = ["uv", "run", "--quiet", COREML, "search", "--db", db,
+                   "--query", query, "--limit", str(limit)]
+        else:
+            cmd = [VEC, "search", "--db", db, "--query", query,
+                   "--model", model, "--limit", str(limit)]
+    elif model in OSS_MODELS:
         cmd = ["uv", "run", "--quiet", OSS, "search", "--db", db,
                "--model", model, "--query", query, "--limit", str(limit)]
     else:
@@ -111,6 +137,93 @@ DEFAULT_DB = os.path.expanduser(
 # port. A port would put the whole mail corpus one bad bind address away from
 # the network.
 DEFAULT_SOCKET = os.path.join(os.path.dirname(DEFAULT_DB), "index.sock")
+
+
+# ⚠️ A DIRECTORY LISTING, NOT A TCC QUERY. There is no API that reports Full
+# Disk Access. Reading a protected directory is the only honest probe, and
+# `~/Library/Mail` is protected on every macOS that has Mail.
+FDA_PROBE = os.path.expanduser("~/Library/Mail")
+
+
+def full_disk_access():
+    """True when this process can still read a protected store."""
+    try:
+        os.listdir(FDA_PROBE)
+        return True
+    except PermissionError:
+        return False
+    except OSError:
+        # No Mail on this machine. Absence is not a denial, so do not claim one.
+        return True
+
+
+def cmd_enable(opts):
+    """Record consent, after showing exactly what the index will hold."""
+    if has_consent() and not opts.again:
+        print("already enabled (%s)" % CONSENT_PATH)
+        return
+    print(CONSENT_TEXT % {"db": opts.db})
+    if not opts.yes:
+        if not sys.stdin.isatty():
+            die("refusing to enable without a terminal. Pass --yes if you mean it.")
+        answer = input("Type 'index my data' to agree: ").strip().lower()
+        if answer != "index my data":
+            print("cancelled; nothing was written")
+            return
+    secure_db_path(opts.db)
+    with open(CONSENT_PATH, "w") as handle:
+        handle.write("agreed %s\n" % time.strftime("%Y-%m-%dT%H:%M:%S"))
+    os.chmod(CONSENT_PATH, 0o600)
+    print("enabled. Build the index with: apple-index refresh")
+
+
+def cmd_forget(opts):
+    """Delete everything this tool ever wrote, and stop the daemon.
+
+    🛑 This is the revocation path `SECURITY.md` demands. It removes the index,
+    the write-ahead log, the socket, the daemon log and the consent record, so
+    the next run starts from nothing and asks again.
+    """
+    targets = [opts.db, opts.db + "-wal", opts.db + "-shm",
+               os.path.join(os.path.dirname(opts.db), "daemon.log"),
+               DEFAULT_SOCKET]
+    present = [t for t in targets if os.path.exists(t)]
+    size = sum(os.path.getsize(t) for t in present
+               if os.path.isfile(t)) / 1e6
+    if not present:
+        print("nothing to forget")
+        return
+    if not opts.yes and not confirm(
+            "Delete the index and every trace of it (%.0f MB)?" % size):
+        print("cancelled")
+        return
+    daemon_request({"op": "stop"})
+    for pattern in ("daemon.py serve", "vec daemon"):
+        subprocess.run(["pkill", "-f", pattern], capture_output=True)
+    for target in present:
+        try:
+            os.remove(target)
+        except OSError as error:
+            print("could not remove %s: %s" % (target, error))
+    # ⚠️ The consent record lives in the `consent` TABLE, so deleting the
+    # database withdraws it and the next ingest asks again.
+    print("forgotten. %.0f MB deleted, consent withdrawn." % size)
+    print("⚠️  A backup may still hold a copy. This cannot reach one.")
+
+
+def warn_if_revoked(opts):
+    """Say so when the grant is gone but the index remains.
+
+    ⚠️ A user who revokes Full Disk Access expects their mail to stop being
+    readable. The index keeps answering, because it is an ordinary file. Saying
+    nothing here is the behaviour `SECURITY.md` calls out by name.
+    """
+    if not os.path.exists(opts.db) or full_disk_access():
+        return
+    sys.stderr.write(
+        "🛑 Full Disk Access is gone, and the index is still here.\n"
+        "   It still holds the plaintext of everything indexed before now.\n"
+        "   Delete it with: apple-index forget\n")
 
 
 def secure_db_path(path):
@@ -1218,7 +1331,9 @@ def cmd_embed(opts):
     if not os.path.exists(VEC):
         die("vec is not built. Run: make -C %s" % HERE)
     connect(opts.db).close()
-    if opts.model in OSS_MODELS:
+    if opts.model in COREML_MODELS:
+        cmd = [VEC, "embed", "--db", opts.db, "--model", opts.model]
+    elif opts.model in OSS_MODELS:
         cmd = ["uv", "run", "--quiet", OSS, "embed", "--db", opts.db,
                "--model", opts.model]
     else:
@@ -1319,6 +1434,7 @@ def record_query(db, query, settings, fingerprint, results, elapsed_ms, cached,
 
 
 def cmd_search(opts):
+    warn_if_revoked(opts)
     db = connect(opts.db)
     started = time.time()
     settings = search_settings(opts)
@@ -1653,7 +1769,17 @@ def cmd_daemon(opts):
         return
 
     if opts.action == "stop":
-        subprocess.run(["pkill", "-f", "daemon.py serve"], capture_output=True)
+        for pattern in ("daemon.py serve", "vec daemon"):
+            subprocess.run(["pkill", "-f", pattern], capture_output=True)
+        # ⚠️ The launchd agent sets KeepAlive, so it restarts the daemon within
+        # seconds of a kill. Two daemons then raced for the socket here, and
+        # `daemon status` reported the one that lost. Say so rather than
+        # leaving the user to wonder why "stopped" did not stop anything.
+        agent = os.path.expanduser(
+            "~/Library/LaunchAgents/com.boulderhopkins.apple-index.plist")
+        if os.path.exists(agent):
+            print("⚠️  a launchd agent will restart it. To stop it for good:")
+            print("    launchctl bootout gui/$(id -u)/com.boulderhopkins.apple-index")
         if os.path.exists(opts.socket):
             os.remove(opts.socket)
         print("stopped")
@@ -1663,12 +1789,19 @@ def cmd_daemon(opts):
         print("already running")
         return
     secure_db_path(opts.db)
+    # 🛑 The Core ML daemon is the Swift binary. `daemon.py` needs PyTorch and
+    # 661 MB to answer the same socket; `vec daemon` holds 110 MB. Both speak
+    # the same protocol, so the client cannot tell which one answered.
+    if opts.model in COREML_MODELS:
+        command = [VEC, "daemon", "--db", opts.db, "--socket", opts.socket,
+                   "--model", opts.model]
+    else:
+        command = ["uv", "run", "--quiet", DAEMON, "serve", "--db", opts.db,
+                   "--socket", opts.socket, "--model", opts.model,
+                   "--refresh", str(opts.refresh)]
     with open(log_path, "a") as log_file:
-        subprocess.Popen(
-            ["uv", "run", "--quiet", DAEMON, "serve", "--db", opts.db,
-             "--socket", opts.socket, "--model", opts.model,
-             "--refresh", str(opts.refresh)],
-            stdout=log_file, stderr=log_file, start_new_session=True)
+        subprocess.Popen(command, stdout=log_file, stderr=log_file,
+                         start_new_session=True)
     print("starting; the model takes a few seconds to load")
     print("  log:    %s" % log_path)
     print("  check:  ./index.py daemon status")
@@ -1685,9 +1818,15 @@ def cmd_refresh(opts):
     sources = opts.source.split(",") if opts.source else SOURCES
     changed = False
     for name in sources:
+        # 🛑 `.get`, never `[name]`. SOURCES lists six sources and this dict
+        # held five, so `refresh` raised KeyError on `maps` — the LAST source,
+        # which killed the run BEFORE the embed step. Every refresh ingested
+        # new records and then embedded none of them, and the traceback looked
+        # like a maps problem rather than a silent embed skip.
         extra = {"mail": ["--with-bodies"], "calendar": ["--since", "3650"],
                  "messages": ["--chat-limit", "1331", "--limit", "2000"],
-                 "notes": [], "contacts": ["--limit", "100000"]}[name]
+                 "notes": [], "contacts": ["--limit", "100000"],
+                 "maps": []}.get(name, [])
         # ⚠️ --db is a flag on the MAIN parser, so it must come BEFORE the
         # subcommand. Putting it after gives "unrecognized arguments".
         proc = subprocess.run([sys.executable, __file__, "--db", opts.db, "ingest",
@@ -2114,6 +2253,7 @@ def cmd_nearby(opts):
 
 
 def cmd_status(opts):
+    warn_if_revoked(opts)
     db = connect(opts.db)
     warn_security(db, opts.db)
     row = db.execute("SELECT granted_at, how FROM consent ORDER BY granted_at").fetchone()
@@ -2148,7 +2288,8 @@ def cmd_status(opts):
     # ⚠️ Quote the rate for the model that is actually behind. A single
     # hardcoded 41 chunks/sec came from Apple's model and told a caller "52
     # minutes" for an e5-small backlog that finished in 5.
-    RATES = {"e5-small-v1": 450.0, "e5-base-v1": 133.0,
+    RATES = {"e5-small-v1": 450.0, "e5-small-coreml-v1": 1000.0,
+             "e5-base-v1": 133.0,
              "sentence-v1": 60.0, "contextual-v1": 60.0}
     for r in per_model:
         pending = total - r["c"]
@@ -2191,7 +2332,7 @@ def main():
     e = sub.add_parser("embed", help="embed every chunk that has no vector")
     e.add_argument("--limit", type=int)
     e.add_argument("--batch", type=int, default=500)
-    e.add_argument("--model", default="e5-small", choices=list(ALL_MODELS))
+    e.add_argument("--model", default="e5-small-coreml", choices=list(ALL_MODELS))
     e.set_defaults(func=cmd_embed)
 
     s = sub.add_parser("search", help="hybrid search over everything indexed")
@@ -2216,7 +2357,7 @@ def main():
     # lexical arm dominates and that advantage never reaches the ranking. The
     # 0.012 hybrid gap is under one case in fourteen, so read the quality as a
     # tie and the resources as the deciding factor. See MODELS.md.
-    s.add_argument("--model", default="e5-small", choices=list(ALL_MODELS),
+    s.add_argument("--model", default="e5-small-coreml", choices=list(ALL_MODELS),
                    help="which embedding model's vectors to search")
     # Measured over eval.py's 13 cases (MRR): lexical-only 0.565, semantic-only
     # 0.269, equal 1:1 0.562, 2:1 and 3:1 both 0.602, 5:1 and 10:1 0.563.
@@ -2280,7 +2421,7 @@ def main():
 
     d = sub.add_parser("daemon", help="start, stop or query the warm daemon")
     d.add_argument("action", choices=["start", "stop", "status"])
-    d.add_argument("--model", default="e5-small")
+    d.add_argument("--model", default="e5-small-coreml")
     d.add_argument("--refresh", type=int, default=300)
     d.add_argument("--socket", default=DEFAULT_SOCKET)
     d.set_defaults(func=cmd_daemon)
@@ -2288,8 +2429,13 @@ def main():
     rf = sub.add_parser("refresh",
                         help="ingest, embed and reload — run this from a terminal")
     rf.add_argument("--source", help="comma separated; default all")
-    rf.add_argument("--model", default="e5-small", choices=list(ALL_MODELS))
+    rf.add_argument("--model", default="e5-small-coreml", choices=list(ALL_MODELS))
     rf.set_defaults(func=cmd_refresh)
+
+    fg = sub.add_parser("forget",
+                        help="delete the index and withdraw consent")
+    fg.add_argument("--yes", action="store_true")
+    fg.set_defaults(func=cmd_forget)
 
     pu = sub.add_parser("purge", help="delete the index, or just the logs")
     pu.add_argument("--yes", action="store_true", help="do not ask")

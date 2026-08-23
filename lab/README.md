@@ -1,8 +1,19 @@
 # lab/ — a semantic index over the apple-tools readers
 
-**Experimental. Nothing here ships.** The root `Makefile` does not build it,
-`make test` does not run it, and `make dist` copies named files only, so this
-directory stays out of the tarball. Delete it and the tool is unchanged.
+**Experimental, and as of 26.822.1 it SHIPS.** `make dist` builds `vec`
+universal and packages it as `index/` alongside `index.py`, the Core ML weights
+and this document. `make test` still does not run anything here.
+
+🛑 **Only the parts that need no PyTorch ship.** `daemon.py`, `embed_oss.py` and
+`coreml/coreml_embed.py` stay in the repo as the reference the Swift port is
+measured against, and are deliberately left out of the tarball. A shipped
+install has no `uv` dependency and nothing to download.
+
+🛑 **Installing builds no index and reads nothing.** The first `apple-index
+refresh` asks for consent and records it, and `apple-index forget` deletes
+everything. Read [SECURITY.md](SECURITY.md) before running it on real data:
+the index is not encrypted, and that is a recorded decision rather than an
+oversight.
 
 ## Why it exists
 
@@ -219,6 +230,16 @@ The reasoning that chose it was "the sentence model is static, so a word gets
 the same vector regardless of its sentence". That is a fact about the model's
 design, not a measurement of retrieval quality, and it was the wrong basis for
 the decision.
+
+**The same weights now run as Core ML in Swift, with no PyTorch and no
+virtualenv.** `vec` carries its own WordPiece tokenizer, and its vectors are
+byte-identical to the Python path's on 19,999 of 20,000 chunks.
+
+**The same weights now run as Core ML, with no PyTorch at all.** 878 chunks/sec
+against 272.6, 0.999999 cosine parity, and no change in MRR. That is the path an
+app can ship. Measurements, and the fp16 mask bug that only one backend showed,
+are in [coreml/BAKEOFF.md](coreml/BAKEOFF.md). Select it with
+`./index.py embed --model e5-small-coreml`.
 
 `vec --model sentence|contextual` selects one. `sentence` is the default. The
 sentence model is also **4× faster on short text**.

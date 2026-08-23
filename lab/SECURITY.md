@@ -46,7 +46,10 @@ the grant expects their mail to stop being readable. The index keeps answering.
 | Index file `0600`, including `-wal` and `-shm` | ✅ enforced on every connect |
 | `.metadata_never_index` so Spotlight builds no second copy | ✅ written |
 | Kept out of the repo working tree | ✅ lives in `~/Library/Application Support/apple-tools/` |
-| Encryption at rest | 🛑 **none** |
+| Explicit opt-in before the first ingest | ✅ `consent` table, `--accept-risk` |
+| A revocation path that deletes everything | ✅ `apple-index forget` |
+| Refusing to serve after the grant is revoked | ✅ the daemon checks and declines |
+| Encryption at rest | 🛑 **none — decided, see below** |
 | Access logging | 🛑 **none** |
 | Automatic expiry | 🛑 **none** |
 
@@ -117,17 +120,33 @@ Stop it with `./index.py daemon stop`.
 `purge` is the closest thing to a revocation. Use it before handing the machine
 to anyone, and after any test run on real data.
 
-## 🛑 Before this ever ships
+## Before this ever ships — where the three blockers stand
 
-Three things are not optional for a released version:
+1. **A `--forget` path.** ✅ **Done.** `apple-index forget` deletes the index,
+   the write-ahead log, the socket, the daemon log and the `consent` row, and
+   stops the daemon first. Revocation is now noticed rather than ignored:
+   `search` and `status` warn when Full Disk Access is gone and the index is
+   still there, and the daemon **refuses to serve** at that point.
+   ⚠️ **It cannot reach a backup.** Time Machine holds copies it will never see.
 
-1. **A `--forget` path that actually runs**, wired to the same moment a user
-   revokes Full Disk Access. Right now nothing connects those.
-2. **A decision on encryption at rest.** SQLCipher is the obvious route. Note
-   that an FTS5 index leaks its own terms, so encrypting only the body column
-   is not enough.
-3. **An explicit opt-in.** A tool that silently aggregates every protected store
-   into one unprotected file is not something a user should get by accident.
+2. **An explicit opt-in.** ✅ **Done, and this document was wrong about it.**
+   The `consent` table, the prompt and `--accept-risk` have existed for some
+   time; this file went on listing the work as outstanding. A stale security
+   document is its own defect.
+
+3. **A decision on encryption at rest.** 🛑 **Decided: NO, and here is why.**
+   - `index.py` reads and writes through Python's stdlib `sqlite3`, which has
+     no SQLCipher and cannot be given one without shipping a compiled
+     extension. Encrypting the file means moving **every** database access into
+     Swift, which is most of the tool.
+   - An FTS5 index leaks its own terms, so encrypting the body column alone
+     buys very little.
+   - A key in the login keychain is readable by anything running as the user,
+     which is the same attacker the file already has.
+   **So the honest posture is: no encryption, and say so loudly.** The consent
+   prompt states it. This is a decision to revisit when the index moves inside
+   an app bundle, where a container and a key with an app-bound ACL are both
+   available. See `docs/todo-index-app.md`.
 
 ## The honest summary
 

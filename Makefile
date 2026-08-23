@@ -235,6 +235,32 @@ dist: set-version completions
 		|| { echo "error: no signed shortcuts in notes/shortcuts/; run 'python3 notes/shortcuts/build-shortcut.py --ship notes/shortcuts/'"; exit 1; }
 	cp notes/shortcuts/*.shortcut $(DIST)/shortcuts/
 	cp notes/shortcuts/README.md $(DIST)/shortcuts/
+	@# The semantic index. 🛑 Only what runs with NO PyTorch ships: the
+	@# stdlib driver, the Swift embedder, and the Core ML weights. daemon.py,
+	@# embed_oss.py and coreml_embed.py stay in the repo as the reference the
+	@# Swift port is measured against, and are deliberately not shipped.
+	@test -d lab/coreml/build-ship || { \
+		echo "error: no lab/coreml/build-ship; run 'make -C lab ship-models'"; exit 1; }
+	mkdir -p $(DIST)/index/models $(DIST)/index/skill
+	cd lab/vec && swift build $(SWIFT_UNIV)
+	cp "$$(cd lab/vec && swift build $(SWIFT_UNIV) --show-bin-path)"/vec $(DIST)/index/
+	@# ⚠️ Universal, like every other binary here. A release that runs only on
+	@# the machine that built it is the bug this check exists to catch.
+	@for arch in arm64 x86_64; do \
+		lipo -archs $(DIST)/index/vec | grep -q $$arch \
+			|| { echo "error: index/vec is missing $$arch"; exit 1; }; \
+	done
+	cp lab/index.py lab/bin/apple-index $(DIST)/index/
+	cp lab/README.md lab/SECURITY.md lab/INCREMENTAL.md lab/MODELS.md $(DIST)/index/
+	cp lab/coreml/BAKEOFF.md $(DIST)/index/
+	cp lab/com.boulderhopkins.apple-index.plist.in $(DIST)/index/
+	cp -R lab/skill/apple-index $(DIST)/index/skill/
+	cp -R lab/coreml/build-ship/ $(DIST)/index/models/
+	@# Prove the packaged index can find its own binary and weights.
+	@PYTHONDONTWRITEBYTECODE=1 $(DIST)/index/apple-index --help >/dev/null \
+		|| { echo "error: packaged apple-index cannot run"; exit 1; }
+	@test -f $(DIST)/index/models/vocab.txt \
+		|| { echo "error: no vocab.txt in the shipped models"; exit 1; }
 	@# Bind the embedded Info.plists. `dist` links its own universal binaries,
 	@# so the re-signing done by `build` does not apply to them — without this
 	@# the shipped tools cannot show a permission dialog at all.
