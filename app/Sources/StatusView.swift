@@ -270,7 +270,13 @@ private struct Frameworks: View {
     var body: some View {
         Section("Calendar, Reminders and Contacts") {
             Note("""
-                 These three the app can ask for, and it asks once at launch.                  Full Disk Access above is the one macOS has no API for.
+                 🛑 The index does not need these. `apple-calendar`, `reminders` \
+                 and `apple-contacts` each carry their OWN grant, because each \
+                 one disclaims and becomes its own responsible process. That is \
+                 how all six sources index while the rows below say no.
+
+                 They would matter only if the app itself read a calendar or a \
+                 contact directly, which it does not.
                  """)
             ForEach(model.grants.entries) { entry in
                 if let attempt = model.grants.attempts[entry.name],

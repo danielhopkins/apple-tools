@@ -85,3 +85,15 @@ targets:
           and so the index covers your events.
         NSRemindersFullAccessUsageDescription: >-
           AppleTools reads and writes your reminders so `apple reminders` works.
+        # ⚠️ The LEGACY keys as well as the split ones. macOS 14 split calendar
+        # into full and write-only access with new key names, and it is not
+        # documented whether the old key is still consulted. Reminders prompts
+        # with only the new key; calendar does not. Carrying both costs nothing.
+        NSCalendarsUsageDescription: >-
+          AppleTools reads and writes your calendar so `apple calendar` works
+          and so the index covers your events.
+        NSRemindersUsageDescription: >-
+          AppleTools reads and writes your reminders so `apple reminders` works.
+        NSContactsFullAccessUsageDescription: >-
+          AppleTools reads your contacts so `apple contacts` works and so the
+          index can find people by name.

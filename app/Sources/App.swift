@@ -28,11 +28,13 @@ final class AppModel: ObservableObject {
     private var ticker: Timer?
 
     func start() {
-        // 🛑 Ask FIRST, before anything spawns a tool. A child asking instead
-        // gets the same dialog attributed to the app, but only when the state
-        // is `notDetermined` — and a background child that is denied leaves the
-        // state at `denied`, which asking again can never undo.
-        grants.requestAndRead()
+        // 🛑 READ, DO NOT ASK. The index does not need the app to hold Calendar,
+        // Reminders or Contacts: `apple-calendar`, `reminders` and
+        // `apple-contacts` disclaim, so each one carries its own grant, and
+        // those grants already work. Asking cost a stuck `denied` record for
+        // Contacts and a minute of stolen focus per launch, for nothing.
+        // The window keeps an "Ask Again" button for a person who wants it.
+        grants.read()
         search.start()
         indexer.startScheduling()
         diagnostics.check()

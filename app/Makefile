@@ -19,7 +19,7 @@ BUNDLE_ID  := com.boulderhopkins.apple-tools
 export APP_VERSION := $(VERSION)
 export APP_BUILD   := $(BUILD)
 
-.PHONY: generate build run install uninstall clean stop grant logs notarize
+.PHONY: generate build release run install uninstall clean stop grant logs notarize
 
 ## Regenerate the Xcode project from project.yml
 generate:
@@ -47,6 +47,23 @@ install: build stop
 	rm -rf "/Applications/$(APP).app"
 	cp -R "$(PRODUCT)" /Applications/
 	@echo "installed /Applications/$(APP).app"
+	@# 🛑 A REBUILD DESTROYS THE NOTARIZATION TICKET, because it re-signs the
+	@# bundle. `make install` therefore installs an UNNOTARIZED app unless it
+	@# runs `notarize` first — and an unnotarized app gets no TCC prompt at all
+	@# on macOS 27.0, so Calendar and Contacts silently fail. This cost hours:
+	@# the app was notarized once, and every `make install` after that quietly
+	@# replaced it. Use `make release`.
+	@xcrun stapler validate "/Applications/$(APP).app" >/dev/null 2>&1 \
+	  || echo "⚠️  NOT NOTARIZED. TCC will not prompt. Run: make release"
+	open "/Applications/$(APP).app"
+
+## Build, notarize, staple, then install. The only way to install something
+## that macOS will show a permission dialog for.
+release: notarize stop
+	rm -rf "/Applications/$(APP).app"
+	cp -R "$(PRODUCT)" /Applications/
+	xcrun stapler validate "/Applications/$(APP).app"
+	spctl -a -vv "/Applications/$(APP).app"
 	open "/Applications/$(APP).app"
 
 run: build stop

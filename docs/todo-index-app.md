@@ -117,7 +117,42 @@ If the claim is false, the fallback is worse but not fatal: every reader gets
 compiled into the app process, and the CLIs stay terminal-attributed forever.
 That is a rewrite of the ingest path, not a tweak.
 
-## 🛑 Step 0b: the disclaiming tools must stop disclaiming inside the app
+## 🛑 Step 0b was WRONG, and the app proved it
+
+**Measured 2026-08-23: the disclaiming tools must KEEP disclaiming inside the
+app.** The section below argued the opposite, and following it broke calendar
+and contacts for a whole day.
+
+The argument was that disclaiming "throws away the app's grants". It does — but
+only the ones the app actually holds. The app holds **Full Disk Access**, which
+`apple-calendar` and `apple-contacts` barely need. What they need is Calendar
+and Contacts, and **each binary already has its own grant**, given long ago from
+a terminal.
+
+With `APPLE_TOOLS_OWN_TCC_IDENTITY` set, so the three ran as the app:
+
+```
+calendar   Error: calendar access was not granted
+contacts   Error: contacts access was not granted: Access Denied
+```
+
+Without it, all six sources index and the cycle reports `errors: NONE`.
+
+🛑 **The app could not obtain those two grants for itself, and no dialog ever
+appeared.** Notarization, a reboot, a fresh bundle id, a delay, a reorder, a
+fresh store and every legacy Info.plist key were each measured and each changed
+nothing. Full record in [`app/README.md`](../app/README.md).
+
+⚠️ **The cost of disclaiming is real and small.** `apple contacts` loses
+`has_photo` and `apple calendar` loses the sync tables, because both read those
+from disk. The index uses neither. The five tools that DO need Full Disk Access
+never disclaim, so they keep the app's grant.
+
+The original section follows.
+
+### The argument as it was written
+
+### Step 0b: the disclaiming tools must stop disclaiming inside the app
 
 `reminders`, `apple-calendar` and `apple-contacts` re-execute themselves
 disclaimed, which makes each one **its own** responsible process. Inside the app

@@ -96,8 +96,17 @@ final class Grants: ObservableObject {
         // below, under `attempts`.
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
-        askCalendar()
+        // ⚠️ NOT during `applicationDidFinishLaunching`. A request made in the
+        // same turn of the run loop as the launch is refused: measured, the
+        // FIRST request the process makes returns false with no error and no
+        // dialog, and leaves the status `notDetermined`.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.settleDelay) {
+            [weak self] in self?.askContacts()
+        }
     }
+
+    /// How long to let the app settle before asking for anything.
+    private nonisolated static let settleDelay: TimeInterval = 5
 
     private func askCalendar() {
         guard EKEventStore.authorizationStatus(for: .event) == .notDetermined else {
@@ -115,9 +124,9 @@ final class Grants: ObservableObject {
     private func askReminders() {
         guard EKEventStore.authorizationStatus(for: .reminder) == .notDetermined else {
             attempts["reminders"] = "skipped: already decided"
-            return askContacts()
+            return done()
         }
-        begin("reminders") { [weak self] in self?.askContacts() }
+        begin("reminders") { [weak self] in self?.done() }
         newEventStore().requestFullAccessToReminders { [weak self] granted, error in
             DispatchQueue.main.async {
                 self?.finish("reminders", granted: granted, error: error)
@@ -128,9 +137,9 @@ final class Grants: ObservableObject {
     private func askContacts() {
         guard CNContactStore.authorizationStatus(for: .contacts) == .notDetermined else {
             attempts["contacts"] = "skipped: already decided"
-            return done()
+            return askCalendar()
         }
-        begin("contacts") { [weak self] in self?.done() }
+        begin("contacts") { [weak self] in self?.askCalendar() }
         newContactStore().requestAccess(for: .contacts) { [weak self] granted, error in
             DispatchQueue.main.async {
                 self?.finish("contacts", granted: granted, error: error)

@@ -31,8 +31,9 @@ ran one indexing cycle before the grant and one after it. Nothing else changed.
 | mail | refused to fall back to AppleScript | ✅ |
 | messages | `Cannot read chat.db … needs Full Disk Access` | ✅ |
 | maps | `Cannot read MapsSync_0.0.1 … needs Full Disk Access` | ✅ |
-| calendar | `calendar access was not granted` | ✅ once Calendar was granted |
-| contacts | `contacts access was not granted: Access Denied` | ✅ once Contacts was granted |
+
+⚠️ **calendar and contacts are a different question**, and Full Disk Access was
+never the answer for them. See the next section.
 
 So the app can index, and a launchd agent never could. That is the whole reason
 the app exists.
@@ -45,105 +46,100 @@ search` typed into Ghostty is attributed to Ghostty, exactly as before. Only
 children the app itself spawns inherit. Route B in the design doc — an XPC proxy
 — is the only thing that changes that, and it is not built.
 
-## 🛑 One TCC dialog at a time, and it waits for a person
+## 🛑 Let the disclaiming tools keep disclaiming
 
-**The app asks for Calendar, Reminders and Contacts itself.** Full Disk Access
-is the one macOS has no API for, so the window carries the reason and opens the
-pane instead.
+**The app holds Full Disk Access. It does NOT hold Calendar, Reminders or
+Contacts, and it does not need to.** `apple-calendar`, `reminders` and
+`apple-contacts` each re-execute themselves **disclaimed**, which makes each one
+its own responsible process, so TCC keys the grant to the **binary**. Those
+grants already exist and already work.
 
-🛑 **A permission request does not return until the user answers the dialog**,
-and macOS shows **one dialog at a time**. So the three requests are chained:
-each starts only when the one before it finishes. Asking for the next while a
-dialog is up gets the next one **denied** — measured, `Access Denied` from
-Contacts with the reminders dialog still on screen, and **TCC recorded that
-denial** as though the user had made it.
+🛑 **The design doc said the opposite, and the doc was wrong.** It reasoned that
+disclaiming inside the app "throws away the app's grants". It does — but only
+the ones the app actually holds, and the app holds Full Disk Access, which
+those three barely need.
 
-⚠️ **A deadline on a prompt is a person's deadline, not a machine's.** A 20
-second one was wrong, and it caused the failure it was written to diagnose. It
-is now ten minutes, and it exists only so a request nobody will ever answer
-cannot hold the chain for the life of the process.
+⚠️ **The cost is real and small.** A disclaimed child loses the app's Full Disk
+Access, so `apple contacts` cannot read `has_photo` out of the AddressBook store
+and `apple calendar` cannot read the sync tables. The index uses neither. The
+five tools that DO need Full Disk Access — mail, notes, messages, maps, phone —
+never disclaim, so they keep the app's grant.
 
-### 🛑 Unresolved: Calendar and Contacts hold a state nothing can clear
-
-**Reminders works. Calendar and Contacts do not, and the state behind them is
-not reachable from this machine.** Measured 2026-08-23 with the notarized,
-stapled app that `spctl` accepts:
+**With `APPLE_TOOLS_OWN_TCC_IDENTITY` set, so the three ran as the app:**
 
 ```
-reminders   granted [status 0]                          -> granted
-calendar    refused [status 0]                          -> notDetermined
-contacts    CNErrorDomain 100: Access Denied [status 2]  -> denied
+calendar   Error: calendar access was not granted
+contacts   Error: contacts access was not granted: Access Denied
 ```
 
-Three facts that cannot all be true of a healthy TCC:
+**Without it:** all six sources index, `errors: NONE`.
 
-1. **`tccutil reset AddressBook <bundle-id>` prints "Successfully reset" and
-   changes nothing.** The next launch reads `status 2` again, one second later.
-2. **System Settings → Privacy & Security → Contacts does not list the app at
-   all**, so there is no switch for the user to turn on either.
-3. **Reminders returned `granted` immediately after its own reset, with no
-   dialog**, which is only possible if the reset did not take.
+### ⚠️ The day this cost, and every wrong turn in it
 
-⚠️ **So the reminders grant is real and the other two are stuck**, not denied by
-the user. The contacts denial was first recorded by this app's own 20s deadline
-bug (see above), and it has outlived the fix.
+The app could not obtain Calendar or Contacts for itself. **No dialog ever
+appeared**, and each of these was measured and ruled out:
 
-🛑 **A BRAND NEW BUNDLE ID GETS THE SAME THREE ANSWERS.** A copy of the app,
-re-signed under `com.boulderhopkins.apple-tools-idtest` and launched clean,
-reported reminders **already granted**, contacts **denied** and calendar
-refused — with no dialog for any of them. An identity TCC has never seen cannot
-hold a decision, so the answers come from a cache that outlives both the bundle
-id and `tccutil`.
+| Suspect | Result |
+|---|---|
+| Not notarized | Notarized, stapled, `spctl` accepts. No change. |
+| Stale `tccd` cache | Rebooted. No change. SIP refuses `launchctl kickstart -k gui/<uid>/com.apple.tccd`. |
+| Stale bundle id | A fresh bundle id got the same three answers. |
+| Asking too early | A 5s delay after launch changed nothing. |
+| Asking in the wrong order | Reordering the chain changed nothing. |
+| A reused `EKEventStore` | A fresh store per request changed nothing. |
+| Missing Info.plist keys | Added every legacy key beside the split ones. No change. |
 
-⚠️ **That test is not airtight.** The copy was made from the signed bundle, and
-LaunchServices may still have associated the path with the original bundle id.
-Re-register with `lsregister -f` before repeating it.
+Meanwhile `apple calendar calendars` and `apple contacts search` answered
+perfectly from a terminal, **under their own identity** — which was the answer
+the whole time.
 
-**Two things are ruled out**, both measured rather than assumed:
+Four wrong turns are worth naming, because each was a bad check rather than a
+bad idea:
 
-- **Notarization.** The app is notarized, stapled, and accepted by `spctl`.
-  Nothing changed.
-- **Restarting `tccd`.** System Integrity Protection refuses it:
-  `launchctl kickstart -k gui/<uid>/com.apple.tccd` returns *"Operation not
-  permitted while System Integrity Protection is engaged"*. Killing the process
-  is ignored.
+1. 🛑 **`make install` rebuilds, and a rebuild re-signs and destroys the
+   notarization ticket.** The app was notarized once and every `make install`
+   after it quietly installed an unnotarized build, which invalidated a whole
+   run of measurements. **`make release` is the target that notarizes, staples
+   and then installs**, and `make install` now warns when the installed bundle
+   fails `stapler validate`.
+2. ⚠️ **A TCC dialog belongs to `UserNotificationCenter`, a BACKGROUND
+   process.** A check of "visible processes" does not list it, so a prompt that
+   was on screen looked absent. To see one:
 
-**What is left, in order:**
+   ```
+   osascript -e 'tell application "System Events" to tell process \
+     "UserNotificationCenter" to get value of every static text of window 1'
+   ```
+3. ⚠️ **`pgrep -x AppleTools` does not match this app.** Reading that as "the
+   app died" wasted another stretch. Use `pgrep -f MacOS/AppleTools`.
+4. 🛑 **`tccutil reset <service> <bundle-id>` prints "Successfully reset" and
+   may change nothing.** Its output is not evidence.
 
-1. **Reboot.** The only remaining way to restart `tccd`, and it clears the
-   LaunchServices cache as well. Untried.
-2. **Change the bundle id for real**, through `project.yml` rather than by
-   editing a signed copy. 🛑 It costs the Full Disk Access grant, which the user
-   must then give again by hand — the reason the id is called load-bearing at
-   the top of this file.
+### One TCC dialog at a time, and it waits for a person
 
-### ⚠️ How this was misdiagnosed, and how to avoid repeating it
+The window keeps an **Ask Again** button, and it is the only thing that asks now.
 
-The dialog belongs to **`UserNotificationCenter`, which is a BACKGROUND
-process**. A check of "visible processes" does not list it, so the prompt looked
-absent when it was on screen the whole time. That produced a confident wrong
-conclusion — *an unnotarized app cannot get a TCC prompt at all* — supported by
-a 30-line reproduction and a control app, and it took a round trip through
-Apple's notary service to disprove. **Notarizing changed nothing.** The dialog
-had simply been waiting, unanswered, on the other side of the screen.
+🛑 **A permission request does not return until the user answers**, and macOS
+shows **one dialog at a time**. Asking for the next grant while a dialog is up
+gets the next one **denied** — measured, `Access Denied` from Contacts with the
+reminders dialog still on screen, and **TCC recorded that denial** as though the
+user had made it. That record survived `tccutil reset` and a reboot.
 
-To see whether one is up:
+⚠️ **A deadline on a prompt is a person's deadline.** A 20 second one was wrong
+and caused the failure it was written to diagnose. It is ten minutes now, and it
+exists only so a request nobody will answer cannot hold the chain forever.
 
-```
-osascript -e 'tell application "System Events" to tell process \
-  "UserNotificationCenter" to get value of every static text of window 1'
-```
+🛑 **That deadline must be a plain timer.** Two versions raced the request
+against `Task.sleep`, on the main actor and off it, and **the sleep never
+fired** — the request occupies a cooperative thread without suspending.
+`DispatchQueue.main.asyncAfter` does not care.
 
-⚠️ **`pgrep -x AppleTools` does not match this app either**, and reading that as
-"the app died" wasted a second stretch of this work. Use `pgrep -f
-MacOS/AppleTools`.
+### Notarization
 
-### Notarization, which is needed anyway
-
-`make notarize` submits the built app, staples the ticket and checks `spctl`.
-🛑 **`xcodebuild build` does not add a secure timestamp** — only `archive`
-does — so a plain build is rejected with *"The signature does not include a
-secure timestamp"*. `OTHER_CODE_SIGN_FLAGS: --timestamp` fixes it.
+`make notarize` submits, staples and checks `spctl`. 🛑 **`xcodebuild build`
+does not add a secure timestamp** — only `archive` does — so a plain build is
+rejected with *"The signature does not include a secure timestamp"*.
+`OTHER_CODE_SIGN_FLAGS: --timestamp` fixes it.
 
 ⚠️ The notarytool keychain profile is named `MiniMusic`, after the first app it
 was stored for. It holds this developer's App Store Connect API key.
@@ -190,11 +186,10 @@ doc.
 `get-task-allow`, which lets any process running as this user attach a debugger
 to an app holding Full Disk Access. Notarization rejects it as well.
 
-🛑 **`APPLE_TOOLS_OWN_TCC_IDENTITY` stops the disclaim, it does not start it.**
-`reminders`, `apple-calendar` and `apple-contacts` re-execute themselves
-disclaimed so a terminal's grant is not what TCC keys on. Inside the app that is
-exactly wrong: disclaiming makes each tool its own responsible process, throwing
-away the app's grants. `Child.environment()` sets the marker so they skip it.
+🛑 **Do NOT set `APPLE_TOOLS_OWN_TCC_IDENTITY` on a child.** It STOPS the
+disclaim rather than starting it, which reads as the opposite of what it does.
+Setting it made `apple-calendar` and `apple-contacts` run as the app, and the
+app has no Calendar or Contacts grant. See above.
 
 ⚠️ **Report the whole of a failure, not its last line.** An argument parser ends
 its usage message with `See 'apple-calendar --help'`, which names nothing. A
