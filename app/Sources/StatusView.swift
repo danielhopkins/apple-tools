@@ -24,6 +24,7 @@ struct StatusView: View {
                 Embedding(model: model)
                 Permissions(model: model)
                 Frameworks(model: model)
+                Security(model: model)
             }
             .padding(22)
         }
@@ -60,9 +61,20 @@ private struct Header: View {
                 Toggle("Automatically", isOn: Binding(
                     get: { model.indexer.automatic },
                     set: { model.indexer.automatic = $0; model.indexer.saveState() }))
+                Toggle("Start at Login", isOn: Binding(
+                    get: { model.loginItem.state == .enabled },
+                    set: { model.loginItem.set($0) }))
                 Spacer()
                 Button("Recheck Permissions") { model.diagnostics.check() }
                     .disabled(model.diagnostics.busy)
+            }
+            if model.loginItem.state == .needsApproval {
+                Note("macOS is holding this login item for your approval. Turn "
+                     + "it on in System Settings \u{2192} General \u{2192} Login Items.",
+                     tint: .orange)
+            }
+            if let failure = model.loginItem.failure {
+                Note(failure, tint: .red)
             }
         }
     }
@@ -305,6 +317,57 @@ private struct Frameworks: View {
                     }
                 }
                 .font(.system(.body, design: .monospaced))
+            }
+        }
+    }
+}
+
+// MARK: - the vault, and deleting the index
+
+private struct Security: View {
+    @ObservedObject var model: AppModel
+    @State private var confirming = false
+
+    var body: some View {
+        Section("Security") {
+            switch model.vault.state {
+            case .mounted:
+                Row("index", "encrypted, unlocked while this app runs")
+            case .locked:
+                Row("index", "encrypted and locked", tint: .orange)
+            case .absent:
+                Row("index", "NOT encrypted", tint: .red)
+            case .failed(let why):
+                Row("index", why, tint: .red)
+            }
+            Row("at", Paths.database.path)
+            if let progress = model.vaultProgress {
+                Row("moving", progress, tint: .orange)
+            }
+            if let failure = model.vaultFailure {
+                Note(failure, tint: .red)
+            }
+            Note("AES-256 disk image. The key sits in your Keychain, so the "
+                 + "index survives a backup as ciphertext and a stolen disk "
+                 + "gives up nothing.")
+            // 🛑 Say the limit out loud. A reader who takes "encrypted" at
+            // face value will assume more than this delivers.
+            Note("🛑 While this app runs, the index is mounted, and any program "
+                 + "running as you can read it \u{2014} the same exposure the "
+                 + "plain file always had, now limited to the time the app is "
+                 + "open. Stronger needs the readers to hold a key themselves, "
+                 + "which Python's stdlib sqlite3 cannot do.", tint: .orange)
+
+            if confirming {
+                Note("This deletes the index and its key. \u{2018}apple-index "
+                     + "refresh\u{2019} rebuilds it in about eight minutes.",
+                     tint: .red)
+                HStack {
+                    Button("Delete Everything") { model.forgetIndex() }
+                    Button("Cancel") { confirming = false }
+                }
+            } else {
+                Button("Delete the Index\u{2026}") { confirming = true }
             }
         }
     }

@@ -28,7 +28,24 @@ enum Paths {
         return base
     }()
 
-    static let database = supportDirectory.appendingPathComponent("lab-index.db")
+    /// The index, wherever it currently lives.
+    ///
+    /// 🛑 COMPUTED, NOT A CONSTANT. It moves into the encrypted vault, and
+    /// every caller must follow it. A cached copy sends `vec daemon` at the old
+    /// plaintext file, which then answers searches out of a stale index that
+    /// nobody is updating any more.
+    static var database: URL {
+        let inVault = Vault.databaseInVault
+        if FileManager.default.fileExists(atPath: inVault.path) { return inVault }
+        return plainDatabase
+    }
+
+    /// The unencrypted location, which is where `lab/` has always put it.
+    static let plainDatabase = supportDirectory
+        .appendingPathComponent("lab-index.db")
+    /// 🛑 The socket stays OUTSIDE the vault. It is a rendezvous point, not
+    /// data, and putting it on a volume that unmounts would break every client
+    /// the moment the app quit.
     static let socket = supportDirectory.appendingPathComponent("index.sock")
     static let logDirectory: URL = {
         let dir = supportDirectory.appendingPathComponent("logs", isDirectory: true)

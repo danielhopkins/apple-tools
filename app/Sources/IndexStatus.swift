@@ -47,10 +47,14 @@ enum IndexReader {
         }
         facts.megabytes = size(of: path)
 
+        // 🛑 A PLAIN PATH, NOT A `file:` URI. The path contains a space
+        // ("Application Support"), and SQLite will not parse an unencoded
+        // space in a URI — it opens, and then every `prepare` fails with "no
+        // such table". `index.py` percent-encodes for exactly this reason;
+        // `SQLITE_OPEN_READONLY` needs no URI at all.
         var handle: OpaquePointer?
-        let uri = "file:\(path.path)?mode=ro"
-        guard sqlite3_open_v2(uri, &handle,
-                              SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK,
+        guard sqlite3_open_v2(path.path, &handle,
+                              SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
               let db = handle else {
             facts.error = "cannot open the index"
             return facts

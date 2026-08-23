@@ -23,9 +23,13 @@ final class AppModel: ObservableObject {
     let search = SearchService()
     let diagnostics = Diagnostics()
     let grants = Grants()
+    let loginItem = LoginItem()
+    let vault = Vault()
 
     @Published private(set) var facts = IndexFacts()
     private var ticker: Timer?
+    @Published private(set) var vaultProgress: String? = nil
+    @Published private(set) var vaultFailure: String? = nil
 
     func start() {
         // 🛑 READ, DO NOT ASK. The index does not need the app to hold Calendar,
@@ -38,10 +42,63 @@ final class AppModel: ObservableObject {
         // that the entitlements make the grants obtainable; before them every
         // request cost its full deadline and stole focus for nothing.
         grants.requestAndRead()
-        search.start()
-        indexer.startScheduling()
-        diagnostics.check()
-        reread()
+        // The index goes stale whenever the app is not running, so starting at
+        // login is not a convenience. It is what makes the schedule mean
+        // anything.
+        loginItem.enableOnFirstRun()
+        // 🛑 THE VAULT COMES BEFORE EVERYTHING THAT READS THE INDEX. The
+        // database path moves when the vault mounts, and `vec daemon` is given
+        // that path once, at launch. Starting it first points it at a
+        // plaintext file that is about to be deleted.
+        openVault { [weak self] in
+            guard let self else { return }
+            self.search.start()
+            self.indexer.startScheduling()
+            self.diagnostics.check()
+            self.reread()
+            self.beginTicking()
+        }
+    }
+
+    /// Mount the encrypted index, moving a plaintext one in the first time.
+    ///
+    /// ⚠️ OFF THE MAIN THREAD. The move copies 812 MB on this machine, and a
+    /// spinning menu bar is not the same thing as a hung one.
+    private func openVault(then ready: @escaping () -> Void) {
+        vault.read()
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                if FileManager.default.fileExists(atPath: Vault.image.path),
+                   !(try Vault.mountedNow()) {
+                    try Vault.mount()
+                }
+                _ = try Vault.migrateIfNeeded { line in
+                    Task { @MainActor in self.vaultProgress = line }
+                }
+            } catch {
+                // 🛑 Write it down. This runs before any window exists, so a
+                // failure that lives only in a @Published property is a failure
+                // nobody can read.
+                let note = "\(Date()): \(error)\n"
+                let path = Paths.logDirectory.appendingPathComponent("vault.log")
+                if let handle = try? FileHandle(forWritingTo: path) {
+                    handle.seekToEndOfFile()
+                    handle.write(note.data(using: .utf8)!)
+                    try? handle.close()
+                } else {
+                    try? note.write(to: path, atomically: true, encoding: .utf8)
+                }
+                Task { @MainActor in self.vaultFailure = "\(error)" }
+            }
+            Task { @MainActor in
+                self.vault.read()
+                self.vaultProgress = nil
+                ready()
+            }
+        }
+    }
+
+    private func beginTicking() {
         // One second while a cycle runs, ten while it does not. The window is
         // the only reader and it is usually closed.
         ticker = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
@@ -64,11 +121,40 @@ final class AppModel: ObservableObject {
         facts = IndexReader.read()
         search.refreshPing()
         grants.read()
+        loginItem.read()
+    }
+
+    /// Delete the index, its key, and the encrypted image.
+    ///
+    /// 🛑 THIS IS THE REVOCATION PATH `lab/SECURITY.md` ASKS FOR, and the key
+    /// is what makes it real. Deleting an 812 MB plaintext file leaves it in
+    /// every backup; deleting the key makes every one of those copies inert.
+    /// So the key goes first, and it goes even if the rest fails.
+    func forgetIndex() {
+        indexer.automatic = false
+        indexer.saveState()
+        search.stop()
+        Vault.destroyKey()
+        Vault.unmount()
+        for target in [Vault.image, Paths.plainDatabase,
+                       URL(fileURLWithPath: Paths.plainDatabase.path + "-wal"),
+                       URL(fileURLWithPath: Paths.plainDatabase.path + "-shm")] {
+            try? FileManager.default.removeItem(at: target)
+        }
+        vault.read()
+        reread()
     }
 
     func quit() {
         indexer.saveState()
         search.stop()
+        // ⚠️ Unmount AFTER the daemon is down. Detaching a volume a process
+        // still holds a file on fails, and the index would stay readable by
+        // anything on the machine until the next reboot.
+        Vault.unmount()
+        // ⚠️ Compaction needs the image detached, so it belongs here and
+        // nowhere else. It is best effort: a slow one must not hold a quit.
+        DispatchQueue.global(qos: .utility).async { Vault.compact() }
         NSApp.terminate(nil)
     }
 
@@ -106,6 +192,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MainActor.assumeIsolated {
             AppModel.shared.indexer.saveState()
             AppModel.shared.search.stop()
+            Vault.unmount()
         }
     }
 }

@@ -130,9 +130,34 @@ def vector_search_cmd(model, db, query, limit, tool=None):
 #
 # ⚠️ Time Machine and any cloud backup will copy this file. Deleting the
 # original mail does not delete it from a backup.
+_SUPPORT = os.path.expanduser("~/Library/Application Support/apple-tools")
+# 🛑 The app moves the index into an ENCRYPTED disk image, mounted at
+# `<support>/mnt`. Both paths must work: an install that has never run the app
+# still has the plaintext file, and the app deletes it only after verifying the
+# copy. Prefer the vault whenever it is mounted.
+#
+# ⚠️ When the image exists and nothing is mounted, the index is LOCKED, not
+# missing. `require_index` says so rather than offering to rebuild 812 MB the
+# user already has.
+VAULT_DB = os.path.join(_SUPPORT, "mnt", "lab-index.db")
+VAULT_IMAGE = os.path.join(_SUPPORT, "index.sparsebundle")
+PLAIN_DB = os.path.join(_SUPPORT, "lab-index.db")
+
 DEFAULT_DB = os.path.expanduser(
     os.environ.get("APPLE_INDEX_DB",
-                   "~/Library/Application Support/apple-tools/lab-index.db"))
+                   VAULT_DB if os.path.exists(VAULT_DB) else PLAIN_DB))
+
+
+def require_index(path):
+    """Explain a locked index instead of treating it as an empty one."""
+    if os.path.exists(path):
+        return
+    if os.path.exists(VAULT_IMAGE):
+        die("the index is locked. It lives in an encrypted image that only "
+            "AppleTools.app mounts.\n"
+            "  Open AppleTools, then try again.\n"
+            "  If you deleted the key on purpose, the index is gone for good "
+            "and `apple-index refresh` rebuilds it.")
 
 # 🛑 The socket lives in the 0700 index directory at mode 0600, never on a TCP
 # port. A port would put the whole mail corpus one bad bind address away from
@@ -1221,6 +1246,7 @@ def take_write_lock(db_path, what):
 
 
 def cmd_ingest(opts):
+    require_index(opts.db)
     take_write_lock(opts.db, "ingest")
     db = connect(opts.db)
     require_consent(db, opts)
@@ -1491,6 +1517,7 @@ def record_query(db, query, settings, fingerprint, results, elapsed_ms, cached,
 
 
 def cmd_search(opts):
+    require_index(opts.db)
     warn_if_revoked(opts)
     db = connect(opts.db)
     started = time.time()
@@ -2416,6 +2443,7 @@ def cmd_consent(opts):
 
 
 def cmd_status(opts):
+    require_index(opts.db)
     warn_if_revoked(opts)
     db = connect(opts.db)
     warn_security(db, opts.db)

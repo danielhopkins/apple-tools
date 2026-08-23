@@ -49,7 +49,7 @@ the grant expects their mail to stop being readable. The index keeps answering.
 | Explicit opt-in before the first ingest | ✅ `consent` table, `--accept-risk` |
 | A revocation path that deletes everything | ✅ `apple-index forget` |
 | Refusing to serve after the grant is revoked | ✅ the daemon checks and declines |
-| Encryption at rest | 🛑 **none — decided, see below** |
+| Encryption at rest | ✅ **AES-256, once the app holds the index** — see below |
 | Access logging | 🛑 **none** |
 | Automatic expiry | 🛑 **none** |
 
@@ -134,19 +134,39 @@ to anyone, and after any test run on real data.
    time; this file went on listing the work as outstanding. A stale security
    document is its own defect.
 
-3. **A decision on encryption at rest.** 🛑 **Decided: NO, and here is why.**
-   - `index.py` reads and writes through Python's stdlib `sqlite3`, which has
-     no SQLCipher and cannot be given one without shipping a compiled
-     extension. Encrypting the file means moving **every** database access into
-     Swift, which is most of the tool.
-   - An FTS5 index leaks its own terms, so encrypting the body column alone
-     buys very little.
-   - A key in the login keychain is readable by anything running as the user,
-     which is the same attacker the file already has.
-   **So the honest posture is: no encryption, and say so loudly.** The consent
-   prompt states it. This is a decision to revisit when the index moves inside
-   an app bundle, where a container and a key with an app-bound ACL are both
-   available. See `docs/todo-index-app.md`.
+3. **A decision on encryption at rest.** ✅ **Done, 2026-08-23, and NOT the way
+   this section predicted.** The index now lives in an **AES-256 encrypted APFS
+   disk image**, created and mounted by `app/AppleTools.app`, with the key in
+   the Keychain. Both readers see an ordinary SQLite file on a mounted volume,
+   so neither `index.py` nor `vec` changed at all.
+
+   **The reasoning below was right about SQLCipher and wrong about the
+   conclusion.** SQLCipher is genuinely unreachable: Python's stdlib `sqlite3`
+   cannot open one, and giving it one means a compiled extension. A disk image
+   sidesteps that entirely.
+
+   🛑 **Be precise about what it buys, because "encrypted" will be read as more
+   than this is.**
+
+   | | |
+   |---|---|
+   | a Time Machine or cloud backup | copies **ciphertext** |
+   | a stolen or discarded disk | gives up **nothing** |
+   | deleting the key | makes 812 MB of decoded mail **inert** — real revocation |
+   | **while the app runs** | the volume is **mounted and readable** by anything running as you |
+
+   That last row is the same exposure the plaintext file always had, now
+   limited to the time the app is open rather than forever. **It is an
+   improvement and it is not a solution.**
+
+   ⚠️ **One prediction here was measured and is wrong.** This section said "a
+   key in the login keychain is readable by anything running as the user".
+   Measured: `security find-generic-password` from a terminal **blocked on an
+   authorization prompt** and returned nothing. The item is bound to the app
+   that created it, so another process needs the user to approve it.
+
+   ⚠️ **The FTS5 point still stands and is why the whole file is encrypted**
+   rather than the body column. An FTS5 index leaks its own terms.
 
 ## The honest summary
 
