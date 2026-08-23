@@ -296,3 +296,72 @@ xcrun notarytool store-credentials "MiniMusic" \
   --key ~/.appstoreconnect/private_keys/AuthKey_G5JB79H867.p8 \
   --key-id G5JB79H867 --issuer <UUID from App Store Connect>
 ```
+
+## Lending the app's grants to a terminal
+
+**Off by default.** Turn it on in the window, or:
+
+```
+defaults write com.boulderhopkins.apple-tools toolProxy -bool true
+```
+
+A tool typed into a terminal is attributed to the **terminal**, so it needs that
+terminal's own Full Disk Access. With this on, `bin/apple` hands the command to
+the app, the app runs the real tool as its own child, and one grant covers every
+terminal, IDE and agent. This is Route B in the design doc.
+
+```
+APPLE_TOOLS_PROXY=always apple maps places --limit 2   # force the proxy path
+APPLE_TOOLS_PROXY=never  apple maps places --limit 2   # force the direct path
+```
+
+⚠️ **Direct first, always.** A terminal that can read the stores does the work
+itself, with no socket and no dependency on the app running. The proxy is a
+fallback: `bin/apple` probes `~/Library/Mail` and only asks the app when that
+read fails.
+
+### 🛑 What the code-signature check does and does not buy
+
+The daemon reads the peer's **audit token** — never the pid, which is racy — and
+requires a Mach-O signed by this developer under
+`com.boulderhopkins.apple-tools.proxy`. Measured:
+
+```
+signed client     -> serves the command, exit 0
+unsigned client   -> refused: the peer is not the signed AppleTools client
+```
+
+- ✅ A program cannot speak the protocol directly.
+- ✅ The identity in the audit log is trustworthy, not self-reported.
+- 🛑 **It is not a boundary.** Anything running as this user can simply execute
+  the signed client and read its output. Within one user account macOS offers
+  no boundary, and nothing available changes that. **The real control is the
+  switch, and every proxied command is logged.**
+
+⚠️ **A Python or shell client would make the check meaningless.** Its code
+identity is `/usr/bin/python3` or `/bin/bash`, signed by Apple and shared by
+every script on the machine. That is why the client is a separate signed target.
+
+### 🛑 The app process cannot own a socket other processes reach
+
+Measured, and it cost hours:
+
+| socket | bound by | a shell connecting |
+|---|---|---|
+| `index.sock` | `vec daemon`, a **child** of the app | ✅ connects |
+| `tools.sock` | the **app process** itself | ❌ `ECONNREFUSED` |
+
+Same directory, same 0600 mode, same owner. The app could connect to its own
+socket; nothing else could. So the proxy runs as a child, `apple-proxy --serve`,
+exactly as the search endpoint already does.
+
+⚠️ **The TCC identity is unaffected.** Responsibility runs down the whole
+process tree, so a tool the daemon spawns is still attributed to the app.
+
+⚠️ **`lsof` cannot see either socket** and reports zero for the working one too,
+so it could not tell them apart. Two wrong conclusions came out of trusting it.
+
+🛑 **An append-only log, never "open, seek, write" with an atomic-write
+fallback.** Two threads that both find the file missing both write atomically,
+and the second replaces the first. The line that vanished was the one proving
+the accept loop had started, which sent this whole investigation the wrong way.

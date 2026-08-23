@@ -120,29 +120,47 @@ final class Vault: ObservableObject {
         }
     }
 
+    /// 🛑 LOOK IN BOTH KEYCHAINS. macOS has two, and `kSecUseDataProtectionKeychain`
+    /// picks which one a call means. Adding that flag to the READ while an
+    /// existing key sat in the FILE keychain made the key unreadable, the vault
+    /// unmountable, and the index gone — `vec` then restarted in a loop against
+    /// a database that no longer exists. A key that cannot be read is
+    /// indistinguishable from a key the user deleted on purpose, which is the
+    /// worst possible thing to get wrong here.
     nonisolated static func readKey() -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: keychainAccount,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-            kSecUseDataProtectionKeychain as String: true,
-        ]
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
+        for dataProtection in [true, false] {
+            var query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: keychainService,
+                kSecAttrAccount as String: keychainAccount,
+                kSecReturnData as String: true,
+                kSecMatchLimit as String: kSecMatchLimitOne,
+            ]
+            query[kSecUseDataProtectionKeychain as String] = dataProtection
+            var item: CFTypeRef?
+            if SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+               let data = item as? Data,
+               let key = String(data: data, encoding: .utf8) {
+                return key
+            }
+        }
+        return nil
     }
 
     /// Deleting the key is the revocation path. The image stays and is inert.
+    /// ⚠️ BOTH KEYCHAINS, for the same reason `readKey` reads both. A delete
+    /// that misses one leaves a working key behind after the user asked for the
+    /// index to be destroyed.
     nonisolated static func destroyKey() {
-        SecItemDelete([
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: keychainAccount,
-            kSecUseDataProtectionKeychain as String: true,
-        ] as CFDictionary)
+        for dataProtection in [true, false] {
+            var query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: keychainService,
+                kSecAttrAccount as String: keychainAccount,
+            ]
+            query[kSecUseDataProtectionKeychain as String] = dataProtection
+            SecItemDelete(query as CFDictionary)
+        }
     }
 
     nonisolated static func newKey() -> String {

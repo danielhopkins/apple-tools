@@ -305,7 +305,61 @@ main() {
         exit 1
     fi
 
+    # 🛑 THE APP'S GRANTS, ONLY WHEN THIS TERMINAL HAS NONE OF ITS OWN.
+    #
+    # A tool typed into a terminal is attributed to the TERMINAL, wherever its
+    # binary lives. So `apple mail search` in a terminal without Full Disk
+    # Access fails, while the same command inside AppleTools.app works. When
+    # that is the situation, hand the command to the app instead.
+    #
+    # ⚠️ DIRECT FIRST, ALWAYS. A terminal that can do the work does it, with no
+    # socket, no round trip and no dependency on the app running. The proxy is
+    # a fallback, never the path.
+    #
+    # 🛑 The app answers only when the user turned the proxy on. An absent
+    # socket is a normal state: the caller gets the tool's own permission error,
+    # which is the honest one.
+    # `APPLE_TOOLS_PROXY` overrides the decision:
+    #   auto    (default) proxy only when this terminal cannot read the stores
+    #   always  proxy every command — the way to TEST the path from a terminal
+    #           that does have Full Disk Access
+    #   never   never proxy, so a failure is this terminal's own
+    local want="${APPLE_TOOLS_PROXY:-auto}"
+    if [ "$want" != never ] \
+       && { [ "$want" = always ] || ! terminal_can_read; } \
+       && proxy="$(proxy_client)"; then
+        "$proxy" "$tool" "$@"
+        local status=$?
+        # 250 means the app did not answer. Fall through and let the real tool
+        # produce its own error, rather than inventing a different one.
+        [ "$status" -ne 250 ] && exit "$status"
+    fi
+
     exec "$target" "$@"
+}
+
+# ⚠️ A DIRECTORY LISTING, NOT A TCC QUERY. No API reports Full Disk Access, and
+# reading a protected directory is the only honest probe. An absent ~/Library/Mail
+# is not a denial, so it counts as readable.
+terminal_can_read() {
+    [ -d "$HOME/Library/Mail" ] || return 0
+    ls "$HOME/Library/Mail" >/dev/null 2>&1
+}
+
+# The signed client inside the app bundle. 🛑 Only this binary passes the app's
+# code-signature check on the socket; a shell or Python client cannot.
+proxy_client() {
+    local candidate
+    for candidate in \
+        "/Applications/AppleTools.app/Contents/Helpers/apple-proxy" \
+        "$HOME/Applications/AppleTools.app/Contents/Helpers/apple-proxy"
+    do
+        if [ -x "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
 }
 
 main "$@"

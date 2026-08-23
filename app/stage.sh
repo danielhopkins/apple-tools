@@ -23,6 +23,14 @@ for tool in apple-calendar apple-contacts apple-mail apple-maps \
   cp "swift/.build/release/$tool" "$STAGE/Helpers/$tool"
 done
 cp bin/apple "$STAGE/Helpers/apple"
+# 🛑 The signed proxy client. It is built by the app's own Xcode project, not
+# by `swift build`, because the app checks its code signature on the socket and
+# an ad-hoc or Apple-signed binary would fail that check.
+if [ -x app/build/Build/Products/Release/apple-proxy ]; then
+  cp app/build/Build/Products/Release/apple-proxy "$STAGE/Helpers/apple-proxy"
+else
+  echo "note: apple-proxy not built yet; it lands on the next build"
+fi
 
 echo "==> notes (python, stdlib only)"
 # 🛑 NOT in Helpers. `codesign` treats every file under `Contents/Helpers` as

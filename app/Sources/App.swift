@@ -25,6 +25,7 @@ final class AppModel: ObservableObject {
     let grants = Grants()
     let loginItem = LoginItem()
     let vault = Vault()
+    let toolProxy = ToolProxy()
 
     @Published private(set) var facts = IndexFacts()
     private var ticker: Timer?
@@ -55,6 +56,8 @@ final class AppModel: ObservableObject {
             self.search.start()
             self.indexer.startScheduling()
             self.diagnostics.check()
+            // 🛑 OFF unless the user turned it on. See ToolProxy.swift.
+            self.toolProxy.apply()
             self.reread()
             self.beginTicking()
         }
@@ -122,6 +125,7 @@ final class AppModel: ObservableObject {
         search.refreshPing()
         grants.read()
         loginItem.read()
+        toolProxy.readActivity()
     }
 
     /// Delete the index, its key, and the encrypted image.
@@ -151,6 +155,7 @@ final class AppModel: ObservableObject {
         // ⚠️ Unmount AFTER the daemon is down. Detaching a volume a process
         // still holds a file on fails, and the index would stay readable by
         // anything on the machine until the next reboot.
+        toolProxy.stop()
         Vault.unmount()
         // ⚠️ Compaction needs the image detached, so it belongs here and
         // nowhere else. It is best effort: a slow one must not hold a quit.
@@ -192,6 +197,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MainActor.assumeIsolated {
             AppModel.shared.indexer.saveState()
             AppModel.shared.search.stop()
+            AppModel.shared.toolProxy.stop()
             Vault.unmount()
         }
     }

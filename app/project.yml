@@ -47,6 +47,28 @@ settings:
     DEAD_CODE_STRIPPING: YES
 
 targets:
+  # 🛑 A SEPARATE, SIGNED Mach-O, and that is its whole reason to exist. The app
+  # checks the peer's code signature on the proxy socket, and a Python or shell
+  # client's identity is `/usr/bin/python3` or `/bin/bash` — signed by Apple and
+  # shared by every script on the machine. A binary signed with THIS developer's
+  # identity gives the check something to say.
+  ProxyClient:
+    type: tool
+    platform: macOS
+    sources:
+      - path: ProxyClient
+      # 🛑 SHARED, not copied. The requirement text lives in one file, so the
+      # app that checks a peer and the client that must satisfy it can never
+      # disagree about what the identifier is.
+      - path: Sources/PeerIdentity.swift
+    settings:
+      base:
+        PRODUCT_NAME: apple-proxy
+        PRODUCT_BUNDLE_IDENTIFIER: com.boulderhopkins.apple-tools.proxy
+        # ⚠️ A plain tool has no Info.plist, so the signing IDENTIFIER comes
+        # from here. `PeerIdentity.requirementText` names it exactly.
+        CREATE_INFOPLIST_SECTION_IN_BINARY: YES
+
   AppleTools:
     type: application
     platform: macOS
@@ -76,6 +98,9 @@ targets:
         # what this app measured. Harmless if the claim is wrong.
         com.apple.security.personal-information.calendars: true
         com.apple.security.personal-information.addressbook: true
+    dependencies:
+      - target: ProxyClient
+        embed: false
     postBuildScripts:
       # 🛑 A build phase, so Xcode signs the OUTER bundle afterwards. Copying
       # helpers in from the Makefile after the build would leave the outer

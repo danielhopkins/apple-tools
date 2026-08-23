@@ -25,6 +25,7 @@ struct StatusView: View {
                 Permissions(model: model)
                 Frameworks(model: model)
                 Security(model: model)
+                Lending(model: model)
             }
             .padding(22)
         }
@@ -368,6 +369,42 @@ private struct Security: View {
                 }
             } else {
                 Button("Delete the Index\u{2026}") { confirming = true }
+            }
+        }
+    }
+}
+
+// MARK: - lending the app's grants to a terminal
+
+private struct Lending: View {
+    @ObservedObject var model: AppModel
+    @AppStorage("toolProxy") private var enabled = false
+
+    var body: some View {
+        Section("Terminal access") {
+            Toggle("Let terminals use this app's permissions", isOn: $enabled)
+                .onChange(of: enabled) { _, _ in model.toolProxy.apply() }
+            Note("A tool typed into a terminal is attributed to the TERMINAL, "
+                 + "so it needs that terminal's own Full Disk Access. With this "
+                 + "on, `apple` hands the command to this app instead, and one "
+                 + "grant covers every terminal.")
+            // 🛑 The cost, in the same place as the switch. Never buried.
+            Note("🛑 This app will then read your mail, messages, notes, "
+                 + "calendar and contacts on behalf of ANY program running as "
+                 + "you, with no prompt. Only a signed AppleTools client is "
+                 + "accepted, which stops a program speaking the protocol "
+                 + "directly \u{2014} it does not stop one from simply running "
+                 + "that client. Within one user account macOS offers no "
+                 + "boundary, so the real control is this switch.", tint: .orange)
+            if model.toolProxy.running {
+                Row("state", "listening")
+                Row("served", "\(model.toolProxy.served) commands")
+                if let last = model.toolProxy.lastCommand {
+                    Row("last", last)
+                }
+                Note("Every proxied command is logged to logs/proxy.log.")
+            } else {
+                Row("state", enabled ? "starting\u{2026}" : "off")
             }
         }
     }

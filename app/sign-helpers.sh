@@ -37,8 +37,22 @@ fi
 # not branch on the file type. Branching on Mach-O is exactly what skipped the
 # dispatcher.
 while IFS= read -r -d '' file; do
-  codesign --force --options runtime --timestamp \
-           --sign "$IDENTITY" "$file" >/dev/null
+  # 🛑 NAME THE IDENTIFIER FOR apple-proxy. `codesign --force` without `-i`
+  # derives the signing identifier from the FILENAME, so the client came out as
+  # `apple-proxy` and failed the app's requirement, which names
+  # `com.boulderhopkins.apple-tools.proxy`. Xcode had set it correctly and this
+  # re-sign threw it away — the app then refused its own signed client with
+  # OSStatus -67050.
+  # ⚠️ Two calls, not an array. macOS ships bash 3.2, where `"${a[@]}"` on an
+  # EMPTY array is an unbound variable under `set -u` and kills the phase.
+  if [ "$(basename "$file")" = apple-proxy ]; then
+    codesign --force --options runtime --timestamp \
+             -i com.boulderhopkins.apple-tools.proxy \
+             --sign "$IDENTITY" "$file" >/dev/null
+  else
+    codesign --force --options runtime --timestamp \
+             --sign "$IDENTITY" "$file" >/dev/null
+  fi
 done < <(find "${CONTENTS}/Helpers" "${CONTENTS}/Resources/index" -type f -perm -u+x -print0)
 
 # 🛑 RE-SEAL THE OUTER BUNDLE. Xcode signs the app at the END of the build,
