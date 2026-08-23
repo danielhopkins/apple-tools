@@ -1,0 +1,8 @@
+# 736 MB of converted weights. `./run-convert.sh` rebuilds them in about a minute.
+build/
+build-enum/
+build-int8/
+build-clamp/
+*.log
+bakeoff*.json
+tokenizer/

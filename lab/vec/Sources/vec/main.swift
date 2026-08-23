@@ -18,6 +18,7 @@
 import Foundation
 import NaturalLanguage
 import Accelerate
+import CoreML
 import SQLite3
 
 let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
@@ -256,6 +257,227 @@ final class Embedder {
     }
 }
 
+// MARK: - the Core ML path
+
+/// Where the converted model and its vocab live.
+///
+/// ⚠️ Resolved from the BINARY, not the working directory, so `vec` works from
+/// anywhere. `--models-dir` and `VEC_COREML_DIR` override it, which is what an
+/// app bundle will pass.
+func coremlDirectory(_ args: Args) -> URL {
+    if let explicit = args.str("models-dir") {
+        return URL(fileURLWithPath: explicit)
+    }
+    if let fromEnvironment = ProcessInfo.processInfo.environment["VEC_COREML_DIR"] {
+        return URL(fileURLWithPath: fromEnvironment)
+    }
+    // ⚠️ Do NOT count path components up from the binary. SwiftPM makes
+    // `.build/release` a SYMLINK to `.build/<triple>/release`, so resolving the
+    // path adds a level and a fixed count lands in the wrong directory. Walk up
+    // looking for the directory instead.
+    var base = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+        .deletingLastPathComponent()
+    // An install puts the packages in `models/` beside the binary; a checkout
+    // puts them under `coreml/build`. Look for both, walking up.
+    for _ in 0..<8 {
+        let installed = base.appendingPathComponent("models").standardizedFileURL
+        if FileManager.default.fileExists(atPath:
+                installed.appendingPathComponent("vocab.txt").path) {
+            return installed
+        }
+        // 🛑 `build`, the FIXED-shape packages — not `build-enum`. Measured:
+        // the enumerated model costs **1369 MB resident** against **192 MB**
+        // for a fixed one, because Core ML holds an execution plan per shape.
+        // It saves 470 MB on disk and spends 1.2 GB of RAM to do it.
+        let candidate = base.appendingPathComponent("coreml/build").standardizedFileURL
+        if FileManager.default.fileExists(atPath: candidate.path) { return candidate }
+        base = base.deletingLastPathComponent()
+    }
+    return URL(fileURLWithPath: "coreml/build-enum")
+}
+
+func makeCoreMLEmbedder(_ args: Args, wantBatch: Int = 32) -> CoreMLEmbedder {
+    let units: MLComputeUnits
+    switch args.str("units") ?? "cpuAndGPU" {
+    case "all": units = .all
+    case "cpuOnly": units = .cpuOnly
+    case "cpuAndNeuralEngine": units = .cpuAndNeuralEngine
+    default: units = .cpuAndGPU
+    }
+    do {
+        return try CoreMLEmbedder(modelsDir: coremlDirectory(args), units: units,
+                                  wantBatch: wantBatch)
+    } catch {
+        fail("\(error)")
+    }
+}
+
+/// Read `LIMIT` chunks that have no vector for this model.
+func pendingChunks(_ db: DB, model: String, limit: Int) -> [(Int64, String)] {
+    var rows: [(Int64, String)] = []
+    let select = db.prepare("""
+        SELECT c.cid, c.text FROM chunk c
+        LEFT JOIN vector v ON v.cid = c.cid AND v.model = '\(model)'
+        WHERE v.cid IS NULL
+        ORDER BY c.cid
+        LIMIT \(limit)
+        """)
+    while sqlite3_step(select) == SQLITE_ROW {
+        let cid = sqlite3_column_int64(select, 0)
+        let text = sqlite3_column_text(select, 1).map { String(cString: $0) } ?? " "
+        rows.append((cid, text))
+    }
+    sqlite3_finalize(select)
+    return rows
+}
+
+func commandEmbedCoreML(_ args: Args) {
+    let db = DB(path: args.req("db"), readOnly: false)
+    let window = args.int("batch", 4096)
+    let limit = args.int("limit", 0)
+    let embedder = makeCoreMLEmbedder(args)
+    let model = embedder.name
+
+    let pending = db.scalarInt("""
+        SELECT COUNT(*) FROM chunk c
+        LEFT JOIN vector v ON v.cid = c.cid AND v.model = '\(model)'
+        WHERE v.cid IS NULL
+        """)
+    let target = limit > 0 ? min(limit, pending) : pending
+    if target == 0 {
+        print("{\"embedded\":0,\"pending\":0,\"seconds\":0.0}")
+        return
+    }
+    FileHandle.standardError.write("vec: \(target) chunks to embed as \(model)\n".data(using: .utf8)!)
+
+    let started = Date()
+    var embedded = 0
+    while embedded < target {
+        let rows = pendingChunks(db, model: model, limit: min(window, target - embedded))
+        if rows.isEmpty { break }
+        let vectors: [[Float]]
+        do { vectors = try embedder.encode(rows.map { $0.1 },
+                                           prefix: CoreMLEmbedder.passagePrefix) }
+        catch { fail("\(error)") }
+
+        db.exec("BEGIN")
+        let insert = db.prepare("INSERT OR REPLACE INTO vector (cid, model, dim, v) VALUES (?, ?, ?, ?)")
+        for (index, row) in rows.enumerated() {
+            let packed = CoreMLEmbedder.quantise(vectors[index])
+            sqlite3_reset(insert)
+            sqlite3_bind_int64(insert, 1, row.0)
+            sqlite3_bind_text(insert, 2, model, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_int(insert, 3, Int32(embedder.dim))
+            packed.withUnsafeBytes { buffer in
+                _ = sqlite3_bind_blob(insert, 4, buffer.baseAddress, Int32(buffer.count), SQLITE_TRANSIENT)
+            }
+            if sqlite3_step(insert) != SQLITE_DONE { fail("insert failed for chunk \(row.0)") }
+        }
+        sqlite3_finalize(insert)
+        db.exec("COMMIT")
+
+        embedded += rows.count
+        let rate = Double(embedded) / Date().timeIntervalSince(started)
+        FileHandle.standardError.write(
+            String(format: "vec: %d/%d  %.0f chunks/sec\n", embedded, target, rate).data(using: .utf8)!)
+    }
+
+    let seconds = Date().timeIntervalSince(started)
+    FileHandle.standardError.write(String(format: "vec: tokenize %.1fs, predict %.1fs\n",
+                                          embedder.tokenizeSeconds,
+                                          embedder.predictSeconds).data(using: .utf8)!)
+    print(String(format: "{\"embedded\":%d,\"model\":\"%@\",\"pending\":%d,\"seconds\":%.1f,\"per_second\":%.1f}",
+                 embedded, model, pending - embedded, seconds,
+                 seconds > 0 ? Double(embedded) / seconds : 0))
+}
+
+/// 🛑 The gate on the tokenizer port: re-embed chunks the PYTHON Core ML path
+/// already wrote, and compare the stored bytes.
+///
+/// A tokenizer that splits one word differently produces a different vector and
+/// nothing downstream can see it. Comparing against rows written by a path known
+/// to match PyTorch turns that into a byte comparison over real text.
+func commandVerify(_ args: Args) {
+    let db = DB(path: args.req("db"), readOnly: true)
+    let sample = args.int("limit", 2000)
+    let embedder = makeCoreMLEmbedder(args)
+    // 🛑 Compare against rows the PYTHON path wrote, under their own name.
+    // Comparing against `e5-small-coreml-v1` after this binary has written it
+    // compares the port to ITSELF: 100% identical, and proof of nothing.
+    // Write the reference first:
+    //   uv run coreml/coreml_embed.py embed --db DB \
+    //       --model-name e5-small-coreml-py-v1
+    let model = args.str("against") ?? "e5-small-coreml-py-v1"
+    _ = embedder.name
+
+    var cids: [Int64] = []
+    var texts: [String] = []
+    var stored: [[Int8]] = []
+    // ⚠️ A random sample, not the first N cids and not `cid % k`. The first N
+    // are one source, and the modulo stride returned 114 rows for --limit 500
+    // because it strides over deleted cids.
+    let select = db.prepare("""
+        SELECT c.cid, c.text, v.v FROM chunk c
+        JOIN vector v ON v.cid = c.cid AND v.model = '\(model)'
+        WHERE c.cid IN (SELECT cid FROM vector WHERE model = '\(model)'
+                        ORDER BY RANDOM() LIMIT \(sample))
+        """)
+    while sqlite3_step(select) == SQLITE_ROW {
+        cids.append(sqlite3_column_int64(select, 0))
+        texts.append(sqlite3_column_text(select, 1).map { String(cString: $0) } ?? " ")
+        let bytes = Int(sqlite3_column_bytes(select, 2))
+        if let blob = sqlite3_column_blob(select, 2) {
+            let pointer = blob.assumingMemoryBound(to: Int8.self)
+            stored.append(Array(UnsafeBufferPointer(start: pointer, count: bytes)))
+        } else {
+            stored.append([])
+        }
+    }
+    sqlite3_finalize(select)
+    if cids.isEmpty {
+        fail("""
+             no rows for '\(model)'. Write the reference set first:
+               uv run coreml/coreml_embed.py embed --db DB --model-name \(model) --limit 20000
+             """)
+    }
+
+    let started = Date()
+    let vectors: [[Float]]
+    do { vectors = try embedder.encode(texts, prefix: CoreMLEmbedder.passagePrefix) }
+    catch { fail("\(error)") }
+    let seconds = Date().timeIntervalSince(started)
+
+    var identical = 0
+    var worstCosine: Float = 1
+    var worstCid: Int64 = 0
+    var maxByteDelta = 0
+    var differing: [Int64] = []
+    for index in 0..<cids.count {
+        let mine = CoreMLEmbedder.quantise(vectors[index])
+        let theirs = stored[index]
+        guard mine.count == theirs.count else { continue }
+        if mine == theirs { identical += 1 } else { differing.append(cids[index]) }
+        var dot: Float = 0, a: Float = 0, b: Float = 0
+        for component in 0..<mine.count {
+            let x = Float(mine[component]), y = Float(theirs[component])
+            dot += x * y; a += x * x; b += y * y
+            maxByteDelta = max(maxByteDelta, abs(Int(mine[component]) - Int(theirs[component])))
+        }
+        let cosine = (a > 0 && b > 0) ? dot / (sqrt(a) * sqrt(b)) : 0
+        if cosine < worstCosine { worstCosine = cosine; worstCid = cids[index] }
+    }
+
+    FileHandle.standardError.write(String(format: "vec: tokenize %.2fs, predict %.2fs\n",
+                                          embedder.tokenizeSeconds,
+                                          embedder.predictSeconds).data(using: .utf8)!)
+    let named = differing.prefix(25).map(String.init).joined(separator: ",")
+    FileHandle.standardError.write("vec: differing cids: [\(named)]\n".data(using: .utf8)!)
+    print(String(format: "{\"compared\":%d,\"identical\":%d,\"identical_pct\":%.2f,\"worst_cosine\":%.6f,\"worst_cid\":%d,\"max_byte_delta\":%d,\"seconds\":%.2f,\"per_second\":%.1f}",
+                 cids.count, identical, 100.0 * Double(identical) / Double(cids.count),
+                 worstCosine, worstCid, maxByteDelta, seconds,
+                 seconds > 0 ? Double(cids.count) / seconds : 0))
+}
+
 // MARK: - commands
 
 func commandAssets() {
@@ -279,6 +501,7 @@ func commandAssets() {
 }
 
 func commandEmbed(_ args: Args) {
+    if (args.str("model") ?? "") == "e5-small-coreml" { return commandEmbedCoreML(args) }
     let db = DB(path: args.req("db"), readOnly: false)
     let batch = args.int("batch", 500)
     let limit = args.int("limit", 0)          // 0 means "everything outstanding"
@@ -371,9 +594,21 @@ func commandSearch(_ args: Args) {
     let limit = args.int("limit", 50)
     let tool = args.str("tool")
 
-    let embedder = Embedder(args.str("model") ?? "sentence")
-    guard let q = embedder.encodeQuery(query) else { fail("the query produced no tokens") }
-    let dim = embedder.dim
+    let q: [Float]
+    let dim: Int
+    let modelName: String
+    if (args.str("model") ?? "") == "e5-small-coreml" {
+        let embedder = makeCoreMLEmbedder(args, wantBatch: 1)
+        do { q = try embedder.encodeQuery(query) } catch { fail("\(error)") }
+        dim = embedder.dim
+        modelName = embedder.name
+    } else {
+        let embedder = Embedder(args.str("model") ?? "sentence")
+        guard let vector = embedder.encodeQuery(query) else { fail("the query produced no tokens") }
+        q = vector
+        dim = embedder.dim
+        modelName = embedder.name
+    }
 
     // Brute force. At 290k vectors this is ~148 MB of reads and 148M multiply
     // adds, which Accelerate does in well under a second. Reach for an ANN
@@ -394,7 +629,7 @@ func commandSearch(_ args: Args) {
               + "JOIN record r ON r.rid = c.rid WHERE r.tool = '\(safe)')"
     }
     let stmt = db.prepare(
-        "SELECT cid, v FROM vector WHERE dim = \(dim) AND model = '\(embedder.name)'"
+        "SELECT cid, v FROM vector WHERE dim = \(dim) AND model = '\(modelName)'"
         + scope)
     var scanned = 0
     let started = Date()
@@ -449,6 +684,24 @@ func commandStatus(_ args: Args) {
           """)
 }
 
+/// Print the token ids for one chunk, so a mismatch can be diffed against
+/// Python instead of guessed at.
+func commandTokens(_ args: Args) {
+    let db = DB(path: args.req("db"), readOnly: true)
+    let cid = args.int("cid", 0)
+    let embedder = makeCoreMLEmbedder(args, wantBatch: 1)
+    _ = embedder
+    let vocabURL = coremlDirectory(args).appendingPathComponent("vocab.txt")
+    guard let tokenizer = try? WordPiece(vocabularyAt: vocabURL) else { fail("no vocab") }
+    let stmt = db.prepare("SELECT text FROM chunk WHERE cid = \(cid)")
+    guard sqlite3_step(stmt) == SQLITE_ROW,
+          let raw = sqlite3_column_text(stmt, 0) else { fail("no chunk \(cid)") }
+    let text = CoreMLEmbedder.passagePrefix + String(cString: raw)
+    sqlite3_finalize(stmt)
+    let ids = tokenizer.encode(text, maxLength: 512)
+    print("{\"cid\":\(cid),\"count\":\(ids.count),\"ids\":[\(ids.map(String.init).joined(separator: ","))]}")
+}
+
 // MARK: - dispatch
 
 let args = Args(CommandLine.arguments)
@@ -456,13 +709,18 @@ switch args.command {
 case "embed":  commandEmbed(args)
 case "search": commandSearch(args)
 case "status": commandStatus(args)
+case "verify": commandVerify(args)
+case "daemon": commandDaemon(args)
+case "tokens": commandTokens(args)
 case "assets": commandAssets()
 default:
     print("""
           usage: vec <command> [--flag value]
 
-            embed  --db PATH [--model sentence|contextual] [--batch 500] [--limit N]
-            search --db PATH --query TEXT [--model sentence|contextual] [--limit 50] [--tool NAME]
+            embed  --db PATH [--model sentence|contextual|e5-small-coreml] [--batch N] [--limit N]
+            search --db PATH --query TEXT [--model ...] [--limit 50] [--tool NAME]
+            verify --db PATH [--limit 2000]              tokenizer parity vs the Python rows
+            daemon --db PATH [--socket PATH] [--reload-every 60]   serve searches, warm
             status --db PATH                             chunk and vector counts
             assets                                       download the model if missing
           """)

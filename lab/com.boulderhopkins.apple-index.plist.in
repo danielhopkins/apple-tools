@@ -5,23 +5,20 @@
 <dict>
   <key>Label</key><string>com.boulderhopkins.apple-index</string>
 
-  <!-- uv resolves the PyTorch environment; launchd's PATH is minimal, so it
-       is spelled out here rather than inherited. -->
+  <!-- 🛑 The Swift binary, not `uv run daemon.py`. The Core ML daemon needs no
+       PyTorch and no virtualenv, and it holds 110 MB against 661 MB. -->
   <key>ProgramArguments</key>
   <array>
-    <string>@UV@</string>
-    <string>run</string>
-    <string>--quiet</string>
-    <string>@LAB@/daemon.py</string>
-    <string>serve</string>
-    <string>--model</string><string>e5-small</string>
-    <!-- 🛑 refresh 0: the agent SERVES but does not INGEST. A launchd agent
-         has no Full Disk Access, so `apple mail`, `apple notes` and
-         `apple messages` all fail from here. Measured, all three. Serving needs
-         no grant, because the index file is not TCC-protected. Refresh from a
-         terminal instead:  apple-index refresh -->
+    <string>@LAB@/vec/.build/release/vec</string>
+    <string>daemon</string>
+    <string>--db</string><string>@HOME@/Library/Application Support/apple-tools/lab-index.db</string>
+    <string>--socket</string><string>@HOME@/Library/Application Support/apple-tools/index.sock</string>
+    <!-- 🛑 The agent SERVES but does not INGEST, and `vec daemon` cannot
+         ingest at all. A launchd agent has no Full Disk Access, so `apple
+         mail`, `apple notes` and `apple messages` all fail from here.
+         Measured, all three. Serving needs no grant, because the index file is
+         not TCC-protected. Refresh from a terminal:  apple-index refresh -->
     <string>--reload-every</string><string>60</string>
-    <string>--refresh</string><string>0</string>
   </array>
 
   <key>EnvironmentVariables</key>
@@ -34,8 +31,8 @@
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
 
-  <!-- It polls every 5 minutes and holds 661 MB. Keep it out of the way of
-       anything the user is actually doing. -->
+  <!-- It watches the index every 60s and holds 110 MB idle. Keep it out of the
+       way of anything the user is actually doing. -->
   <key>ProcessType</key><string>Background</string>
   <key>LowPriorityIO</key><true/>
   <key>Nice</key><integer>5</integer>

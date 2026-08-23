@@ -1613,6 +1613,7 @@ tool you are changing before you change it — every claim in there was paid for
 | `prior-art.md` | other projects solving this; check before building |
 | `todo-deep-links.md` | planned: a `url` on every entity, so anything we name can be opened and cross-linked |
 | `todo-offline-tests.md` | planned: move the Notes suite off live Notes.app so it can run in CI at all |
+| `todo-index-app.md` | planned: a notarized app that holds the grants, the index and the schedule — and why `lab/` cannot ship without one |
 
 ## Building
 
@@ -1702,9 +1703,9 @@ Contacts for the calling terminal it skips rather than fails.
 
 ## lab/ — a semantic index across every source (experimental)
 
-🛑 **Not part of the shipped tool.** `lab/` is excluded from `make build`,
-`make test` and `make dist`. It exists to answer one thing the tools above
-cannot: **searching when you do not know which app holds the answer.**
+**Ships as of 26.822.1**, as `apple-index`. It answers the one thing the tools
+above cannot: **searching when you do not know which app holds the answer.**
+🛑 Only the PyTorch-free half ships; `make test` still runs nothing here.
 
 ```
 apple-index search "the greenhouse budget"     # one query across all five sources
@@ -1724,16 +1725,27 @@ Four rules at the call site:
    snippets are truncated. `apple-index search … --json` then
    `apple notes export <id>`.
 2. ⚠️ **`apple-index refresh` only works from a terminal, and nothing runs it
-   for you.** A launchd agent has **no Full Disk Access**, measured: `apple
-   mail`, `apple notes` and `apple messages` all fail from one. The background
-   agent serves searches and cannot ingest. Refresh costs ~8s.
+   for you.** A launchd agent has **no Full Disk Access**, measured twice — the
+   Swift daemon's own probe reports `full_disk_access: false` under launchd.
+   The background agent serves searches and cannot ingest. Refresh costs ~8s.
 3. 🛑 **The index holds the plaintext of every email** — ~105 MB of decoded
    bodies in one unencrypted file, protected by neither Full Disk Access nor
    the 0700 directories its sources sit behind. Never copy results anywhere
-   that leaves the machine. See [`lab/SECURITY.md`](lab/SECURITY.md).
+   that leaves the machine. The first ingest asks for consent; `apple-index
+   forget` deletes the index, the logs and that consent. **Not encrypting it is
+   a recorded decision**, not an oversight — see
+   [`lab/SECURITY.md`](lab/SECURITY.md).
 4. **It is read-only.** It never writes to Notes, Mail, Calendar or Contacts.
 
-Install with `cd lab && make install install-agent install-skill`.
+Install with `brew install apple-tools`, or from a checkout with
+`cd lab && make install install-agent install-skill`.
+
+**The embedder is Core ML, in Swift, with no PyTorch.** `e5-small-v2` converted
+to three fixed shapes; 663 chunks/sec on this corpus, byte-identical vectors to
+the PyTorch path on 19,999 of 20,000 chunks. The warm daemon is `vec daemon`:
+110 MB idle against 661 MB, and 15 ms per search. Every measurement, and the
+three tokenizer bugs the parity gate caught, are in
+[`lab/coreml/BAKEOFF.md`](lab/coreml/BAKEOFF.md).
 
 ## Permissions
 

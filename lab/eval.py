@@ -161,9 +161,12 @@ def resolve(db, locator, cap=200):
     return uids
 
 
+EXTRA = []          # set from --model / --no-daemon / --db, applied to every search
+
+
 def search(query, extra):
     cmd = [sys.executable, os.path.join(HERE, "index.py"), "search", query,
-           "--limit", "10", "--json"] + extra
+           "--limit", "10", "--json"] + EXTRA + extra
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         return []
@@ -226,6 +229,12 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--db", default=None)
     p.add_argument("--compare", action="store_true")
+    # ⚠️ `--db` used to steer only the CASE RESOLUTION. The search subprocess
+    # never saw it, so evaluating a second index scored the default one and the
+    # two runs looked identical for the wrong reason.
+    p.add_argument("--model", default=None, help="embedding model to score")
+    p.add_argument("--no-daemon", action="store_true",
+                   help="never ask the warm daemon; it holds one model only")
     p.add_argument("--verbose", action="store_true")
     opts = p.parse_args()
 
@@ -233,6 +242,10 @@ def main():
     from importlib.machinery import SourceFileLoader
     idx = SourceFileLoader("idx", os.path.join(HERE, "index.py")).load_module()
     dbpath = opts.db or idx.DEFAULT_DB
+    global EXTRA
+    EXTRA = (["--db", dbpath] if opts.db else [])
+    EXTRA += (["--model", opts.model] if opts.model else [])
+    EXTRA += (["--no-daemon"] if opts.no_daemon else [])
     db = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(dbpath), uri=True)
 
     cases, broken = [], []
