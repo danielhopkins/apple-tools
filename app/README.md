@@ -244,8 +244,19 @@ make dmg     # build, notarize the app, build the DMG, notarize and staple it
 ```
 
 ⚠️ **Two notarizations, and both are needed.** The app inside is one artifact
-and the DMG is another. Gatekeeper checks the one the user downloads, so the
-DMG is stapled too.
+and the DMG is another. Gatekeeper checks the one the user downloads.
+
+🛑 **SIGN THE DMG ITSELF, before submitting it.** Notarizing and stapling an
+UNSIGNED disk image succeeds at every step and then fails the only check that
+matters: `spctl -a -t open` reports *"no usable signature"*. A staple is not a
+signature. Measured — the first DMG came back `Accepted`, stapled cleanly, and
+was still rejected.
+
+⚠️ **A `notarytool` failure can be a keychain prompt you cannot see.** "No
+Keychain password item found for profile" was reported here for a profile that
+existed: macOS was waiting for the user to approve access to it, off screen.
+The same class of mistake as the TCC dialog above. **Do not conclude a
+credential is gone until a human has looked at the screen.**
 
 Then attach the DMG to a GitHub release at `v<VERSION>` and update
 `Casks/apple-tools-app.rb`.

@@ -125,6 +125,11 @@ dmg: notarize
 	ln -s /Applications $(DERIVED)/dmgroot/Applications
 	hdiutil create -volname "$(APP)" -srcfolder $(DERIVED)/dmgroot \
 	  -ov -format UDZO -quiet "$(DMG)"
+	@# 🛑 SIGN THE DMG ITSELF, before submitting it. Notarizing and stapling an
+	@# UNSIGNED disk image succeeds, and then `spctl -a -t open` still reports
+	@# "no usable signature" — Gatekeeper checks the signature on the artifact
+	@# the user downloads, and a staple is not one.
+	codesign --force --timestamp --sign "$(IDENTITY): Dan Hopkins ($(TEAM))" "$(DMG)"
 	xcrun notarytool submit "$(DMG)" --keychain-profile "$(PROFILE)" --wait
 	xcrun stapler staple "$(DMG)"
 	spctl -a -vv -t open --context context:primary-signature "$(DMG)"
