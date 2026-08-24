@@ -133,7 +133,23 @@ final class WarmIndex {
     private(set) var lastScanMs = 0.0
     private(set) var lastRankMs = 0.0
 
-    func search(query: String, limit: Int, tool: String?) throws -> [(Int64, Float)] {
+    /// 🛑 `perTool` IS THE FIX FOR A SOURCE THAT NEVER REACHES THE RANKER.
+    ///
+    /// A global top-K samples the corpus in proportion to its size. Measured on
+    /// this index: mail is 81.3% of chunks, and for "what books have I been
+    /// reading" it took **54 of the 60** semantic candidates. The Obsidian
+    /// vault got 2. No ranking rule can rescue a document that was never
+    /// retrieved, and the whole point of this index is that the user does not
+    /// have to name the app first.
+    ///
+    /// With `perTool` set, every tool contributes its own top-K, and the
+    /// ranker gets to compare a book note against an email instead of never
+    /// seeing the book note.
+    ///
+    /// ⚠️ It costs nothing extra. The scores for every row are already
+    /// computed by one `cblas_sgemv`; this only changes which of them are kept.
+    func search(query: String, limit: Int, tool: String?,
+                perTool: Int = 0) throws -> [(Int64, Float)] {
         let embedStarted = Date()
         let vector = try embedder.encodeQuery(query)
         lastEmbedMs = Date().timeIntervalSince(embedStarted) * 1000
@@ -164,23 +180,46 @@ final class WarmIndex {
         lastScanMs = Date().timeIntervalSince(scanStarted) * 1000
         let rankStarted = Date()
         var best: [(Int64, Float)] = []
-        for index in 0..<rows {
-            if let tool = tool, tools[index] != tool { continue }
-            let score = scores[index]
-            if score <= 0 { continue }
-            if best.count < limit {
-                best.append((cids[index], score))
-                if best.count == limit { best.sort { $0.1 > $1.1 } }
-            } else if score > best[best.count - 1].1 {
-                best[best.count - 1] = (cids[index], score)
-                var position = best.count - 1
-                while position > 0 && best[position].1 > best[position - 1].1 {
-                    best.swapAt(position, position - 1)
-                    position -= 1
+        if perTool > 0 {
+            // One bucket per tool, each holding that tool's own top-K.
+            var buckets: [String: [(Int64, Float)]] = [:]
+            for index in 0..<rows {
+                if let tool = tool, tools[index] != tool { continue }
+                let score = scores[index]
+                if score <= 0 { continue }
+                let key = tools[index]
+                var bucket = buckets[key] ?? []
+                if bucket.count < perTool {
+                    bucket.append((cids[index], score))
+                    bucket.sort { $0.1 > $1.1 }
+                } else if score > bucket[bucket.count - 1].1 {
+                    bucket[bucket.count - 1] = (cids[index], score)
+                    bucket.sort { $0.1 > $1.1 }
+                }
+                buckets[key] = bucket
+            }
+            // ⚠️ Sorted globally afterwards, so the CALLER still sees one
+            // ranked list. The quota decides what is retrieved, not what wins.
+            best = buckets.values.flatMap { $0 }.sorted { $0.1 > $1.1 }
+        } else {
+            for index in 0..<rows {
+                if let tool = tool, tools[index] != tool { continue }
+                let score = scores[index]
+                if score <= 0 { continue }
+                if best.count < limit {
+                    best.append((cids[index], score))
+                    if best.count == limit { best.sort { $0.1 > $1.1 } }
+                } else if score > best[best.count - 1].1 {
+                    best[best.count - 1] = (cids[index], score)
+                    var position = best.count - 1
+                    while position > 0 && best[position].1 > best[position - 1].1 {
+                        best.swapAt(position, position - 1)
+                        position -= 1
+                    }
                 }
             }
+            if best.count < limit { best.sort { $0.1 > $1.1 } }
         }
-        if best.count < limit { best.sort { $0.1 > $1.1 } }
         lastRankMs = Date().timeIntervalSince(rankStarted) * 1000
         return best
     }
@@ -320,7 +359,8 @@ func commandDaemon(_ args: Args) {
                 let limit = request["limit"] as? Int ?? 100
                 let started = Date()
                 let hits = try warm.search(query: query, limit: limit,
-                                           tool: request["tool"] as? String)
+                                           tool: request["tool"] as? String,
+                                           perTool: request["per_tool"] as? Int ?? 0)
                 reply = ["ok": true,
                          "hits": hits.map { ["cid": $0.0, "score": $0.1] },
                          "embed_ms": (warm.lastEmbedMs * 10).rounded() / 10,

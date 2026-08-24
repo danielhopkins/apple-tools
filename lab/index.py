@@ -1772,7 +1772,14 @@ def search_settings(opts):
             "adaptive_threshold": opts.adaptive_threshold,
             "tool": opts.tool, "since": opts.since,
             "drop_stopwords": opts.drop_stopwords, "rare_only": opts.rare_only,
-            "min_chunk": opts.min_chunk}
+            "min_chunk": opts.min_chunk,
+            # 🛑 EVERY FLAG THAT CHANGES THE RESULT BELONGS IN THE CACHE KEY.
+            # `pool` and `per_tool` were missing, so changing either returned
+            # the PREVIOUS answer from `result_cache` — a user who tuned a flag
+            # saw no effect, and an evaluation comparing six values of
+            # `--per-tool` scored all six identically because it was reading
+            # one cached result six times.
+            "pool": opts.pool, "per_tool": opts.per_tool}
 
 
 def cache_key(query, settings, fingerprint):
@@ -1858,13 +1865,32 @@ def cmd_search(opts):
         try:
             if opts.lexical_unit == "chunk":
                 seen = set()
-                for row in db.execute("""
+                # 🛑 A PER-TOOL QUOTA, for the same reason the semantic arm
+                # has one. A global `ORDER BY bm25 LIMIT` samples the corpus in
+                # proportion to its size, and mail is 81.3% of the chunks here.
+                # A source that is 3% of the index never reaches the ranker,
+                # which defeats the point of not having to name the app.
+                sql = """
                         SELECT c.rid, c.cid, c.text FROM chunk_fts f
                         JOIN chunk c ON c.cid = f.rowid
                         JOIN record r ON r.rid = c.rid
                         WHERE chunk_fts MATCH ? AND (? IS NULL OR r.tool = ?)
                         ORDER BY bm25(chunk_fts)
-                        LIMIT ?""", (match, opts.tool, opts.tool, pool * 4)):
+                        LIMIT ?"""
+                if opts.per_tool:
+                    # ⚠️ A window function, so one query still does it. Needs
+                    # SQLite 3.25+; the system one here is 3.53.
+                    sql = """
+                        SELECT rid, cid, text FROM (
+                          SELECT c.rid, c.cid, c.text,
+                                 ROW_NUMBER() OVER (PARTITION BY r.tool
+                                                    ORDER BY bm25(chunk_fts)) rank
+                          FROM chunk_fts f
+                          JOIN chunk c ON c.cid = f.rowid
+                          JOIN record r ON r.rid = c.rid
+                          WHERE chunk_fts MATCH ? AND (? IS NULL OR r.tool = ?)
+                        ) WHERE rank <= %d LIMIT ?""" % opts.per_tool
+                for row in db.execute(sql, (match, opts.tool, opts.tool, pool * 4)):
                     if row["rid"] in seen:
                         continue
                     seen.add(row["rid"])
@@ -1893,7 +1919,8 @@ def cmd_search(opts):
             # decline, and the search then loads the right model itself.
             reply = daemon_request({"op": "search", "query": opts.query,
                                     "model": opts.model, "limit": pool * 2,
-                                    "tool": opts.tool})
+                                    "tool": opts.tool,
+                                    "per_tool": opts.per_tool})
             if reply and not reply.get("ok") and opts.verbose:
                 sys.stderr.write("daemon declined: %s\n" % reply.get("error"))
             if reply and reply.get("ok"):
@@ -2974,6 +3001,35 @@ def main():
     s.add_argument("--w-semantic", type=float, default=1.0, dest="w_semantic")
     s.add_argument("--recency-head", type=int, default=10, dest="recency_head",
                    help="how many top candidates the recency arm re-orders")
+    # 🛑 OFF BY DEFAULT, AND THAT IS A MEASUREMENT, NOT A GUESS.
+    #
+    # The problem is real: mail holds 81.3% of the chunks here, and for "what
+    # books have I been reading" it took 54 of the 60 semantic candidates while
+    # the Obsidian vault got 2. A source that is never retrieved cannot be
+    # ranked, and the whole point of this index is not having to name the app.
+    #
+    # A per-tool quota fixes the retrieval and costs more than it earns. Over
+    # eval.py's 29 cases:
+    #
+    #     per-tool  0   MRR 0.565      (no quota)
+    #     per-tool  5   MRR 0.474
+    #     per-tool 10   MRR 0.338
+    #     per-tool 20   MRR 0.237
+    #     per-tool 40   MRR 0.175
+    #
+    # Monotonically worse. The quota admits a weak candidate from every source
+    # — a calendar entry called "Book camping" — and those displace good ones.
+    #
+    # ⚠️ AND THE EVALUATION CANNOT SEE THE OTHER HALF. Its 29 cases have their
+    # answers in mail and notes; not one asks a question the vault should win.
+    # So this measures what the quota COSTS and says nothing about what it
+    # BUYS. Adding vault cases comes before tuning this again — shipping a
+    # default that is worse on 29 measured cases to fix an unmeasured one is
+    # the mistake the adaptive fusion rule already made here.
+    s.add_argument("--per-tool", type=int, default=0, dest="per_tool",
+                   metavar="K",
+                   help="retrieve K candidates from EACH tool before ranking "
+                        "(0 = one global pool, which the largest source wins)")
     s.add_argument("--pool", type=int, default=0,
                    help="candidates each arm retrieves before fusion "
                         "(0 = max(limit*6, 60))")

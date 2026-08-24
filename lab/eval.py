@@ -39,6 +39,18 @@ CASES = [
     ("Ocean First swim",                       "3015 Bluff St",                    "keyword"),
     ("climate equity fund greenhouse",         "Climate Equity Fund",              "keyword"),
 
+    # 🛑 VAULT QUESTIONS, added 2026-08-24. Without these the evaluation could
+    # measure only what a change COSTS the mail-heavy cases and nothing about
+    # what it BUYS a small source — which is how a retrieval quota that fixed a
+    # real failure looked purely harmful. Every locator below was checked to
+    # resolve to a handful of records, and the first three to `files` alone.
+    ("do our COPTA bylaws prohibit business relationships",
+                                               "conflict with the National PTA Bylaws", "vault"),
+    ("how should meeting minutes be written",   "Colorado PTA Meeting Minutes Style Guide", "vault"),
+    ("who runs marketing for Colorado PTA",     "Marketing Director Christy Carter", "vault"),
+    ("which company did Global Founders back",  "Global Founders Capital",          "vault"),
+    ("who is president of COPTA",               "President Burnham",                "vault"),
+
     # descriptive questions, avoiding the literal words where possible
     ("what is the code for the HOA bathroom door",
                                                "Bathroom code 3384",               "descriptive"),
@@ -214,6 +226,15 @@ W = ["--w-recency", "0", "--w-lexical", "4", "--w-semantic", "1"]
 #              0.459 at 100. Shipped at 0.
 STRATEGIES = {
     "default":          W + ["--adaptive-threshold", "4"],
+    # 🛑 Does a per-tool retrieval quota help or dilute? Mail is 81.3% of the
+    # chunks here and took 54 of 60 candidates for one real query, so a small
+    # source never reached the ranker. The quota fixes that; the question is
+    # what it costs the queries that legitimately belong to mail.
+    "per-tool 0":       W + ["--per-tool", "0"],
+    "per-tool 5":       W + ["--per-tool", "5"],
+    "per-tool 10":      W + ["--per-tool", "10"],
+    "per-tool 20":      W + ["--per-tool", "20"],
+    "per-tool 40":      W + ["--per-tool", "40"],
     "adaptive off":     W + ["--no-adaptive"],
     "t=3":              W + ["--adaptive-threshold", "3"],
     "t=5":              W + ["--adaptive-threshold", "5"],
