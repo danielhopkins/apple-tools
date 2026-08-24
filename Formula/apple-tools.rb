@@ -35,9 +35,16 @@ class AppleTools < Formula
     # silently installed four skills out of five — the one for the newest
     # feature was the one missing.
     #
-    # ⚠️ `opt_libexec`, not `libexec`. A symlink into the versioned Cellar path
-    # dangles after the next upgrade; the opt prefix follows it.
-    (pkgshare/"skills").install_symlink opt_libexec/"index/skill/apple-index"
+    # 🛑 COPY IT, DO NOT SYMLINK IT. `install_symlink opt_libexec/...` looks
+    # version-proof and is not: Homebrew RELATIVIZES a symlink inside the
+    # prefix, so `opt` was rewritten to the concrete Cellar path and the link
+    # dangled the moment the next version replaced it. Shipped broken in
+    # 26.824.2 — `share/apple-tools/skills/apple-index` pointed at 26.824.1.
+    # The skill is a few kilobytes; a copy cannot dangle.
+    # ⚠️ `cp_r`, not `install`. Homebrew's `install` MOVES the path, so it would
+    # take the skill out of `index/skill/` before `libexec.install "index"`
+    # ships that directory — leaving the payload silently short one file.
+    cp_r "index/skill/apple-index", pkgshare/"skills"
 
     # The signed Shortcuts that provide the Notes write path. apple-notes finds
     # them by walking up from its own location to share/apple-tools/shortcuts,
