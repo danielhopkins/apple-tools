@@ -8,7 +8,7 @@ PLIST   := $(HOME)/Library/LaunchAgents/$(AGENT).plist
 UV      := $(shell command -v uv)
 
 .PHONY: build install uninstall install-agent uninstall-agent agent-status \
-        install-skill uninstall-skill demo status test clean
+        install-skill link-installed-skills uninstall-skill demo status test clean
 
 ## Build the Swift embedder (Core ML + Apple's models)
 build:
@@ -65,12 +65,37 @@ agent-status:
 ## skills/ ships in `make dist`, and this is experimental.
 CLAUDE_DIRS ?= $(wildcard $(HOME)/.claude-personal $(HOME)/.claude-inevitable $(HOME)/.claude)
 
+## Point every Claude config dir at the CHECKOUT's skills
+##
+## ⚠️ THIS OVERWRITES LINKS TO THE INSTALLED COPY. Since 26.824.3 the formula
+## ships all five skills to `share/apple-tools/skills`, and a machine may be
+## linked there instead. Use this while EDITING a skill, so Claude sees the
+## change without a release; use `link-installed-skills` to go back.
 install-skill:
 	@test -n "$(CLAUDE_DIRS)" || { echo "error: no Claude config dir found"; exit 1; }
 	@for dir in $(CLAUDE_DIRS); do \
 	  mkdir -p "$$dir/skills"; \
 	  ln -sfn "$(LAB)/skill/apple-index" "$$dir/skills/apple-index"; \
 	  echo "  linked $$dir/skills/apple-index"; \
+	done
+
+## Point every Claude config dir at the INSTALLED skills
+##
+## 🛑 `share/apple-tools` is a symlink Homebrew rewrites on every upgrade, so a
+## link through it stays valid across versions. Do NOT link into the Cellar
+## path directly — that dangles the moment the next version lands, which is
+## exactly how 26.824.2 shipped a broken `apple-index` skill.
+BREW_SKILLS ?= $(shell brew --prefix 2>/dev/null)/share/apple-tools/skills
+
+link-installed-skills:
+	@test -d "$(BREW_SKILLS)" || { echo "error: $(BREW_SKILLS) not found. brew install apple-tools"; exit 1; }
+	@test -n "$(CLAUDE_DIRS)" || { echo "error: no Claude config dir found"; exit 1; }
+	@for dir in $(CLAUDE_DIRS); do \
+	  mkdir -p "$$dir/skills"; \
+	  for skill in "$(BREW_SKILLS)"/*; do \
+	    ln -sfn "$$skill" "$$dir/skills/$$(basename $$skill)"; \
+	  done; \
+	  echo "  linked $$dir/skills -> $(BREW_SKILLS)"; \
 	done
 
 uninstall-skill:
