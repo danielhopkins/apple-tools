@@ -1501,12 +1501,39 @@ def cache_key(query, settings, fingerprint):
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()
 
 
+# 🛑 THE LOG IS A SECOND COPY OF THE PROTECTED CONTENT, so it does not get to
+# grow without limit. A logged result carries the title and a 240-character
+# snippet of real message text, indexed by what was searched for. Three days of
+# ordinary use produced 3,816 rows and 25 MB, and nothing pruned it.
+#
+# ⚠️ Thirty days is a retention policy, not a size cap. A week of heavy use can
+# still be large; what it cannot be is unbounded.
+LOG_RETENTION_DAYS = 30
+
+
+def prune_logs(db, days=LOG_RETENTION_DAYS, commit=True):
+    """Drop logged queries and cached results older than `days`.
+
+    ⚠️ Cheap enough to run on every search: `query_log_ts` indexes the column,
+    so a delete that matches nothing costs an index probe. Doing it on write is
+    what makes the policy real — a prune that needs a cron job is a prune that
+    silently stops happening.
+    """
+    cutoff = time.time() - days * 86400
+    dropped = db.execute("DELETE FROM query_log WHERE ts < ?", (cutoff,)).rowcount
+    dropped += db.execute("DELETE FROM result_cache WHERE ts < ?", (cutoff,)).rowcount
+    if commit and dropped:
+        db.commit()
+    return dropped
+
+
 def record_query(db, query, settings, fingerprint, results, elapsed_ms, cached,
                  keep_snippets=True):
     # ⚠️ The log is a SECOND store of the same protected content: a snippet is
     # real message text. --no-snippet-log keeps the ranking and drops the text.
     if not keep_snippets:
         results = [{k: v for k, v in r.items() if k != "snippet"} for r in results]
+    prune_logs(db, commit=False)
     db.execute("""INSERT INTO query_log
                   (ts, query, settings, fingerprint, elapsed_ms, n_results, cached, results)
                   VALUES (?,?,?,?,?,?,?,?)""",
@@ -2027,6 +2054,12 @@ def cmd_refresh(opts):
 def cmd_purge(opts):
     """Delete the index, or just the logs. The closest thing to a revocation."""
     targets = [opts.db, opts.db + "-wal", opts.db + "-shm"]
+    if opts.logs_only and getattr(opts, "older_than", 0):
+        db = connect(opts.db)
+        dropped = prune_logs(db, days=opts.older_than)
+        print("dropped %d entries older than %d days" % (dropped, opts.older_than))
+        db.execute("VACUUM")
+        return
     if opts.logs_only:
         db = connect(opts.db)
         n_log = db.execute("SELECT COUNT(*) c FROM query_log").fetchone()["c"]
@@ -2498,6 +2531,17 @@ def cmd_status(opts):
         print("%d chunks, %d embedded as %s, %d pending"
               % (total, r["c"], r["model"], total - r["c"]))
     print("%.1f MB at %s" % (size, opts.db))
+    # ⚠️ Name the query log in `status`. It is a SECOND copy of the protected
+    # content — each logged hit keeps a 240-character snippet of real message
+    # text — and a store nobody can see is a store nobody deletes.
+    logged = db.execute("SELECT COUNT(*) c FROM query_log").fetchone()["c"]
+    cached = db.execute("SELECT COUNT(*) c FROM result_cache").fetchone()["c"]
+    if logged or cached:
+        oldest = db.execute("SELECT MIN(ts) t FROM query_log").fetchone()["t"]
+        age = (time.time() - oldest) / 86400 if oldest else 0
+        print("%d logged queries and %d cached results, kept %d days "
+              "(oldest %.1f days). Clear: apple-index purge --logs-only"
+              % (logged, cached, LOG_RETENTION_DAYS, age))
     # ⚠️ Quote the rate for the model that is actually behind. A single
     # hardcoded 41 chunks/sec came from Apple's model and told a caller "52
     # minutes" for an e5-small backlog that finished in 5.
@@ -2675,6 +2719,11 @@ def main():
     pu.add_argument("--yes", action="store_true", help="do not ask")
     pu.add_argument("--logs-only", action="store_true", dest="logs_only",
                     help="keep the index, drop query_log and result_cache")
+    pu.add_argument("--older-than", type=int, default=0, dest="older_than",
+                    metavar="DAYS",
+                    help="with --logs-only: drop only entries older than DAYS "
+                         "(default 0 = all of them). Searches already prune "
+                         "at %d days." % LOG_RETENTION_DAYS)
     pu.set_defaults(func=cmd_purge)
 
     n = sub.add_parser("near", help="everything indexed near a place")
