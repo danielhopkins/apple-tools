@@ -1799,16 +1799,31 @@ def render(results, opts, cached):
 
 SECURITY_WARNING = """\
 🛑 SECURITY: this index holds the PLAINTEXT of everything it reads.
-   %s of decoded mail, messages, notes and contacts, in one file:
+   %s of decoded mail, messages, notes and contacts, in one UNENCRYPTED file:
      %s
    The stores it came from are protected by Full Disk Access and 0700
    directories. This file is protected by neither, so any process running as
    you can read every email with no grant and no prompt. Revoking Full Disk
    Access does NOT disable it, and every backup copies it.
    Mitigations applied: directory 0700, file 0600, Spotlight excluded.
-   Not applied: encryption, access logging, expiry.
-   Remove it with:  ./index.py purge --yes        Details: lab/SECURITY.md
+   Not applied: access logging, expiry.
+
+   ENCRYPT IT: install AppleTools.app, which moves this file into an AES-256
+   disk image keyed to your Keychain.  brew install --cask \\
+     danielhopkins/formulae/apple-tools-app
+   Or remove it:  apple-index purge --yes        Details: lab/SECURITY.md
 """
+
+
+def index_is_encrypted(path):
+    """True when the index sits inside the app's encrypted disk image.
+
+    ⚠️ A PATH TEST, not a question about the file. The image is mounted, so the
+    database on it looks exactly like any other file — mode, size and header are
+    all identical. Where it lives is the only thing that distinguishes them.
+    """
+    return os.path.realpath(path).startswith(
+        os.path.realpath(os.path.join(_SUPPORT, "mnt")) + os.sep)
 
 
 def warn_security(db, path, force=False):
@@ -1816,7 +1831,14 @@ def warn_security(db, path, force=False):
 
     ⚠️ A warning that lives only in a document is a warning nobody reads. This
     prints on ingest and on status, every time, and names the real size.
+
+    🛑 SILENT ONCE THE INDEX IS ENCRYPTED, because then the warning is FALSE.
+    It said "Not applied: encryption" and "protected by neither" long after
+    AppleTools.app had moved the file into an AES-256 image. A security banner
+    that is wrong is worse than none: it trains the reader to skip it.
     """
+    if index_is_encrypted(path) and not force:
+        return
     try:
         size = os.path.getsize(path) / 1e6
     except OSError:
