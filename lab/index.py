@@ -296,6 +296,17 @@ STOPWORDS = {
     "her", "its", "have", "has", "had", "get", "got", "any", "all", "some",
 }
 
+# ⚠️ `index.py` carries no version string of its own, so nothing can stamp it
+# and nothing can drift. It asks the dispatcher, which `make bump` does stamp.
+def tool_version():
+    try:
+        out = subprocess.run(["apple", "--version"], capture_output=True,
+                             text=True, timeout=5)
+        return out.stdout.strip().split()[-1] if out.returncode == 0 else "unknown"
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
 SOURCES = ["notes", "mail", "messages", "calendar", "contacts", "maps",
            "reminders", "files"]
 
@@ -442,6 +453,19 @@ CREATE TABLE IF NOT EXISTS consent (
   version    TEXT NOT NULL,
   how        TEXT NOT NULL          -- 'interactive' or '--accept-risk'
 );
+
+-- 🛑 A REAL SERIES, because `record.seen_at` is not one. That column moves
+-- when a record CHANGES, so a note edited today looks like a note indexed
+-- today and the curve flattens history into the present. This table is written
+-- once per ingest and never updated.
+CREATE TABLE IF NOT EXISTS index_history (
+  ts       REAL NOT NULL,
+  tool     TEXT NOT NULL,
+  records  INTEGER NOT NULL,
+  chunks   INTEGER NOT NULL,
+  PRIMARY KEY (ts, tool)
+);
+CREATE INDEX IF NOT EXISTS index_history_ts ON index_history(ts);
 
 CREATE TABLE IF NOT EXISTS query_log (
   qid        INTEGER PRIMARY KEY,
@@ -1642,6 +1666,7 @@ def cmd_ingest(opts):
         print("%-9s +%d ~%d -%d  (%d total, %.1fs)%s"
               % (name, added, updated, removed, total, time.time() - started, dupe_note))
 
+    snapshot_history(db)
     pending = db.execute("""SELECT COUNT(*) c FROM chunk c
                             LEFT JOIN vector v ON v.cid = c.cid
                             WHERE v.cid IS NULL""").fetchone()["c"]
@@ -2868,6 +2893,111 @@ def cmd_consent(opts):
                       "changed": False}))
 
 
+def snapshot_history(db, when=None):
+    """One row per tool, per ingest. ⚠️ Rounded to the minute, so a burst of
+    per-source ingests in one refresh collapses into a single point instead of
+    eight points a second apart."""
+    ts = round((when or time.time()) / 60) * 60
+    rows = db.execute("""
+        SELECT r.tool, COUNT(DISTINCT r.rid) records, COUNT(c.cid) chunks
+        FROM record r LEFT JOIN chunk c ON c.rid = r.rid
+        GROUP BY r.tool""").fetchall()
+    for row in rows:
+        db.execute("""INSERT INTO index_history (ts, tool, records, chunks)
+                      VALUES (?,?,?,?)
+                      ON CONFLICT(ts, tool) DO UPDATE SET records=?, chunks=?""",
+                   (ts, row["tool"], row["records"], row["chunks"],
+                    row["records"], row["chunks"]))
+    db.commit()
+
+
+def backfill_history(db):
+    """Seed the series from `seen_at`, once, so a new install has a shape.
+
+    🛑 AN APPROXIMATION, AND LABELLED AS ONE. `seen_at` is when a record was
+    last written, not when it first arrived, so an edited record counts on the
+    day it changed. For a corpus that mostly appends the curve is close; for a
+    source that was re-ingested wholesale it is a step where the real history
+    was a slope.
+    """
+    if db.execute("SELECT COUNT(*) c FROM index_history").fetchone()["c"]:
+        return 0
+    days = db.execute("""
+        SELECT DISTINCT CAST(seen_at / 86400 AS INTEGER) * 86400 day
+        FROM record ORDER BY day""").fetchall()
+    written = 0
+    for row in days:
+        # 🛑 End of that day, so a point means "this is what the index held",
+        # not "this is what arrived".
+        edge = row["day"] + 86399
+        for tool_row in db.execute("""
+                SELECT r.tool, COUNT(DISTINCT r.rid) records, COUNT(c.cid) chunks
+                FROM record r LEFT JOIN chunk c ON c.rid = r.rid
+                WHERE r.seen_at <= ? GROUP BY r.tool""", (edge,)):
+            db.execute("""INSERT OR REPLACE INTO index_history
+                          (ts, tool, records, chunks) VALUES (?,?,?,?)""",
+                       (float(edge), tool_row["tool"],
+                        tool_row["records"], tool_row["chunks"]))
+            written += 1
+    db.commit()
+    return written
+
+
+def cmd_stats(opts):
+    """Everything the app's window needs, in one call.
+
+    ⚠️ ONE COMMAND, not five. The window refreshes on a timer, and five
+    subprocesses per tick is five python starts per tick.
+    """
+    db = connect(opts.db)
+    backfill_history(db)
+
+    sources = []
+    for row in db.execute("""
+            SELECT r.tool, COUNT(DISTINCT r.rid) records, COUNT(c.cid) chunks
+            FROM record r LEFT JOIN chunk c ON c.rid = r.rid
+            GROUP BY r.tool ORDER BY r.tool"""):
+        # ⚠️ The container is the account, mailbox, list, calendar or folder.
+        # It is what makes "what am I indexing" answerable rather than a total.
+        parts = [{"name": p["container"] or "(none)",
+                  "records": p["records"], "chunks": p["chunks"]}
+                 for p in db.execute("""
+            SELECT COALESCE(r.container,'') container,
+                   COUNT(DISTINCT r.rid) records, COUNT(c.cid) chunks
+            FROM record r LEFT JOIN chunk c ON c.rid = r.rid
+            WHERE r.tool = ? GROUP BY r.container
+            ORDER BY records DESC LIMIT 60""", (row["tool"],))]
+        state = db.execute("SELECT updated FROM source_state WHERE tool = ?",
+                           (row["tool"],)).fetchone()
+        sources.append({"tool": row["tool"], "records": row["records"],
+                        "chunks": row["chunks"],
+                        "updated": state["updated"] if state else None,
+                        "containers": parts})
+
+    history = [{"ts": h["ts"], "tool": h["tool"],
+                "records": h["records"], "chunks": h["chunks"]}
+               for h in db.execute(
+                   "SELECT ts, tool, records, chunks FROM index_history "
+                   "ORDER BY ts")]
+
+    models = [{"model": m["model"], "vectors": m["c"]} for m in db.execute(
+        "SELECT model, COUNT(*) c FROM vector GROUP BY model")]
+    total_chunks = db.execute("SELECT COUNT(*) c FROM chunk").fetchone()["c"]
+    size = sum(os.path.getsize(opts.db + s)
+               for s in ("", "-wal", "-shm") if os.path.exists(opts.db + s))
+    print(json.dumps({
+        "version": tool_version(),
+        "db": opts.db,
+        "encrypted": index_is_encrypted(opts.db),
+        "bytes": size,
+        "chunks": total_chunks,
+        "models": models,
+        "sources": sources,
+        "history": history,
+        "retention_days": LOG_RETENTION_DAYS,
+    }, indent=2))
+
+
 def cmd_status(opts):
     require_index(opts.db)
     warn_if_revoked(opts)
@@ -3184,6 +3314,10 @@ def main():
     fl.add_argument("--name", help="what to call it (default: the folder name)")
     fl.add_argument("--exclude", help="comma separated subdirectory names to skip")
     fl.set_defaults(func=cmd_files)
+
+    sub.add_parser("stats",
+                   help="everything the app's window needs, as JSON"
+                   ).set_defaults(func=cmd_stats)
 
     sub.add_parser("sources",
                    help="the per-source arguments `refresh` uses, as JSON"

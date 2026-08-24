@@ -28,6 +28,15 @@ final class AppModel: ObservableObject {
     let toolProxy = ToolProxy()
 
     @Published private(set) var facts = IndexFacts()
+    @Published private(set) var stats = IndexStats()
+    private var statsRefreshed = Date.distantPast
+
+    /// 🛑 The RUNNING build, from the bundle. A stale build was diagnosed as a
+    /// code bug for an hour because nothing on screen said which one it was.
+    var appVersion: String {
+        let short = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString")
+        return (short as? String) ?? "?"
+    }
     private var ticker: Timer?
     @Published private(set) var vaultProgress: String? = nil
     @Published private(set) var vaultFailure: String? = nil
@@ -122,6 +131,10 @@ final class AppModel: ObservableObject {
 
     func reread() {
         facts = IndexReader.read()
+        // ⚠️ THROTTLED, because `stats` spawns python. The ticker runs every
+        // two seconds; thirty python starts a minute to redraw a chart that
+        // changes every five minutes is not a trade worth making.
+        if Date().timeIntervalSince(statsRefreshed) > 30 { refreshStats() }
         search.refreshPing()
         grants.read()
         loginItem.read()
@@ -147,6 +160,15 @@ final class AppModel: ObservableObject {
         }
         vault.read()
         reread()
+    }
+
+    /// Read the whole picture in one subprocess, off the main thread.
+    func refreshStats() {
+        statsRefreshed = Date()
+        Task.detached(priority: .utility) {
+            let fresh = StatsReader.read()
+            await MainActor.run { if fresh.loaded || fresh.error != nil { self.stats = fresh } }
+        }
     }
 
     func quit() {
@@ -191,6 +213,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { @MainActor in AppModel.shared.start() }
     }
 
+
     func applicationWillTerminate(_ notification: Notification) {
         // Take the search endpoint down with the app. Leaving it bound to the
         // socket after a quit is how two daemons end up racing it.
@@ -216,14 +239,27 @@ struct AppleToolsApp: App {
             // ⚠️ A template image, so it follows the menu bar in both themes.
             Image(systemName: model.healthy
                   ? "magnifyingglass.circle" : "magnifyingglass.circle.fill")
+                // 🛑 THE LABEL, NOT THE MENU CONTENT. A MenuBarExtra's content
+                // is not built until someone opens the menu, and an accessory
+                // app never receives `applicationDidBecomeActive`, so neither
+                // could open a window on first launch. The label is built at
+                // launch, and `openWindow` is available to it.
+                .onAppear {
+                    let key = "hasShownWindow"
+                    guard !UserDefaults.standard.bool(forKey: key) else { return }
+                    UserDefaults.standard.set(true, forKey: key)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                        NSApp.activate(ignoringOtherApps: true)
+                        openWindow(id: "status")
+                    }
+                }
         }
 
         Window("Index", id: "status") {
             StatusView(model: model)
-                .frame(minWidth: 620, minHeight: 520)
+                .frame(minWidth: 720, minHeight: 560)
         }
-        .defaultSize(width: 700, height: 640)
-        .windowResizability(.contentSize)
+        .defaultSize(width: 860, height: 760)
     }
 }
 
@@ -257,6 +293,15 @@ enum Format {
         if seconds < 3600 { return "\(Int(seconds / 60)) min ago" }
         if seconds < 86400 { return "\(Int(seconds / 3600)) h ago" }
         return "\(Int(seconds / 86400)) d ago"
+    }
+
+    /// ⚠️ `.file` counts in the same units the Finder does, so the number here
+    /// matches what the user sees in Get Info rather than being 7% smaller.
+    static func bytes(_ value: Int) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        formatter.allowedUnits = [.useMB, .useGB]
+        return formatter.string(fromByteCount: Int64(value))
     }
 
     static func count(_ value: Int) -> String {
