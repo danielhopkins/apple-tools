@@ -116,7 +116,8 @@ CASES = [
                                  "I have uploaded the July financial statements", "recent"),
     ("why is the finance chair missing the board meeting",
                                  "I will be at my mom\u2019s memorial service", "no-overlap"),
-    ("where do the kids swim",                  "Ocean First",                "no-overlap"),
+    # ⚠️ TWO right answers, in different words and different towns.
+    ("where do the kids swim",   ("Ocean First", "Goldfish Swim School"), "no-overlap"),
     # ⚠️ "4877 Hopkins Pl" is the user's own address and matches 1,615
     # records. Anchored on the event title, which is unique to it.
     ("where is the piano lesson",   "Weekly Dan/Margot Piano with Elizabeth", "descriptive"),
@@ -175,10 +176,20 @@ def resolve(db, locator, cap=200):
     A recurring calendar event legitimately matches once per occurrence, so the
     cap is generous. Measured: "Mile marathon" matched 152 records.
     """
-    rows = db.execute("""
-        SELECT DISTINCT r.uid FROM chunk c JOIN record r ON r.rid = c.rid
-        WHERE c.text LIKE ?""", ("%" + locator + "%",)).fetchall()
-    uids = [r[0] for r in rows]
+    # 🛑 A LOCATOR MAY BE SEVERAL STRINGS, because a question may have several
+    # right answers in different words. "where do the kids swim" is answered by
+    # BOTH `Ocean First` in Boulder and `Goldfish Swim School` in Superior, and
+    # anchoring on one scored a correct rank-1 hit as a miss — which is how the
+    # adaptive fusion rule looked useless on the very query it was built for.
+    # Third time this file has been wrong that way; see the gymnastics case.
+    locators = [locator] if isinstance(locator, str) else list(locator)
+    uids = []
+    for one in locators:
+        rows = db.execute("""
+            SELECT DISTINCT r.uid FROM chunk c JOIN record r ON r.rid = c.rid
+            WHERE c.text LIKE ?""", ("%" + one + "%",)).fetchall()
+        uids.extend(r[0] for r in rows)
+    uids = list(dict.fromkeys(uids))
     if not uids or len(uids) > cap:
         return None
     return uids
@@ -248,6 +259,9 @@ STRATEGIES = {
     "per-tool 20":      W + ["--per-tool", "20"],
     "per-tool 40":      W + ["--per-tool", "40"],
     "adaptive off":     W + ["--no-adaptive"],
+    "adaptive t=2":     W + ["--adaptive", "--adaptive-threshold", "2"],
+    "adaptive t=3":     W + ["--adaptive", "--adaptive-threshold", "3"],
+    "adaptive t=4":     W + ["--adaptive", "--adaptive-threshold", "4"],
     "t=3":              W + ["--adaptive-threshold", "3"],
     "t=5":              W + ["--adaptive-threshold", "5"],
     "pool 300":         W + ["--adaptive-threshold", "4", "--pool", "300"],
@@ -304,7 +318,7 @@ def main():
         print("🛑 %d broken case(s): matched nothing, or several different things"
               % len(broken))
         for locator in broken:
-            print("   %s" % locator[:60])
+            print("   %s" % (locator if isinstance(locator, str) else " / ".join(locator))[:60])
         print()
     if not cases:
         sys.exit("no usable cases")
