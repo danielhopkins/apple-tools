@@ -151,5 +151,5 @@ enum Paths {
     /// live list comes from `index.py sources --json`, because the per-source
     /// arguments live there and two copies of them drift.
     static let indexSources = ["notes", "mail", "messages",
-                               "calendar", "contacts", "maps"]
+                               "calendar", "contacts", "maps", "reminders"]
 }

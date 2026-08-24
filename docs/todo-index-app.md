@@ -146,7 +146,7 @@ set out to get.
 
 ⚠️ **If those entitlements ever stop working, the fallback is measured**: drop
 `APPLE_TOOLS_OWN_TCC_IDENTITY` and let the three tools disclaim. They then use
-their own long-standing grants and all six sources index — at the cost of the
+their own long-standing grants and every source indexes — at the cost of the
 app's Full Disk Access for those two, which loses `apple contacts --photo`
 reporting and the calendar sync tables.
 

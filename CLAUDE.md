@@ -1708,10 +1708,11 @@ above cannot: **searching when you do not know which app holds the answer.**
 🛑 Only the PyTorch-free half ships; `make test` still runs nothing here.
 
 ```
-apple-index search "the greenhouse budget"     # one query across all five sources
+apple-index search "the greenhouse budget"     # one query across all seven sources
 ```
 
-It builds one SQLite index over mail, messages, notes, calendar and contacts,
+It builds one SQLite index over mail, messages, notes, calendar, contacts,
+reminders and visited places,
 and searches it with FTS5 plus an `e5-small-v2` embedding. A query takes 70 to
 300 ms against 239,000 chunks. Full detail in
 [`lab/README.md`](lab/README.md); the model comparison is in

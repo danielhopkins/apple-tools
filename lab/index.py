@@ -296,7 +296,8 @@ STOPWORDS = {
     "her", "its", "have", "has", "had", "get", "got", "any", "all", "some",
 }
 
-SOURCES = ["notes", "mail", "messages", "calendar", "contacts", "maps"]
+SOURCES = ["notes", "mail", "messages", "calendar", "contacts", "maps",
+           "reminders"]
 
 # 🛑 ONE PLACE, because two places drift. `refresh` uses these, and so does the
 # app's scheduler, which reads them back through `index.py sources --json`
@@ -313,6 +314,7 @@ REFRESH_ARGS = {
     "calendar": ["--since", "3650"],
     "contacts": ["--limit", "100000"],
     "maps": [],
+    "reminders": [],
 }
 
 
@@ -954,6 +956,75 @@ def ingest_contacts(opts):
         yield record
 
 
+def ingest_reminders(opts):
+    """Reminders, completed ones included.
+
+    🛑 `--include-completed`, and that is the point. 1,417 of 1,478 reminders on
+    this machine are done, and a finished reminder is the record of what
+    actually happened. Indexing only the open ones would index the 4% that is
+    still a todo list and throw away the history.
+
+    ⚠️ A reminder has no per-item URL scheme, like calendar. See
+    docs/todo-deep-links.md.
+    """
+    rows = apple("reminders", "show-all", "--include-completed", "--json")
+    if opts.limit:
+        rows = rows[:opts.limit]
+    for row in rows:
+        external = row.get("externalId")
+        if not external:
+            continue
+        title = row.get("title") or ""
+
+        # 🛑 `location` is a COORDINATE PAIR as a string, not an address —
+        # `locationTitle` holds the human name. Reading `location` as text puts
+        # "40.035336, -105.240627" in the body and places nothing on a map.
+        lat = lon = None
+        pair = (row.get("location") or "").split(",")
+        if len(pair) == 2:
+            try:
+                lat, lon = float(pair[0]), float(pair[1])
+            except ValueError:
+                lat = lon = None
+
+        # ⚠️ Tags are invisible to EventKit and never appear in the title, so a
+        # reminder tagged #PTA has no "PTA" anywhere in its text. Put them in
+        # the body or the index cannot find it by that word.
+        tags = row.get("tags") or []
+        body = "\n".join(x for x in [
+            row.get("notes"),
+            row.get("locationTitle"),
+            row.get("url"),
+            " ".join("#" + t for t in tags) if tags else None,
+        ] if x)
+
+        # 🛑 WHEN did this happen. A completed reminder's due date may be years
+        # off or absent; what dates it is when it was finished. Prefer the
+        # completion, then the due date, then creation, so every row has one.
+        occurred = (epoch(row.get("completionDate")) or epoch(row.get("dueDate"))
+                    or epoch(row.get("creationDate")))
+
+        state = "done" if row.get("isCompleted") else "open"
+        yield {
+            "uid": "reminders:%s" % external,
+            "latitude": lat, "longitude": lon,
+            "tool": "reminders", "kind": "reminder", "native_id": external,
+            "url": None,
+            "title": title,
+            "container": row.get("list"),
+            "created": epoch(row.get("creationDate")),
+            "modified": epoch(row.get("lastModified")),
+            "occurred": occurred,
+            "people": [],
+            "body": body.strip(),
+            # ⚠️ The completion state is part of the revision. Ticking a
+            # reminder changes nothing else about it, and without this the
+            # index would keep reporting it as open forever.
+            "rev": rev_of(title, body, state, row.get("dueDate"),
+                          row.get("lastModified")),
+        }
+
+
 ADAPTERS = {
     "notes": ingest_notes,
     "mail": ingest_mail,
@@ -961,6 +1032,7 @@ ADAPTERS = {
     "calendar": ingest_calendar,
     "contacts": ingest_contacts,
     "maps": ingest_maps,
+    "reminders": ingest_reminders,
 }
 
 
