@@ -1,6 +1,6 @@
 ---
 name: apple-index
-description: Search across ALL of the user's Apple data at once — mail, messages, notes, calendar, contacts, reminders and visited places — with one query, and ask where things happened, using a local semantic index (`apple-index`). Use when the user asks for something but does not say which app holds it ("find that thing about the budget", "where did I see the door code", "what do I know about X", "did anyone tell me about Y", "look up that address someone sent me"), when the question is about PROXIMITY ("what was near the dentist", "which of these places are close together", "what else did I do while I was there"), or when a normal `apple` search over one tool has already failed. It searches meaning as well as words, so it finds a note about "Director of Development" from a query about "fundraising". EXPERIMENTAL and read-only.
+description: Search across ALL of the user's Apple data at once — mail, messages, notes, calendar, contacts, reminders, visited places and their own files (an Obsidian vault, for example) — with one query, and ask where things happened, using a local semantic index (`apple-index`). Use when the user asks for something but does not say which app holds it ("find that thing about the budget", "where did I see the door code", "what do I know about X", "did anyone tell me about Y", "look up that address someone sent me"), when the question is about PROXIMITY ("what was near the dentist", "which of these places are close together", "what else did I do while I was there"), or when a normal `apple` search over one tool has already failed. It searches meaning as well as words, so it finds a note about "Director of Development" from a query about "fundraising". EXPERIMENTAL and read-only.
 ---
 
 # apple-index
@@ -47,6 +47,32 @@ EventKit, not Calendar.app. So:
   --at`.** Measured on this index: **617 of 11,379 events, 5%.** An event whose
   location was typed as text has none.
 - **Mail, messages, notes, contacts and most reminders have none at all.**
+
+## Files, and the Obsidian vault
+
+`files` indexes folders the user has configured, and understands an Obsidian
+vault natively: frontmatter, wikilinks and `obsidian://` deep links.
+
+```
+apple-index files                    # which folders are indexed
+apple-index files add ~/path/vault   # add one
+apple-index search "…" --tool files  # search only those files
+```
+
+- 🛑 **The FOLDER PATH is the description, and it is stored as `container`.**
+  A note in `11 - 🤝 Volunteering/COPTA/LEC/Research` is filed there by the
+  user, which is a real fact about it. Nothing writes a description of what a
+  folder means, because that is a second thing to keep true and it goes stale.
+- **Frontmatter is searchable text.** `type: person` is in the indexed body, so
+  "type person directory" finds the people notes. The word "person" appears
+  nowhere else in them.
+- **A `files` hit carries a real `obsidian://` URL**, which most sources here
+  cannot offer. Open it rather than describing the path.
+- ⚠️ **A vault loses on volume in an unfiltered search.** 996 files against
+  40,455 emails, so a general question tends to surface mail. **Pass `--tool
+  files` when the question is about the user's own notes**: "what books have I
+  been reading" returns nothing from the vault without it, and returns the
+  reading notes with it.
 
 ⚠️ **So "nothing near X" means "nothing INDEXED WITH A COORDINATE is near X".**
 It is not evidence the user was not there. Both commands print how many records
@@ -120,7 +146,7 @@ apple notes export 583                        # the truth
 
 ```
 apple-index search QUERY [--limit N]
-            [--tool notes|mail|messages|calendar|contacts|maps|reminders]
+            [--tool notes|mail|messages|calendar|contacts|maps|reminders|files]
                         [--since DAYS] [--json]
 apple-index near PLACE  [--radius KM] [--tool T] [--since DAYS] [--past]
                         [--limit N] [--local-only] [--json]

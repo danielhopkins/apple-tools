@@ -297,7 +297,7 @@ STOPWORDS = {
 }
 
 SOURCES = ["notes", "mail", "messages", "calendar", "contacts", "maps",
-           "reminders"]
+           "reminders", "files"]
 
 # 🛑 ONE PLACE, because two places drift. `refresh` uses these, and so does the
 # app's scheduler, which reads them back through `index.py sources --json`
@@ -315,6 +315,7 @@ REFRESH_ARGS = {
     "contacts": ["--limit", "100000"],
     "maps": [],
     "reminders": [],
+    "files": [],
 }
 
 
@@ -1025,6 +1026,211 @@ def ingest_reminders(opts):
         }
 
 
+# --------------------------------------------------------------------------
+# files — a folder of markdown, with Obsidian understood
+# --------------------------------------------------------------------------
+
+# 🛑 ROOTS ARE CONFIGURED, NEVER GUESSED. A guessed path that happens to exist
+# on one machine is exactly the kind of thing that ships and then indexes
+# somebody's Downloads folder. `apple-index files add <path>` writes this.
+FILES_CONFIG = os.path.join(os.path.dirname(DEFAULT_DB), "files.json")
+
+# ⚠️ Directories that are never content. `Attachments` and an images folder can
+# be hundreds of megabytes of binaries next to five megabytes of text — on this
+# vault, 959 MB against 5.6 MB.
+FILE_SKIP_DIRS = {
+    ".obsidian", ".git", ".trash", ".stfolder", ".stversions",
+    "node_modules", "__pycache__", "Attachments", "attachments",
+    ".smart-connections", ".makemd",
+}
+FILE_EXTENSIONS = {".md", ".markdown", ".txt"}
+# ⚠️ A cap, because one runaway export should not become 40% of the index. The
+# largest real note in this vault is 701 KB, so this keeps everything genuine.
+FILE_MAX_BYTES = 2 * 1024 * 1024
+
+
+def files_roots():
+    """The configured roots, each {path, name, exclude}."""
+    try:
+        with open(FILES_CONFIG) as handle:
+            config = json.load(handle)
+    except (OSError, ValueError):
+        return []
+    roots = []
+    for entry in config.get("roots", []):
+        path = os.path.expanduser(entry.get("path", ""))
+        if not path:
+            continue
+        roots.append({
+            "path": os.path.realpath(path),
+            "name": entry.get("name") or os.path.basename(path.rstrip("/")),
+            "exclude": entry.get("exclude") or [],
+        })
+    return roots
+
+
+def is_obsidian_vault(path):
+    return os.path.isdir(os.path.join(path, ".obsidian"))
+
+
+def parse_frontmatter(text):
+    """The YAML subset Obsidian actually writes: `key: value` and `- item`.
+
+    🛑 NOT a YAML parser, and deliberately. Bringing PyYAML in would break the
+    stdlib-only rule the whole ingest path is built on, for a block that is
+    flat `key: value` in 861 of 861 notes here. Anything it cannot read is
+    skipped rather than guessed at.
+
+    Returns (fields, body). A file with no frontmatter returns ({}, text).
+    """
+    if not text.startswith("---\n"):
+        return {}, text
+    end = text.find("\n---", 4)
+    if end == -1:
+        return {}, text
+    block, body = text[4:end], text[end + 4:].lstrip("\n")
+    fields, key = {}, None
+    for line in block.splitlines():
+        if line.startswith(("- ", "  - ")) and key:
+            fields.setdefault(key, [])
+            if isinstance(fields[key], list):
+                fields[key].append(line.split("- ", 1)[1].strip())
+            continue
+        match = re.match(r"^([A-Za-z][\w-]*)\s*:\s*(.*)$", line)
+        if not match:
+            continue
+        key, value = match.group(1), match.group(2).strip()
+        fields[key] = value if value else []
+    return fields, body
+
+
+# ⚠️ Wikilinks carry meaning and must survive into the text. `[[Ada Lovelace]]`
+# is how a note names a person, and stripping the brackets without keeping the
+# name loses the only mention. `[[path/to/note|Shown]]` keeps the shown half.
+WIKILINK = re.compile(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]")
+
+
+def flatten_markdown(text):
+    text = WIKILINK.sub(lambda m: (m.group(2) or m.group(1)).split("/")[-1], text)
+    # Images add nothing searchable and their alt text is usually a filename.
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)
+    return text
+
+
+def obsidian_url(root, relative):
+    return "obsidian://open?vault=%s&file=%s" % (
+        urllib.parse.quote(os.path.basename(root["path"])),
+        urllib.parse.quote(os.path.splitext(relative)[0]))
+
+
+def ingest_files(opts):
+    """Markdown and text files from configured roots, Obsidian understood.
+
+    🛑 THE PATH IS THE DESCRIPTION, and it is stored as `container` rather than
+    smeared into the text. A note in `11 - 🤝 Volunteering/Columbine PTA/` is
+    filed there by the user; that is a real fact about the file. Writing a
+    hand-maintained folder description instead would be a second thing to keep
+    true, and it goes stale silently.
+    """
+    roots = files_roots()
+    if not roots:
+        sys.stderr.write(
+            "no file roots configured. Add one:\n"
+            "  apple-index files add ~/path/to/vault\n")
+        return
+    seen = 0
+    for root in roots:
+        base = root["path"]
+        if not os.path.isdir(base):
+            sys.stderr.write("skipping missing root: %s\n" % base)
+            continue
+        vault = is_obsidian_vault(base)
+        excluded = set(FILE_SKIP_DIRS) | set(root["exclude"])
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = [d for d in dirnames
+                           if d not in excluded and not d.startswith(".")]
+            for name in sorted(filenames):
+                if os.path.splitext(name)[1].lower() not in FILE_EXTENSIONS:
+                    continue
+                path = os.path.join(dirpath, name)
+                try:
+                    stat = os.stat(path)
+                except OSError:
+                    continue
+                if stat.st_size > FILE_MAX_BYTES:
+                    sys.stderr.write("skipping %.1f MB file: %s\n"
+                                     % (stat.st_size / 1e6, path))
+                    continue
+                if opts.limit and seen >= opts.limit:
+                    return
+                seen += 1
+                try:
+                    raw = open(path, encoding="utf-8", errors="replace").read()
+                except OSError:
+                    continue
+
+                relative = os.path.relpath(path, base)
+                fields, body = parse_frontmatter(raw) if vault else ({}, raw)
+                body = flatten_markdown(body)
+
+                # ⚠️ Frontmatter goes in the body as `key: value` lines, because
+                # that is how it is searched. `type: person` is invisible
+                # otherwise — the word "person" appears nowhere in the note.
+                meta_lines = []
+                for key, value in fields.items():
+                    if key in ("cover", "isbn13", "isbn", "goodreads"):
+                        continue      # identifiers, not language
+                    text = ", ".join(value) if isinstance(value, list) else value
+                    if text:
+                        # ⚠️ FLATTEN THESE TOO. Frontmatter carries wikilinks —
+                        # `source: "[[2026-08-22 COPTA BOD Meeting]]"` — and
+                        # flattening only the body left 52 records with raw
+                        # brackets around the very names that make them
+                        # findable.
+                        meta_lines.append("%s: %s"
+                                          % (key, flatten_markdown(text).strip('"')))
+
+                title = (fields.get("title") if isinstance(fields.get("title"), str)
+                         else None)
+                if not title:
+                    heading = re.search(r"^#\s+(.+)$", body, re.M)
+                    title = heading.group(1).strip() if heading else \
+                        os.path.splitext(name)[0]
+
+                folder = os.path.dirname(relative)
+                rendered = ("\n".join(meta_lines) + "\n\n" + body).strip()
+                yield {
+                    "uid": "files:%s:%s" % (root["name"], relative),
+                    "latitude": None, "longitude": None,
+                    "tool": "files",
+                    "kind": "note" if vault else "file",
+                    "native_id": path,
+                    # 🛑 A REAL DEEP LINK, which most sources here cannot offer.
+                    # `obsidian://open` opens the note itself.
+                    "url": obsidian_url(root, relative) if vault else "file://"
+                           + urllib.parse.quote(path),
+                    "title": title,
+                    "container": folder or root["name"],
+                    "created": stat.st_birthtime if hasattr(stat, "st_birthtime")
+                               else stat.st_ctime,
+                    "modified": stat.st_mtime,
+                    # A dated note is dated by its own frontmatter; everything
+                    # else by when it was last written.
+                    "occurred": epoch(fields.get("date") if isinstance(
+                        fields.get("date"), str) else None) or stat.st_mtime,
+                    "people": [],
+                    "body": rendered,
+                    # 🛑 HASH WHAT THIS ADAPTER PRODUCES, not the file's stats.
+                    # A rev of mtime+size tracks the FILE, so improving how the
+                    # adapter renders a note — flattening frontmatter
+                    # wikilinks, say — reaches no existing record: the file did
+                    # not change, so `ingest` reports `+0 ~0 -0` and the fix
+                    # silently never lands. Hashing the rendered body costs
+                    # nothing, because the body is already in memory.
+                    "rev": rev_of(title, folder, rendered),
+                }
+
+
 ADAPTERS = {
     "notes": ingest_notes,
     "mail": ingest_mail,
@@ -1033,6 +1239,7 @@ ADAPTERS = {
     "contacts": ingest_contacts,
     "maps": ingest_maps,
     "reminders": ingest_reminders,
+    "files": ingest_files,
 }
 
 
@@ -2536,6 +2743,66 @@ def cmd_nearby(opts):
         print("no group of %d or more within %g km." % (opts.min_size, opts.radius))
 
 
+def cmd_files(opts):
+    """List, add or remove the folders the `files` source indexes.
+
+    🛑 Roots are configured, never guessed. A guessed path that happens to
+    exist on one machine is how a tool ends up indexing somebody's Downloads.
+    """
+    try:
+        with open(FILES_CONFIG) as handle:
+            config = json.load(handle)
+    except (OSError, ValueError):
+        config = {"roots": []}
+    roots = config.setdefault("roots", [])
+
+    if opts.action == "add":
+        path = os.path.realpath(os.path.expanduser(opts.path))
+        if not os.path.isdir(path):
+            die("not a directory: %s" % path)
+        if any(os.path.realpath(os.path.expanduser(r["path"])) == path for r in roots):
+            print("already indexed: %s" % path)
+            return
+        name = opts.name or os.path.basename(path.rstrip("/"))
+        roots.append({"path": path, "name": name,
+                      "exclude": opts.exclude.split(",") if opts.exclude else []})
+        with open(FILES_CONFIG, "w") as handle:
+            json.dump(config, handle, indent=2)
+        os.chmod(FILES_CONFIG, 0o600)
+        kind = "Obsidian vault" if is_obsidian_vault(path) else "folder"
+        print("added %s as '%s' (%s)" % (path, name, kind))
+        print("index it with:  apple-index ingest --source files")
+        return
+
+    if opts.action == "remove":
+        path = os.path.realpath(os.path.expanduser(opts.path))
+        kept = [r for r in roots
+                if os.path.realpath(os.path.expanduser(r["path"])) != path]
+        if len(kept) == len(roots):
+            die("not a configured root: %s" % path)
+        config["roots"] = kept
+        with open(FILES_CONFIG, "w") as handle:
+            json.dump(config, handle, indent=2)
+        # ⚠️ Removing a root does NOT remove its records. Say so, and say how.
+        print("removed %s from the config." % path)
+        print("Its indexed records stay until you run:")
+        print("  apple-index ingest --source files --full")
+        return
+
+    if not roots:
+        print("no folders indexed. Add one:")
+        print("  apple-index files add ~/path/to/vault")
+        return
+    for root in roots:
+        path = os.path.expanduser(root["path"])
+        kind = "obsidian" if is_obsidian_vault(path) else "folder"
+        # ⚠️ A ternary, not `cond and "" or X`. An empty string is falsy, so the
+        # and/or form returns X for BOTH branches — it reported every present
+        # folder as MISSING.
+        here = "" if os.path.isdir(path) else "  🛑 MISSING"
+        print("%-10s %-9s %s%s" % (root.get("name", "?"), kind, path, here))
+
+
 def cmd_sources(opts):
     """What refresh runs for each source. The app reads this rather than
     keeping a second copy of REFRESH_ARGS in Swift."""
@@ -2833,6 +3100,15 @@ def main():
                     help="cap the records compared; the pairing is O(n^2)")
     nb.add_argument("--json", action="store_true")
     nb.set_defaults(func=cmd_nearby)
+
+    fl = sub.add_parser("files",
+                        help="folders the `files` source indexes")
+    fl.add_argument("action", nargs="?", default="list",
+                    choices=["list", "add", "remove"])
+    fl.add_argument("path", nargs="?", help="the folder, for add/remove")
+    fl.add_argument("--name", help="what to call it (default: the folder name)")
+    fl.add_argument("--exclude", help="comma separated subdirectory names to skip")
+    fl.set_defaults(func=cmd_files)
 
     sub.add_parser("sources",
                    help="the per-source arguments `refresh` uses, as JSON"
