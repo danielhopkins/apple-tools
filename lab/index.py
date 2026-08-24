@@ -1522,7 +1522,12 @@ def prune_logs(db, days=LOG_RETENTION_DAYS, commit=True):
     cutoff = time.time() - days * 86400
     dropped = db.execute("DELETE FROM query_log WHERE ts < ?", (cutoff,)).rowcount
     dropped += db.execute("DELETE FROM result_cache WHERE ts < ?", (cutoff,)).rowcount
-    if commit and dropped:
+    # 🛑 COMMIT EVEN WHEN NOTHING WAS DROPPED. A DELETE that matches no rows
+    # still opens a transaction, and `if dropped: commit()` left it open — the
+    # next `VACUUM` then failed with "cannot VACUUM from within a transaction".
+    # The rowcount says what changed; it does not say whether a transaction is
+    # open.
+    if commit:
         db.commit()
     return dropped
 
