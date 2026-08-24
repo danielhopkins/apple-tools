@@ -14,11 +14,13 @@ CONTENTS="${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}"
 
 [ -d "$STAGE" ] || { echo "warning: no staged payload; run app/stage.sh"; exit 0; }
 
-rm -rf "${CONTENTS}/Helpers" "${CONTENTS}/Resources/index" "${CONTENTS}/Resources/notes"
+rm -rf "${CONTENTS}/Helpers" "${CONTENTS}/Resources/index" \
+       "${CONTENTS}/Resources/notes" "${CONTENTS}/Resources/skills"
 mkdir -p "${CONTENTS}/Helpers" "${CONTENTS}/Resources"
 cp -R "$STAGE/Helpers/." "${CONTENTS}/Helpers/"
 cp -R "$STAGE/index" "${CONTENTS}/Resources/index"
 cp -R "$STAGE/notes" "${CONTENTS}/Resources/notes"
+cp -R "$STAGE/skills" "${CONTENTS}/Resources/skills"
 
 IDENTITY="${EXPANDED_CODE_SIGN_IDENTITY:-}"
 if [ -z "$IDENTITY" ]; then

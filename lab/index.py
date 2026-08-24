@@ -2591,12 +2591,28 @@ def main():
                         "(0 = max(limit*6, 60))")
     s.add_argument("--w-recency", type=float, default=0.0, dest="w_recency",
                    help="weight of a third arm ranking candidates newest first")
-    # Measured over eval.py's 28 cases (MRR / hit@10): off 0.589/0.64,
-    # threshold 2 or 3 0.602/0.71, threshold 4 0.620/0.71, threshold 5
-    # 0.607/0.64. The re-fuse target barely matters — 1:2, 1:3 and 0:1 all tie
-    # at threshold 4 — so the TRIGGER is the whole mechanism.
+    # 🛑 OFF BY DEFAULT SINCE 26.824.2, and it used to be on.
+    #
+    # It was tuned against the PyTorch e5-small vectors, where it earned its
+    # keep: over eval.py's 28 cases, off scored MRR 0.589 and threshold 4
+    # scored 0.620. Re-measured on the SAME 29 cases against the shipped Core
+    # ML vectors:
+    #
+    #     default (threshold 4)   hit@1 0.48   hit@3 0.55   MRR 0.535
+    #     adaptive off            hit@1 0.52   hit@3 0.62   MRR 0.573
+    #
+    # ⚠️ A THRESHOLD ON A COUNT OF FIVE IS A KNIFE EDGE. The two vector sets
+    # agree to about one part in a million and this rule swings 0.038 MRR
+    # between them, in opposite directions. Its gain was always smaller than
+    # that swing, so it was never measuring the thing it was named for.
+    #
+    # `--adaptive` turns it back on. `--no-adaptive` still parses, so anything
+    # that already passes it keeps working.
+    s.add_argument("--adaptive", action="store_true", dest="adaptive",
+                   default=False,
+                   help="re-fuse semantic-heavy when the lexical arm dominates")
     s.add_argument("--no-adaptive", action="store_false", dest="adaptive",
-                   help="do not re-fuse even when the lexical arm dominates")
+                   help="the default; kept so existing callers still parse")
     s.add_argument("--adaptive-threshold", type=int, default=4,
                    dest="adaptive_threshold",
                    help="how many of the top 5 must be missing from the "

@@ -59,6 +59,13 @@ cask "apple-tools-app" do
 
       brew install danielhopkins/formulae/apple-tools
 
+    All five Claude skills ride inside the app. Link them into whichever Claude
+    config dir you use:
+
+      mkdir -p "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"
+      ln -sfn /Applications/AppleTools.app/Contents/Resources/skills/* \\
+              "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/"
+
     The index holds the decoded plaintext of your mail. It lives in an AES-256
     disk image that only this app mounts, and it is readable by anything running
     as you WHILE THE APP IS OPEN. "Delete the Index" in the window removes it

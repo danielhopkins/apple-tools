@@ -14,7 +14,7 @@ REPO="$PWD"
 STAGE="$REPO/app/build/stage"
 
 rm -rf "$STAGE"
-mkdir -p "$STAGE/Helpers" "$STAGE/index" "$STAGE/notes"
+mkdir -p "$STAGE/Helpers" "$STAGE/index" "$STAGE/notes" "$STAGE/skills"
 
 echo "==> swift tools"
 [ -x swift/.build/release/apple-mail ] || (cd swift && swift build -c release)
@@ -73,6 +73,15 @@ for shape in s64-b32 s256-b32 s512-b32 s64-b1; do
 done
 cp "$SRC/vocab.txt" "$STAGE/index/models/vocab.txt"
 
+echo "==> claude skills"
+# 🛑 ALL FIVE, and the fifth lives somewhere else. Four sit in `skills/`, and
+# `apple-index` ships inside the index payload at `lab/skill/apple-index`. The
+# formula's caveats used to symlink `skills/*` and silently install four out of
+# five — the one for the newest feature was the one missing.
+mkdir -p "$STAGE/skills"
+cp -R skills/* "$STAGE/skills/"
+cp -R lab/skill/apple-index "$STAGE/skills/"
+
 echo "==> shortcuts (the Notes write path)"
 mkdir -p "$STAGE/index/shortcuts"
 cp notes/shortcuts/*.shortcut "$STAGE/index/shortcuts/" 2>/dev/null || true
@@ -81,7 +90,8 @@ cp notes/shortcuts/*.shortcut "$STAGE/index/shortcuts/" 2>/dev/null || true
 # as "no `apple` dispatcher found on this machine" hours later.
 for required in Helpers/apple Helpers/apple-mail notes/apple-notes \
                 notes/notestore.py notes/notestore.proto index/vec \
-                index/index.py index/models/vocab.txt; do
+                index/index.py index/models/vocab.txt \
+                skills/apple-tools/SKILL.md skills/apple-index/SKILL.md; do
   [ -e "$STAGE/$required" ] || { echo "missing: $required"; exit 1; }
 done
 echo "staged $(du -sh "$STAGE" | cut -f1) in $STAGE"
