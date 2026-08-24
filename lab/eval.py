@@ -44,8 +44,19 @@ CASES = [
     # what it BUYS a small source — which is how a retrieval quota that fixed a
     # real failure looked purely harmful. Every locator below was checked to
     # resolve to a handful of records, and the first three to `files` alone.
+    # 🛑 THIS CASE WAS WRONG WHEN IT WAS WRITTEN, and it nearly steered a
+    # retrieval change. Its first locator was "conflict with the National PTA
+    # Bylaws", picked out of the COPTA Bylaws note because the words matched.
+    # That passage is about bylaws conflicting with EACH OTHER. The bylaws note
+    # contains no "conflict of interest", no "business relationship" and no
+    # "prohibit" — it does not answer the question at all, so the search was
+    # right to leave it out and the harness was scoring the correct behaviour a
+    # miss. Same failure as the gymnastics case above.
+    #
+    # The real answer: COPTA RESCINDED its Conflict of Interest Policy on
+    # 2025-07-20 and adopted a Code of Conduct, recorded in the retreat minutes.
     ("do our COPTA bylaws prohibit business relationships",
-                                               "conflict with the National PTA Bylaws", "vault"),
+                                               "RESCIND the Conflict of Interest Policy", "vault"),
     ("how should meeting minutes be written",   "Colorado PTA Meeting Minutes Style Guide", "vault"),
     ("who runs marketing for Colorado PTA",     "Marketing Director Christy Carter", "vault"),
     ("which company did Global Founders back",  "Global Founders Capital",          "vault"),
@@ -210,7 +221,8 @@ def score(extra, cases, verbose=False):
 # default leak into the comparison, which once relabelled a 3:1 run as "1:1".
 # ⚠️ Every strategy states BOTH weights. Leaving one out lets the current
 # default leak into the comparison, which once relabelled a 3:1 run as "1:1".
-W = ["--w-recency", "0", "--w-lexical", "4", "--w-semantic", "1"]
+# ⚠️ The baseline follows the shipped default, which moved from 4:1 to 2:1.
+W = ["--w-recency", "0", "--w-lexical", "2", "--w-semantic", "1"]
 # 🛑 EVERY ROW HERE WAS MEASURED, INCLUDING THE ONES THAT LOST. Run
 # `./eval.py --compare` to reproduce. Two dead ends are kept in the table on
 # purpose, because both looked obviously right beforehand:
@@ -240,8 +252,19 @@ STRATEGIES = {
     "t=5":              W + ["--adaptive-threshold", "5"],
     "pool 300":         W + ["--adaptive-threshold", "4", "--pool", "300"],
     "min-chunk 60":     W + ["--adaptive-threshold", "4", "--min-chunk", "60"],
-    "3:1":              ["--w-recency", "0", "--w-lexical", "3", "--w-semantic", "1"],
-    "1:1":              ["--w-recency", "0", "--w-lexical", "1", "--w-semantic", "1"],
+    "8:1":             ["--w-recency", "0", "--w-lexical", "8", "--w-semantic", "1"],
+    "6:1":             ["--w-recency", "0", "--w-lexical", "6", "--w-semantic", "1"],
+    "5:1":             ["--w-recency", "0", "--w-lexical", "5", "--w-semantic", "1"],
+    "3:1":             ["--w-recency", "0", "--w-lexical", "3", "--w-semantic", "1"],
+    "2:1":             ["--w-recency", "0", "--w-lexical", "2", "--w-semantic", "1"],
+    "2.5:1":           ["--w-recency", "0", "--w-lexical", "2.5", "--w-semantic", "1"],
+    "1.75:1":          ["--w-recency", "0", "--w-lexical", "1.75", "--w-semantic", "1"],
+    "1.5:1":           ["--w-recency", "0", "--w-lexical", "1.5", "--w-semantic", "1"],
+    "1.25:1":          ["--w-recency", "0", "--w-lexical", "1.25", "--w-semantic", "1"],
+    "1:1":             ["--w-recency", "0", "--w-lexical", "1", "--w-semantic", "1"],
+    "1:2":             ["--w-recency", "0", "--w-lexical", "1", "--w-semantic", "2"],
+    "1:3":             ["--w-recency", "0", "--w-lexical", "1", "--w-semantic", "3"],
+    "0:1":             ["--w-recency", "0", "--w-lexical", "0", "--w-semantic", "1"],
 }
 
 

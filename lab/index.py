@@ -2997,7 +2997,26 @@ def main():
     # 4:1 is the lower of the two tied best. Raised from 3:1 after a field test
     # found multi-token verbatim queries beating a surname collision by only
     # 0.0127.
-    s.add_argument("--w-lexical", type=float, default=4.0, dest="w_lexical")
+    # 🛑 2:1 SINCE 26.824.7, AND IT WAS 4:1. Measured over eval.py's 34 cases,
+    # which now include five the Obsidian vault should win:
+    #
+    #     8:1   0.474      2.5:1  0.526
+    #     6:1   0.477      2:1    0.523
+    #     5:1   0.506      1.75:1 0.523
+    #     4:1   0.509      1.5:1  0.523
+    #     3:1   0.517      1.25:1 0.489
+    #                      1:1    0.481
+    #
+    # ⚠️ 2.5:1 scores highest by 0.003, which is one case moving one rank. 2:1
+    # is chosen instead because it sits in the MIDDLE of the plateau rather
+    # than at its edge, and the cliff below 1.5:1 is steep.
+    #
+    # 🛑 A PLATEAU IS WHY THIS IS TRUSTWORTHY AND THE ADAPTIVE RULE WAS NOT.
+    # Four consecutive points agree to 0.003, and the curve is smooth on both
+    # sides. The adaptive fusion rule was a threshold on a count of five — a
+    # knife edge whose gain was smaller than the swing it caused between two
+    # vector sets that agree to one part in a million.
+    s.add_argument("--w-lexical", type=float, default=2.0, dest="w_lexical")
     s.add_argument("--w-semantic", type=float, default=1.0, dest="w_semantic")
     s.add_argument("--recency-head", type=int, default=10, dest="recency_head",
                    help="how many top candidates the recency arm re-orders")
