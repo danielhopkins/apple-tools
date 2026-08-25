@@ -158,6 +158,45 @@ CASES = [
     # 🛑 The first case anchored on `maps`. NO-OVERLAP: the query says "hair
     # cut" and the record says "Barber Shop", category "Beauty Service".
     ("where do I get my hair cut",              "Welcome Stranger Barber Shop", "no-overlap"),
+
+    # 🛑 VOCABULARY SPLIT, added 2026-08-25 after a real question failed. This
+    # is a DIFFERENT class from `no-overlap`, and conflating the two sent one
+    # session's recommendation the wrong way for a whole turn.
+    #
+    # `no-overlap` means the answer shares no content word with the query, so
+    # only the embedding can reach it. A vocabulary split is the opposite
+    # problem: BOTH words are in the corpus, in different documents, written by
+    # different people. The exec committee minutes say "air conditioning" and
+    # never once say "HVAC". The mail thread says "HVAC" and never says "air
+    # conditioning". A search for either word retrieves a plausible-looking
+    # result set and silently drops the other half.
+    #
+    # ⚠️ THAT IS WHY IT IS WORTH ITS OWN KIND. The failure returns confident,
+    # on-topic results, so nothing about the output says half the record set is
+    # missing. Measured on the real question: `COPTA HVAC` put the committee
+    # minutes nowhere in the top 300, while `office air conditioning` put them
+    # at rank 1 and 2 of the `files` source.
+    #
+    # ⚠️ The vector arm does NOT bridge this on its own. `HVAC` and `air
+    # conditioning` embed at cosine 0.9257, which looks close until you see
+    # `HVAC`/`bicycle` at 0.8003 — e5-small's whole usable range here is 0.17
+    # wide. Ranked against all 251,949 vectors, a query of `HVAC` alone puts
+    # the minutes outside the top 2000 chunks. The default pool is 60.
+    #
+    # ⚠️ Two of these four already pass at rank 1. They are kept as regression
+    # guards, not as demonstrations: a change that fixes the split must not
+    # break the queries whose wording already matched.
+    ("what did the committee decide about the office HVAC",
+             "The office air conditioning has failed and requires an emergency repair",
+                                                              "vocabulary"),
+    ("who gave us an air conditioning estimate",
+             "forwarding estimates for the repair/replacement of the HVAC units",
+                                                              "vocabulary"),
+    ("what will the HOA charge us to fix the air conditioner seal on the roof",
+             "the seal around the HVAC unit where it attaches to the roof",
+                                                              "vocabulary"),
+    ("can we repair the office air conditioner instead of replacing it",
+             "flushed with sealant in the hopes it would hold", "vocabulary"),
 ]
 
 
@@ -195,14 +234,27 @@ def resolve(db, locator, cap=200):
     return uids
 
 
-EXTRA = []          # set from --model / --no-daemon / --db, applied to every search
+EXTRA = []          # set from --model / --no-daemon, applied to every search
+GLOBAL = []         # 🛑 flags that must precede the SUBCOMMAND, i.e. --db
 
 
 def search(query, extra):
-    cmd = [sys.executable, os.path.join(HERE, "index.py"), "search", query,
-           "--limit", "10", "--json"] + EXTRA + extra
+    # 🛑 `--db` is a GLOBAL option on index.py and has to come BEFORE the
+    # subcommand. It used to be appended with the rest, where argparse rejects
+    # it as an unrecognised argument -- and `search()` swallows a non-zero exit
+    # by returning [], so EVERY case scored a miss and the run printed
+    # `MRR 0.000` with no error. A whole comparison against a second index read
+    # as "the new index retrieves nothing".
+    #
+    # ⚠️ That is the same shape as the result_cache bug below: a broken harness
+    # that answers confidently. Any run reporting 0.000 across the board is a
+    # harness failure, not a search failure. Check the subprocess first.
+    cmd = ([sys.executable, os.path.join(HERE, "index.py")] + GLOBAL
+           + ["search", query, "--limit", "10", "--json"] + EXTRA + extra)
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
+        sys.stderr.write("search failed (exit %d): %s\n"
+                         % (proc.returncode, (proc.stderr or "").strip()[:300]))
         return []
     try:
         return [r["uid"] for r in json.loads(proc.stdout)]
@@ -300,9 +352,9 @@ def main():
     from importlib.machinery import SourceFileLoader
     idx = SourceFileLoader("idx", os.path.join(HERE, "index.py")).load_module()
     dbpath = opts.db or idx.DEFAULT_DB
-    global EXTRA
-    EXTRA = (["--db", dbpath] if opts.db else [])
-    EXTRA += (["--model", opts.model] if opts.model else [])
+    global EXTRA, GLOBAL
+    GLOBAL = (["--db", dbpath] if opts.db else [])
+    EXTRA = (["--model", opts.model] if opts.model else [])
     EXTRA += (["--no-daemon"] if opts.no_daemon else [])
     db = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(dbpath), uri=True)
 

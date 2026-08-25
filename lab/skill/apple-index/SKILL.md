@@ -145,7 +145,7 @@ apple notes export 583                        # the truth
 ## Commands
 
 ```
-apple-index search QUERY [--limit N]
+apple-index search QUERY [--limit N] [--also "another phrasing"]...
             [--tool notes|mail|messages|calendar|contacts|maps|reminders|files]
                         [--since DAYS] [--json]
 apple-index near PLACE  [--radius KM] [--tool T] [--since DAYS] [--past]
@@ -182,6 +182,81 @@ drops the right answer first.
 ⚠️ **Nothing here tells you "no good match exists".** If the results look
 wrong, they probably are, and you should fall back to an `apple` search over a
 likely tool rather than trusting the top hit.
+
+**It says on stderr when it cut the list**: `showing 10 of 100 results`. Silence
+means you have everything. ⚠️ **A list exactly `--limit` long is the shape to
+distrust** — read that line, or raise `--limit`, before you tell the user how
+many of anything there are.
+
+## 🛑 `--also`: the corpus may not use the user's word
+
+**The people who wrote the records and the person asking are often two
+different people, using two different words for one thing.** Measured on this
+index: a committee's minutes say "air conditioning" and never once say "HVAC";
+the mail thread about the same broken unit says "HVAC" and never says "air
+conditioning".
+
+🛑 **Searching one word returns a confident, on-topic, HALF-EMPTY answer.**
+`COPTA HVAC` returned five real HVAC emails and looked complete. Six meeting
+records on the same subject, going back ten months, were not retrieved at all.
+Nothing in the output said so. This is the failure to fear, because it does not
+look like a failure.
+
+**`--also` takes another phrasing and fuses the lists.** Repeatable.
+
+```
+apple-index search "office HVAC" \
+  --also "office air conditioning" \
+  --also "rooftop unit repair estimate" --json
+```
+
+**Write the alternates yourself, from the question.** You know that HVAC, air
+conditioning, furnace and rooftop unit name one thing; the index does not. The
+vector arm will not bridge it for you — `HVAC` and `air conditioning` embed at
+cosine 0.926, but `HVAC` and `bicycle` embed at 0.800, so the whole usable
+range is 0.17 wide and a synonym does not separate from noise.
+
+### ⚠️ Expand a QUESTION. Never expand a keyword lookup.
+
+Measured across the eval suite, by query kind:
+
+| kind | plain | with `--also` | |
+|---|---|---|---|
+| vocabulary split | 0.562 | **0.667** | expand |
+| vault / documents | 0.113 | **0.162** | expand |
+| descriptive question | 0.588 | **0.599** | expand |
+| **short keyword lookup** | 0.857 | **0.821** | **do not** |
+| **"what happened recently"** | 0.833 | **0.800** | **do not** |
+
+Whole suite: MRR 0.535 plain, 0.546 with `--also` everywhere, **0.553** expanding
+questions only. hit@10 rises 0.70 to 0.76 — two more answers found at all.
+
+A keyword query is already the right words. Paraphrasing it only adds noise.
+Use `--also` when the user asked a question in their own words, and skip it when
+they named a thing.
+
+- **Two or three alternates is enough.** Vary the vocabulary, not the grammar —
+  "office air conditioning" helps, "what about the office HVAC" does not.
+- **Fusion is `max`, and the tool does it.** Do not run several searches and
+  merge them yourself: summing ranks sends good hits from rank 1 to a miss.
+- ⚠️ **`score` becomes a fused score and `fused_over` appears in the JSON.**
+  Do not compare it to a plain search's score.
+- 🛑 **It does not help when the answer shares NO word with the question.**
+  "where do the kids swim" still will not find "Ocean First". Fall back to an
+  `apple` search over a likely tool.
+
+### ⚠️ It fixes retrieval, not rank
+
+On the real question above, `--also` brought all six meeting records back —
+**at ranks 26 to 53**, because mail is 81% of the index and fills the head of
+the list. So when the question belongs to a particular source, say so:
+
+```
+apple-index search "office air conditioning" --tool files --limit 10
+```
+
+That put the two right meeting records at **rank 1 and 2**. `--tool` filters
+inside both retrieval arms, so a small source is ranked against itself.
 
 ## ⚠️ Refresh needs a terminal, and nothing runs it automatically
 
@@ -225,7 +300,16 @@ surfaced it at once.
 
 - ⚠️ **A fact stated only by a name it does not share with the query.** "Where
   do the kids swim" does not find "Ocean First". Fall back to `apple` searches
-  over a likely tool.
+  over a likely tool. ⚠️ **`--also` does NOT fix this one** — measured, all
+  four such cases stay missed however the query is rephrased.
+- ⚠️ **A word the corpus spells differently.** Use `--also`; see above.
+- ⚠️ **Ranking a small source above mail.** Mail is 81% of the index and fills
+  the head of a global list. Use `--tool` when the question belongs somewhere.
+- ⚠️ **Enumerating a thread.** It finds a conversation; it does not list every
+  message in one. Subject search over one real mail thread returned 5 messages
+  and `apple mail search --field content` returned 43. When the question is
+  "what do we know about X", use the index to LOCATE and the `apple` tool to
+  ENUMERATE.
 - ⚠️ **Anything added since the last refresh.** Run `refresh` first.
 - **Attachment contents.** Never indexed, same as `apple mail`.
 

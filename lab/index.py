@@ -285,7 +285,44 @@ def secure_db_path(path):
 
 CHUNK_CHARS = 900          # ~200 tokens, under the model's 256-token window
 CHUNK_OVERLAP = 150
-MAX_CHUNKS_PER_RECORD = 20 # bound the cost of one enormous note or thread
+# 🛑 THE CAP IS PER SOURCE, and 20 was silently losing most of a long document.
+# Chunks are taken from the FRONT, so a capped record embeds its first ~15,000
+# characters and nothing else. Measured 2026-08-25: `COPTA Bylaws.md` produced
+# 162 chunks uncapped and the index held 20 — Sections 5, 6 and 7 of a real
+# governance document were unreachable by the vector arm. One 112 KB meeting
+# transcript had 13% of its text embedded.
+#
+# ⚠️ `record_fts` holds the FULL body, so only the SEMANTIC arm is blinded.
+# That is the arm a paraphrase needs, which is why the loss was invisible: a
+# lexical hit still returned something plausible.
+#
+# 🛑 RAISING IT GLOBALLY IS WORSE THAN LEAVING IT ALONE. Measured over the
+# 37-case suite: files-only 200 scores 0.535 against a 0.541 baseline (noise),
+# while raising EVERY source to 200 scores 0.511. Mail is 81% of the chunks
+# here, and 1,608 mail records sit at the cap; letting each contribute ten
+# times as many candidates dilutes every other query. A full re-embed also
+# costs 334s against 23s for files alone.
+#
+# ⚠️ The suite CANNOT see the benefit, by construction. `eval.py`'s resolve()
+# reads `chunk.text`, so a locator past the cap does not resolve and the case
+# is unwritable at the low cap. The benefit was measured separately: two
+# questions answered only past chunk 20 went from MISS to RANK 1.
+MAX_CHUNKS_PER_RECORD = 20
+MAX_CHUNKS_BY_SOURCE = {
+    # Long-form documents the user writes and keeps: an Obsidian vault, meeting
+    # minutes, bylaws, transcripts. These are the records that legitimately run
+    # to hundreds of chunks, and the ones a paraphrased question has to reach.
+    "files": 200,
+}
+
+
+def max_chunks_for(tool):
+    """The chunk cap for one source. `INDEX_MAX_CHUNKS` overrides everything,
+    which is how the sweep behind these numbers was run."""
+    override = os.environ.get("INDEX_MAX_CHUNKS")
+    if override:
+        return int(override)
+    return MAX_CHUNKS_BY_SOURCE.get(tool, MAX_CHUNKS_PER_RECORD)
 RRF_K = 60                 # the usual Reciprocal Rank Fusion constant
 
 # Only used to decide whether a query is a keyword lookup or a question.
@@ -1385,6 +1422,7 @@ def chunks_for(record):
     if record.get("tool") == "maps" and record.get("kind") == "visit":
         return []
 
+    cap = max_chunks_for(record.get("tool"))
     out = []
     title = (record.get("title") or "").strip()
     people = " ".join(p["name"] for p in record.get("people") or [] if p.get("name"))
@@ -1396,7 +1434,7 @@ def chunks_for(record):
     if record.get("tool") == "mail" or record.get("_quoted"):
         body = strip_quotes(body)
     if not body:
-        return out[:MAX_CHUNKS_PER_RECORD]
+        return out[:cap]
 
     def emit(crumb, text):
         # The title and the heading path ride along, so a chunk lifted out of
@@ -1425,7 +1463,7 @@ def chunks_for(record):
             pending, pending_len = [], 0
 
     for crumb, text in structural_blocks(body):
-        if len(out) >= MAX_CHUNKS_PER_RECORD:
+        if len(out) >= cap:
             break
         if crumb != pending_crumb:
             flush()
@@ -1438,7 +1476,7 @@ def chunks_for(record):
                 piece = text[start:start + CHUNK_CHARS].strip()
                 if piece:
                     emit(crumb, piece)
-                if len(out) >= MAX_CHUNKS_PER_RECORD:
+                if len(out) >= cap:
                     break
             continue
 
@@ -1448,7 +1486,7 @@ def chunks_for(record):
         pending_len += len(text) + 1
 
     flush()
-    return out[:MAX_CHUNKS_PER_RECORD]
+    return out[:cap]
 
 
 # --------------------------------------------------------------------------
@@ -1796,6 +1834,11 @@ def search_settings(opts):
             "w_recency": opts.w_recency, "adaptive": opts.adaptive,
             "adaptive_threshold": opts.adaptive_threshold,
             "tool": opts.tool, "since": opts.since,
+            # 🛑 EVERY flag that changes a result belongs in the cache key.
+            # `pool` and `per_tool` were missing once, and a comparison of six
+            # values returned one cached answer six times -- it read as a flat
+            # response curve. `also` changes the result set outright.
+            "also": tuple(opts.also or ()),
             "drop_stopwords": opts.drop_stopwords, "rare_only": opts.rare_only,
             "min_chunk": opts.min_chunk,
             # 🛑 EVERY FLAG THAT CHANGES THE RESULT BELONGS IN THE CACHE KEY.
@@ -1879,11 +1922,87 @@ def cmd_search(opts):
             render(results, opts, cached=True)
             return
 
+    # 🛑 `--also` runs ANOTHER PHRASING of the same question and fuses by MAX.
+    #
+    # A vocabulary split — the corpus says "air conditioning", the caller says
+    # "HVAC" — is invisible from the results, because the matching half comes
+    # back looking complete. Expansion is the fix, and the FUSION RULE is the
+    # part that is easy to get wrong, which is why it lives here and not in a
+    # caller's head.
+    #
+    # 🛑 MAX, NEVER SUM. Summing reciprocal ranks rewards a record appearing in
+    # MANY lists over one ranking FIRST in one list, which is backwards: the
+    # main query is the only phrasing known to be the user's question and the
+    # rest are guesses. Measured over 33 cases: sum sent three cases from rank
+    # 1 to a miss, and weighting the main query higher made it worse
+    # monotonically (w=1 0.521, w=2 0.501, w=3 0.498, w=5 0.487). Under max no
+    # case fell out of the top 10.
+    #
+    # ⚠️ EXPAND A QUESTION, NEVER A KEYWORD LOOKUP. Measured by kind:
+    # vocabulary 0.562 -> 0.675, vault 0.190 -> 0.239, descriptive 0.577 ->
+    # 0.601, but keyword 0.857 -> 0.821 and recent 0.833 -> 0.800. A keyword
+    # query is already the right words; paraphrasing only adds noise. The CLI
+    # does not guess — the caller decides by passing `--also` or not.
+    #
+    # ⚠️ It does NOT fix the `no-overlap` class. All four such cases stay
+    # missed under every fusion variant tried. See RANKING.md.
+    phrasings = [opts.query] + list(opts.also or [])
+    by_uid, best = {}, {}
+    for phrasing in phrasings:
+        for rank, row in enumerate(rank_one(opts, db, phrasing), 1):
+            score = 1.0 / (RRF_K + rank)
+            uid = row["uid"]
+            if uid not in best or score > best[uid]:
+                best[uid] = score
+                by_uid[uid] = row
+    eligible = sorted(by_uid, key=lambda u: -best[u])
+    results = []
+    for uid in eligible[:opts.limit]:
+        row = dict(by_uid[uid])
+        if len(phrasings) > 1:
+            # The fused score is a different quantity from a single query's, so
+            # do not let a caller compare the two. Say which it is.
+            row["score"] = round(best[uid], 6)
+            row["fused_over"] = len(phrasings)
+        results.append(row)
+
+    # ⚠️ SAY WHAT WAS CUT. `apple maps places` answered "how many times did we
+    # go to the Elks Lodge" with 1 when the truth was 4, because its --limit
+    # hid the rest in silence. Same failure, different tool: a search that
+    # returns exactly --limit rows and says nothing cannot be told apart from a
+    # search that found exactly that many.
+    if len(eligible) > opts.limit:
+        sys.stderr.write("showing %d of %d results\n" % (opts.limit, len(eligible)))
+
+    elapsed_ms = (time.time() - started) * 1000
+    # ⚠️ The cache is the OTHER second copy of protected content. It obeys the
+    # same flag, otherwise stripping the log alone would achieve nothing.
+    cached_rows = results if not opts.no_snippet_log else [
+        {k: v for k, v in r.items() if k != "snippet"} for r in results]
+    db.execute("""INSERT OR REPLACE INTO result_cache (key, ts, query, results, elapsed_ms)
+                  VALUES (?,?,?,?,?)""",
+               (key, time.time(), opts.query, json.dumps(cached_rows), round(elapsed_ms, 1)))
+    record_query(db, opts.query, settings, fingerprint, results, elapsed_ms,
+                 cached=False, keep_snippets=not opts.no_snippet_log)
+    render(results, opts, cached=False)
+
+def rank_one(opts, db, query):
+    """Retrieve, fuse and materialise ONE phrasing.
+
+    Returns EVERY eligible record in rank order. The caller truncates, so it
+    can report how many it cut -- `search` used to return exactly `--limit`
+    rows and say nothing, and a caller had no way to tell a short list from a
+    truncated one. `apple maps places` has printed that line for months.
+
+    🛑 Split out of cmd_search on 2026-08-25 so `--also` can run several
+    phrasings through the same path. Nothing here reads `opts.query`; the
+    phrasing is the argument, which is the whole point.
+    """
     pool = opts.pool or max(opts.limit * 6, 60)
 
     # 1. lexical
     lexical, lexical_chunk = [], {}
-    match = fts_query(opts.query, opts.fts_mode,
+    match = fts_query(query, opts.fts_mode,
                       drop_stopwords=opts.drop_stopwords,
                       db=db, rare_only=opts.rare_only)
     if match:
@@ -1942,7 +2061,7 @@ def cmd_search(opts):
         if not opts.no_daemon:
             # Always name the model. A daemon holding a different one must
             # decline, and the search then loads the right model itself.
-            reply = daemon_request({"op": "search", "query": opts.query,
+            reply = daemon_request({"op": "search", "query": query,
                                     "model": opts.model, "limit": pool * 2,
                                     "tool": opts.tool,
                                     "per_tool": opts.per_tool})
@@ -1955,7 +2074,7 @@ def cmd_search(opts):
 
         if served is None:
             proc = subprocess.run(
-                vector_search_cmd(opts.model, opts.db, opts.query, pool * 2,
+                vector_search_cmd(opts.model, opts.db, query, pool * 2,
                                   tool=opts.tool),
                 capture_output=True, text=True)
             if opts.verbose:
@@ -1995,7 +2114,7 @@ def cmd_search(opts):
     # overlap rather than falling back to the record's opening paragraph.
     for rid, text in lexical_chunk.items():
         matched_chunk.setdefault(rid, text)
-    terms = [t.lower() for t in re.findall(r"[\w']+", opts.query) if len(t) > 1]
+    terms = [t.lower() for t in re.findall(r"[\w']+", query) if len(t) > 1]
     for rid in lexical:
         if rid in matched_chunk or not terms:
             continue
@@ -2016,7 +2135,7 @@ def cmd_search(opts):
     w_lex, w_sem = opts.w_lexical, opts.w_semantic
     if opts.auto_weight:
         # Content words, ignoring stopwords: a short query is a keyword lookup.
-        content = [t for t in re.findall(r"[\w']+", opts.query.lower())
+        content = [t for t in re.findall(r"[\w']+", query.lower())
                    if len(t) > 2 and t not in STOPWORDS]
         if len(content) <= 2:
             w_lex, w_sem = 3.0, 1.0
@@ -2122,20 +2241,7 @@ def cmd_search(opts):
                               matched_chunk.get(rid) or row["body"] or "")[:240],
             "from_chunk": rid in matched_chunk,
         })
-        if len(results) >= opts.limit:
-            break
-
-    elapsed_ms = (time.time() - started) * 1000
-    # ⚠️ The cache is the OTHER second copy of protected content. It obeys the
-    # same flag, otherwise stripping the log alone would achieve nothing.
-    cached_rows = results if not opts.no_snippet_log else [
-        {k: v for k, v in r.items() if k != "snippet"} for r in results]
-    db.execute("""INSERT OR REPLACE INTO result_cache (key, ts, query, results, elapsed_ms)
-                  VALUES (?,?,?,?,?)""",
-               (key, time.time(), opts.query, json.dumps(cached_rows), round(elapsed_ms, 1)))
-    record_query(db, opts.query, settings, fingerprint, results, elapsed_ms,
-                 cached=False, keep_snippets=not opts.no_snippet_log)
-    render(results, opts, cached=False)
+    return results
 
 
 def render(results, opts, cached):
@@ -3096,6 +3202,11 @@ def main():
     s = sub.add_parser("search", help="hybrid search over everything indexed")
     s.add_argument("query")
     s.add_argument("--limit", type=int, default=10)
+    # 🛑 Repeatable. Another PHRASING of the same question, fused by max --
+    # see cmd_search for why max and not sum, and why this is opt-in.
+    s.add_argument("--also", action="append", metavar="QUERY",
+                   help="another phrasing of the same question; fused by max. "
+                        "Use for a descriptive question, NOT a keyword lookup")
     s.add_argument("--tool")
     s.add_argument("--since", type=int, help="days back")
     s.add_argument("--fts-mode", choices=["and", "or"], default="or")
