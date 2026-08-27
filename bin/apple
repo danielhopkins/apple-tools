@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-APPLE_TOOLS_VERSION="26.827.0"
+APPLE_TOOLS_VERSION="26.827.1"
 
 # Resolve the repo root even when invoked through a symlink in ~/bin.
 SOURCE="${BASH_SOURCE[0]}"
