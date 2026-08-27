@@ -169,6 +169,85 @@ check("a tenth of a degree-minute of longitude is about 102 m at 40N",
 
 
 # --------------------------------------------------------------------------
+# a tagged face adopts the card that shares its name
+# --------------------------------------------------------------------------
+
+# 🛑 PHOTOS ONLY CARRIES A CONTACTS ID WHEN THE USER CONFIRMED ONE IN
+# PHOTOS.APP. 16 of the 63 named faces here have none, so they arrive under a
+# `photos:<name>` handle and read as strangers — even when a card for them is
+# sitting in Contacts with a birthday on it. Measured: Natalie Hasson had a
+# card from 2017 and was reported as unknown.
+#
+# 🛑 `merge_by_name` COULD NOT DO THIS. It builds its table of claimable names
+# from people ALREADY IN THE REPORT, so a card only becomes claimable once some
+# mail or message already named that person. A child who has never sent
+# anything has a card and no records, and the card is invisible to it.
+
+def entry(pid, name, channels, known=False):
+    return {"id": pid, "name": name, "handle": pid, "known": known,
+            "channels": dict(channels), "handles": {pid}, "days": set(),
+            "channel_days": {}, "alone": {}, "same_list": 0, "upcoming": 0,
+            "mail_from": 0, "mail_to": 0, "mail_bulk": 0, "mail_seen": 0,
+            "rids": [], "first": None, "last": None, "months": {},
+            "names": {name: 1}, "card_is_company": False}
+
+
+CARD = "AAAA-1111:ABPerson"
+ALIASES = {CARD: {"Natalie Hasson"}, "BBBB-2222:ABPerson": {"Jill Hasson"}}
+
+people = {"photos:Natalie Hasson":
+          entry("photos:Natalie Hasson", "Natalie Hasson", {"photos": 306})}
+moved = index.adopt_photo_cards(people, ALIASES, set())
+check("a photo face takes the card that shares its name",
+      moved.get("photos:Natalie Hasson"), CARD)
+check("...and the row is re-keyed to the card", CARD in people, True)
+check("...and is marked known", people[CARD]["known"], True)
+
+# ⚠️ ONLY WHEN PHOTOS IS THE SOLE CHANNEL. Anything with an address or a number
+# has already had a better chance to match on the handle, and did not.
+people = {"x@y.com": entry("x@y.com", "Natalie Hasson", {"mail": 40})}
+check("an address is NEVER adopted by name",
+      index.adopt_photo_cards(people, ALIASES, set()), {})
+people = {"photos:Natalie Hasson":
+          entry("photos:Natalie Hasson", "Natalie Hasson",
+                {"photos": 10, "mail": 1})}
+check("a face that also has mail is left alone",
+      index.adopt_photo_cards(people, ALIASES, set()), {})
+
+# 🛑 TWO CARDS CLAIMING ONE NAME IS REFUSED. Two people really can share a
+# name, and the wrong merge is worse than none.
+TWO = {"AAAA-1111:ABPerson": {"John Smith"}, "BBBB-2222:ABPerson": {"John Smith"}}
+people = {"photos:John Smith": entry("photos:John Smith", "John Smith",
+                                     {"photos": 5})}
+check("an ambiguous name is refused, not guessed",
+      index.adopt_photo_cards(people, TWO, set()), {})
+
+# ⚠️ A business card is never adopted, the same rule the report already uses.
+people = {"photos:Natalie Hasson":
+          entry("photos:Natalie Hasson", "Natalie Hasson", {"photos": 306})}
+check("a company card is not adopted",
+      index.adopt_photo_cards(people, ALIASES, {CARD}), {})
+
+# ⚠️ THE NAME MUST AGREE IN FULL. This is why creating a "Ryan Montgomery"
+# card did NOT link her: Photos spells her "Ryan Mcgomery", and a second row
+# is the bare first name. Neither matches, and neither should.
+for spelling in ("Ryan Mcgomery", "Ryan"):
+    people = {"photos:" + spelling: entry("photos:" + spelling, spelling,
+                                          {"photos": 22})}
+    check("a misspelt or partial name does not adopt: %r" % spelling,
+          index.adopt_photo_cards(people, {CARD: {"Ryan Montgomery"}}, set()), {})
+
+# 🛑 A CARD THAT ALREADY HAS RECORDS ABSORBS rather than being overwritten.
+people = {CARD: entry(CARD, "Natalie Hasson", {"mail": 3}, known=True),
+          "photos:Natalie Hasson":
+          entry("photos:Natalie Hasson", "Natalie Hasson", {"photos": 306})}
+index.adopt_photo_cards(people, ALIASES, set())
+check("an existing card keeps its own channels and gains the photos",
+      people[CARD]["channels"], {"mail": 3, "photos": 306})
+check("...and the photo row is gone", "photos:Natalie Hasson" in people, False)
+
+
+# --------------------------------------------------------------------------
 
 if FAILURES:
     sys.stderr.write("test-photos: %d failed\n\n" % len(FAILURES))

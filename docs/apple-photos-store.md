@@ -96,6 +96,37 @@ id join merges them; no name match ever could, and the
 have three to eight `ZPERSON` rows. Group by `Z_PK` and take the row that has
 faces, as above.
 
+### 16 faces carry no id, and three of them had cards all along
+
+🛑 **`ZPERSONURI` is only set when the user confirmed a name against a contact
+inside Photos.app.** 16 of the 63 named faces here have none. Those people
+arrive under a `photos:<name>` handle and read as strangers — even when a card
+for them is sitting in Contacts. Measured: **Natalie Hasson, Kate Auda and Mary
+Hopkins all had cards, all three were reported as unknown**, and Natalie's card
+has carried her birthday since 2017.
+
+🛑 **`merge_by_name` could not fix it, and the reason is not obvious.** It
+builds its table of claimable names out of the people **already in the
+report**, so a card only becomes claimable once some mail, message, call or
+event has already named that person. A child who has never sent anything has a
+card and no records, so the card is invisible to it. `adopt_photo_cards` builds
+the table from every card in Contacts instead.
+
+⚠️ **Why this is safe for a face and would not be for an address.** A tagged
+face's name was typed by the user, in their own library, onto a face they
+recognised. A display name on an email is typed by the sender. Widening
+`merge_by_name` to every card would let a stranger signing themselves "John
+Smith" adopt a real John Smith's card.
+
+Three fences: the entry's only channel is photos; exactly one card answers to
+that name; the card is not marked as a business.
+
+⚠️ **THE NAME MUST AGREE IN FULL, and that is not a shortcoming.** Photos holds
+four rows for one child here — `Ryan`, `Ryan Montgomery`, `Ryan` again, and
+`Ryan Mcgomery` — and the two rows that carry faces are the bare first name and
+the misspelling. Creating a correctly spelled card linked neither, and should
+not have. The fix is renaming the person in Photos.app, which no CLI can do.
+
 ### Two traps in wiring this into the people report
 
 🛑 **A Contacts id is not a mail handle, and `handle_key` destroyed it.**
@@ -295,6 +326,48 @@ friends' homes, since that is what a reverse geocode of a house returns. They
 are in the index and on the map's labels.
 
 ---
+
+## Detecting a new photo
+
+There is no watermark. `survey()` reads the whole library every run — 2.9 s —
+and the ingest compares a `rev` per record. A place's rev is its name, photo
+count and day count. A day's rev is the date, the place, the photo count and
+the names in it.
+
+Measured by injecting one synthetic asset and diffing the emitted uids:
+
+| A new photo… | What the ingest sees |
+|---|---|
+| at a known place, on a new day | **+1 day record** |
+| at a known place, on a day that already has one | that day's **rev changes** → updated |
+| somewhere the camera has never been | **+1 place, +1 day** |
+| nothing changed at all | `+0 ~0 -0` in **3.1 s** |
+
+⚠️ **A DELETED photo is only half-caught without `--full`.** If it changes a
+surviving day's photo count, the rev catches it on the next ordinary run. If it
+empties a day or a place entirely, that record lingers until the id-set sweep.
+The app runs that sweep weekly, so a vanished place can persist up to 7 days.
+
+### The uid drifts, a little
+
+🛑 **A place's uid is its rounded cluster MEAN**, so adding photos moves it.
+A large cluster barely shifts — one new photo moves a 7,823-photo mean by a
+fraction of a metre. A small one can cross the 0.001° (≈111 m) rounding cell.
+
+Measured with a deliberately adversarial case — 40 synthetic photos each placed
+200 m from an existing cluster, which maximises the drag on a small mean:
+
+```
+baseline place uids                1480
+after 40 nearby new photos         1483
+  vanished (pruned by --full)         6
+  new                                 9
+```
+
+**0.4% churn**, far inside the 20% guard that stops `--full` from emptying a
+source. The cost of a churned uid is that the place record loses its `first`
+date and starts again. Real photos mostly land *inside* an existing cluster,
+where nothing moves; this number is an upper bound, not a typical run.
 
 ## Cost
 

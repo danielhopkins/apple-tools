@@ -3829,6 +3829,75 @@ def my_handles(db, identities, card_parts, overrides):
     return known, detected, {n for n in my_names if n}, my_parts, by_card
 
 
+def adopt_photo_cards(people, aliases, companies):
+    """Give a tagged face the contact card that shares its name.
+
+    🛑 PHOTOS ONLY CARRIES A CONTACTS ID WHEN THE USER CONFIRMED ONE IN
+    PHOTOS.APP, and on this library 16 of the 63 named faces have none. Those
+    people arrive under a `photos:<name>` handle and read as strangers — even
+    when a card for them is sitting in Contacts with a birthday on it.
+    Measured: Natalie Hasson, Kate Auda and Mary Hopkins all have cards, all
+    three were reported as unknown, and one of them has been in the address
+    book since 2007.
+
+    🛑 `merge_by_name` CANNOT DO THIS, and the reason is not obvious. It builds
+    its table of claimable names out of the people already in the report, so a
+    card only becomes claimable once some mail, message, call or event already
+    named that person. A child who has never sent anything has a card and no
+    records, so the card is invisible to it. This pass builds the table from
+    every card in Contacts instead.
+
+    ⚠️ WHY THIS IS SAFE HERE AND WOULD NOT BE FOR MAIL. A tagged face's name
+    was typed by the user, in their own library, onto a face they recognised.
+    A display name on an email is typed by the sender. Widening `merge_by_name`
+    to every card would let a stranger who signs themselves "John Smith" adopt
+    a real John Smith's card, which is why it is not widened.
+
+    Three fences:
+      * the entry's ONLY channel is photos — anything with an address or a
+        number has already had a better chance to match, and did not
+      * exactly one card answers to that name; two is refused, because two
+        people really can share a name and the wrong merge is worse than none
+      * the card is not marked as a business
+
+    Returns the old-id to new-id map, so the caller can repoint the edges.
+    """
+    def norm(value):
+        return " ".join(sorted(
+            re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).split()))
+
+    claims = {}
+    for cid, names in aliases.items():
+        if cid in companies:
+            continue
+        for claim in names:
+            claims.setdefault(norm(claim), set()).add(cid)
+
+    moved = {}
+    for entry in list(people.values()):
+        if entry["known"] or list(entry["channels"]) != ["photos"]:
+            continue
+        owners = claims.get(norm(entry["name"]), set())
+        if len(owners) != 1:
+            continue
+        cid = next(iter(owners))
+        target = people.get(cid)
+        if target is None:
+            # ⚠️ RE-KEYED IN PLACE. The card has no records of its own, which
+            # is the whole reason this pass exists, so there is nothing to
+            # fold into — the entry simply becomes that card's row.
+            del people[entry["id"]]
+            moved[entry["id"]] = cid
+            entry["id"] = cid
+            entry["known"] = True
+            people[cid] = entry
+        else:
+            moved[entry["id"]] = cid
+            absorb(target, entry)
+            del people[entry["id"]]
+    return moved
+
+
 def merge_by_name(people, aliases):
     """Fold an unnamed-by-Contacts address into the card that shares its name.
 
@@ -4716,7 +4785,11 @@ def cmd_people(opts):
             edges = {pair: w for pair, w in edges.items()
                      if pair[0] in people and pair[1] in people}
 
-    merged = merge_by_name(people, aliases)
+    # 🛑 FIRST, because it is the only pass that can see a card with no
+    # records of its own. Running it after `merge_namesakes` would let two
+    # unnamed rows fold together first and take a name neither card claims.
+    merged = adopt_photo_cards(people, aliases, companies)
+    merged.update(merge_by_name(people, aliases))
     # ⚠️ AFTER the card merge, so a card always wins the name it claims.
     merged.update(merge_namesakes(people))
     if merged:

@@ -1912,6 +1912,19 @@ things.
   assets belong to the iCloud Shared Library. A day whose *every* photo came
   from a shared camera is marked `alongside` and counted like a mailing list:
   an edge in the web, never a day of contact.
+- 🛑 **PHOTOS ONLY CARRIES A CONTACTS ID WHEN THE USER CONFIRMED ONE IN
+  PHOTOS.APP.** 16 of the 63 named faces here have none, so they arrive as
+  `photos:<name>` and read as strangers — even with a card sitting in Contacts.
+  Measured: three of them had cards, one since 2017 with a birthday on it. A
+  face whose ONLY channel is photos now adopts the card that shares its name,
+  when exactly one card claims it and that card is not a business. ⚠️ **The
+  name must agree in FULL.** A card named "Ryan Montgomery" does not link a
+  face Photos spells "Ryan Mcgomery", and it should not. Fix the name in
+  Photos.app.
+- 🛑 **`merge_by_name` CANNOT DO THIS**, and the reason is not obvious: it
+  builds its table of claimable names from people already in the report, so a
+  card is only claimable once some mail or event already named that person. A
+  child who has never sent anything has a card and no records.
 - 🛑 **The user's own face lands on a card with nothing to match on** — the
   right name, no email, no phone — so no handle rule could claim it and the
   user was drawn **sixth** in his own list. Photos cannot settle it either:
