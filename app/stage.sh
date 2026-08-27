@@ -48,7 +48,10 @@ cp notes/apple-notes notes/notestore.proto notes/*.py "$STAGE/notes/"
 echo "==> index"
 [ -x lab/vec/.build/release/vec ] || (cd lab/vec && swift build -c release)
 cp lab/vec/.build/release/vec "$STAGE/index/vec"
-cp lab/index.py lab/bin/apple-index "$STAGE/index/"
+# 🛑 photos.py travels with index.py. `import photos` lives inside the
+# photos adapter, so a bundle without it cannot ingest the Photos
+# library at all -- and the app is what does the ingesting.
+cp lab/index.py lab/photos.py lab/bin/apple-index "$STAGE/index/"
 
 echo "==> core ml packages"
 # ⚠️ The FIXED-shape packages, and `vocab.txt` beside them. `coreml/build-enum`
@@ -90,7 +93,7 @@ cp notes/shortcuts/*.shortcut "$STAGE/index/shortcuts/" 2>/dev/null || true
 # as "no `apple` dispatcher found on this machine" hours later.
 for required in Helpers/apple Helpers/apple-mail notes/apple-notes \
                 notes/notestore.py notes/notestore.proto index/vec \
-                index/index.py index/models/vocab.txt \
+                index/index.py index/photos.py index/models/vocab.txt \
                 skills/apple-tools/SKILL.md skills/apple-index/SKILL.md; do
   [ -e "$STAGE/$required" ] || { echo "missing: $required"; exit 1; }
 done

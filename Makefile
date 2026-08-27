@@ -250,7 +250,12 @@ dist: set-version completions
 		lipo -archs $(DIST)/index/vec | grep -q $$arch \
 			|| { echo "error: index/vec is missing $$arch"; exit 1; }; \
 	done
-	cp lab/index.py lab/bin/apple-index $(DIST)/index/
+	# 🛑 photos.py IS A SIBLING IMPORT, not a nicety. `index.py` does
+	# `import photos` inside the photos adapter, so leaving it out ships an
+	# `apple-index` that tracebacks on `--source photos` for every brew
+	# install while working perfectly from the checkout. Caught before
+	# release, the same way the formula's bin.install list was.
+	cp lab/index.py lab/photos.py lab/bin/apple-index $(DIST)/index/
 	cp lab/README.md lab/SECURITY.md lab/INCREMENTAL.md lab/MODELS.md $(DIST)/index/
 	cp lab/coreml/BAKEOFF.md $(DIST)/index/
 	cp lab/com.boulderhopkins.apple-index.plist.in $(DIST)/index/

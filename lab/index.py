@@ -1034,7 +1034,21 @@ def ingest_photos(opts):
     and no rank — below a cleaning service. Children do not send email. Six of
     the top twenty people here are absent from every other source.
     """
-    import photos as photo_store
+    # 🛑 A SIBLING IMPORT, AND A PACKAGING HAZARD. `photos.py` has to travel
+    # beside `index.py` into the release tarball and into the app bundle, and
+    # both copy lists name their files one at a time. It was left out of both
+    # the first time and would have shipped an `apple-index` that tracebacks on
+    # `--source photos` for every brew install, while working perfectly from a
+    # checkout. Say what is missing rather than raising ImportError at the
+    # caller, which names a module and not the problem.
+    try:
+        import photos as photo_store
+    except ImportError as exc:
+        sys.stderr.write(
+            "photos: photos.py is not installed beside index.py (%s).\n"
+            "  This build shipped without it. Every other source still works.\n"
+            % exc)
+        return
     try:
         places, days = photo_store.survey()
     except photo_store.Unavailable as exc:
