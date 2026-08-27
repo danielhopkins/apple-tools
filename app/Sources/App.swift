@@ -26,10 +26,23 @@ final class AppModel: ObservableObject {
     let loginItem = LoginItem()
     let vault = Vault()
     let toolProxy = ToolProxy()
+    /// ⚠️ Read when the window opens, and after every edit. Not on the
+    /// ticker: it spawns python, and the answer changes only when a person
+    /// presses a button.
+    let folders = Folders()
 
     @Published private(set) var facts = IndexFacts()
     @Published private(set) var stats = IndexStats()
     private var statsRefreshed = Date.distantPast
+    /// The social picture, on its own schedule. ⚠️ NOT part of `reread()`: it
+    /// costs three seconds of subprocess and answers nothing the app needs in
+    /// order to index or to search.
+    @Published private(set) var people = PeopleStats()
+    @Published private(set) var places = PlacesStats()
+    private var placesBusy = false
+    private var placesRefreshed = Date.distantPast
+    @Published private(set) var peopleBusy = false
+    private var peopleRefreshed = Date.distantPast
 
     /// 🛑 The RUNNING build, from the bundle. A stale build was diagnosed as a
     /// code bug for an hour because nothing on screen said which one it was.
@@ -171,6 +184,45 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Who you talk to, who overlaps with whom, and which emoji you use.
+    ///
+    /// ⚠️ IT READS A STORED REPORT. `index.py` computes it after an indexing
+    /// cycle once a day and hands back the stored copy otherwise, so opening
+    /// the window costs 80 ms rather than 3.6 s. `force` is the Recalculate
+    /// button, and it is the only thing here that pays the full price.
+    func refreshPeople(force: Bool = false) {
+        guard !peopleBusy else { return }
+        guard force || Date().timeIntervalSince(peopleRefreshed) > 60
+                || !people.loaded else { return }
+        peopleRefreshed = Date()
+        peopleBusy = true
+        Task.detached(priority: .utility) {
+            let fresh = PeopleReader.read(refresh: force)
+            await MainActor.run {
+                self.peopleBusy = false
+                if fresh.loaded || fresh.error != nil { self.people = fresh }
+            }
+        }
+    }
+
+    /// Everywhere you have been. ⚠️ Cheaper than `people` — it reads the
+    /// index rather than every body — but it is still a subprocess, so it runs
+    /// when the panel appears and not on the thirty-second timer.
+    func refreshPlaces(force: Bool = false) {
+        guard !placesBusy else { return }
+        guard force || Date().timeIntervalSince(placesRefreshed) > 60
+                || !places.loaded else { return }
+        placesRefreshed = Date()
+        placesBusy = true
+        Task.detached(priority: .utility) {
+            let fresh = PlacesReader.read()
+            await MainActor.run {
+                self.placesBusy = false
+                if fresh.loaded || fresh.error != nil { self.places = fresh }
+            }
+        }
+    }
+
     func quit() {
         indexer.saveState()
         search.stop()
@@ -206,11 +258,54 @@ final class AppModel: ObservableObject {
     }
 }
 
+/// Whether the app shows a Dock tile, which follows whether a window is open.
+///
+/// 🛑 `LSUIElement` IS AN INITIAL POLICY, NOT A LIFE SENTENCE. A background
+/// indexer with a permanent Dock tile is noise, which is why the app is an
+/// accessory — but a visible window belonging to an accessory app cannot be
+/// switched back to. It is absent from the Dock, absent from ⌘-Tab, and once
+/// another window covers it the only way back is the menu bar item. Raising
+/// the policy while a window is open gives it a tile, a ⌘-Tab entry and a menu
+/// bar, and lowering it again afterwards keeps the app out of the way.
+@MainActor
+enum DockPresence {
+    /// ⚠️ COUNTED FROM THE WINDOWS THEMSELVES, never from a flag toggled on
+    /// open and close. A flag drifts the first time a window closes by a route
+    /// nobody thought of, and the app is then either stuck in the Dock or
+    /// unreachable behind another window.
+    static func follow() {
+        let visible = NSApp.windows.contains {
+            $0.isVisible && $0.canBecomeMain && !($0 is NSPanel)
+        }
+        let wanted: NSApplication.ActivationPolicy = visible ? .regular : .accessory
+        guard NSApp.activationPolicy() != wanted else { return }
+        NSApp.setActivationPolicy(wanted)
+    }
+
+    /// ⚠️ ONE RUNLOOP LATER, ALWAYS. Both edges need it, for opposite reasons:
+    /// `willCloseNotification` fires while the window is still in
+    /// `NSApp.windows`, so counting there finds it and the tile never leaves;
+    /// and SwiftUI runs a scene's `onAppear` before the window is on screen,
+    /// so counting there finds nothing and the tile never arrives. Measured:
+    /// the first version called this directly from `onAppear` and the app
+    /// stayed background-only with its window wide open.
+    static func followSoon() {
+        DispatchQueue.main.async { follow() }
+    }
+}
+
 /// Starting the work does not wait for a window. ⚠️ In an LSUIElement app the
 /// user may never open one, and both jobs still have to run.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         Task { @MainActor in AppModel.shared.start() }
+        for edge in [NSWindow.willCloseNotification,
+                     NSWindow.didBecomeKeyNotification] {
+            NotificationCenter.default.addObserver(
+                forName: edge, object: nil, queue: .main) { _ in
+                    MainActor.assumeIsolated { DockPresence.followSoon() }
+                }
+        }
     }
 
 
@@ -258,6 +353,7 @@ struct AppleToolsApp: App {
         Window("Index", id: "status") {
             StatusView(model: model)
                 .frame(minWidth: 720, minHeight: 560)
+                .onAppear { DockPresence.followSoon() }
         }
         .defaultSize(width: 860, height: 760)
     }
@@ -302,6 +398,12 @@ enum Format {
         formatter.countStyle = .file
         formatter.allowedUnits = [.useMB, .useGB]
         return formatter.string(fromByteCount: Int64(value))
+    }
+
+    static func year(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy"
+        return formatter.string(from: date)
     }
 
     static func count(_ value: Int) -> String {

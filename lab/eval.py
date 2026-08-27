@@ -338,6 +338,19 @@ STRATEGIES = {
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--db", default=None)
+    # 🛑 THE 29 CASES IN THIS FILE CANNOT SEPARATE 0.78 FROM 0.80. They are
+    # hand-written against one machine's private data: enough to catch a broken
+    # fusion rule, far too few to decide a model swap, and unshareable. An
+    # external file is how a public case set — EnronQA, 1,257 of them — gets
+    # scored by the same code. See `bench/enronqa.py`.
+    p.add_argument("--cases", default=None, metavar="FILE",
+                   help="score cases from a JSON file instead of the built-in "
+                        "ones: {\"cases\": [[query, locator, kind], ...]}")
+    p.add_argument("--limit", type=int, default=None, metavar="N",
+                   help="sample N cases. ⚠️ A search is a subprocess, so 1,257 "
+                        "cases across 8 strategies is an hour")
+    p.add_argument("--seed", type=int, default=7,
+                   help="the sample is deterministic, so two runs compare")
     p.add_argument("--compare", action="store_true")
     # ⚠️ `--db` used to steer only the CASE RESOLUTION. The search subprocess
     # never saw it, so evaluating a second index scored the default one and the
@@ -358,8 +371,29 @@ def main():
     EXTRA += (["--no-daemon"] if opts.no_daemon else [])
     db = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(dbpath), uri=True)
 
+    wanted = CASES
+    if opts.cases:
+        with open(opts.cases) as handle:
+            loaded = json.load(handle)
+        manifest = loaded.get("manifest", {}) if isinstance(loaded, dict) else {}
+        wanted = [tuple(case) for case in
+                  (loaded["cases"] if isinstance(loaded, dict) else loaded)]
+        if manifest:
+            print("cases from %s: %s inbox %s, %d emails"
+                  % (os.path.basename(opts.cases), manifest.get("dataset", "?"),
+                     manifest.get("user", "?"), manifest.get("emails", 0)))
+
+    # ⚠️ SAMPLED BEFORE RESOLVING, not after. Resolving every one of 1,257
+    # locators against the index costs a query each, and the run then throws
+    # most of them away.
+    if opts.limit and len(wanted) > opts.limit:
+        import random
+        random.Random(opts.seed).shuffle(wanted)
+        wanted = wanted[:opts.limit]
+        print("sampled %d cases (seed %d)" % (len(wanted), opts.seed))
+
     cases, broken = [], []
-    for query, locator, kind in CASES:
+    for query, locator, kind in wanted:
         uids = resolve(db, locator)
         if uids:
             cases.append((query, set(uids), kind))
@@ -369,16 +403,24 @@ def main():
     if broken:
         print("🛑 %d broken case(s): matched nothing, or several different things"
               % len(broken))
-        for locator in broken:
+        for locator in broken[:12]:
             print("   %s" % (locator if isinstance(locator, str) else " / ".join(locator))[:60])
+        if len(broken) > 12:
+            print("   ... and %d more" % (len(broken) - 12))
         print()
     if not cases:
         sys.exit("no usable cases")
     print("%d usable cases (%d keyword, %d descriptive)"
           % (len(cases), sum(k == "keyword" for _, _, k in cases),
              sum(k == "descriptive" for _, _, k in cases)))
-    print("valid answers per case: %s\n"
-          % ", ".join(str(len(u)) for _, u, _ in cases))
+    # ⚠️ Useful for 29 hand-written cases, where a locator matching six records
+    # is worth seeing. For 1,254 it is a screen of the digit 1.
+    spread = sorted({len(u) for _, u, _ in cases})
+    if len(cases) <= 40:
+        print("valid answers per case: %s\n"
+              % ", ".join(str(len(u)) for _, u, _ in cases))
+    else:
+        print("valid answers per case: %d..%d\n" % (spread[0], spread[-1]))
 
     if not opts.compare:
         a1, a3, a10, mrr = score([], cases, verbose=True)

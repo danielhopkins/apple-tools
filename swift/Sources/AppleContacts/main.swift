@@ -78,7 +78,18 @@ func requireContactsAccess() throws {
 private let readKeys: [CNKeyDescriptor] = [
     CNContactIdentifierKey, CNContactGivenNameKey, CNContactMiddleNameKey,
     CNContactFamilyNameKey, CNContactNamePrefixKey, CNContactNameSuffixKey,
+    // ⚠️ CONTACTS.APP LABELS THIS FIELD "Maiden Name". The framework calls it
+    // the PREVIOUS family name, and that is the word this tool uses: the same
+    // field holds a name changed by a second marriage, a divorce, an adoption
+    // or a deed poll, and none of those is a maiden name. One field, one
+    // neutral word.
+    CNContactPreviousFamilyNameKey,
     CNContactNicknameKey, CNContactOrganizationNameKey, CNContactDepartmentNameKey,
+    // 🛑 PERSON OR COMPANY. Contacts.app shows it as the "Company" checkbox on
+    // a card, and it is the only reliable way to tell PayPal from a person —
+    // a company card carries emails, phones and an address exactly like
+    // anyone else.
+    CNContactTypeKey,
     CNContactJobTitleKey, CNContactEmailAddressesKey, CNContactPhoneNumbersKey,
     CNContactPostalAddressesKey, CNContactUrlAddressesKey, CNContactBirthdayKey,
     CNContactDatesKey, CNContactRelationsKey,
@@ -134,6 +145,16 @@ struct ContactInfo: Encodable {
     let prefix: String?
     let suffix: String?
     let nickname: String?
+    /// True when the card is marked as a company rather than a person.
+    /// Absent otherwise, never `false` — the rule every optional key here
+    /// follows.
+    let is_company: Bool?
+    /// The family name this person used before the current one. Contacts.app
+    /// shows the same field as "Maiden Name".
+    ///
+    /// ⚠️ It is a NAME, not an alias for the whole card. `name` stays the
+    /// current one, and this key is absent unless the card records it.
+    let previous_family_name: String?
     let company: String?
     let department: String?
     let job_title: String?
@@ -260,6 +281,8 @@ private func info(
         prefix: blankToNil(contact.namePrefix),
         suffix: blankToNil(contact.nameSuffix),
         nickname: blankToNil(contact.nickname),
+        is_company: contact.contactType == .organization ? true : nil,
+        previous_family_name: blankToNil(contact.previousFamilyName),
         company: blankToNil(contact.organizationName),
         department: blankToNil(contact.departmentName),
         job_title: blankToNil(contact.jobTitle),
@@ -872,8 +895,15 @@ private func confirmWritten(_ fields: ContactFields, on saved: CNContact, name: 
 private func matches(_ contact: CNContact, _ needle: String) -> Bool {
     let haystacks = [
         contact.givenName, contact.middleName, contact.familyName, contact.nickname,
+        contact.previousFamilyName,
         contact.organizationName, contact.departmentName, contact.jobTitle,
         "\(contact.givenName) \(contact.familyName)",
+        // 🛑 THE PREVIOUS NAME AS A WHOLE NAME TOO. Searching "Steph Anderson"
+        // has to find the card that now reads "Stephanie Hopkins", and the
+        // two halves live in different fields — neither one matches on its
+        // own.
+        "\(contact.givenName) \(contact.previousFamilyName)",
+        "\(contact.nickname) \(contact.previousFamilyName)",
     ]
     if haystacks.contains(where: { $0.lowercased().contains(needle) }) { return true }
     if contact.emailAddresses.contains(where: { ($0.value as String).lowercased().contains(needle) }) {
@@ -1236,6 +1266,17 @@ struct ContactFields: ParsableArguments {
     @Option(name: .long, help: "Nickname")
     var nickname: String?
 
+    @Option(name: .long,
+            help: "Family name used before the current one (Contacts.app calls it Maiden Name)")
+    var previousFamilyName: String?
+
+    @Flag(name: .long,
+          help: "Mark this card as a company, or as a person, not both")
+    var company_card: Bool = false
+
+    @Flag(name: .long, help: "Mark this card as a person rather than a company")
+    var personCard: Bool = false
+
     @Option(name: .long, help: "Company / organization")
     var company: String?
 
@@ -1425,7 +1466,9 @@ struct ContactFields: ParsableArguments {
 
     var isEmpty: Bool {
         first == nil && middle == nil && last == nil && namePrefix == nil
-            && nameSuffix == nil && nickname == nil && company == nil
+            && nameSuffix == nil && nickname == nil && previousFamilyName == nil
+            && !company_card && !personCard
+            && company == nil
             && department == nil && jobTitle == nil && birthday == nil
             && anniversary == nil && died == nil && !clearDates
             && email.isEmpty && phone.isEmpty
@@ -1946,6 +1989,9 @@ struct ContactFields: ParsableArguments {
         if let namePrefix { contact.namePrefix = namePrefix }
         if let nameSuffix { contact.nameSuffix = nameSuffix }
         if let nickname { contact.nickname = nickname }
+        if let previousFamilyName { contact.previousFamilyName = previousFamilyName }
+        if company_card { contact.contactType = .organization }
+        if personCard { contact.contactType = .person }
         if let company { contact.organizationName = company }
         if let department { contact.departmentName = department }
         if let jobTitle { contact.jobTitle = jobTitle }
@@ -2084,6 +2130,11 @@ struct ContactFields: ParsableArguments {
         if let namePrefix { set(namePrefix as NSString, kABTitleProperty) }
         if let nameSuffix { set(nameSuffix as NSString, kABSuffixProperty) }
         if let nickname { set(nickname as NSString, kABNicknameProperty) }
+        // 🛑 The legacy framework's constant still says "maiden". It is the same
+        // field CNContactPreviousFamilyNameKey writes.
+        if let previousFamilyName {
+            set(previousFamilyName as NSString, kABMaidenNameProperty)
+        }
         if let company { set(company as NSString, kABOrganizationProperty) }
         if let department { set(department as NSString, kABDepartmentProperty) }
         if let jobTitle { set(jobTitle as NSString, kABJobTitleProperty) }

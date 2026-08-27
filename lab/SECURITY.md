@@ -38,6 +38,27 @@ binary can write into, so the kernel-level protection cannot be reproduced.
 ⚠️ **Revoking Full Disk Access does not disable the index.** A user who removes
 the grant expects their mail to stop being readable. The index keeps answering.
 
+### ⚠️ One thing this section does NOT defeat: iCloud encryption of notes
+
+A fair objection to all of the above is "but my notes are encrypted in iCloud,
+and this file is not." **On a default account that is not true**, and the
+correction is worth having because it changes what this index costs.
+
+`icloud-md` — [`../docs/prior-art.md`](../docs/prior-art.md) — talks to the
+CloudKit private database for Notes and reports that it **requires Advanced Data
+Protection to be off**, because *"with ADP on, note content is end-to-end
+encrypted in a way this tool doesn't attempt to decrypt."* The corollary is the
+part that matters here: without ADP, the fields named `TitleEncrypted` and
+`TextDataEncrypted` arrive **as plain readable bytes** — compressed, not
+client-side encrypted. The name says encrypted; the bytes are not.
+
+- **So indexing note plaintext locally does not remove a protection that iCloud
+  was providing**, unless the user has ADP switched on.
+- 🛑 **It is still a second copy in a second place**, and every other word in
+  this file stands. This narrows the objection; it does not answer it.
+- ⚠️ **Not measured here.** It is `icloud-md`'s claim, read from its README. If
+  it ever matters, test it rather than cite it.
+
 ## What is actually done about it
 
 | Mitigation | State |

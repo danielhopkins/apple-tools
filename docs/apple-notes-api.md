@@ -10,7 +10,7 @@ There are two completely separate access paths:
 | Path | Direction | Used by | Notes |
 |------|-----------|---------|-------|
 | **SQLite** (`NoteStore.sqlite`) | **read-only** | the `apple-notes` CLI | Fast, no UI, decodes the protobuf note body. **Never write to it** — it desyncs iCloud. |
-| **AppleScript** (`tell application "Notes"`) | **read/write** | the test suite, any editing | The only supported way to create/edit/delete/attach. Slower; mutations sync to iCloud and all your devices. |
+| **AppleScript** (`tell application "Notes"`) | **read/write** | the test suite, any editing | The only **Apple-supported** way to create/edit/delete/attach. ⚠️ Not the only way: Shortcuts is what `create`/`append` use, and CloudKit reaches Notes off-Mac — see [`prior-art.md`](prior-art.md). Slower; mutations sync to iCloud and all your devices. |
 
 ---
 

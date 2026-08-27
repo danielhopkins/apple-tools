@@ -115,6 +115,42 @@ gymnastics query when a calendar event says **CATS Gym**. e5 returned the
 correct record and the harness scored it a miss. **A wrong label is worse than
 a missing case: it punishes the right answer.**
 
+## 🛑 The evidence here is 29 hand-written cases, and that is not enough
+
+Every number above comes from cases written by hand against this machine's real
+data. They caught a badly wrong model — `NLContextualEmbedding` — and they are
+the reason this file exists. They cannot do the next job.
+
+**They cannot separate 0.78 from 0.80.** The e5-small / e5-base decision above
+turned on 0.012 MRR, "under one case in fourteen", and was correctly read as a
+tie. A newer model claiming a two-point gain would be indistinguishable from
+noise on this harness. They are also unshareable: every case names something
+private, so no result here can be reproduced by anyone.
+
+**[`bench/`](bench/README.md) is the answer to both.** EnronQA — 103,638 real
+emails, 528,304 question/answer pairs, public — scored by this same `eval.py`
+against a separate index. 1,254 cases in two minutes:
+
+| e5-small-coreml, inbox `germany-c` | |
+|---|---|
+| hit@1 | 0.68 |
+| hit@3 | 0.87 |
+| hit@10 | 0.94 |
+| **MRR** | **0.780** |
+
+**What it has already shown.** All 29 fusion strategies against 1,254 cases:
+the best weighting is **6:1 lexical:semantic at MRR 0.795**, the shipped default
+scores **0.780**, and **vectors alone score 0.690**. So the lexical arm is worth
+ten points there, which agrees with the vector-arm-alone numbers above.
+🛑 **1.5 points on one source is not a reason to move the shipped weighting** —
+see the rule below. Full table and the caveats in
+[`bench/README.md`](bench/README.md).
+
+⚠️ **It complements these cases, it does not replace them.** Every EnronQA case
+is a long, well-formed `descriptive` question written by an LLM from the answer.
+There is not one short keyword lookup, and nothing about calendar, places or
+cross-source fusion. **A model that wins there and loses here has not won.**
+
 ## Changing the model
 
 ```

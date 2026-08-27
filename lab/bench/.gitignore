@@ -1,0 +1,3 @@
+# The corpus, the cases and the index are downloaded, not authored. `enronqa.py
+# fetch` rebuilds all three in about a minute.
+enron/

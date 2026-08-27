@@ -193,12 +193,18 @@ files, one test file. Same `Info.plist` + `Package.swift` shape as ours.
 **Gathered 2026-07-28.** The survey above is about the suite as a whole; this
 section is about one question: *has anyone solved writing to Apple Notes better
 than we have?* Notes has its own ecosystem, separate from the six-app projects
-above, and it splits cleanly in two: **forensic readers** that decode
-`NoteStore.sqlite` and never write, and **AppleScript wrappers** that write and
-carry every trap we documented.
+above, and it splits in three: **forensic readers** that decode
+`NoteStore.sqlite` and never write, **AppleScript wrappers** that write and
+carry every trap we documented, and — added 2026-08-26 — **one CloudKit client**
+that writes from a machine that is not a Mac at all.
+
+⚠️ **It said "splits cleanly in two" until 2026-08-26.** A taxonomy in a survey
+is a claim about what nobody has built, and it ages worse than any measurement
+in this file.
 
 | Project | Lang | ★ | Last push | License | Writes? |
 |---|---|---|---|---|---|
+| [coddingtonbear/icloud-md](https://github.com/coddingtonbear/icloud-md) | TS | — | 2026 | MIT | **yes — CloudKit, off-Mac, two-way** |
 | [threeplanetssoftware/apple_cloud_notes_parser](https://github.com/threeplanetssoftware/apple_cloud_notes_parser) | Ruby | 537 | 2026-07-25 | MIT | no — forensic reader |
 | [antoniorodr/memo](https://github.com/antoniorodr/memo) | Python | 316 | 2026-07-28 | Apache-2.0 | **yes, incl. image-preserving edit** |
 | [RhetTbull/macnotesapp](https://github.com/RhetTbull/macnotesapp) | Python | 268 | 2026-01-29 | MIT | yes — ScriptingBridge |
@@ -211,6 +217,95 @@ A dozen more `apple-notes-cli` repos exist with 0–17 stars, mostly written in
 2026 as Claude/agent adapters. Spot-checked several: all are `osascript`
 wrappers around `make new note` / `set body`, none engage with attachments. Not
 worth reading individually.
+
+### 🛑 icloud-md — the camp this section said did not exist
+
+**Added 2026-08-26.** The framing above is wrong, or at least incomplete. It
+says the Notes field "splits cleanly in two: forensic readers that decode
+`NoteStore.sqlite` and never write, and AppleScript wrappers that write and
+carry every trap we documented." There is a third camp, and it has one member:
+
+| | |
+|---|---|
+| [coddingtonbear/icloud-md](https://github.com/coddingtonbear/icloud-md) | CLI, TypeScript, Node 20+, MIT |
+| [coddingtonbear/obsidian-apple-notes](https://github.com/coddingtonbear/obsidian-apple-notes) | Obsidian plugin over the same CLI, MIT |
+
+⚠️ **Read from the README, not from the source.** Everything below is the
+project's own account. Nothing here has been run, and no TypeScript has been
+read — which is a weaker standard than the rest of this file and is why each
+claim says whose claim it is.
+
+**It does not touch a Mac.** It speaks the CloudKit **private database web
+service** directly — `p<N>-ckdatabasews.icloud.com/database/1/com.apple.notes/`,
+with `records/query`, `records/modify` and `changes/zone`, and incremental sync
+through `syncToken`/`moreComing`. So it runs on Linux and Windows, and it is
+two-way: clone a folder of Markdown, edit it anywhere, push it back.
+
+🛑 **AUTHENTICATION IS THE PART NOT REVERSE-ENGINEERED, and that is the good
+idea.** `clone` opens a real Playwright browser on Apple's own sign-in pages and
+harvests the session cookies afterwards. The tool never sees the password and
+never reimplements SRP or two-factor. ⚠️ We have no use for it — nothing here
+authenticates to anything — but it is the cleanest answer to "how do I talk to
+a service whose login I must not reimplement" that this survey has turned up.
+
+🛑 **IT REQUIRES ADVANCED DATA PROTECTION TO BE OFF, AND THE REASON IS A FACT
+ABOUT THE USER'S DATA.** In the project's words: *"with ADP on, note content is
+end-to-end encrypted in a way this tool doesn't attempt to decrypt."* The
+corollary is the part worth keeping: on an account **without** ADP, the fields
+named `TitleEncrypted` and `TextDataEncrypted` arrive **as plain readable
+bytes** — compressed, not client-side encrypted. The name says encrypted and the
+bytes are not. That belongs beside [`../lab/SECURITY.md`](../lab/SECURITY.md):
+an index of note plaintext on this machine is not adding an exposure that iCloud
+was otherwise preventing.
+
+**What it claims to round-trip**, which is more than anything else here:
+headings, nested lists, **checklists**, blockquotes, fenced code, inline
+formatting, links, and **tables including row and column edits**. Plus Obsidian
+notation — wikilinks, embeds, callouts, tags, highlights, footnotes.
+
+- 🛑 **Checklists and tables, from off a Mac.** The section below is titled
+  "nobody has solved it in AppleScript" and that is still true: this is not
+  AppleScript. Our own route to a real checklist is Shortcuts/AppIntents. So
+  there are now **three** ways to write one and none of them is the scripting
+  dictionary, which contains the word zero times.
+- ⚠️ **Attachments are read-only and there is no upload.** Whether a push
+  *preserves* the attachments already on a note is not stated, and it is the
+  first thing to test — it is the failure that makes an AppleScript body write
+  unusable here, and 45% of a real store carries one.
+
+**Conflict handling is better than anything else surveyed.** A three-way merge
+on pull, auto-merging non-overlapping edits; an optimistic-lock check on push
+that refuses a note changed remotely since the last sync rather than
+overwriting it. ⚠️ Its own caveat: *"Concurrent edits from other Apple devices
+aren't merged the way Notes itself does internally."*
+
+**Its own safety notice**, quoted because it is the right tone and we should
+match it: *"This is not an official or supported Apple API… Apple can change
+either of those at any time without notice. Data loss is a real possibility,
+not a hypothetical one."*
+
+Stated limitations: shared-note deletions and renames refused; folders never
+renamed or deleted remotely; no real-time sync; the vault title mode cannot be
+changed after clone; file arguments resolve by path rather than by note.
+
+#### What it means for us: nothing to take, one claim to soften
+
+🛑 **It is not a route this repo can use, and the reason is the first line of
+`CLAUDE.md`**: *"Everything runs locally against the user's real data — no sync
+service, no API keys."* icloud-md needs an iCloud session, the network, and ADP
+turned off. Adopting it would trade the whole premise for reach we do not need
+— every machine this runs on is a Mac with the notes already on disk.
+
+⚠️ **But `apple-notes-api.md` calls AppleScript "the only supported way to
+create/edit/delete/attach", and a reader can take that as "the only way".** It
+is not, on two counts now: Shortcuts is the route this repo actually uses for
+`create` and `append`, and CloudKit is a fourth route that reaches checklists
+and tables from a machine that is not a Mac. "Supported" is carrying more weight
+in that sentence than it can hold.
+
+**Worth testing if we ever care:** does a push preserve existing attachments?
+That single question decides whether this is a better write path than ours for
+anyone who is willing to pay the iCloud price.
 
 ### memo — the one idea worth taking
 
@@ -345,6 +440,11 @@ analysis; that repo's `notes.md` is the best single write-up of the format and
 is what to read before extending the protobuf decoder.
 
 ### The checklist write problem — nobody has solved it in AppleScript
+
+⚠️ **The title is exact and the scope is narrow.** Two routes reach a real
+checklist without AppleScript: **Shortcuts/AppIntents**, which is what this repo
+uses, and **CloudKit**, which is what `icloud-md` uses from off a Mac. Neither
+contradicts a word below; both are outside it.
 
 A body write flattens every checklist into a plain bulleted list and discards
 which items were ticked (see [`apple-notes-api.md`](apple-notes-api.md)). Asked
@@ -1065,3 +1165,195 @@ credentials, no keystrokes). They are unreachable: absent from the Shortcuts
 action picker, unsignable (`Tools.visibilityFlags & 4` is unset), and unsigned
 import is refused. Apple Intelligence is **not** the gate. Do not spend the
 afternoon we spent on it.
+
+## Cross-source search — the "open Spotlight" framing
+
+**Gathered 2026-08-25.** The three surveys above ask whether anyone reads or
+writes one Apple app better than we do. This one asks a different question, the
+one `lab/` raised: *has anyone built an open, CLI-first index across all of a
+person's local data — the thing Spotlight is and `mdfind` cannot express?*
+
+**Short answer: one project, and it is good.** [LEANN](https://github.com/StarTrail-org/LEANN)
+is the only peer in the field that indexes Apple Mail and `chat.db` behind a
+real CLI. Everything else splits into four camps that each miss on one axis:
+GUI apps over **files only**, note-app plugins over **one corpus**, screen
+recorders that **capture instead of read**, and launchers that just **re-query
+Spotlight's keyword index**.
+
+### The field
+
+| Project | Lang | ★ | Pushed | License | Sources | Interface |
+|---|---|---|---|---|---|---|
+| [LEANN](https://github.com/StarTrail-org/LEANN) | Python | 12,835 | 2026-08-21 | MIT | files, code, **Apple Mail**, **iMessage**, WeChat, browser history, ChatGPT/Claude logs, Slack, Twitter | **CLI** + MCP |
+| [khoj](https://github.com/khoj-ai/khoj) | Python | 36,716 | 2026-08-02 | **AGPL-3.0** | docs, Obsidian, Notion, web | server + web/app plugins |
+| [onyx](https://github.com/onyx-dot-app/onyx) | Python | 31,756 | 2026-08-25 | mixed | ~40 SaaS connectors | server |
+| [screenpipe](https://github.com/screenpipe/screenpipe) | Rust | 21,222 | 2026-08-25 | mixed | **screen + audio capture** | app + SDK |
+| [SurfSense](https://github.com/MODSetter/SurfSense) | Python | 16,007 | 2026-08-25 | mixed | web, uploads, connectors | server |
+| [reor](https://github.com/reorproject/reor) | JS | 8,569 | **2025-05-13** | AGPL-3.0 | its own markdown vault | app (stale) |
+| [omni-macos](https://github.com/hanxiao/omni-macos) | Swift | 217 | 2026-08-24 | Apache-2.0 | files + Photos, **all modalities** | app + HTTP + MCP |
+| [semantic-mail](https://github.com/yahorbarkouski/semantic-mail) | Python | 73 | 2025-06-21 | — | **Gmail API** | CLI |
+| [mcp-apple-notes](https://github.com/RafalWilinski/mcp-apple-notes) | TS | 411 | **2024-12-17** | **none** | Apple Notes | MCP (dead) |
+| [Memsearch](https://www.memsearch.app/) | closed | — | — | closed | files, photos, PDFs | app |
+| [Recoll](https://www.recoll.org/) | C++ | — | — | GPL | files, mbox/maildir | GUI + `recoll -t` |
+
+Sources and interfaces are from READMEs except where a subsection below says the
+source was read.
+
+### LEANN — the only real peer, and worth reading
+
+MIT, MLsys 2026 paper ([arXiv 2506.08276](https://arxiv.org/abs/2506.08276)),
+Berkeley Sky Lab. `leann build` / `search` / `ask` / `watch` / `list`. One index
+per corpus (`mail_index`, `imessage_index`), so a query is per-source; there is
+no cross-source fusion and no notion of a record's native id.
+
+🛑 **Its storage decision is the opposite of ours and it is defensible.** LEANN
+stores a pruned proximity graph and **recomputes embeddings at query time**
+rather than keeping them — 79 MB for 780k email chunks against 2.4 GB, a 97%
+saving, paid for in query-time compute. We store int8 vectors at 512 bytes a
+chunk, about 122 MB for 239k chunks, and scan them with Accelerate in 15 ms.
+Neither is wrong. **Their bet is that disk is scarce; ours is that a warm daemon
+and a fast scan are cheaper than re-embedding.** If the index ever has to cover
+a corpus ten times this size, read their paper before adding a shard.
+
+*Verified by reading `apps/imessage_data/imessage_reader.py` and
+`apps/email_data/LEANN_email_reader.py`:*
+
+- 🛑 **Its iMessage reader drops every `attributedBody` message.** The query is
+  `WHERE m.text IS NOT NULL AND m.text != ''`. On this store that silently
+  discards 4,227 rows, **1,921 of which are ordinary messages with real words in
+  them** — see [`apple-messages-store.md`](apple-messages-store.md). This is
+  exactly the trap we documented, met by the strongest project in the field. It
+  does not look like a bug; it looks like a quiet gap in the history.
+- 🛑 **It divides every message date by 1e9 unconditionally.** `chat.db` holds
+  Apple-epoch **nanoseconds** in modern rows and whole **seconds** in pre-10.13
+  ones. A seconds row divided by a billion lands on 2001-01-01, so the oldest
+  conversations all date to the epoch. Our reader sniffs the magnitude. It does
+  handle `0` as unset, which is the other half of the same trap.
+- ⚠️ **Its mail reader never opens the Envelope Index.** It `os.walk`s
+  `~/Library/Mail/**/Messages` for `*.emlx`, splits the byte-count prefix off the
+  first line, and hands the rest to Python's `email` module. Consequences: no
+  account name, no mailbox, no read or flagged state, no way to exclude trash and
+  junk, and every file must be opened on every build. This is the position
+  `apple-pim` moved us off in July.
+- ⚠️ **HTML parts are skipped by default** (`include_html=False`), so an
+  HTML-only message contributes its subject and nothing else. With the flag on,
+  raw tags go into the embedding — there is no HTML-to-text step either way.
+- ⚠️ **`_payload_to_text` decodes every part as UTF-8 with `errors="ignore"`**
+  and never reads the part's charset, so a Latin-1 body loses its accented
+  characters before it is ever chunked.
+- ⚠️ **Attachment bytes are not in the `.emlx`** — Mail strips them out — so
+  walking the files alone cannot see them. Nothing in the reader looks in
+  `Attachments/`.
+
+**No Notes, no Calendar, no Contacts, no Reminders, no places.** The `apps/`
+directory is documents, code, email, iMessage, WeChat, browser history, LLM chat
+logs, Slack and Twitter. That is the gap we sit in.
+
+### The other camps, and why each one misses
+
+- **Files only.** [omni-macos](https://github.com/hanxiao/omni-macos) is the best
+  built thing here — MLX-Swift, `jina-embeddings-v5-omni`, text/image/audio/video
+  in **one vector space**, bf16 vectors in SQLite with a 4-bit quantized replica
+  for memory pressure. It indexes the file system and the Photos library and
+  nothing else, and it has **no CLI**: an HTTP API on `127.0.0.1:51234` plus MCP.
+  ⚠️ **The multi-modal shared space is an idea worth keeping** for the day
+  attachments and screenshots enter the index. Its model weights are CC-BY-NC-4.0
+  while its code is Apache-2.0 — the weights are the part that cannot be shipped.
+- **One corpus.** `mcp-apple-notes` (411★, **no license**, untouched since
+  December 2024), `notelens`, `apple-notes-semantic-search`, `imessage-rag`,
+  `semantic-mail` (Gmail API, not Mail.app). Each proves its own source and stops
+  there. None of them can answer "which app holds this".
+- **Capture, not read.** [screenpipe](https://github.com/screenpipe/screenpipe)
+  (21k★) records the screen and microphone continuously. ⚠️ **It is a different
+  product with a different threat model**: it manufactures a corpus that did not
+  exist rather than indexing the one the user already has. Worth naming when
+  someone asks why we do not "just record everything" — every record we index has
+  a native id that reads back through a real API, and a screenshot has none.
+- **Launchers.** Raycast, Alfred and the rest **re-query Spotlight's keyword
+  index**. They add actions, clipboard history and extensions; none of them
+  builds an independent body index over mail or messages, and none does semantic
+  matching over local records. So "a better Spotlight" in the launcher market
+  means a better *front end to the same index* — not a second index.
+- **Lexical desktop search.** [Recoll](https://www.recoll.org/) is the honest
+  ancestor: Xapian, BM25, a real CLI in `recoll -t`, and mail support for
+  mbox/maildir. **No semantic arm and no Apple app stores** — Notes, Messages,
+  Calendar and Contacts are not files, so a file indexer cannot see them at all.
+
+### The architecture converged, which is corroboration
+
+The hybrid design in `lab/` is now the field default rather than a bet: **SQLite,
+FTS5 for the lexical arm, vectors for the semantic one, Reciprocal Rank Fusion to
+merge them, one file, no server.** `sqlite-vec` plus FTS5 plus RRF is a written-up
+pattern with worked examples, and
+[vstash](https://arxiv.org/pdf/2604.15484) is the same shape in a paper.
+`RRF_K = 60` is everyone's constant.
+
+🛑 **Where we differ is the fusion rule, and it was measured, not inherited.**
+We take **MAX, never SUM**, over the arms — summing reciprocal ranks rewards a
+record for appearing in both lists over a record that one arm ranked first. See
+`lab/index.py:1933` and `lab/RANKING.md`. Nothing surveyed discusses this.
+
+### Apple's own position, updated
+
+The [CoreSpotlight measurement](#corespotlight-measured) still stands and now has
+company:
+
+- ⚠️ **Apple is building the semantic index we cannot read.** macOS 26.6 spends
+  background time generating embeddings so that a Mac arrives at macOS 27 with a
+  **semantic Spotlight index already built**. That index is the OS's, per app
+  bundle, and a CLI has no bundle.
+- 🛑 **`CSUserQuery` semantic search is still reported non-functional by
+  third-party developers**, more than a year after WWDC24 announced it — see
+  Apple's forum threads [767355](https://developer.apple.com/forums/thread/767355)
+  and [793867](https://developer.apple.com/forums/thread/793867). Our own probe
+  returns **0 items and no error**, which matches. So the supported route is
+  neither readable nor, by other people's accounts, working.
+- **`util/check-spotlight` is the tripwire.** Re-run it after a macOS 27 upgrade
+  rather than re-investigating; it exits 0 only if something came back.
+
+### What we have that this half of the field does not
+
+- **Eight sources under one query, with `tool` and a native id on every record.**
+  LEANN indexes two Apple sources into two separate indexes. Nothing surveyed
+  indexes Notes, Calendar, Contacts, Reminders and visited places at all.
+- **The index stores ids and defers to the reader.** Every peer here treats the
+  indexed copy as the answer. A hit from `apple-index` is a pointer you read back
+  through `apple notes export <id>`, so a stale chunk can never become the answer.
+- **Geography as a first-class question.** `near` and `nearby` join a Maps
+  arrival to a calendar event by coordinate. No project in this survey has a
+  spatial arm.
+- **Local embeddings with no API key and no PyTorch.** Core ML `e5-small-v2`,
+  878 chunks/sec, byte-identical to the Python path. Memsearch sends text to
+  **Google Gemini** for embeddings; semantic-mail needs Ollama; Khoj needs a
+  server. ⚠️ omni-macos is the one peer that is genuinely on-device and
+  first-class about it.
+- **A written-down consent and deletion story.** [`lab/SECURITY.md`](../lab/SECURITY.md)
+  records that the index holds the plaintext of every email and is not encrypted,
+  as a decision. `apple-index forget` deletes the index, the logs and the consent.
+  No surveyed project states what its index holds or how to destroy it.
+
+### Ideas worth taking from here
+
+- **Graph-based selective recomputation** (LEANN) — the answer if the index ever
+  outgrows a full int8 scan. MIT, so readable, and the paper is the better source.
+- **One shared vector space across modalities** (omni-macos) — for attachments,
+  screenshots and voice memos later. Note the weights' licence.
+- **`leann watch` with a Merkle-tree snapshot** for change detection — compare
+  against the per-source watermarks in [`lab/INCREMENTAL.md`](../lab/INCREMENTAL.md)
+  and sift's four-field fingerprint above.
+- **Report the `attributedBody` and nanoseconds findings upstream.** LEANN is MIT,
+  active, and both are small fixes. It is the one project in this survey where
+  our measurements would land.
+
+### Refreshing this section
+
+```
+for r in StarTrail-org/LEANN khoj-ai/khoj onyx-dot-app/onyx \
+         screenpipe/screenpipe MODSetter/SurfSense reorproject/reor \
+         hanxiao/omni-macos yahorbarkouski/semantic-mail \
+         RafalWilinski/mcp-apple-notes; do
+  gh api "repos/$r" --jq '"\(.full_name)\t★\(.stargazers_count)\tpushed \(.pushed_at[0:10])\t\(.license.spdx_id)"'
+done
+gh search repos "local semantic search personal data" --limit 30
+gh search repos "apple notes semantic search embeddings" --limit 20
+```

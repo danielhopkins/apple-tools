@@ -53,6 +53,8 @@ reach.
 
 ```
 index.py          the driver: ingest, chunk, FTS5, fusion, output. Stdlib only.
+photos.py         the Photos reader: tagged faces with their Contacts id,
+                  coordinates, and Apple's stored reverse geocode. Stdlib only.
 vec/              Swift: the embedding model and the dot products.
 Makefile          build, demo, clean
 index.db          created by `./index.py init`. Not committed.
@@ -87,8 +89,380 @@ make build                                  # build vec
 
 `make demo` runs exactly that.
 
-Sources: `notes`, `mail`, `messages`, `calendar`, `contacts`, `maps`. Pass
-several with `--source notes,calendar`.
+Sources: `notes`, `mail`, `messages`, `calendar`, `contacts`, `maps`,
+`photos`, `reminders`, `files`. Pass several with `--source notes,calendar`.
+🛑 `SOURCES` in `index.py` is the one list; this line is a copy and a review
+caught it already stale.
+
+### `files` — the one source whose contents are a decision
+
+Every other source reads a store at a known path. This one reads whatever
+folders you name, so it is the only one that has to be configured.
+
+```
+apple-index files                        # what is configured
+apple-index files add ~/notes            # and --name, --exclude a,b
+apple-index files remove ~/notes
+apple-index files --json                 # what the app's window reads
+```
+
+The AppleTools window edits the same list, in the `files` row of the Sources
+panel.
+
+- 🛑 **ROOTS ARE CONFIGURED, NEVER GUESSED.** A guessed path that happens to
+  exist on one machine is how a tool ends up indexing somebody's Downloads.
+- **An Obsidian vault is recognised**, and `.obsidian` is skipped along with
+  `.git`, `node_modules`, `__pycache__` and any `Attachments` folder. On this
+  vault those hold 959 MB of binaries next to 5.6 MB of text.
+- Extensions read: `.md`, `.markdown`, `.txt`. A file over 2 MB is skipped, so
+  one runaway export cannot become 40% of the index.
+- 🛑 **ADDING A FOLDER DOES NOT INDEX IT, AND REMOVING ONE DOES NOT UNINDEX IT.**
+  `ingest` only ever adds, so the records from a removed folder survive until
+  `apple-index ingest --source files --full`.
+- 🛑 **`stats` reports this source by TOP-LEVEL FOLDER, alone among the
+  sources.** Its `container` is a whole relative path rather than a flat name,
+  so the raw listing was 49 rows here, most of them a subfolder of another row,
+  ordered by size — an answer to "which folder is biggest", which is nobody's
+  question. `top_level_containers` folds them; 49 became 12. ⚠️ **The cut
+  applies after the fold**, so the SQL `LIMIT` is dropped for this source:
+  folding a truncated list reports a folder short by whatever fell past the cut,
+  and a wrong number is worse than a missing row.
+- 🛑 **`files.json` lives in `~/Library/Application Support/apple-tools`, not
+  beside the index.** It followed `dirname(DEFAULT_DB)` until 26.827.0, which is
+  inside the encrypted vault whenever the app has it mounted — so a folder added
+  from the app disappeared with the volume and `apple-index forget` destroyed
+  the configuration with the index. A copy still at the old path is moved on
+  sight. ⚠️ An explicit `APPLE_INDEX_DB` still wins, because `lab/bench` relies
+  on that to keep its own configuration away from the real one.
+
+## Who you talk to
+
+`people` answers three questions the search side cannot: who is in this data,
+who is in it together, and when was each of them around. It is what the app's
+window draws as a web, an emoji list and a timeline.
+
+```
+apple-index people --top 80 | jq '.people[0]'
+```
+
+It reads every indexed record with a person on it — mail, messages and
+calendar — and adds two things the index does not hold: `apple contacts list`,
+to turn a handle into a name, and `apple phone recents`, because call history
+is not an indexed source. About 3.6 seconds on a 239k-chunk index.
+
+🛑 **IT IS COMPUTED ONCE A DAY AND STORED**, in a `people_cache` table beside
+the index. Reading the stored copy is **80 ms against 3.6 s**, so opening the
+window costs nothing.
+
+```
+apple-index people                  # the stored report
+apple-index people --refresh        # recompute now
+apple-index people --ensure         # refresh it if it is a day old; print one line
+apple-index people --max-age -1     # accept a stored report of any age
+```
+
+- **The daily policy lives here, not in the app.** The app runs
+  `people --ensure` at the end of every indexing cycle, which costs 80 ms when
+  the stored report is fresh. ⚠️ A second copy of "daily" in Swift is how two
+  schedules drift.
+- 🛑 **A ruling does not wait for the clock.** `--me`, `--not-a-person` and
+  `--is-a-person` each force the recompute they imply. Marking Mint and seeing
+  nothing change for a day is indistinguishable from the flag not working.
+- **Every reading says `cached` and `computed`**, and the window prints the
+  age. ⚠️ A reader that cannot tell a stored answer from a fresh one cannot
+  tell a stale one either.
+- 🛑 **It travels with the index and dies with it.** Rebuilding throws it away,
+  which is right: it is an answer about the index, not a setting the user
+  typed. Their rulings live outside it, in `people.json`, for the opposite
+  reason.
+
+🛑 **Deciding which handles are the USER is the whole problem**, and getting it
+wrong deletes a real person from their own graph or puts the user in it.
+**49 handles here**, from six rules, each one added because the one before it
+was not enough:
+
+1. **The accounts Mail knows.** Certain, and incomplete. Three.
+2. **One inferred address**: the top recipient no account claims, and only when
+   it is on 30% of mail *and* three times the runner-up. Here that is 54.2%
+   against 10.3%. ⚠️ A plain threshold does not work — a spouse is on 24.0% of
+   calendar events and a colleague on 23.0%.
+3. **Every handle on the card that claims one of those.** A card holds the
+   addresses Mail has forgotten.
+4. **Every address signing itself with a name the card answers to.** 🛑 THE
+   FORMAL NAME IS NOT ON THE CARD: it reads "Dan Hopkins", and old addresses
+   sign themselves "Daniel Hopkins". So the family name must match exactly and
+   the given name must be a **stem** of the card's, or the card's of it, at
+   three characters or more. 21 here — former employers, a university, a
+   machine hostname, two dead photo services. ⚠️ A relative with the same name
+   would be taken too, which is why every one is reported.
+5. **The user's own local part at somebody else's service.** 15 here: two
+   Send-to-Kindle endpoints, a plus-address at a former employer, Google Wave.
+   ⚠️ Six characters at least, and the next character must be a separator —
+   without the length guard the local part `dan` claims `dan@` everywhere.
+6. **Anything the user declares**: `apple-index people --me <handle>`. For an
+   alias on their own domain, which no rule can safely infer — a domain rule
+   was measured and rejected here, because it took three real colleagues at
+   `copta.org` and `theinevitable.co` along with the two aliases it wanted.
+
+Everything inferred is reported — `me.detected`, `me.by_name`, `me.by_address`,
+`me.declared` — and the window prints it, because a wrong guess is otherwise
+invisible.
+
+⚠️ **A bounce path is not a person either.** VERP encodes the recipient in the
+sender, so a newsletter bounce arrives from
+`bounces+3371362-2618-danielhopkins=gmail.com@mailer.example`. 18 here, one day
+each, all of them appearing in a search for the user's own family name. They are
+excluded with reason `bounce`, and it cannot be a false positive: the address
+literally contains the user's, with `@` written as `=`.
+
+🛑 **THE SAME PERSON, WRITTEN THREE WAYS.** Three separate rules fold them:
+
+1. **A directory writes the name backwards.** "Leopold, Robin" and "Robin
+   Leopold" are one person; so are "Lee, Ming-Ming" and "Ming-Ming Lee". 208
+   such pairs here. The fix is to **sort the words** before comparing, which is
+   safe only because a **card must claim the name** — seven companies here sign
+   themselves "Support", sorting makes all seven agree, and not one has a card.
+2. **Several addresses, no card at all.** Work, personal, a role address at the
+   same charity, the one at the employer they left. `John Giffin` appeared five
+   times, `Xin Zheng` three, `Staci Ruddy` three. 154 groups covering 379 rows,
+   and every one of the fourteen largest is plainly one person. ⚠️ **Two words
+   at least** — a single word is not a name. ⚠️ **It can be wrong**: two
+   strangers sharing a full name with no cards are folded. Nothing here does,
+   and the alternative is paid on every screen. A contact card beats it.
+3. **A name change**, below.
+
+⚠️ **A merge chain has to resolve.** b folds into a, then a into c, and an edge
+pointing at b must end up at c or it points at nobody.
+
+🛑 **A NAME CHANGE IS TWO PEOPLE, and no address matching finds them.**
+Measured here: one card reads "Stephanie Hopkins" and holds six handles, and an
+old address signing itself "Steph Anderson" carried 568 more encounters from
+2006 to 2012 — ending in the month the other row begins.
+
+The fix is on the card, not in the code: `apple contacts edit <id>
+--previous-family-name Anderson`. A card then claims four names, and any of
+them can pull an un-carded address in:
+
+    given + family        Stephanie Hopkins
+    given + previous      Stephanie Anderson
+    nickname + family     Steph Hopkins
+    nickname + previous   Steph Anderson    ← the one that matched
+
+⚠️ **The previous family name alone is not the name that arrives.** Mail signed
+itself with the nickname, so both halves have to be crossed. ⚠️ A name that two
+cards answer to still merges nothing.
+
+Three more rules worth knowing at the call site:
+
+- 🛑 **A BUSINESS IS NOT SOMEBODY YOU TALK TO.** Five rules keep them out, and
+  every exclusion is reported in `excluded` with its reason rather than dropped
+  silently — each rule can be wrong about somebody, and a person who has
+  quietly vanished from their own social graph is what nobody would notice.
+  Measured here, 734 of 9,301: 619 `no-reply`, 67 `short-code`, 22 `list`,
+  16 `calendar-feed`, 10 `company`.
+  - **`company`** — the card's "Company" tick box, which is the only reliable
+    answer: a company card carries emails, phones and an address exactly like
+    anyone else. ⚠️ It is often left off, so a card naming an organisation with
+    **no personal name** counts too; none of the cards that rule catches
+    carries a first name or a nickname, so it cannot take a person with it.
+  - **`short-code`** — 🛑 a three-to-six digit number is an SMS short code and
+    cannot be a person. PayPal, Venmo, Chase and United Airlines all arrive
+    this way, each with a real contact card.
+  - **`no-reply`** — a local part no person reads. ⚠️ Conservative on purpose:
+    `office@`, `info@` and `contact@` are **not** on the list, because a small
+    charity's office address really is answered by one person.
+  - **`calendar-feed`** — 🛑 Google puts system addresses in the organiser and
+    attendee fields: `unknownorganizer@calendar.google.com` for an event whose
+    owner it cannot name, and `…@group.calendar.google.com` for a subscribed
+    calendar or a meeting room. Three ranked inside the top sixty, one above
+    real people.
+  - 🛑 **`never-answered`** — **40 emails and not one reply, ever.** This is
+    the only rule that reads the RELATIONSHIP rather than the address, and it
+    is the one that catches a sender whose From line and address look exactly
+    like a person's: `id@proxyvote.com` signing "NORTHWESTERN MUTUAL",
+    `community_at_boulderreportinglab_org…`, `sharon@culinaryschoolrockies.com`.
+    Measured: every real correspondent in the top sixty has written back at
+    least twice, and the five transactional senders that survived every other
+    rule have exactly **zero**. ⚠️ **One reply spares them**, however lopsided —
+    Dean Mathena at 178 in, 2 out, is kept. ⚠️ **Mail only**: a text or a call
+    is two-way by its nature, so a handle with either is never judged this way.
+  - **`bulk-mail`** — 12 to 39 emails, never answered, a newsletter footer
+    (`unsubscribe`, `view in your browser`, `do not reply`) on **half** of
+    them, and the address does not carry their own name. ⚠️ Below forty,
+    volume alone is wrong: two of the school's teachers wrote 16 and 19 times
+    and were never answered, and they are people.
+    - 🛑 **THE NAME GUARD TURNS ON THE DOMAIN.** `nancy.s@…school.com` carries
+      "nancy", which the domain does not — a person. `chase@emailinfo.chase.com`
+      carries "chase", which the domain does too — a brand writing from its own
+      name. Without that clause the guard spared Chase, NYT, Northwestern
+      Mutual and AT&T. ⚠️ Four characters at least: "ent" is a substring of
+      "estatements".
+  - **`list`** — see below.
+
+  ⚠️ **The body scan reads the CANDIDATES' mail, not all of it.** Testing all
+  40,557 bodies for a newsletter footer costs 17 seconds; testing only the few
+  hundred belonging to somebody never written back to costs almost nothing. The
+  first version scanned everything and tripled the command.
+
+  **Two escape hatches, and the code is neither.** A business with a contact
+  card is fixed by ticking "Company" on it, or
+  `apple contacts edit <id> --company-card`. A business with **no card** — Mint
+  ranked 17th here on 244 days and has none — is fixed with:
+
+  ```
+  apple-index people --not-a-person team@mint.com
+  apple-index people --is-a-person  someone@example.com   # and back again
+  ```
+
+  🛑 **A ruling beats every rule, in both directions**, and that second
+  direction is the one that matters: a business left in the list is visible,
+  and a person taken out of it is not.
+
+  🛑 **Rulings live in `~/Library/Application Support/apple-tools/people.json`,
+  NOT beside the index.** `dirname(DEFAULT_DB)` follows the encrypted vault, so
+  a file written there is unreadable whenever AppleTools is not running and is
+  **destroyed by `apple-index forget`**. A ruling the user typed has to outlive
+  the index it is about. **`files.json` moved for the same reason in
+  26.827.0**, and a copy still at the old path is moved on sight the next time
+  `apple-index files` runs.
+- 🛑 **A mailing list is not a person, and the display name gives it away.**
+  `notifications@github.com` arrives under the name of whoever triggered it —
+  51 names, the commonest 23% of them. A real correspondent of twenty years
+  signs three ways and the commonest is 75%. So the test is *dominance*, not a
+  count of spellings, which put both in the same bucket. Only applied to an
+  address with no contact card; reported as `counts.bulk`.
+- ⚠️ **An edge is co-occurrence on one record**, and it is quadratic. One
+  calendar event here carries 97 attendees, which alone is 4,656 edges saying
+  nothing but "these people were on one invitation". Records with more than 12
+  people count toward each person's total and draw no edges.
+- 🛑 **THE UNIT IS A DAY.** The first version counted indexed records and
+  called the sum "encounters". Three things were wrong with it, and the number
+  it produced — 9,059 for a spouse — was the symptom:
+
+  1. **A record is a different size in every source.** One mail record is one
+     email; one messages record is a block of ten texts; one calendar record is
+     one event. Measured: 3,024 message blocks for one person held 30,395
+     actual texts.
+  2. **Being on the same list is not talking.** 3,118 of the 5,751 emails
+     naming her — 54% — were written by a third party to both of them. A school
+     newsletter to forty parents counted as an encounter with each one.
+  3. **A count of items rewards whoever writes in bursts.** Forty texts in one
+     evening is one conversation.
+
+  A day is the same unit in every source and cannot be inflated by volume.
+  Measured here: that spouse comes out at 2,321 days across twenty years, and a
+  committee colleague at 288. Both survive a sanity check; 9,059 did not.
+
+  Read `days`. `channels` carries item counts in each channel's own unit —
+  emails, texts, events, calls — and `channel_days` the same thing in days.
+  🛑 **Never add `channels` together.** `same_list` counts the mail a third
+  party sent you both, and is never in `days`. `alone` counts the items with
+  nobody else on them, per channel — 🛑 per channel for the same reason, since
+  a single `alone` figure came out at 17,201 for one person, which is texts
+  wearing a number that reads like emails.
+
+  **Verified against the raw store, not the index.** Reading the `To`/`Cc`/`From`
+  headers of all 41,225 `.emlx` files directly gives, for that spouse:
+
+  | | raw headers | `people` |
+  |---|---|---|
+  | messages carrying her address | 5,927 | — |
+  | one of us wrote to the other | 2,625 | 2,598 |
+  | a third party wrote to us both | 3,136 | 3,153 |
+  | just the two of us | 1,336 | 1,351 |
+
+  Within 1% on every line. ⚠️ **1,980 of the 5,927 are `Cc`**, which is what
+  made the first version's "6,000 emails together" both true and wrong. The
+  year curve is the other confirmation: direct mail peaks at 310 in 2011 and
+  falls to 42 by 2022, because the conversation moved to texting in 2012.
+  ⚠️ **An edge is still co-occurrence**, shared lists included. "Who turns up
+  alongside whom" and "who do I talk to" are different questions.
+- 🛑 **A DAY THAT HAS NOT HAPPENED IS NOT A DAY OF CONTACT.** The calendar
+  adapter fetches a **year ahead**: 1,008 of the 12,014 events here are in the
+  future, the furthest on 2027-08-25. A recurring swimming lesson therefore
+  gave its organiser contact every week until next August. Three things went
+  wrong at once and only the third was visible — the day count was inflated,
+  `last` read 2027, and the timeline's axis ran a year past today, squashing
+  twenty years of real history into less width than it had. Future records are
+  counted in `upcoming` instead, per person, because "you have something with
+  them next week" is true and worth keeping. It is just not contact.
+- **`directory` is everyone, and everyone carries a month series.** The window
+  draws a few dozen people; "who is this person" is a fair question about any
+  of them, and so is "show me both Meyers" — one of whom is in 300th place.
+  4,725 here against 80 drawn. 🛑 **One shared `months_axis`**, with each
+  person's series a list of `[position, days]` into it: repeating "2014-07"
+  nine thousand times is most of what a month series costs. The whole document
+  is 3.1 MB for 16,806 month rows. ⚠️ 3,849 more people are left out entirely:
+  they never exchanged anything with the user and appear only in somebody
+  else's `same_list`.
+
+Emoji come only from what the user **sent**: a `me:` line in a messages block,
+and a non-quoted line of mail from one of their own addresses. 🛑 Counting
+everything measures what other people type at *them* — 😂 at 200 becomes 😂 at
+1,499, and the two answers look alike.
+
+## Photos: who you were with, and where you have been
+
+The Photos library answers the two questions no other source here can, and it
+is read for those two things alone. Full measurements in
+[`../docs/apple-photos-store.md`](../docs/apple-photos-store.md).
+
+### The people
+
+Every other channel needs an address or a phone number, so it can only see
+somebody who **sends** things. Children do not send email.
+
+Measured against this exact ranking, before and after:
+
+| | days before | days after | rank before | rank after |
+|---|---|---|---|---|
+| the user's child | 18 | **1,394** | unranked | **3** |
+
+She is in 9,416 photographs across 1,378 days, three times more than anyone
+else in the library. Before photos she sat in the directory below **Merry
+Maids**, a cleaning service, at 57 days. Fifteen more people entered the
+directory who appear in no other source at all; every one is a child or close
+family.
+
+- 🛑 **The join is by Contacts id, not by name.** `ZPERSON.ZPERSONURI` holds
+  `UUID:ABPerson`. ⚠️ It survives a name change, which nothing else here does.
+- 🛑 **Emma is a dog.** `ZDETECTIONTYPE` separates people (1) from dogs (3) and
+  cats (4). Without the filter she ranks fourth by tagged days. `osxphotos`
+  does not expose this field.
+- ⚠️ **It measures who was PHOTOGRAPHED, not who was there.** The user appears
+  on 661 days and was present for all 1,378 of his daughter's.
+- 🛑 **A shared-library photo is not proof you were there.** Those days are
+  marked `alongside` and counted like a mailing list.
+
+⚠️ **OPEN QUESTION.** `days` is one unit for every channel, so somebody you
+email daily outranks somebody you are physically with. Whether "who you talk
+to" and "who you are with" are one ranking or two is not decided.
+
+### The places
+
+```
+./index.py places --limit 20
+```
+
+🛑 **TWO SOURCES, TWO UNITS, NEVER ADDED.** `maps` records an **arrival** with
+a start time. `photos` records that a camera was somewhere on a **day**. 98 of
+the 1,487 places here have both. Each row carries `visits` and `photo_days`
+side by side, and nothing sums them — the same correction `people` made once by
+adding emails to texts.
+
+Photos reaches back to 2005 and holds 27,603 located pictures; the Maps store
+holds 450 arrivals. ⚠️ Neither alone is "everywhere you have been".
+
+### What is not indexed
+
+The pictures, the OCR and Apple's scene labels. 36,341 photos carry **5,349
+characters** of title and description between them. The OCR covers 5.9% and
+the store keeps it as a bag of lowercased words with the order destroyed.
+
+Measured: `eval.py` scores **MRR 0.538** with photos in the index and **0.538**
+with every photo record deleted. The source costs nothing and gains nothing on
+those 34 cases, which is the honest result — they are questions about mail and
+notes.
 
 ## Geography
 

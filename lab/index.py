@@ -152,7 +152,19 @@ def require_index(path):
     """Explain a locked index instead of treating it as an empty one."""
     if os.path.exists(path):
         return
-    if os.path.exists(VAULT_IMAGE):
+    # 🛑 ONLY THE REAL INDEX CAN BE LOCKED. This fired on ANY path that did not
+    # exist yet, so once the app had built a vault every scratch database was
+    # reported as an encrypted index needing AppleTools to be opened — which
+    # broke `make bench`, whose whole design is a second database under
+    # `APPLE_INDEX_DB`, and any `--db` pointed somewhere new. A path the user
+    # named is a path to create, not a vault to unlock.
+    #
+    # ⚠️ BOTH DEFAULT PATHS, NOT JUST THE VAULT ONE. Testing `path == VAULT_DB`
+    # alone was wrong in the exact case this message exists for: when nothing
+    # is mounted, `DEFAULT_DB` resolves to the PLAIN path, so the real index
+    # asked about itself and was told to run `init` — which would build a
+    # second, empty index beside the encrypted one it could not see.
+    if path in (VAULT_DB, PLAIN_DB) and os.path.exists(VAULT_IMAGE):
         die("the index is locked. It lives in an encrypted image that only "
             "AppleTools.app mounts.\n"
             "  Open AppleTools, then try again.\n"
@@ -345,7 +357,7 @@ def tool_version():
 
 
 SOURCES = ["notes", "mail", "messages", "calendar", "contacts", "maps",
-           "reminders", "files"]
+           "photos", "reminders", "files"]
 
 # 🛑 ONE PLACE, because two places drift. `refresh` uses these, and so does the
 # app's scheduler, which reads them back through `index.py sources --json`
@@ -362,6 +374,7 @@ REFRESH_ARGS = {
     "calendar": ["--since", "3650"],
     "contacts": ["--limit", "100000"],
     "maps": [],
+    "photos": [],
     "reminders": [],
     "files": [],
 }
@@ -491,6 +504,20 @@ CREATE TABLE IF NOT EXISTS consent (
   how        TEXT NOT NULL          -- 'interactive' or '--accept-risk'
 );
 
+-- The `people` report, computed once and read back many times.
+--
+-- 🛑 IT IS DERIVED DATA, SO IT LIVES WITH THE INDEX. Reading every record with
+-- a person on it, then shelling out to Contacts and call history, costs about
+-- three seconds — cheap once a day and wrong to pay every time a window opens.
+-- Rebuilding the index correctly throws this away with it, which is what
+-- should happen: it is an answer about the index, not a setting the user
+-- typed. Their rulings live outside, in people.json, for the opposite reason.
+CREATE TABLE IF NOT EXISTS people_cache (
+  one         INTEGER PRIMARY KEY CHECK (one = 1),
+  computed_at REAL NOT NULL,
+  payload     TEXT NOT NULL
+);
+
 -- 🛑 A REAL SERIES, because `record.seen_at` is not one. That column moves
 -- when a record CHANGES, so a note edited today looks like a note indexed
 -- today and the curve flattens history into the present. This table is written
@@ -540,6 +567,12 @@ CREATE TABLE IF NOT EXISTS source_state (
 
 def connect(path, create=False):
     if not create and not os.path.exists(path):
+        # 🛑 THE LOCKED CASE FIRST, AND HERE RATHER THAN AT EACH CALL SITE.
+        # `require_index` was called by three commands out of nineteen, so
+        # `people` and `places` answered a locked index with "Run: ./index.py
+        # init" — an instruction that would build a second, empty index beside
+        # the encrypted one it could not see. Every command reaches `connect`.
+        require_index(path)
         die("no index at %s. Run: ./index.py init" % path)
     secure_db_path(path)
     db = sqlite3.connect(path)
@@ -971,6 +1004,128 @@ def ingest_maps(opts):
         }
 
 
+# --------------------------------------------------------------------------
+# photos — who you were with, and where you have been
+# --------------------------------------------------------------------------
+
+def ingest_photos(opts):
+    """Photo days and photo places, from the Photos library.
+
+    🛑 THIS SOURCE INDEXES NO PICTURES AND NO WORDS OUT OF THEM, and that is a
+    measurement rather than a limitation. This library holds 36,341 photos
+    carrying 5,349 characters of title and description between them — 0.15
+    characters per photo — and twelve distinct keywords, most of them a pet
+    photographer's watermark. Apple's own scene labels exist and are
+    synonym-inflated past the point of meaning: one photo carries "Laugh,
+    Laughed, Laughing, Laughter" and "Apparatus, Apparel, Art". Live Text OCR
+    covers 5.9% of photos and the store keeps it as a deduplicated bag of
+    lowercased words with the order destroyed, so a receipt is findable by
+    keyword and unreadable as a sentence. None of it would help a retrieval
+    index that already holds 239,000 real chunks. See
+    docs/apple-photos-store.md.
+
+    What this source is for is the two things no other source here can answer:
+    who the user was physically with, and everywhere they have been.
+
+    ⚠️ IT ANSWERS THE FIRST ONE BETTER THAN MAIL DOES, for the people mail
+    cannot see at all. Measured against the ranking this feeds: the user's
+    child is the most photographed person in the library by a factor of three,
+    1,378 days against the runner-up, and the text channels give her 18 days
+    and no rank — below a cleaning service. Children do not send email. Six of
+    the top twenty people here are absent from every other source.
+    """
+    import photos as photo_store
+    try:
+        places, days = photo_store.survey()
+    except photo_store.Unavailable as exc:
+        # ⚠️ Not fatal, and not silent. A machine with no Photos library, or a
+        # process without Full Disk Access, indexes every other source and says
+        # what it skipped.
+        sys.stderr.write("photos: %s\n" % exc)
+        return
+
+    # 🛑 THE UID CANNOT BE THE CLUSTER'S INDEX. Clusters are recomputed from
+    # scratch every run and their order moves as photos arrive, so an index
+    # would rename every place on any change and `--full` would delete the lot.
+    # A rounded coordinate is stable: 0.001 degrees is about 110 metres, well
+    # inside the 250 m radius that made the cluster, so a mean that shifts by a
+    # few metres keeps its name.
+    keys, taken = [], {}
+    for spot in places:
+        key = "%.3f,%.3f" % (spot["latitude"], spot["longitude"])
+        # ⚠️ Two clusters CAN round into one cell when they sit diagonally
+        # apart. Rare, and silently merging them would join two places; the
+        # suffix keeps them separate and the order is stable because `survey`
+        # sorts by days.
+        taken[key] = taken.get(key, 0) + 1
+        if taken[key] > 1:
+            key = "%s#%d" % (key, taken[key])
+        keys.append(key)
+
+    for spot, key in zip(places, keys):
+        name = spot.get("name") or ""
+        where = [name, spot.get("city"), spot.get("state"), spot.get("country")]
+        title = name or spot.get("city") or "%.4f, %.4f" % (
+            spot["latitude"], spot["longitude"])
+        yield {
+            "uid": "photos:place:%s" % key,
+            "tool": "photos", "kind": "place", "native_id": key,
+            "url": None,
+            "title": title,
+            "container": spot.get("country"),
+            "created": spot.get("first"),
+            "modified": None,
+            "occurred": spot.get("last"),
+            "latitude": spot["latitude"], "longitude": spot["longitude"],
+            "people": [],
+            "body": ", ".join(x for x in where if x),
+            "rev": rev_of(title, str(spot["photos"]), str(spot["days"])),
+        }
+
+    for entry in days:
+        at = entry["place"]
+        spot = places[at] if at is not None else None
+        key = keys[at] if at is not None else "-"
+        where = ""
+        if spot:
+            where = ", ".join(x for x in [spot.get("name"), spot.get("city"),
+                                          spot.get("country")] if x)
+        # 🛑 A PHOTO FROM SOMEBODY ELSE'S CAMERA IS NOT PROOF YOU WERE THERE.
+        # 7,460 assets here belong to the iCloud Shared Library rather than to
+        # this Mac's own library — other people's cameras pointed at the same
+        # families. Most of the time that is the best evidence there is, since
+        # it is the photo somebody else took OF the user. But a day whose every
+        # photo came from a shared camera may be a day the user was not at, so
+        # its people are marked `alongside` rather than `subject`, exactly as a
+        # mailing list is `same_list` rather than contact.
+        shared_only = entry["shared"] == entry["photos"]
+        role = "alongside" if shared_only else "subject"
+        # ⚠️ THE COUNT TRAVELS WITH THE PERSON, because a photo day holds a
+        # different number of pictures of each person in it and the channel's
+        # unit is one photo. Recomputing it in the report would mean opening
+        # the Photos store a second time.
+        people = [{"role": role, "name": who["name"],
+                   "handle": who["contact_id"] or ("photos:" + who["name"]),
+                   "photos": who["photos"]}
+                  for who in entry["people"].values()]
+        names = ", ".join(who["name"] for who in entry["people"].values())
+        yield {
+            "uid": "photos:day:%s:%s" % (entry["day"], key),
+            "tool": "photos", "kind": "day",
+            "native_id": entry["day"],
+            "url": None,
+            "title": where or entry["day"],
+            "container": (spot or {}).get("country"),
+            "created": None, "modified": None,
+            "occurred": entry["when"],
+            "latitude": (spot or {}).get("latitude"),
+            "longitude": (spot or {}).get("longitude"),
+            "people": people,
+            "body": "\n".join(x for x in [where, names] if x),
+            "rev": rev_of(entry["day"], key, str(entry["photos"]), names),
+        }
+
+
 def ingest_contacts(opts):
     store = store_revs_contacts()
     listing = apple("contacts", "list", "--limit", opts.limit or 100000)
@@ -1094,7 +1249,52 @@ def ingest_reminders(opts):
 # 🛑 ROOTS ARE CONFIGURED, NEVER GUESSED. A guessed path that happens to exist
 # on one machine is exactly the kind of thing that ships and then indexes
 # somebody's Downloads folder. `apple-index files add <path>` writes this.
-FILES_CONFIG = os.path.join(os.path.dirname(DEFAULT_DB), "files.json")
+#
+# 🛑 `_SUPPORT`, NOT `dirname(DEFAULT_DB)`. That path FOLLOWS THE VAULT: it is
+# `<support>/mnt` whenever the app has the encrypted image mounted. A folder
+# added from the app therefore landed inside the volume, disappeared the moment
+# the app quit, and `apple-index forget` destroyed it with the index. Same trap
+# `PEOPLE_CONFIG` records, and the same fix.
+#
+# ⚠️ An explicit `APPLE_INDEX_DB` still wins, because `lab/bench` relies on it
+# to keep its own configuration away from the real one.
+FILES_CONFIG = os.path.join(
+    os.path.dirname(os.path.expanduser(os.environ["APPLE_INDEX_DB"]))
+    if os.environ.get("APPLE_INDEX_DB") else _SUPPORT,
+    "files.json")
+
+# Where the vault-following version used to write. Read as a fallback, never
+# written, so an install that configured folders before this fix keeps them.
+FILES_CONFIG_LEGACY = os.path.join(os.path.dirname(DEFAULT_DB), "files.json")
+
+
+def read_files_config():
+    """The configuration, from the current path or the one it used to use."""
+    # 🛑 DE-DUPLICATE, DO NOT SKIP. An earlier version dropped the legacy path
+    # when it equalled the current one — and the condition matched the FIRST
+    # entry too, so whenever the vault was unmounted the two paths coincided
+    # and NOTHING was read. Every configured folder read as "you have none".
+    seen = set()
+    for path in (FILES_CONFIG, FILES_CONFIG_LEGACY):
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            with open(path) as handle:
+                config = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if isinstance(config, dict):
+            return config
+    return {"roots": []}
+
+
+def write_files_config(config):
+    """Write it, always to the path that survives the vault unmounting."""
+    os.makedirs(os.path.dirname(FILES_CONFIG), mode=0o700, exist_ok=True)
+    with open(FILES_CONFIG, "w") as handle:
+        json.dump(config, handle, indent=2)
+    os.chmod(FILES_CONFIG, 0o600)
 
 # ⚠️ Directories that are never content. `Attachments` and an images folder can
 # be hundreds of megabytes of binaries next to five megabytes of text — on this
@@ -1112,11 +1312,7 @@ FILE_MAX_BYTES = 2 * 1024 * 1024
 
 def files_roots():
     """The configured roots, each {path, name, exclude}."""
-    try:
-        with open(FILES_CONFIG) as handle:
-            config = json.load(handle)
-    except (OSError, ValueError):
-        return []
+    config = read_files_config()
     roots = []
     for entry in config.get("roots", []):
         path = os.path.expanduser(entry.get("path", ""))
@@ -1299,6 +1495,7 @@ ADAPTERS = {
     "calendar": ingest_calendar,
     "contacts": ingest_contacts,
     "maps": ingest_maps,
+    "photos": ingest_photos,
     "reminders": ingest_reminders,
     "files": ingest_files,
 }
@@ -2907,27 +3104,46 @@ def cmd_files(opts):
     🛑 Roots are configured, never guessed. A guessed path that happens to
     exist on one machine is how a tool ends up indexing somebody's Downloads.
     """
-    try:
-        with open(FILES_CONFIG) as handle:
-            config = json.load(handle)
-    except (OSError, ValueError):
-        config = {"roots": []}
+    config = read_files_config()
     roots = config.setdefault("roots", [])
+    # ⚠️ MOVE IT ON SIGHT, BUT NEVER FROM `--json`. A configuration still at
+    # the vault-following path is one `apple-index forget` away from being
+    # deleted with the index, so the human-facing listing copies it out rather
+    # than waiting for an edit. `--json` is what the app polls on every window
+    # open, and Rule 2 of CLAUDE.md is that a read does not write.
+    if roots and not getattr(opts, "json", False) \
+            and not os.path.exists(FILES_CONFIG):
+        write_files_config(config)
+
+    def described(root):
+        path = os.path.expanduser(root.get("path", ""))
+        return {
+            "path": path,
+            "name": root.get("name") or os.path.basename(path.rstrip("/")),
+            "exclude": root.get("exclude") or [],
+            "kind": "obsidian" if is_obsidian_vault(path) else "folder",
+            "present": os.path.isdir(path),
+        }
 
     if opts.action == "add":
         path = os.path.realpath(os.path.expanduser(opts.path))
         if not os.path.isdir(path):
             die("not a directory: %s" % path)
         if any(os.path.realpath(os.path.expanduser(r["path"])) == path for r in roots):
-            print("already indexed: %s" % path)
+            if getattr(opts, "json", False):
+                print(json.dumps({"added": False, "already": True, "path": path}))
+            else:
+                print("already indexed: %s" % path)
             return
         name = opts.name or os.path.basename(path.rstrip("/"))
         roots.append({"path": path, "name": name,
                       "exclude": opts.exclude.split(",") if opts.exclude else []})
-        with open(FILES_CONFIG, "w") as handle:
-            json.dump(config, handle, indent=2)
-        os.chmod(FILES_CONFIG, 0o600)
+        write_files_config(config)
         kind = "Obsidian vault" if is_obsidian_vault(path) else "folder"
+        if getattr(opts, "json", False):
+            print(json.dumps({"added": True, "path": path, "name": name,
+                              "kind": kind}))
+            return
         print("added %s as '%s' (%s)" % (path, name, kind))
         print("index it with:  apple-index ingest --source files")
         return
@@ -2939,26 +3155,32 @@ def cmd_files(opts):
         if len(kept) == len(roots):
             die("not a configured root: %s" % path)
         config["roots"] = kept
-        with open(FILES_CONFIG, "w") as handle:
-            json.dump(config, handle, indent=2)
+        write_files_config(config)
         # ⚠️ Removing a root does NOT remove its records. Say so, and say how.
+        if getattr(opts, "json", False):
+            print(json.dumps({"removed": True, "path": path,
+                              "records_remain": True}))
+            return
         print("removed %s from the config." % path)
         print("Its indexed records stay until you run:")
         print("  apple-index ingest --source files --full")
         return
 
+    if getattr(opts, "json", False):
+        print(json.dumps({"config": FILES_CONFIG,
+                          "roots": [described(r) for r in roots]}, indent=2))
+        return
     if not roots:
         print("no folders indexed. Add one:")
         print("  apple-index files add ~/path/to/vault")
         return
     for root in roots:
-        path = os.path.expanduser(root["path"])
-        kind = "obsidian" if is_obsidian_vault(path) else "folder"
+        one = described(root)
         # ⚠️ A ternary, not `cond and "" or X`. An empty string is falsy, so the
         # and/or form returns X for BOTH branches — it reported every present
         # folder as MISSING.
-        here = "" if os.path.isdir(path) else "  🛑 MISSING"
-        print("%-10s %-9s %s%s" % (root.get("name", "?"), kind, path, here))
+        here = "" if one["present"] else "  🛑 MISSING"
+        print("%-10s %-9s %s%s" % (one["name"], one["kind"], one["path"], here))
 
 
 def cmd_sources(opts):
@@ -3049,6 +3271,182 @@ def backfill_history(db):
     return written
 
 
+def top_level_containers(parts, limit=None):
+    """Fold a source's containers to their first path segment.
+
+    🛑 ONLY `files` NEEDS THIS, and that is why it is not applied to every
+    source. Every other adapter files a record under one flat name — an
+    account, a mailbox, a calendar, a list. A file is filed under its whole
+    relative folder, so this vault produced 49 rows, most of them a subfolder
+    of another row, ordered by size. That answers "which folder is biggest",
+    which is not the question anyone has. ⚠️ Folding mail the same way would
+    throw away the mailbox and leave the account, and the mailbox is the half
+    that says what is indexed.
+
+    🛑 THE LIMIT APPLIES AFTER THE FOLD. Cutting the largest paths first and
+    folding what survives reports a top-level folder short by everything past
+    the cut — a wrong number, where a missing row is only a missing row.
+
+    ⚠️ TWO ROOTS WITH A FOLDER OF THE SAME NAME MERGE HERE. They already did
+    before this: a file at the root of a root is filed under the ROOT's name,
+    which collides with a top-level folder of that name in another root.
+    """
+    folded = {}
+    for part in parts:
+        name = part["name"]
+        # A container that is not a path — "(none)", a calendar name — is left
+        # exactly as the caller wrote it.
+        head = name.lstrip("/").split("/", 1)[0] or name
+        entry = folded.setdefault(head, {"name": head, "records": 0,
+                                         "chunks": 0})
+        entry["records"] += part["records"]
+        entry["chunks"] += part["chunks"]
+    # ⚠️ Ties break on the name. Ordered by size alone, two folders of equal
+    # size swap places between refreshes, which reads as data changing.
+    out = sorted(folded.values(), key=lambda p: (-p["records"], p["name"]))
+    return out[:limit] if limit else out
+
+
+def cmd_places(opts):
+    """Everywhere the user has been, from the two sources that know.
+
+    🛑 TWO SOURCES, TWO UNITS, NEVER ADDED. `maps` records a genuine ARRIVAL,
+    with a start time, from Maps' Visited Places. `photos` records that a
+    camera was somewhere on some DAY. They measure different things, and the
+    same place usually has both. Summing them would produce a number that means
+    nothing — the same mistake the `people` report made once by adding emails
+    to texts, and it is worse here because the two sources overlap.
+
+    So a row that both sources know carries `visits` and `photo_days` side by
+    side, each named after what it counts, and the caller picks one.
+
+    ⚠️ NEITHER IS "WHERE YOU HAVE BEEN". Maps keeps 450 arrivals here; the
+    photo library holds 27,603 located pictures over twenty-one years. Photos
+    reaches back much further and misses everywhere the user did not take a
+    picture. Maps sees only where Maps was running. Say which one an answer
+    came from.
+
+    ⚠️ THIS IS NOT Significant Locations, which belongs to `routined` under
+    /var/db/locationd/ and no unprivileged process can read.
+    """
+    db = connect(opts.db)
+    rows = list(db.execute(
+        "SELECT tool, title, container, body, latitude, longitude, "
+        "       created, occurred "
+        "  FROM record "
+        " WHERE kind = 'place' AND latitude IS NOT NULL "
+        "   AND tool IN ('photos', 'maps')"))
+
+    # A photo place already carries a day count; a maps place carries visits.
+    # Neither is stored on the record, so both are counted back off the days
+    # and visits that reference them.
+    photo_days = {}
+    for row in db.execute(
+            "SELECT latitude, longitude, occurred FROM record "
+            " WHERE tool = 'photos' AND kind = 'day' AND latitude IS NOT NULL"):
+        key = "%.3f,%.3f" % (row["latitude"], row["longitude"])
+        photo_days[key] = photo_days.get(key, 0) + 1
+    visits = {}
+    for row in db.execute(
+            "SELECT latitude, longitude FROM record "
+            " WHERE tool = 'maps' AND kind = 'visit' AND latitude IS NOT NULL"):
+        key = "%.3f,%.3f" % (row["latitude"], row["longitude"])
+        visits[key] = visits.get(key, 0) + 1
+
+    places = []
+    for row in rows:
+        key = "%.3f,%.3f" % (row["latitude"], row["longitude"])
+        lines = (row["body"] or "").split("\n")
+        places.append({
+            "name": row["title"],
+            "where": lines[0] if lines else "",
+            # 🛑 `container` MEANS A DIFFERENT THING IN EACH ADAPTER, and
+            # reading it as a country for both put "Dining", "Transportation"
+            # and "Travel Accommodation" in the country list — 65 countries
+            # where the honest answer is 8. `maps` puts the place CATEGORY
+            # there; only `photos` puts a country. A maps-only place has no
+            # country here, and inventing one would be worse than saying so.
+            "country": row["container"] if row["tool"] == "photos" else None,
+            "latitude": row["latitude"], "longitude": row["longitude"],
+            "sources": [row["tool"]],
+            "photo_days": photo_days.get(key, 0) if row["tool"] == "photos" else 0,
+            "visits": visits.get(key, 0) if row["tool"] == "maps" else 0,
+            "first": row["created"], "last": row["occurred"],
+        })
+
+    # 🛑 ONE DOT PER PLACE. Without this the map drew a Maps pin and a photo
+    # pin a few metres apart for every place the user both went to and
+    # photographed, which reads as two places and inflates every count on
+    # screen. The threshold is the same 250 m the clusters were built with.
+    # ⚠️ `max`, NEVER `+`. A visit and a photo day are different units and must
+    # not be added — this ordering exists only to decide which row anchors a
+    # merge and which name survives, and it is not a measurement of anything.
+    def weight(spot):
+        return max(spot["photo_days"], spot["visits"])
+
+    merged = []
+    for spot in sorted(places, key=lambda s: -weight(s)):
+        for kept in merged:
+            if photos_metres(spot, kept) <= 250.0:
+                kept["photo_days"] += spot["photo_days"]
+                kept["visits"] += spot["visits"]
+                for tool in spot["sources"]:
+                    if tool not in kept["sources"]:
+                        kept["sources"].append(tool)
+                # 🛑 THE ANCHOR KEEPS ITS NAME. An earlier version preferred
+                # the Maps name here, on the theory that Apple's directory
+                # names a place better than a reverse-geocoded street number.
+                # It renamed this user's HOME — 1,647 photo days, the largest
+                # place in the library — after a charity's office 180 m away
+                # with two recorded visits, because that office is what Maps
+                # had a name for. A place is named by whichever source actually
+                # knows it, and the loop below sorts that source first.
+                if not kept["country"] and spot["country"]:
+                    kept["country"] = spot["country"]
+                if spot["first"]:
+                    kept["first"] = min(kept["first"] or spot["first"],
+                                        spot["first"])
+                if spot["last"]:
+                    kept["last"] = max(kept["last"] or spot["last"], spot["last"])
+                break
+        else:
+            merged.append(spot)
+
+    countries = {}
+    for spot in merged:
+        if spot["country"]:
+            countries[spot["country"]] = countries.get(spot["country"], 0) + 1
+    dated = [s["last"] for s in merged if s["last"]]
+    report = {
+        "generated": time.time(),
+        "counts": {
+            "places": len(merged),
+            "countries": len(countries),
+            "from_photos": sum(1 for s in merged if "photos" in s["sources"]),
+            "from_maps": sum(1 for s in merged if "maps" in s["sources"]),
+            "both": sum(1 for s in merged if len(s["sources"]) > 1),
+        },
+        "span": {"first": min((s["first"] for s in merged if s["first"]),
+                              default=None),
+                 "last": max(dated, default=None)},
+        "countries": sorted(({"name": n, "places": k}
+                             for n, k in countries.items()),
+                            key=lambda c: -c["places"]),
+        "places": sorted(merged, key=lambda s: -weight(s))[
+            :(opts.limit or 4000)],
+    }
+    print(json.dumps(report, indent=2))
+
+
+def photos_metres(a, b):
+    """Distance between two place rows, in metres."""
+    import math
+    lat = math.radians((a["latitude"] + b["latitude"]) / 2.0)
+    dx = math.radians(b["longitude"] - a["longitude"]) * math.cos(lat)
+    dy = math.radians(b["latitude"] - a["latitude"])
+    return 6371000.0 * math.hypot(dx, dy)
+
+
 def cmd_stats(opts):
     """Everything the app's window needs, in one call.
 
@@ -3065,6 +3463,11 @@ def cmd_stats(opts):
             GROUP BY r.tool ORDER BY r.tool"""):
         # ⚠️ The container is the account, mailbox, list, calendar or folder.
         # It is what makes "what am I indexing" answerable rather than a total.
+        # 🛑 NO SQL LIMIT FOR `files`. Its containers are folded to their top
+        # level below, and folding a truncated list reports a folder short by
+        # whatever fell past the cut. One row per distinct folder is a bounded
+        # read either way.
+        folds = row["tool"] == "files"
         parts = [{"name": p["container"] or "(none)",
                   "records": p["records"], "chunks": p["chunks"]}
                  for p in db.execute("""
@@ -3072,7 +3475,10 @@ def cmd_stats(opts):
                    COUNT(DISTINCT r.rid) records, COUNT(c.cid) chunks
             FROM record r LEFT JOIN chunk c ON c.rid = r.rid
             WHERE r.tool = ? GROUP BY r.container
-            ORDER BY records DESC LIMIT 60""", (row["tool"],))]
+            ORDER BY records DESC""" + ("" if folds else " LIMIT 60"),
+            (row["tool"],))]
+        if folds:
+            parts = top_level_containers(parts, 60)
         state = db.execute("SELECT updated FROM source_state WHERE tool = ?",
                            (row["tool"],)).fetchone()
         sources.append({"tool": row["tool"], "records": row["records"],
@@ -3102,6 +3508,1422 @@ def cmd_stats(opts):
         "history": history,
         "retention_days": LOG_RETENTION_DAYS,
     }, indent=2))
+
+
+# --------------------------------------------------------------------------
+# who you talk to
+# --------------------------------------------------------------------------
+#
+# `people` answers three questions the rest of the index cannot: who is in
+# this data, who is in it TOGETHER, and when was each of them around. Every
+# number here comes from records already indexed, plus two cheap subprocesses:
+# Contacts, to turn a handle into a name, and call history, which is not an
+# indexed source.
+#
+# ⚠️ It is not a diagnostic. Nothing in the window depends on it, and a
+# failure here must never make the index look broken.
+
+# A wide class of characters that MAY start an emoji. The presentation test
+# below is what decides, not this class — matching widely and then filtering
+# is what keeps `✓` and `♦` out of a list of favourite emoji. Both appear
+# hundreds of times in mail signatures and newsletters, and both looked like
+# top emoji until the filter existed.
+_EMOJI_WIDE = ("\U0001F000-\U0001FAFF"
+               "←-⇿⌀-⏿■-➿⬀-⯿"
+               "©®™〰〽㊗㊙#*0-9")
+_EMOJI_ELEMENT = "[%s](?:[\U0001F3FB-\U0001F3FF])?(?:️)?(?:⃣)?" % _EMOJI_WIDE
+# 🛑 A FLAG IS TWO CODEPOINTS AND NOTHING JOINS THEM. Regional indicators carry
+# no ZWJ and no variation selector, so the general rule below splits 🇺🇸 into
+# two letters. It has to be matched first, on its own.
+_EMOJI_FLAG = "[\U0001F1E6-\U0001F1FF]{2}"
+EMOJI_RE = re.compile("(?:%s)|(?:%s)(?:‍(?:%s))*"
+                      % (_EMOJI_FLAG, _EMOJI_ELEMENT, _EMOJI_ELEMENT))
+
+# Emoji_Presentation: what renders as an emoji with no U+FE0F after it.
+# Anything outside this set counts only when it carries one.
+_EMOJI_PRESENT = re.compile(
+    "[\U0001F300-\U0001FAFF\U0001F000-\U0001F02F\U0001F0A0-\U0001F0FF"
+    "\U0001F100-\U0001F1FF"
+    "⌚⌛⏩-⏬⏰⏳◽◾☔☕"
+    "♈-♓♿⚓⚡⚪⚫⚽⚾⛄⛅"
+    "⛎⛔⛪⛲⛳⛵⛺⛽✅✊✋"
+    "✨❌❎❓-❕❗➕-➗➰➿"
+    "⬛⬜⭐⭕]")
+
+
+def emoji_in(text):
+    """Every emoji in one string, as whole clusters.
+
+    ⚠️ CLUSTERS, not codepoints. 👨‍👩‍👧‍👦 is one emoji and four people; 👍🏽 is one
+    emoji and two codepoints. Counting codepoints reports a family as four
+    separate faces and a skin tone as its own entry.
+    """
+    found = []
+    for match in EMOJI_RE.finditer(text):
+        cluster = match.group(0)
+        if "️" in cluster or "‍" in cluster or _EMOJI_PRESENT.match(cluster):
+            found.append(cluster)
+    return found
+
+
+_ANGLE_ADDRESS = re.compile(r"<([^>]+)>")
+
+
+def split_handle(raw):
+    """`"Ada <ada@x.com>"` to `("Ada", "ada@x.com")`.
+
+    ⚠️ MAIL SPELLS ONE PERSON TWO WAYS. An author arrives as a display name
+    with the address in angle brackets, a recipient as the bare address. Left
+    unsplit, one person becomes two rows and neither carries their real count.
+    """
+    raw = (raw or "").strip()
+    match = _ANGLE_ADDRESS.search(raw)
+    if match:
+        return raw[:match.start()].strip().strip('"'), match.group(1).strip().lower()
+    return "", raw.strip('"').lower()
+
+
+def phone_key(raw):
+    """The last ten digits of a phone number, or a short code as it stands."""
+    digits = re.sub(r"\D", "", raw or "")
+    if not digits:
+        return ""
+    return digits[-10:] if len(digits) > 10 else digits
+
+
+def handle_key(raw):
+    """A stable key for one handle, plus whatever name came with it.
+
+    ⚠️ A PHONE NUMBER IS NOT NORMALISED IN ANY STORE HERE. `chat.db` keeps
+    `+13035550123` and Contacts keeps `(303) 555-0123`. Comparing the strings
+    matches nothing, so both go through the digits.
+    """
+    # 🛑 TESTED BEFORE `split_handle`, WHICH LOWERCASES. A Contacts id is a
+    # UUID, and `apple contacts get` will not take a lower-cased one. Checked
+    # after the split, `…-F074D8875BBE:ABPerson` arrived as `…:abperson`, fell
+    # through to the phone branch, and `phone_key` reduced the UUID's digits to
+    # a ten-digit "number": 5940748875. That is not a near miss — it is a
+    # plausible-looking phone key, so the person merged into whoever really
+    # owns that number rather than failing loudly. One real contact was folded
+    # into a stranger's row that way.
+    raw = (raw or "").strip()
+    if raw.endswith(":ABPerson"):
+        return raw, ""
+    # ⚠️ A face Photos names but Contacts does not know keeps a name-derived
+    # key, because there is no card to fold it onto. The case is kept: this is
+    # the only name that person will ever be shown under.
+    if raw.startswith("photos:"):
+        return raw, raw[len("photos:"):]
+    name, handle = split_handle(raw)
+    # ⚠️ A percent-encoded display name reaches the index as written.
+    # "Matt%20%26%20Jennifer" is one real couple, and it is what the window
+    # would have shown.
+    if "%" in name:
+        name = urllib.parse.unquote(name)
+    if not handle:
+        return "", ""
+    if "@" in handle:
+        return handle, name
+    digits = phone_key(handle)
+    if digits:
+        return digits, name
+    # 🛑 Neither an address nor a number is not a handle. `To:` headers carry
+    # "undisclosed-recipients:;", which otherwise becomes a person you have
+    # written to 200 times.
+    return "", ""
+
+
+def contact_identities():
+    """Every email and phone this Mac knows, mapped to one contact.
+
+    ⚠️ FIRST CARD WINS. Two cards can claim one address — a duplicate, or a
+    shared family address — and picking either is better than splitting the
+    person in two.
+    """
+    rows = apple("contacts", "list", "--limit", 100000, allow_fail=True) or []
+    identities, aliases, companies, parts = {}, {}, set(), {}
+    for row in rows:
+        cid = row.get("id")
+        name = (row.get("name") or "").strip()
+        if not cid or not name or name == "<unnamed>":
+            continue
+        if is_company_card(row):
+            companies.add(cid)
+        aliases[cid] = card_names(row)
+        parts[cid] = ((row.get("first_name") or "").strip().lower(),
+                      (row.get("last_name") or "").strip().lower())
+        # 🛑 THE CARD'S OWN ID IS AN IDENTITY. `photos` hands over
+        # `UUID:ABPerson` and nothing else, so without this line a tagged face
+        # became a stranger with `known: false` and never merged with the same
+        # person's mail.
+        identities.setdefault(cid, (cid, name))
+        for entry in row.get("emails") or []:
+            key = (entry.get("address") or "").strip().lower()
+            if key:
+                identities.setdefault(key, (cid, name))
+        for entry in row.get("phones") or []:
+            key = phone_key(entry.get("number"))
+            if key:
+                identities.setdefault(key, (cid, name))
+    return identities, aliases, companies, parts
+
+
+def is_company_card(row):
+    """Is this card a business rather than a person?
+
+    Contacts.app has a "Company" checkbox on every card, and it is the only
+    reliable answer: a company card carries emails, phones and an address
+    exactly like anyone else. 71 of the 694 cards here have it set, including
+    every one the user named — PayPal, Venmo, Chase, United Airlines.
+
+    ⚠️ THE CHECKBOX IS OFTEN LEFT OFF. A card with an organisation name and no
+    personal name is a business whatever the checkbox says. Measured: 2 more
+    here, State Farm and an elementary school, and **none** of the cards that
+    rule catches carries a first name or a nickname — so it cannot take a
+    person with it.
+    """
+    if row.get("is_company"):
+        return True
+    return bool(row.get("company")) and not (row.get("first_name")
+                                             or row.get("last_name"))
+
+
+def card_names(row):
+    """Every name one card answers to.
+
+    🛑 A PERSON WHO CHANGED THEIR NAME IS TWO PEOPLE IN THIS DATA, and no
+    amount of address matching finds them. Measured here: one card reads
+    "Stephanie Hopkins" and holds six handles; an old address signing itself
+    "Steph Anderson" carried 568 more encounters from 2006 to 2012, under its
+    own row, ending exactly where the other begins.
+
+    The name they used before is `previous_family_name`, which Contacts.app
+    labels "Maiden Name". The neutral word is the right one here: the same
+    field carries a name changed by a second marriage, a divorce, an adoption
+    or a deed poll.
+
+    ⚠️ THE PREVIOUS FAMILY NAME ALONE IS NOT THE NAME THAT ARRIVES. Mail
+    signed itself "Steph Anderson" — the NICKNAME and the previous family
+    name — so both halves have to be crossed. Four names come off a card:
+    given+family, given+previous, nickname+family, nickname+previous.
+
+    ⚠️ It is only ever a claim. `merge_by_name` still refuses a name that two
+    cards both answer to.
+    """
+    first = (row.get("first_name") or "").strip()
+    nick = (row.get("nickname") or "").strip()
+    last = (row.get("last_name") or "").strip()
+    previous = (row.get("previous_family_name") or "").strip()
+    names = {(row.get("name") or "").strip()}
+    for given in (first, nick):
+        for family in (last, previous):
+            if given and family:
+                names.add("%s %s" % (given, family))
+    return {n for n in names if n}
+
+
+def my_handles(db, identities, card_parts, overrides):
+    """Every handle that is the user, and how each one was decided.
+
+    🛑 A SHARE-OF-RECIPIENTS THRESHOLD ALONE IS WRONG, and the numbers say so.
+    Measured on this store: the user's own gmail address is on 54.2% of mail,
+    but a spouse is on 24.0% of calendar events and a colleague on 23.0%. Any
+    threshold low enough to be useful across sources sweeps both of them in,
+    and a person counted as the user vanishes from their own social graph.
+
+    So the accounts are read from Mail, which is certain, and exactly one more
+    address may be inferred: the top recipient that no account already claims,
+    and only when it is on 30% of mail AND at least three times the runner-up.
+    Here that is 54.2% against 10.3%, and it names the one address Mail cannot
+    know about. Everything inferred is reported, so a wrong guess is visible
+    rather than silent.
+    """
+    known, detected = {"me"}, []
+    # 🛑 THE USER'S OWN ANSWER FIRST, before anything is inferred from it. An
+    # address they have said is theirs is theirs, and it may be the only clue
+    # that a whole domain or a service endpoint belongs to them.
+    known |= {h for h, kind in overrides.items() if kind == "me"}
+    # ⚠️ `--json`, because `apple mail accounts` prints a human table by
+    # default. Without it the parse fails, `allow_fail` returns nothing, and
+    # every account address quietly stops counting as the user — which put the
+    # user second in their own list of people.
+    for account in apple("mail", "accounts", "--json", allow_fail=True) or []:
+        for address in account.get("addresses") or []:
+            known.add(address.strip().lower())
+        if account.get("email"):
+            known.add(account["email"].strip().lower())
+
+    counts, records = {}, 0
+    for row in db.execute("SELECT people FROM record WHERE tool = 'mail' "
+                          "AND people NOT IN ('', '[]')"):
+        records += 1
+        seen = set()
+        for person in json.loads(row["people"]):
+            if person.get("role") != "recipient":
+                continue
+            key, _ = handle_key(person.get("handle"))
+            if key and key not in known:
+                seen.add(key)
+        for key in seen:
+            counts[key] = counts.get(key, 0) + 1
+
+    if records:
+        ranked = sorted(counts.items(), key=lambda kv: -kv[1])[:2]
+        if ranked and ranked[0][1] >= 0.30 * records and (
+                len(ranked) < 2 or ranked[0][1] >= 3 * ranked[1][1]):
+            detected.append(ranked[0][0])
+            known.add(ranked[0][0])
+
+    # 🛑 THE USER'S OWN CARD FINISHES THE JOB. Mail knows the three accounts
+    # that still collect mail; the card knows every address the user has ever
+    # had. Measured here: one card carries 14 handles — old employers, a
+    # university address, two dead photo services — and every one of them
+    # counted as somebody else. The user ranked as his own second-closest
+    # correspondent, with 789 encounters, under his own name.
+    #
+    # ⚠️ A CARD IS CLAIMED BY ONE MATCH, not by its name. Names repeat inside a
+    # family; an address does not.
+    cards, named = {}, {}
+    for handle, (cid, name) in identities.items():
+        cards.setdefault(cid, set()).add(handle)
+        named[cid] = name
+    my_names, my_parts = set(), set()
+    for cid, handles in cards.items():
+        if handles & known:
+            known |= handles
+            my_names.add(named.get(cid, ""))
+            given, family = card_parts.get(cid, ("", ""))
+            if given and family:
+                my_parts.add((given, family))
+
+    # 🛑 THE USER'S OWN FACE ARRIVES ON A CARD WITH NOTHING TO MATCH ON. Photos
+    # links a tagged face to a contact by id, and the card it links this user's
+    # own face to is a bare local one: the right name, no email, no phone. So
+    # no handle rule above can ever claim it, and the user was drawn SIXTH in
+    # his own list of people, with 3,005 photographs of himself.
+    #
+    # ⚠️ Photos itself cannot settle this. `ZPERSON.ZISMECONFIDENCE` exists and
+    # is empty on every row of this library, so there is no "me" flag to read.
+    #
+    # ⚠️ A NAME MATCH, WHICH IS THE RISKY KIND, so it is fenced twice. The card
+    # must answer to a name one of the user's real cards already answers to,
+    # AND it must carry no address and no number of its own — a relative who
+    # shares a name almost always has one. Every card taken this way is
+    # reported in `me.by_card`, never absorbed silently, because a person who
+    # has quietly become "the user" is exactly what nobody would notice.
+    wanted_names = {re.sub(r"[^a-z0-9]+", " ", n.lower()).strip()
+                    for n in my_names}
+    by_card = []
+    for cid, handles in cards.items():
+        if cid in known or handles & known:
+            continue
+        # ⚠️ THE SAME STEM RULE `is_me_by_name` USES, and it has to be. The
+        # user's real card reads "Dan Hopkins"; the card Photos tagged his face
+        # against reads "Daniel Hopkins". An exact-name test matched neither.
+        if not is_me_by_name(named.get(cid, ""), wanted_names, my_parts):
+            continue
+        if any(h != cid for h in handles):
+            continue
+        known |= handles
+        by_card.append(cid)
+    return known, detected, {n for n in my_names if n}, my_parts, by_card
+
+
+def merge_by_name(people, aliases):
+    """Fold an unnamed-by-Contacts address into the card that shares its name.
+
+    🛑 ONE PERSON, TWO CIRCLES. A twenty-year correspondent writes from an old
+    address that no card claims and a new one that does, and the graph drew
+    "Cat Cantor" twice, side by side, with the encounters split between them.
+
+    ⚠️ The name has to match a card EXACTLY, ignoring case and punctuation, and
+    exactly ONE card may claim it. Two people really can share a name, and
+    merging the wrong pair is worse than drawing two circles.
+
+    Returns the old-id to new-id map, so the caller can repoint the edges.
+    """
+    def norm(value):
+        """A name, comparable however it is written.
+
+        🛑 THE WORDS ARE SORTED, because a directory writes a name backwards.
+        "Leopold, Robin" and "Robin Leopold" are one person with two addresses,
+        and so are "Lee, Ming-Ming" and "Ming-Ming Lee" — 208 such pairs on this
+        store. Comparing the strings in order matches none of them.
+
+        ⚠️ SAFE ONLY BECAUSE A CARD MUST CLAIM THE NAME. Seven different
+        companies here sign themselves "Support"; sorting words makes all seven
+        agree, and not one of them has a contact card, so nothing merges. The
+        card requirement below is what carries this, not the normalisation.
+        """
+        return " ".join(sorted(
+            re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).split()))
+
+    # ⚠️ A SET OF IDS, not a list. One card claims up to four names and two of
+    # them can normalise to the same string, which appended the same id twice
+    # and made the card look like two cards fighting over one name — blocking
+    # exactly the merge this exists to allow.
+    cards = {}
+    for entry in people.values():
+        if not entry["known"]:
+            continue
+        # Every name the card answers to, not only the one it displays.
+        for claim in aliases.get(entry["id"], set()) | {entry["name"]}:
+            cards.setdefault(norm(claim), set()).add(entry["id"])
+
+    moved = {}
+    for entry in list(people.values()):
+        if entry["known"]:
+            continue
+        claimed = cards.get(norm(entry["name"]), set())
+        if len(claimed) != 1:
+            continue
+        target = people[next(iter(claimed))]
+        moved[entry["id"]] = target["id"]
+        absorb(target, entry)
+        del people[entry["id"]]
+    return moved
+
+
+def merge_namesakes(people):
+    """Fold together addresses with no card that share a full name.
+
+    🛑 ONE PERSON, FIVE ADDRESSES. Work, personal, a role address at the same
+    charity, and the one at the employer they left. `John Giffin` appears five
+    times here, `Xin Zheng` three, `Staci Ruddy` three — and none of them has a
+    contact card, so `merge_by_name` cannot help: it needs a card to fold into.
+    Measured: 154 such groups covering 379 rows, and **every one of the
+    fourteen largest is plainly the same person**.
+
+    ⚠️ TWO WORDS AT LEAST, and that is the whole guard. Seven different
+    companies here sign themselves "Support"; a single word is not a name.
+
+    ⚠️ IT CAN STILL BE WRONG. Two strangers who share a full name and have no
+    cards get folded together. Nothing on this store does, and the cost of the
+    alternative — one person drawn five times — is paid on every screen. The
+    fix for a bad one is a contact card, which beats this.
+    """
+    def norm(value):
+        return " ".join(sorted(
+            re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).split()))
+
+    groups = {}
+    for entry in people.values():
+        if entry["known"]:
+            continue
+        name = norm(entry["name"])
+        if len(name.split()) < 2:
+            continue
+        groups.setdefault(name, []).append(entry)
+
+    moved = {}
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        # The busiest keeps its id, so anything already pointing at that
+        # person stays valid.
+        members.sort(key=lambda e: -len(e["days"]))
+        target = members[0]
+        for entry in members[1:]:
+            moved[entry["id"]] = target["id"]
+            absorb(target, entry)
+            del people[entry["id"]]
+    return moved
+
+
+def absorb(target, entry):
+    """Fold one person's record into another's."""
+    target["handles"] |= entry["handles"]
+    target["same_list"] += entry["same_list"]
+    for channel, count in entry["alone"].items():
+        target["alone"][channel] = target["alone"].get(channel, 0) + count
+    target["upcoming"] += entry["upcoming"]
+    for field in ("mail_from", "mail_to", "mail_bulk", "mail_seen"):
+        target[field] += entry[field]
+    target["rids"] = (target["rids"] + entry["rids"])[:80]
+    # ⚠️ A UNION, NOT A SUM. Both rows can hold the same day — the day a
+    # name change was announced is exactly such a day — and adding the
+    # counts would report it twice.
+    target["days"] |= entry["days"]
+    for channel, days in entry["channel_days"].items():
+        target["channel_days"].setdefault(channel, set()).update(days)
+    for channel, count in entry["channels"].items():
+        target["channels"][channel] = target["channels"].get(channel, 0) + count
+    for month, days in entry["months"].items():
+        target["months"].setdefault(month, set()).update(days)
+    for spelling, count in entry["names"].items():
+        target["names"][spelling] = target["names"].get(spelling, 0) + count
+    for edge in ("first", "last"):
+        if entry[edge] is None:
+            continue
+        if target[edge] is None:
+            target[edge] = entry[edge]
+        else:
+            target[edge] = (min(target[edge], entry[edge]) if edge == "first"
+                            else max(target[edge], entry[edge]))
+
+
+# 🛑 THE ESCAPE HATCH FOR A BUSINESS WITH NO CONTACT CARD. Ticking "Company"
+# on a card is the right fix when a card exists — but Mint, which ranked 17th
+# here on 244 days, has no card at all, and inventing one to hold a tick box
+# is clutter in the place the user actually reads.
+#
+# 🛑 `_SUPPORT`, NEVER `dirname(DEFAULT_DB)`. That path FOLLOWS THE VAULT: when
+# the encrypted image is mounted it resolves inside it, so a file written there
+# is unreadable whenever AppleTools is not running and is **destroyed by
+# `apple-index forget`**, which deletes the image. A ruling the user typed must
+# outlive the index it is about. Measured: the first version of this landed in
+# `mnt/` for exactly that reason.
+#
+# ⚠️ IT WORKS BOTH WAYS. `--is-a-person` rescues somebody the rules exclude
+# wrongly, which matters more than the other direction: a business left in is
+# visible, and a person taken out is not.
+PEOPLE_CONFIG = os.path.join(_SUPPORT, "people.json")
+
+
+def people_overrides():
+    """Handles the user has ruled on: handle -> 'business' or 'person'."""
+    try:
+        with open(PEOPLE_CONFIG) as handle:
+            config = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    for kind in ("business", "person", "me"):
+        for raw in config.get(kind) or []:
+            key, _ = handle_key(raw)
+            if key:
+                out[key] = kind
+    return out
+
+
+def write_overrides(business, person, me=()):
+    """Record a ruling. Returns the lines to print."""
+    try:
+        with open(PEOPLE_CONFIG) as handle:
+            config = json.load(handle)
+    except (OSError, ValueError):
+        config = {}
+    said = []
+    for kind, raws in (("business", business), ("person", person), ("me", me)):
+        others = [k for k in ("business", "person", "me") if k != kind]
+        for raw in raws:
+            key, _ = handle_key(raw)
+            if not key:
+                die("not a handle: %s" % raw)
+            # ⚠️ One answer per handle. Saying "business" removes an earlier
+            # "person" rather than leaving the two to fight.
+            for other in others:
+                config[other] = [h for h in config.get(other) or []
+                                 if handle_key(h)[0] != key]
+            current = config.setdefault(kind, [])
+            if key in {handle_key(h)[0] for h in current}:
+                said.append("%s is already recorded as a %s" % (key, kind))
+                continue
+            current.append(key)
+            said.append("%s recorded as a %s" % (key, kind))
+    if said:
+        with open(PEOPLE_CONFIG, "w") as handle:
+            json.dump(config, handle, indent=2)
+        os.chmod(PEOPLE_CONFIG, 0o600)
+    return said
+
+
+# 🛑 A LOCAL PART NO PERSON EVER READS. Conservative on purpose: `office@`,
+# `info@` and `contact@` are NOT here, because a small charity's office
+# address really is answered by one person, and two in this store are.
+NO_REPLY = re.compile(
+    r"^(no[._-]?reply|do[._-]?not[._-]?reply|auto[-_.]?confirm|mailer[-_]daemon"
+    r"|bounce|unsubscribe|notifications?|alerts?|offers|newsletter|receipts"
+    r"|billing|postmaster)([-_.+].*)?$", re.I)
+
+
+# ⚠️ READ ONCE, so every record in one run is measured against the same
+# instant. Calling time.time() per record makes "today" drift during a run.
+NOW = time.time()
+
+
+def is_me_by_name(name, wanted, my_parts):
+    """Does this display name belong to the user, going by their own card?
+
+    🛑 THE FORMAL NAME IS NOT ON THE CARD. The card here reads "Dan Hopkins",
+    and seven old addresses sign themselves "Daniel Hopkins" — two former
+    employers, an old hotmail, a machine hostname. An exact-name test misses
+    every one, and they show up as somebody the user talks to, in a search for
+    their own family name.
+
+    So the family name must match exactly, and the given name must be a stem of
+    the card's or the card's a stem of it — "Dan" inside "Daniel". At least
+    three characters, so an initial cannot claim a stranger.
+
+    ⚠️ A RELATIVE WITH THE SAME NAME WOULD BE TAKEN TOO. Measured here: seven
+    matches, all of them the user, and no other Hopkins on this store has a
+    given name beginning "Dan". Every address it takes is reported in
+    `me.by_name`, so a wrong one is visible rather than silent.
+    """
+    flat = re.sub(r"[^a-z0-9]+", " ", (name or "").lower()).strip()
+    if flat in wanted:
+        return True
+    words = flat.split()
+    if len(words) < 2:
+        return False
+    given, family = words[0], words[-1]
+    for card_given, card_family in my_parts:
+        if family != card_family:
+            continue
+        short, long = sorted([given, card_given], key=len)
+        if len(short) >= 3 and long.startswith(short):
+            return True
+    return False
+
+
+# One day. ⚠️ The report changes when the INDEX changes, not on a clock, so
+# this is a ceiling on staleness rather than a schedule. The app refreshes it
+# after an indexing cycle once a day; a ruling refreshes it at once.
+PEOPLE_MAX_AGE = 24 * 3600
+
+
+def _duration(seconds):
+    if seconds < 90:
+        return "%.1fs" % seconds
+    if seconds < 5400:
+        return "%d min" % (seconds / 60)
+    if seconds < 36 * 3600:
+        return "%d h" % (seconds / 3600)
+    return "%d days" % (seconds / 86400)
+
+
+def read_people_cache(db, max_age):
+    """The stored report, or None when there is none or it is too old."""
+    try:
+        row = db.execute("SELECT computed_at, payload FROM people_cache "
+                         "WHERE one = 1").fetchone()
+    except sqlite3.OperationalError:
+        return None                      # an index older than this table
+    if row is None:
+        return None
+    if max_age is not None and time.time() - row["computed_at"] > max_age:
+        return None
+    try:
+        report = json.loads(row["payload"])
+    except ValueError:
+        return None
+    # ⚠️ SAY IT CAME FROM THE CACHE, and when it was made. A reader who cannot
+    # tell a stored answer from a fresh one cannot tell a stale one either.
+    report["cached"] = True
+    report["computed"] = row["computed_at"]
+    return report
+
+
+def write_people_cache(db, report):
+    db.execute("INSERT INTO people_cache (one, computed_at, payload) "
+               "VALUES (1, ?, ?) ON CONFLICT(one) DO UPDATE SET "
+               "computed_at = excluded.computed_at, payload = excluded.payload",
+               (report["generated"], json.dumps(report)))
+    db.commit()
+
+
+def _tally(reasons):
+    counts = {}
+    for reason in reasons:
+        counts[reason] = counts.get(reason, 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
+
+
+def is_bounce_path(handle, mine):
+    """A return path that carries the user's own address inside it.
+
+    🛑 VERP ENCODES THE RECIPIENT IN THE SENDER. A newsletter bounce arrives
+    from `bounces+3371362-2618-danielhopkins=gmail.com@mailer.example`, and
+    that address is not a person — it is the user's own address written into
+    somebody's return path. 16 of them here, one day each, all of them showing
+    up in a search for the user's own family name.
+
+    ⚠️ It cannot be a false positive: the address literally contains the
+    user's, with the `@` replaced by `=`.
+    """
+    local = handle.rsplit("@", 1)[0]
+    return any("@" in address and address.replace("@", "=") in local
+               for address in mine)
+
+
+# 🛑 FORTY EMAILS, NEVER ONCE ANSWERED. Measured on this store: every real
+# correspondent in the top sixty has written back at least twice, and the five
+# transactional senders that survived every other rule — a proxy-vote service,
+# a credit union's contact centre, Amazon shipping, QuickBooks, a newsletter —
+# have exactly zero. At forty the volume settles it on its own: somebody you
+# have never answered forty times is not somebody you talk to.
+BULK_CERTAIN = 40
+# ⚠️ Below that, volume is not enough — two of this school's teachers wrote 16
+# and 19 times and were never answered, and they are people. So the weaker tier
+# needs a second reason, and a guard.
+BULK_LIKELY = 12
+BULK_MARKER = re.compile(
+    r"unsubscribe|view (this|it) (email|in your browser)|do not reply"
+    r"|automated (message|email|notification)|manage your (preferences|subscription)"
+    r"|update your preferences|no longer wish to receive", re.I)
+_NAME_TOKEN = re.compile(r"[a-z0-9]+")
+
+
+def carries_own_name(handle, name):
+    """Is this person's own name inside their address?
+
+    🛑 THE TOKEN MUST BE ABSENT FROM THE DOMAIN, and that is the whole test.
+    `nancy.s@…boulderjourneyschool.com` carries "nancy", which the domain does
+    not — a person. `chase@emailinfo.chase.com` carries "chase", which the
+    domain does too — a brand writing from its own name. Without that clause
+    the guard spared Chase, NYT, Northwestern Mutual and AT&T.
+
+    ⚠️ FOUR CHARACTERS AT LEAST. "ent" is a substring of "estatements", which
+    made Ent Credit Union look like somebody signing their own name.
+
+    ⚠️ It errs toward keeping a person: a real English word in a local part
+    ("connect@ironman.com" against the name "Ironman|Connect") is spared. That
+    is the right direction to be wrong in.
+    """
+    if "@" not in handle:
+        return False
+    local, _, domain = handle.lower().partition("@")
+    if (name or "").strip().lower() == handle.strip().lower():
+        return False                      # the "name" is just the address
+    for token in _NAME_TOKEN.findall((name or "").lower()):
+        if len(token) >= 4 and token in local and token not in domain:
+            return True
+    return False
+
+
+def not_a_person(entry, overrides=None, mine=()):
+    """Why this handle should not be drawn as somebody the user talks to.
+
+    Returns a reason, or None to keep them. Every one is reported rather than
+    dropped silently, because each rule can be wrong about somebody.
+
+      marked         the user said so — `people --not-a-person <handle>`
+      bounce         a return path carrying the user's own address
+      never-answered 40+ emails and not one reply, ever. 🛑 The one rule that
+                     reads the RELATIONSHIP rather than the address
+      bulk-mail      12+ emails, never answered, a newsletter footer on half of
+                     them, and the address does not carry their own name
+      company        the card is marked as a business, or names one and no
+                     person. 🛑 THE USER'S OWN ESCAPE HATCH: tick "Company" on
+                     a card in Contacts, or run `apple contacts edit <id>
+                     --company-card`, and it stops being drawn here
+      short-code     an SMS short code. 🛑 A five-digit number cannot be a person
+      no-reply       an address written by a machine
+      calendar-feed  a Google Calendar system address, not a guest
+      list           many display names and none of them dominant
+
+    ⚠️ ONLY `list` LOOKS AT BEHAVIOUR. The other three read the handle or the
+    card, so they cannot be fooled by a quiet year or a chatty one.
+    """
+    # 🛑 THE USER'S OWN ANSWER WINS, in both directions and over every rule
+    # below. They can see the list; the rules cannot.
+    ruling = (overrides or {}).get(entry["handle"])
+    if ruling == "business":
+        return "marked"
+    if ruling == "person":
+        return None
+    if entry.get("card_is_company"):
+        return "company"
+    handle = entry["handle"]
+    if is_bounce_path(handle, mine):
+        return "bounce"
+    if "@" not in handle and handle.isdigit() and 3 <= len(handle) <= 6:
+        return "short-code"
+    # 🛑 TRANSACTIONAL MAIL, DECIDED BY RECIPROCITY. A person writes back. Every
+    # rule above reads the handle or the card; this one reads the relationship,
+    # so it catches a sender whose address and name look exactly like a
+    # person's — "Sharon Halkovics", "NORTHWESTERN MUTUAL", "Boulder Reporting
+    # Lab" — and it cannot be fooled by a friendly From line.
+    #
+    # ⚠️ MAIL ONLY. A text or a call is two-way by its nature, so a handle with
+    # either is never judged this way.
+    if not (entry.get("channels", {}).get("messages")
+            or entry.get("channels", {}).get("phone")):
+        if entry.get("mail_to") == 0 and "@" in handle:
+            if entry.get("mail_from", 0) >= BULK_CERTAIN:
+                return "never-answered"
+            if (entry.get("mail_from", 0) >= BULK_LIKELY
+                    and entry.get("mail_bulk", 0)
+                        >= 0.5 * max(entry.get("mail_seen", 0), 1)
+                    and not carries_own_name(handle, entry.get("name", ""))):
+                return "bulk-mail"
+
+    if "@" in handle:
+        local, _, domain = handle.partition("@")
+        if NO_REPLY.match(local):
+            return "no-reply"
+        # 🛑 A CALENDAR FEED IS NOT A GUEST. Google puts three system addresses
+        # in the organiser and attendee fields: `unknownorganizer@` on an event
+        # whose owner it cannot name, and a `...@group.calendar.google.com`
+        # or `...@resource.calendar.google.com` for a subscribed calendar or a
+        # meeting room. Three of them ranked inside the top sixty here, one of
+        # them above real people.
+        if domain.endswith("calendar.google.com"):
+            return "calendar-feed"
+    return classify_bulk(entry)
+
+
+def classify_bulk(entry):
+    """Is this address a mailing list rather than a person?
+
+    🛑 THE DISPLAY NAME IS WHAT GIVES IT AWAY, and counting distinct spellings
+    alone is not enough. Measured on this store, normalising the name first
+    and then asking which spelling DOMINATES separates the two cleanly:
+
+        notifications@github.com    51 names, top 23%   robot
+        info@meetup.com             35 names, top 14%   robot
+        invitations@linkedin.com    73 names, top 41%   robot
+        musicalhands@comcast.net     3 names, top 75%   a person
+        whopkins44@gmail.com         3 names, top 70%   a person
+
+    A raw count of spellings put all five in the same bucket, because a real
+    correspondent of twenty years signs themselves "Cat Cantor", "cat cantor"
+    and "musicalhands", and that already looked like a robot.
+
+    ⚠️ Only ever applied to an address with NO contact card, so nobody in
+    Contacts can be hidden by it.
+    """
+    if entry["known"]:
+        return None
+    spellings = {}
+    for raw, count in entry["names"].items():
+        key = re.sub(r"[^a-z0-9]+", " ", raw.lower()).strip()
+        if key:
+            spellings[key] = spellings.get(key, 0) + count
+    if len(spellings) < 5:
+        return None
+    if max(spellings.values()) < 0.5 * sum(spellings.values()):
+        return "list"
+    return None
+
+
+# 🛑 A CLIQUE CAP, because a co-occurrence edge is quadratic. One real calendar
+# event here carries 97 attendees, which on its own is 4,656 edges — more than
+# every genuine pair in the graph put together, all of them saying nothing but
+# "these people were on one invitation". A record with more people than this
+# still counts toward each person's own total; it just draws no edges.
+EDGE_CLIQUE_CAP = 12
+
+
+def is_direct(tool, author, key, others, mine):
+    """Did one of us write to the other, or were we both on somebody's list?
+
+    🛑 THE TEST IS PER PERSON, NOT PER RECORD, and getting that wrong silently
+    undid the whole correction. An earlier version asked whether the author
+    was among the other people on the record — which is true of almost every
+    email, because the author IS one of the others unless the user wrote it.
+    Every mail counted as direct, and `same_list` came back 0 for people whose
+    mail was 80% newsletters. Nothing in the output said so.
+
+    An event is shared by definition, so it always counts. An email counts for
+    one person only when the user wrote it or THAT person wrote it, and never
+    when it went to more people than a conversation holds — the same cap the
+    edges use, which also catches a mass mail the user sent themselves.
+    """
+    if tool == "calendar":
+        return True
+    if others > EDGE_CLIQUE_CAP:
+        return False
+    return author in mine or author == key
+
+
+def cmd_people(opts):
+    """Who you talk to, who they overlap with, and which emoji you use.
+
+    🛑 THE HEADLINE IS DAYS, NOT ITEMS, and that is the whole correction. The
+    first version counted indexed records and called the sum "encounters",
+    which reported a spouse at 9,059. Three things were wrong with it:
+
+      1. A record is a different SIZE in every source. One mail record is one
+         email; one messages record is a block of TEN texts; one calendar
+         record is one event. Summing them means nothing. Measured: 3,024
+         message blocks for one person held 30,395 actual texts.
+      2. **Being on the same list is not talking.** 3,118 of the 5,751 emails
+         naming that person — 54% — were written by a third party to both of
+         them. A school newsletter to forty parents counted as an encounter
+         with each one.
+      3. A count of items rewards whoever texts in bursts. Forty texts in one
+         evening is one conversation.
+
+    A DAY is the same unit in every source and cannot be inflated by volume.
+    Measured on this store: a spouse of twenty years comes out at 3,107 days,
+    about two days in five, and a committee colleague at 470. Both survive a
+    sanity check, which 9,059 did not.
+
+    ⚠️ The per-channel counts are still reported, each in its OWN unit —
+    emails, texts, events, calls — because "we exchanged 30,395 texts" is a
+    true and interesting sentence. What must not happen is adding it to
+    anything.
+    """
+    said = write_overrides(opts.not_a_person or [], opts.is_a_person or [],
+                           opts.me or [])
+    for line in said:
+        sys.stderr.write("  %s\n" % line)
+    overrides = people_overrides()
+
+    started = time.time()
+    db = connect(opts.db)
+
+    # 🛑 A RULING MUST NOT WAIT FOR THE CLOCK. Marking Mint as a business and
+    # seeing nothing change for a day is indistinguishable from the flag not
+    # working, so any ruling forces the recompute it implies.
+    stale = bool(said) or opts.refresh
+    if not stale:
+        cached = read_people_cache(
+            db, None if opts.max_age < 0 else (opts.max_age or PEOPLE_MAX_AGE))
+        if cached is not None:
+            # ⚠️ `--ensure` is for the SCHEDULER, which wants the work done and
+            # not the three megabytes of JSON that prove it.
+            if opts.ensure:
+                age = time.time() - cached["computed"]
+                print("people: cached, %s old" % _duration(age))
+            else:
+                print(json.dumps(cached, indent=2))
+            return
+    identities, aliases, companies, card_parts = contact_identities()
+    mine, detected, my_names, my_parts, my_cards = my_handles(
+        db, identities, card_parts, overrides)
+    top = opts.top or 80
+
+    people = {}
+    edges = {}
+
+    def person(key, name):
+        """The record for one person, created on first sight."""
+        cid, known_name = identities.get(key, (None, ""))
+        pid = cid or ("handle:" + key)
+        entry = people.get(pid)
+        if entry is None:
+            entry = people[pid] = {
+                "id": pid, "name": known_name or key,
+                "handle": key, "handles": set(), "known": cid is not None,
+                "channels": {}, "days": set(), "channel_days": {},
+                "same_list": 0, "alone": {}, "upcoming": 0,
+                # 🛑 RECIPROCITY. Who wrote to whom is the one signal that
+                # separates a correspondent from a sender, and it is free:
+                # the author is already in hand.
+                "mail_from": 0, "mail_to": 0, "mail_bulk": 0, "mail_seen": 0,
+                "rids": [],
+                "first": None, "last": None, "months": {}, "names": {},
+                "card_is_company": cid in companies,
+            }
+        entry["handles"].add(key)
+        # ⚠️ EVERY SPELLING IS KEPT, not just the first. The display name is
+        # what separates a person from a mailing list further down, and it is
+        # also the only name an address with no contact card ever gets.
+        if name:
+            entry["names"][name] = entry["names"].get(name, 0) + 1
+        if known_name:
+            entry["name"] = known_name
+        return entry
+
+    def touch(entry, tool, when, count=1):
+        """One exchange, on one day, in one channel's own unit."""
+        # 🛑 A DAY THAT HAS NOT HAPPENED IS NOT A DAY OF CONTACT. The calendar
+        # adapter fetches a YEAR AHEAD — 1,008 of the 12,014 events here are in
+        # the future, the furthest on 2027-08-25 — so a recurring swimming
+        # lesson gave its organiser contact every week until next August.
+        # Three things went wrong at once, and only the third was visible:
+        # the day count was inflated, `last` read 2027, and the timeline's
+        # axis ran a year past today, squashing twenty years of real history
+        # into less width than it had.
+        #
+        # ⚠️ It is counted as `upcoming` rather than dropped, because "you have
+        # something with them next week" is true and worth keeping. It is just
+        # not contact.
+        if when and when > NOW:
+            entry["upcoming"] += count
+            return
+        entry["channels"][tool] = entry["channels"].get(tool, 0) + count
+        if not when:
+            return
+        entry["first"] = when if entry["first"] is None else min(entry["first"], when)
+        entry["last"] = when if entry["last"] is None else max(entry["last"], when)
+        stamp = datetime.fromtimestamp(when, timezone.utc)
+        day = stamp.strftime("%Y-%m-%d")
+        entry["days"].add(day)
+        # 🛑 DAYS PER CHANNEL TOO, because "which channel do we mostly use"
+        # cannot be answered from the item counts: one is emails and another
+        # is individual texts, and texts win that comparison every time
+        # whatever the truth is.
+        entry["channel_days"].setdefault(tool, set()).add(day)
+        entry["months"].setdefault(stamp.strftime("%Y-%m"), set()).add(day)
+
+    def collect(listed):
+        """Everyone on one record who is not the user, with their names."""
+        others = {}
+        for entry in listed:
+            key, name = handle_key(entry.get("handle"))
+            # ⚠️ A CALENDAR ATTENDEE KEEPS THE NAME IN ITS OWN FIELD, not
+            # inside the handle the way mail does. Reading only the handle
+            # threw away the one name a guest who is not in Contacts has.
+            if not name and (entry.get("name") or "") != (entry.get("handle") or ""):
+                name = (entry.get("name") or "").strip()
+            # 🛑 The user is in almost every record and belongs in none of
+            # them. Left in, they are the biggest node in their own graph and
+            # every edge runs through them.
+            if not key or key in mine:
+                continue
+            others.setdefault(key, name)
+        return others
+
+    def draw_edges(ids):
+        if 2 <= len(ids) <= EDGE_CLIQUE_CAP:
+            ids = sorted(set(ids))
+            for i in range(len(ids)):
+                for j in range(i + 1, len(ids)):
+                    pair = (ids[i], ids[j])
+                    edges[pair] = edges.get(pair, 0) + 1
+
+    considered = 0
+
+    # ---- mail and calendar: one record is one email or one event -----------
+    for row in db.execute(
+            "SELECT rid, tool, people, occurred, created FROM record "
+            "WHERE tool IN ('mail', 'calendar') AND people NOT IN ('', '[]')"):
+        try:
+            listed = json.loads(row["people"])
+        except (TypeError, ValueError):
+            continue
+        others = collect(listed)
+        if not others:
+            continue
+        considered += 1
+        when = row["occurred"] or row["created"]
+        author, _ = handle_key(
+            next((p.get("handle") for p in listed
+                  if p.get("role") in ("author", "organizer")), ""))
+        ids = []
+        for key, name in others.items():
+            entry = person(key, name)
+            if row["tool"] == "mail":
+                entry["mail_seen"] += 1
+                if author == key:
+                    entry["mail_from"] += 1
+                    # ⚠️ BOUNDED. Only a candidate's bodies are ever read, and
+                    # a candidate has fewer than 40 mails, so 80 is generous.
+                    # Keeping every rid for 9,000 people is a list nobody uses.
+                    if len(entry["rids"]) < 80:
+                        entry["rids"].append(row["rid"])
+                elif author in mine:
+                    entry["mail_to"] += 1
+            if is_direct(row["tool"], author, key, len(others), mine):
+                touch(entry, row["tool"], when)
+                # ⚠️ NOBODY ELSE ON IT. The most concrete number here, and the
+                # one that answers "surely not". Measured for a spouse of
+                # twenty years, straight off the .emlx headers: 5,927 messages
+                # carry her address, 2,625 are one of us writing to the other,
+                # and 1,336 are just the two of us. Each is a true answer to a
+                # different question.
+                #
+                # 🛑 PER CHANNEL, like `channels`. A single figure came out at
+                # 17,201 for that person, which is texts wearing a number that
+                # looked like emails — the same unit mistake, one level down.
+                if len(others) == 1:
+                    entry["alone"][row["tool"]] = \
+                        entry["alone"].get(row["tool"], 0) + 1
+            else:
+                entry["same_list"] += 1
+            ids.append(entry["id"])
+        # ⚠️ AN EDGE IS CO-OCCURRENCE, so a shared mailing list still makes
+        # one. That is the honest answer to "who turns up alongside whom",
+        # and it is a different question from "who do I talk to".
+        draw_edges(ids)
+
+    # ---- messages: one record is a BLOCK, and the unit is one text ---------
+    for row in db.execute(
+            "SELECT people, body, occurred, created FROM record "
+            "WHERE tool = 'messages' AND people NOT IN ('', '[]')"):
+        try:
+            listed = json.loads(row["people"])
+        except (TypeError, ValueError):
+            continue
+        others = collect(listed)
+        if not others:
+            continue
+        considered += 1
+        when = row["occurred"] or row["created"]
+        # ⚠️ A GROUP CHAT CANNOT SAY WHO THE USER WAS ANSWERING. Their own
+        # texts count only in a one-to-one chat; in a group, the other
+        # person's own texts are what is counted for them.
+        alone = len(others) == 1
+        sent = {}
+        for line in (row["body"] or "").split("\n"):
+            who, _, text = line.partition(": ")
+            if not text.strip():
+                continue
+            key, _name = handle_key(who)
+            if who == "me" or key in mine:
+                if alone:
+                    for other in others:
+                        sent[other] = sent.get(other, 0) + 1
+            elif key in others:
+                sent[key] = sent.get(key, 0) + 1
+        ids = []
+        for key, name in others.items():
+            entry = person(key, name)
+            touch(entry, "messages", when, count=sent.get(key, 0))
+            if alone:
+                entry["alone"]["messages"] = \
+                    entry["alone"].get("messages", 0) + sent.get(key, 0)
+            ids.append(entry["id"])
+        draw_edges(ids)
+
+    # ---- photos: one record is one DAY, and the unit is one photograph ------
+    #
+    # 🛑 THE ONE SOURCE THAT SEES PEOPLE WHO DO NOT WRITE. Every channel above
+    # needs an address or a number, so it can only find somebody who sends
+    # things. Measured against this exact ranking before photos existed: the
+    # user's child had 18 days from 30 texts and 24 calls, no rank at all, and
+    # sat below a cleaning service at 57. She is in 9,416 photographs across
+    # 1,378 days, three times more than anyone else in the library. Five more
+    # of the twenty most-photographed people were absent from the report
+    # entirely, and every one of them is a child.
+    #
+    # ⚠️ IT MEASURES WHO WAS PHOTOGRAPHED, NOT WHO WAS THERE, and the
+    # difference falls hardest on the person holding the camera. The user
+    # appears on 661 days and was present for all 1,378 of his daughter's. That
+    # asymmetry costs nothing here, because the user is excluded from their own
+    # graph anyway — but never read a photo day count as "days together"
+    # without saying whose camera it was.
+    for row in db.execute(
+            "SELECT people, occurred FROM record "
+            "WHERE tool = 'photos' AND kind = 'day' "
+            "AND people NOT IN ('', '[]')"):
+        try:
+            listed = json.loads(row["people"])
+        except (TypeError, ValueError):
+            continue
+        others = collect(listed)
+        if not others:
+            continue
+        considered += 1
+        when = row["occurred"]
+        shots = {}
+        # 🛑 A DAY WHOSE EVERY PHOTO CAME FROM SOMEBODY ELSE'S CAMERA IS NOT
+        # EVIDENCE THE USER WAS THERE. The adapter marks those `alongside`
+        # rather than `subject`, and they are counted the way a mailing list
+        # is: co-occurrence, an edge in the web, never a day of contact.
+        alongside = set()
+        for tagged in listed:
+            key, _ = handle_key(tagged.get("handle"))
+            if not key:
+                continue
+            shots[key] = shots.get(key, 0) + int(tagged.get("photos") or 1)
+            if tagged.get("role") == "alongside":
+                alongside.add(key)
+        ids = []
+        for key, name in others.items():
+            entry = person(key, name)
+            if key in alongside:
+                entry["same_list"] += 1
+            else:
+                touch(entry, "photos", when, count=shots.get(key, 1))
+                # ⚠️ NOBODY ELSE IN THE FRAME that day. The photo equivalent of
+                # an email with one recipient, and the same honest answer to
+                # "surely not".
+                if len(others) == 1:
+                    entry["alone"]["photos"] = \
+                        entry["alone"].get("photos", 0) + shots.get(key, 1)
+            ids.append(entry["id"])
+        # ⚠️ THE STRONGEST EDGE IN THE WHOLE GRAPH, because two people in one
+        # photograph were in one room. A shared mailing list makes an edge too,
+        # and it means far less.
+        draw_edges(ids)
+
+    # ⚠️ CALL HISTORY IS NOT AN INDEXED SOURCE, so it is read live. It is also
+    # a relay mirror of the iPhone rather than the whole history — four months
+    # here against years on the phone — so the window says "recent calls", and
+    # a person's `first` must never be read as "when we met".
+    calls = apple("phone", "recents", "--limit", 100000, "--json",
+                  allow_fail=True) or []
+    call_span = None
+    for call in calls:
+        key, _ = handle_key(call.get("handle") or call.get("number"))
+        if not key or key in mine:
+            continue
+        when = epoch(call.get("date"))
+        entry = person(key, call.get("name") or "")
+        if call.get("contact_id"):
+            entry["known"] = True
+            if call.get("name"):
+                entry["name"] = call["name"]
+        touch(entry, "phone", when)
+        if when:
+            call_span = (min(call_span[0], when), max(call_span[1], when)) \
+                if call_span else (when, when)
+
+    # 🛑 THREE PASSES, IN THIS ORDER, and each one needs the one before it.
+    #
+    #   1. name    an address with no card is called by the name it signs
+    #              itself with most often, not by the first one that arrived
+    #   2. merge   which needs step 1: the merge matches on the display name,
+    #              and before step 1 that name is still the raw address, so
+    #              nothing ever matched and "Cat Cantor" stayed two people
+    #   3. bulk    which consumes the spellings, so it has to go last
+    for entry in people.values():
+        if not entry["known"] and entry["names"]:
+            entry["name"] = max(entry["names"].items(),
+                                key=lambda kv: (kv[1], kv[0]))[0]
+
+    # 🛑 AN OLD EMPLOYER'S ADDRESS IS STILL YOU, and no card lists it. Ten
+    # more addresses here — splunk, victorops, stackhawk, a university, two
+    # startups since acquired — arrived under the user's own name and none of
+    # them was on the card. The largest ranked inside the top eighty, so the
+    # user was drawn as one of the people he talks to.
+    #
+    # ⚠️ THE SAME RULE `merge_by_name` USES, pointed at the user: an address
+    # with no card, signing itself with a name a card already claims. The risk
+    # is a relative with the same name, so every address it takes is reported
+    # in `me.by_name` rather than absorbed silently.
+    # 🛑 THE USER'S OWN LOCAL PART AT SOMEBODY ELSE'S SERVICE IS STILL THEM.
+    # Six here: two Send-to-Kindle endpoints, a plus-address at a former
+    # employer, a receipts service, Google Wave. Each arrives under the user's
+    # own name and each was drawn as somebody they talk to.
+    #
+    # ⚠️ SIX CHARACTERS AT LEAST, and the next character must be a separator.
+    # Without the length guard the local part `dan` would claim `dan@` at every
+    # domain on the store.
+    my_locals = {address.split("@")[0] for address in mine if "@" in address}
+    my_locals = {local for local in my_locals if len(local) >= 6}
+
+    def is_my_address(handle):
+        if "@" not in handle:
+            return False
+        local = handle.rsplit("@", 1)[0]
+        for mine_local in my_locals:
+            if local == mine_local:
+                return True
+            if local.startswith(mine_local) and local[len(mine_local)] in "+_.-":
+                return True
+        return False
+
+    by_name, by_address = [], []
+    if my_names:
+        wanted = {re.sub(r"[^a-z0-9]+", " ", n.lower()).strip() for n in my_names}
+        for entry in list(people.values()):
+            if entry["known"]:
+                continue
+            if is_me_by_name(entry["name"], wanted, my_parts):
+                by_name.extend(sorted(entry["handles"]))
+            elif is_my_address(entry["handle"]):
+                by_address.extend(sorted(entry["handles"]))
+            else:
+                continue
+            mine |= entry["handles"]
+            del people[entry["id"]]
+        if by_name or by_address:
+            edges = {pair: w for pair, w in edges.items()
+                     if pair[0] in people and pair[1] in people}
+
+    merged = merge_by_name(people, aliases)
+    # ⚠️ AFTER the card merge, so a card always wins the name it claims.
+    merged.update(merge_namesakes(people))
+    if merged:
+        # ⚠️ A CHAIN HAS TO RESOLVE. b folded into a, then a into c, and an
+        # edge pointing at b must end up at c or it points at nobody.
+        def final(pid):
+            seen = set()
+            while pid in merged and pid not in seen:
+                seen.add(pid)
+                pid = merged[pid]
+            return pid
+        merged = {old: final(old) for old in merged}
+        edges = {(merged.get(a, a), merged.get(b, b)): w
+                 for (a, b), w in edges.items()
+                 if merged.get(a, a) != merged.get(b, b)}
+
+    # 🛑 ONLY THE CANDIDATES' BODIES. Testing all 40,557 mail bodies for a
+    # newsletter footer costs 17 seconds; testing the few hundred that belong
+    # to somebody who has never once been written back to costs almost nothing.
+    # The first version scanned everything, which tripled the whole command.
+    wanted = {}
+    for entry in people.values():
+        if (entry["mail_to"] == 0 and 12 <= entry["mail_from"] < BULK_CERTAIN
+                and not (entry["channels"].get("messages")
+                         or entry["channels"].get("phone"))):
+            for rid in entry["rids"]:
+                wanted.setdefault(rid, []).append(entry)
+    if wanted:
+        marks = list(wanted)
+        for start in range(0, len(marks), 900):     # SQLite's variable limit
+            batch = marks[start:start + 900]
+            for row in db.execute(
+                    "SELECT rid, body FROM record WHERE rid IN (%s)"
+                    % ",".join("?" * len(batch)), batch):
+                if BULK_MARKER.search(row["body"] or ""):
+                    for entry in wanted[row["rid"]]:
+                        entry["mail_bulk"] += 1
+
+    for entry in people.values():
+        entry["not_person"] = not_a_person(entry, overrides, mine)
+        entry.pop("names")
+        entry.pop("rids")
+
+    # 🛑 RANKED ON DAYS. Ranking on items put four committee colleagues above
+    # three of the user's own children, because a committee generates mail and
+    # a child sends texts.
+    ordered = sorted(people.values(), key=lambda p: -len(p["days"]))
+    dropped = [p for p in ordered if p["not_person"]]
+    ranked = [p for p in ordered if not p["not_person"]][:top]
+    keep = {p["id"] for p in ranked}
+    listed = [p for p in ordered
+              if not p["not_person"] and (p["days"] or p["known"])]
+
+    # 🛑 ONE SHARED MONTH AXIS, and every series is a list of positions into
+    # it. Repeating "2014-07" nine thousand times is most of what a month
+    # series costs, and everybody needs one now that the search filters the
+    # timeline: a person in 300th place has to be drawable, because the drawn
+    # set is chosen by the reader rather than by rank.
+    axis = sorted({month for p in listed for month in p["months"]})
+    at = {month: offset for offset, month in enumerate(axis)}
+
+    def series(entry):
+        """Months as [position, days], sorted, positions into `axis`."""
+        return sorted([at[month], len(days)]
+                      for month, days in entry["months"].items())
+
+    # ⚠️ ONE DAY OF REAL CONTACT, OR A CARD. 3,849 of the 8,574 have neither:
+    # they are names that appeared beside the user on somebody else's mailing
+    # list and never wrote to them. They belong in `same_list`, not in a list
+    # of people the user talks to.
+    #
+    # 🛑 BUILT BEFORE THE LOOP BELOW, which turns `days` from a set into a
+    # count in place. Built after it, this read `len()` of an integer for
+    # everybody drawn and of a set for everybody else.
+    directory = [
+        {"id": p["id"], "name": p["name"], "handle": p["handle"],
+         "known": p["known"], "days": len(p["days"]), "channels": p["channels"],
+         "channel_days": {c: len(d) for c, d in p["channel_days"].items()},
+         "alone": p["alone"], "same_list": p["same_list"],
+         "upcoming": p["upcoming"], "first": p["first"], "last": p["last"],
+         "months": series(p)}
+        for p in listed]
+
+    for entry in ranked:
+        entry["handles"] = sorted(entry["handles"])
+        entry["months"] = series(entry)
+        entry["days"] = len(entry["days"])
+        entry["channel_days"] = {channel: len(days)
+                                 for channel, days in entry["channel_days"].items()}
+
+    kept_edges = sorted(((a, b, w) for (a, b), w in edges.items()
+                         if w >= 2 and a in keep and b in keep),
+                        key=lambda e: -e[2])[:600]
+
+
+    report = {
+        "generated": time.time(),
+        "cached": False,
+        "me": {"handles": sorted(mine), "detected": detected,
+               "by_name": sorted(set(by_name)),
+               "by_address": sorted(set(by_address)),
+               # ⚠️ A handle-less card claimed by NAME alone. Read this before
+               # trusting a ranking: it is the one rule here that could turn a
+               # relative into the user.
+               "by_card": sorted(my_cards),
+               "declared": sorted(h for h, k in overrides.items() if k == "me")},
+        "counts": {"records": considered, "people": len(people),
+                   "shown": len(ranked), "calls": len(calls),
+                   "excluded": len(dropped)},
+        # 🛑 NAMED, NOT JUST COUNTED. Every rule here can be wrong about
+        # somebody, and a person who has quietly vanished from their own
+        # social graph is exactly what nobody would notice.
+        "excluded": _tally(p["not_person"] for p in dropped),
+        "overrides": {"business": sorted(h for h, k in overrides.items()
+                                         if k == "business"),
+                      "person": sorted(h for h, k in overrides.items()
+                                       if k == "person")},
+        "excluded_examples": [
+            {"name": p["name"], "handle": p["handle"],
+             "reason": p["not_person"], "days": len(p["days"])}
+            for p in dropped[:24]],
+        "phone_window": ({"first": call_span[0], "last": call_span[1]}
+                         if call_span else None),
+        "months_axis": axis,
+        "people": ranked,
+        "directory": directory,
+        "directory_omitted": sum(1 for p in ordered if not p["not_person"]
+                                 and not p["days"] and not p["known"]),
+        "edges": [{"a": a, "b": b, "weight": w} for a, b, w in kept_edges],
+        "emoji": emoji_report(db, mine),
+    }
+    report["computed"] = report["generated"]
+    write_people_cache(db, report)
+    if opts.ensure:
+        print("people: computed %d people in %s"
+              % (len(report["directory"]), _duration(time.time() - started)))
+    else:
+        print(json.dumps(report, indent=2))
+
+
+def emoji_report(db, mine):
+    """The emoji the user themselves typed, and when.
+
+    🛑 ONLY WHAT THE USER SENT. Counting every emoji in the store measures
+    what everyone else types at them: their own top emoji is 😂 at 200, and
+    the store's is 😂 at 1,499. The two answers look alike and mean opposite
+    things.
+
+    Two sources, and each one has to prove the text is the user's:
+
+      messages — a block body is `handle: text` per line, and the adapter
+                 writes `me` for anything the user sent. Exact, not inferred.
+      mail     — the author address is one of the user's own, and the line is
+                 not quoted. ⚠️ WITHOUT THE QUOTE TEST a reply carries every
+                 emoji in the thread below it, and the user is credited with
+                 what was written at them. 262,027 quoted lines here.
+    """
+    totals, per_year, by_source = {}, {}, {"messages": 0, "mail": 0}
+
+    def add(cluster, year, source):
+        totals[cluster] = totals.get(cluster, 0) + 1
+        by_source[source] += 1
+        if year:
+            bucket = per_year.setdefault(year, {})
+            bucket[cluster] = bucket.get(cluster, 0) + 1
+
+    for row in db.execute("SELECT body, occurred FROM record WHERE tool = 'messages'"):
+        year = (datetime.fromtimestamp(row["occurred"], timezone.utc).strftime("%Y")
+                if row["occurred"] else None)
+        for line in (row["body"] or "").split("\n"):
+            who, _, text = line.partition(": ")
+            if who != "me":
+                continue
+            for cluster in emoji_in(text):
+                add(cluster, year, "messages")
+
+    for row in db.execute("SELECT body, people, occurred FROM record WHERE tool = 'mail'"):
+        try:
+            listed = json.loads(row["people"] or "[]")
+        except ValueError:
+            continue
+        author = next((p.get("handle") for p in listed
+                       if p.get("role") == "author"), "")
+        key, _ = handle_key(author)
+        if key not in mine:
+            continue
+        year = (datetime.fromtimestamp(row["occurred"], timezone.utc).strftime("%Y")
+                if row["occurred"] else None)
+        for line in (row["body"] or "").split("\n"):
+            if line.lstrip().startswith(">"):
+                continue
+            for cluster in emoji_in(line):
+                add(cluster, year, "mail")
+
+    top = sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))
+    champions = []
+    for year in sorted(per_year):
+        cluster, count = max(per_year[year].items(), key=lambda kv: (kv[1], kv[0]))
+        champions.append({"year": year, "emoji": cluster, "count": count,
+                          "total": sum(per_year[year].values())})
+    return {
+        "total": sum(totals.values()),
+        "distinct": len(totals),
+        "sources": by_source,
+        "top": [{"emoji": e, "count": c} for e, c in top[:48]],
+        "by_year": champions,
+    }
 
 
 def cmd_status(opts):
@@ -3424,11 +5246,41 @@ def main():
     fl.add_argument("path", nargs="?", help="the folder, for add/remove")
     fl.add_argument("--name", help="what to call it (default: the folder name)")
     fl.add_argument("--exclude", help="comma separated subdirectory names to skip")
+    fl.add_argument("--json", action="store_true")
     fl.set_defaults(func=cmd_files)
+
+    pl = sub.add_parser("places",
+                        help="everywhere you have been, as JSON")
+    pl.add_argument("--limit", type=int, help="how many places to return")
+    pl.set_defaults(func=cmd_places)
 
     sub.add_parser("stats",
                    help="everything the app's window needs, as JSON"
                    ).set_defaults(func=cmd_stats)
+
+    pe = sub.add_parser("people",
+                        help="who you talk to, who overlaps, and which emoji "
+                             "you use, as JSON")
+    pe.add_argument("--top", type=int, default=80,
+                    help="how many people to report (default 80)")
+    pe.add_argument("--not-a-person", action="append", metavar="HANDLE",
+                    help="record that this address or number is a business, "
+                         "not somebody you talk to. Repeatable")
+    pe.add_argument("--is-a-person", action="append", metavar="HANDLE",
+                    help="undo that, or rescue somebody the rules excluded "
+                         "wrongly. Repeatable")
+    pe.add_argument("--ensure", action="store_true",
+                    help="make sure the stored report is fresh, and print one "
+                         "line rather than the report. For the scheduler")
+    pe.add_argument("--refresh", action="store_true",
+                    help="recompute now, whatever the stored report says")
+    pe.add_argument("--max-age", type=int, default=0, metavar="SECONDS",
+                    help="how old a stored report may be (default one day; "
+                         "-1 accepts any age)")
+    pe.add_argument("--me", action="append", metavar="HANDLE",
+                    help="record that this address or number is YOU — an old "
+                         "one, an alias, a service endpoint. Repeatable")
+    pe.set_defaults(func=cmd_people)
 
     sub.add_parser("sources",
                    help="the per-source arguments `refresh` uses, as JSON"

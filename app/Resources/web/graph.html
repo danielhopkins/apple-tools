@@ -1,0 +1,302 @@
+<!doctype html>
+<meta charset="utf-8">
+<!--
+  The contact web.
+
+  🛑 EVERYTHING IS LOCAL. No stylesheet, no font and no script comes from off
+  this machine, and the Content-Security-Policy below is what enforces it
+  rather than good intentions: this page runs inside an app that holds Full
+  Disk Access, so a request to a third party would be that app phoning home.
+  `default-src 'none'` denies everything, then each thing the page actually
+  needs is allowed back one at a time.
+-->
+<meta http-equiv="Content-Security-Policy" content="
+  default-src 'none';
+  script-src 'self' 'unsafe-inline';
+  style-src 'unsafe-inline';
+  connect-src 'none';
+  img-src 'none';
+  base-uri 'none';
+  form-action 'none';
+">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden;
+               background: transparent;
+               -webkit-user-select: none; user-select: none; }
+  svg { display: block; width: 100%; height: 100%; cursor: grab; }
+  text { font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+         pointer-events: none; }
+</style>
+<svg id="stage"></svg>
+<script src="d3.min.js"></script>
+<script>
+"use strict";
+
+// Swift calls window.render(payload) with everything it knows. The page calls
+// back only when somebody clicks a circle.
+const svg = d3.select("#stage");
+const root = svg.append("g");
+const spokeLayer = root.append("g");
+const linkLayer = root.append("g");
+const nodeLayer = root.append("g");
+const labelLayer = root.append("g");
+
+let simulation = null;
+let state = { nodes: [], links: [], theme: "light", selected: null,
+              scaled: false, youRadius: 19, layoutKey: "" };
+
+// 🛑 POSITIONS SURVIVE A RE-RENDER. d3 mutates the node objects it is given, so
+// keeping them by id is what stops the graph jumping when the time slider moves
+// or the selection changes. Rebuilding the array on every payload made the
+// whole picture reshuffle on every frame of playback.
+const placed = new Map();
+
+const ink = () => state.theme === "dark" ? "255,255,255" : "0,0,0";
+const paper = () => state.theme === "dark" ? "#1e1e1e" : "#ececec";
+
+const CHANNEL = {
+  mail:     { light: "#2f6fe0", dark: "#5b93f0" },
+  messages: { light: "#2aa14f", dark: "#48c46f" },
+  phone:    { light: "#e08a17", dark: "#f0a53c" },
+  calendar: { light: "#8a4fd0", dark: "#a97ae4" }
+};
+const colour = (n) => (CHANNEL[n.channel] || CHANNEL.mail)[state.theme];
+
+function post(message) {
+  if (window.webkit && window.webkit.messageHandlers &&
+      window.webkit.messageHandlers.graph) {
+    window.webkit.messageHandlers.graph.postMessage(message);
+  }
+}
+
+// ⚠️ Presence is decided by Swift, which owns the time window. The page never
+// computes it: two implementations of "was this person around in 2014" would
+// disagree the first time either one changed.
+const shown = (n) => n.presence > 0;
+
+// 🛑 THE SVG'S OWN RECTANGLE, NEVER `window.innerHeight`. A WKWebView inside a
+// SwiftUI frame does not resize its window object to the view: `innerHeight`
+// came back far larger than the 380-point panel, so the centring forces pulled
+// everything to a middle that was below the bottom edge and the panel looked
+// empty with one circle stranded at the base. Measure the element that is
+// actually drawn.
+function stageSize() {
+  const box = svg.node().getBoundingClientRect();
+  return { w: Math.max(box.width, 50), h: Math.max(box.height, 50) };
+}
+
+window.render = function (payload) {
+  const fresh = JSON.parse(payload);
+  const size = stageSize();
+  state.theme = fresh.theme;
+  state.selected = fresh.selected;
+  state.scaled = fresh.scaled;
+
+  const nodes = fresh.nodes.map(function (n) {
+    const old = placed.get(n.id);
+    if (old) { Object.assign(old, n); return old; }
+    const seeded = Object.assign({}, n);
+    // Seeded on a circle, so the first frame is not a random explosion.
+    const angle = 2 * Math.PI * (n.rank / Math.max(fresh.nodes.length, 1));
+    seeded.x = size.w / 2 + Math.cos(angle) * size.w * 0.3;
+    seeded.y = size.h / 2 + Math.sin(angle) * size.h * 0.3;
+    placed.set(n.id, seeded);
+    return seeded;
+  });
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const links = fresh.links
+    .filter((l) => byId.has(l.source) && byId.has(l.target))
+    .map((l) => ({ source: byId.get(l.source), target: byId.get(l.target),
+                   weight: l.weight }));
+  state.nodes = nodes;
+  state.links = links;
+
+  // 🛑 THE PAGE DECIDES WHEN TO RE-RUN THE SIMULATION, from a key Swift sends.
+  // Tracking it on the Swift side means two places remembering what was last
+  // drawn, and they drift the first time a frame is skipped — which shows as a
+  // graph that never settles, or one that never rearranges when it should.
+  if (!simulation || fresh.layoutKey !== state.layoutKey) {
+    state.layoutKey = fresh.layoutKey;
+    start(size);
+  }
+  paint();
+};
+
+function start(size) {
+  if (simulation) simulation.stop();
+  const you = { x: size.w / 2, y: size.h / 2, radius: state.youRadius };
+  simulation = d3.forceSimulation(state.nodes)
+    // 🛑 THE FORCE THE HAND-WRITTEN LAYOUT DID NOT HAVE. A force-directed model
+    // places centres; it has no idea a node is a disc. `forceCollide` is the
+    // separate pass every graph library ships for exactly that, and it is the
+    // whole reason this page exists.
+    .force("collide", d3.forceCollide((d) => d.radius + 9).iterations(3))
+    .force("charge", d3.forceManyBody().strength((d) => -34 - d.radius * 9))
+    // A log-scaled weight arrives from Swift already, so an edge that runs
+    // from 2 to 2,321 does not pull at full strength on every real pair.
+    .force("link", d3.forceLink(state.links)
+      .strength((l) => 0.04 + 0.5 * l.weight)
+      .distance((l) => 150 - 90 * l.weight))
+    // ⚠️ Two axis forces, not forceCenter. Centring shifts the whole graph and
+    // lets it drift off screen; these pull each node home. The vertical pull
+    // is stronger because the panel is three times wider than it is tall.
+    .force("x", d3.forceX(size.w / 2).strength(0.045))
+    .force("y", d3.forceY(size.h / 2).strength(0.10))
+    // 🛑 KEEP THE MIDDLE CLEAR FOR "YOU" — one more disc nothing may overlap,
+    // which needs no special case in the drawing.
+    .force("you", pushOutOfCentre(you))
+    .alpha(1).alphaDecay(0.028)
+    .on("tick", tick);
+}
+
+function pushOutOfCentre(you) {
+  let nodes;
+  function force() {
+    for (const n of nodes) {
+      const dx = n.x - you.x, dy = n.y - you.y;
+      const reach = Math.hypot(dx, dy) || 0.01;
+      const clear = you.radius + n.radius + 16;
+      if (reach < clear) {
+        const push = (clear - reach) / reach;
+        n.vx += dx * push * 0.35;
+        n.vy += dy * push * 0.35;
+      }
+    }
+  }
+  force.initialize = function (ns) { nodes = ns; };
+  return force;
+}
+
+function tick() {
+  // 🛑 ROOM FOR THE LABEL, NOT JUST THE CIRCLE. Clamping the centre to the
+  // panel keeps every disc inside and clips every name: a label is centred
+  // under its node and runs well past it, so "Christena Burnham" at the left
+  // edge was drawn as "istena Burnham". The margins are asymmetric because a
+  // label hangs below the circle and nothing hangs above it.
+  const size = stageSize();
+  for (const n of state.nodes) {
+    n.x = Math.max(n.radius + 46, Math.min(size.w - n.radius - 46, n.x));
+    n.y = Math.max(n.radius + 8, Math.min(size.h - n.radius - 22, n.y));
+  }
+  paint();
+}
+
+function paint() {
+  const size = stageSize();
+  const mid = { x: size.w / 2, y: size.h / 2 };
+  const lit = (n) => n.id === state.selected;
+  const alpha = (value) => "rgba(" + ink() + "," + value + ")";
+
+  spokeLayer.selectAll("line").data(state.nodes.filter(shown), (d) => d.id)
+    .join("line")
+    .attr("x1", mid.x).attr("y1", mid.y)
+    .attr("x2", (d) => d.x).attr("y2", (d) => d.y)
+    .attr("stroke", (d) => alpha((lit(d) ? 0.4 : 0.05) * d.presence))
+    .attr("stroke-width", (d) => lit(d) ? 1.6 : 0.6);
+
+  linkLayer.selectAll("line")
+    .data(state.links.filter((l) => shown(l.source) && shown(l.target)),
+          (d) => d.source.id + "" + d.target.id)
+    .join("line")
+    .attr("x1", (d) => d.source.x).attr("y1", (d) => d.source.y)
+    .attr("x2", (d) => d.target.x).attr("y2", (d) => d.target.y)
+    .attr("stroke", function (d) {
+      const on = lit(d.source) || lit(d.target);
+      const near = Math.min(d.source.presence, d.target.presence);
+      return alpha((on ? 0.5 : 0.05 + 0.24 * d.weight) * near);
+    })
+    .attr("stroke-width", (d) => (lit(d.source) || lit(d.target))
+                                 ? 1.8 : 0.4 + 1.6 * d.weight);
+
+  const circles = nodeLayer.selectAll("circle.person").data(state.nodes, (d) => d.id)
+    .join(function (enter) {
+      return enter.append("circle").attr("class", "person")
+        .attr("cursor", "pointer")
+        .on("click", (event, d) => post({ selected: d.id }))
+        .call(d3.drag()
+          .on("start", function (event, d) {
+            if (!event.active) simulation.alphaTarget(0.25).restart();
+            d.fx = d.x; d.fy = d.y;
+          })
+          .on("drag", function (event, d) { d.fx = event.x; d.fy = event.y; })
+          // ⚠️ RELEASED, NOT PINNED. Leaving fx/fy set makes a dragged node
+          // stay where it was dropped for ever, and the graph slowly becomes
+          // a set of pins nobody remembers placing.
+          .on("end", function (event, d) {
+            if (!event.active) simulation.alphaTarget(0);
+            d.fx = null; d.fy = null;
+          }));
+    });
+  circles
+    .attr("cx", (d) => d.x).attr("cy", (d) => d.y)
+    .attr("r", (d) => shown(d)
+                      ? Math.max(4, state.scaled ? d.radius * d.presence : d.radius)
+                      : 3)
+    .attr("fill", (d) => shown(d) ? colour(d) : "none")
+    .attr("fill-opacity", (d) => (lit(d) ? 0.95 : 0.68) * d.presence)
+    .attr("stroke", (d) => colour(d))
+    .attr("stroke-opacity", (d) => shown(d) ? d.presence : 0.18)
+    .attr("stroke-width", (d) => lit(d) ? 2 : 0.8);
+
+  // 🛑 A LABEL ONLY WHERE ONE FITS, checked against those already placed.
+  // Naming all seventy makes a thicket in which no name can be read.
+  const taken = [];
+  const labelled = state.nodes.filter(function (d) {
+    if (!shown(d)) return false;
+    if (!lit(d) && d.radius <= 8) return false;
+    const width = d.name.length * 5.6 + 8;
+    const box = { x: d.x - width / 2, y: d.y + d.radius, w: width, h: 15 };
+    const clash = taken.some((t) => !(box.x + box.w < t.x || t.x + t.w < box.x ||
+                                      box.y + box.h < t.y || t.y + t.h < box.y));
+    if (!lit(d) && clash) return false;
+    taken.push(box);
+    return true;
+  });
+  labelLayer.selectAll("text.name").data(labelled, (d) => d.id)
+    .join((enter) => enter.append("text").attr("class", "name"))
+    .attr("x", (d) => d.x).attr("y", (d) => d.y + d.radius + 12)
+    .attr("text-anchor", "middle")
+    .attr("font-size", 10).attr("font-weight", 500)
+    .attr("fill", "rgb(" + ink() + ")")
+    .attr("fill-opacity", (d) => d.presence)
+    .text((d) => d.name);
+
+  // You, last, so nothing is drawn over it.
+  nodeLayer.selectAll("circle.you").data([0])
+    .join((enter) => enter.append("circle").attr("class", "you"))
+    .attr("cx", mid.x).attr("cy", mid.y).attr("r", state.youRadius)
+    .attr("fill", alpha(0.82))
+    .attr("stroke", paper()).attr("stroke-width", 2.5);
+  labelLayer.selectAll("text.you").data([0])
+    .join((enter) => enter.append("text").attr("class", "you"))
+    .attr("x", mid.x).attr("y", mid.y + 3.5).attr("text-anchor", "middle")
+    .attr("font-size", 10).attr("font-weight", 600)
+    .attr("fill", paper()).text("You");
+}
+
+svg.call(d3.zoom().scaleExtent([0.4, 6])
+  .filter((event) => !event.button && event.type !== "dblclick")
+  .on("zoom", (event) => root.attr("transform", event.transform)));
+
+// ⚠️ The panel resizes with the window, and the centring forces are pinned to
+// its middle. Without this the graph keeps orbiting where the middle used to be.
+//
+// 🛑 A ResizeObserver ON THE SVG, not a window resize listener. The window
+// never resizes — the VIEW does — so the listener never fired, and the first
+// layout ran against whatever size the element happened to have before SwiftUI
+// had given it one.
+let lastSize = { w: 0, h: 0 };
+new ResizeObserver(function () {
+  const size = stageSize();
+  if (Math.abs(size.w - lastSize.w) < 4 && Math.abs(size.h - lastSize.h) < 4) return;
+  lastSize = size;
+  if (!simulation) return;
+  simulation.force("x", d3.forceX(size.w / 2).strength(0.045));
+  simulation.force("y", d3.forceY(size.h / 2).strength(0.10));
+  simulation.force("you", pushOutOfCentre({ x: size.w / 2, y: size.h / 2,
+                                            radius: state.youRadius }));
+  simulation.alpha(0.5).restart();
+}).observe(svg.node());
+
+post({ ready: true });
+</script>

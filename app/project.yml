@@ -74,6 +74,15 @@ targets:
     platform: macOS
     sources:
       - path: Sources
+      # 🛑 The icon the website already uses, padded to Apple's 824-in-1024
+      # grid by `make-icon.sh`. Do not edit the .icns by hand — it is built.
+      - path: Icon/AppleTools.icns
+      # 🛑 A FOLDER REFERENCE, so `web/` keeps its name inside Resources and
+      # `Bundle.url(forResource:subdirectory:)` finds it. Copied as a group
+      # instead, the files land loose in Resources and the subdirectory lookup
+      # returns nil.
+      - path: Resources/web
+        type: folder
     entitlements:
       path: AppleTools.entitlements
       properties:
@@ -113,10 +122,17 @@ targets:
       properties:
         CFBundleName: AppleTools
         CFBundleDisplayName: AppleTools
+        # ⚠️ NO EXTENSION. `CFBundleIconFile` names the file without `.icns`,
+        # and with one macOS finds nothing and shows the generic tile.
+        CFBundleIconFile: AppleTools
         CFBundlePackageType: APPL
         CFBundleShortVersionString: ${APP_VERSION}
         CFBundleVersion: ${APP_BUILD}
-        # No Dock icon. A background indexer with a Dock tile is noise.
+        # 🛑 NO DOCK ICON AT REST, and one while a window is open. A background
+        # indexer with a permanent Dock tile is noise; a visible window with no
+        # tile cannot be switched back to once it is behind something. The app
+        # raises its activation policy while the window lives — see
+        # `DockPresence` in App.swift.
         LSUIElement: true
         LSMinimumSystemVersion: "14.0"
         NSHumanReadableCopyright: ""

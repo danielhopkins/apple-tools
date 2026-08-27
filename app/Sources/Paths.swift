@@ -140,6 +140,15 @@ enum Paths {
         return exists(bundled.appendingPathComponent("apple-notes")) ? bundled : nil
     }
 
+    /// The d3 page the contact web is drawn on. 🛑 Inside the bundle, always:
+    /// it is loaded with `loadFileURL`, and the directory it sits in is the
+    /// only place that web view is allowed to read.
+    static var graphPage: URL? {
+        Bundle.main.url(forResource: "graph", withExtension: "html",
+                        subdirectory: "web")
+            ?? Bundle.main.url(forResource: "graph", withExtension: "html")
+    }
+
     static var python: URL { URL(fileURLWithPath: "/usr/bin/python3") }
 
     /// Every tool `apple status` reports on. ⚠️ NOT the same list as the index
@@ -151,6 +160,6 @@ enum Paths {
     /// live list comes from `index.py sources --json`, because the per-source
     /// arguments live there and two copies of them drift.
     static let indexSources = ["notes", "mail", "messages",
-                               "calendar", "contacts", "maps", "reminders",
-                               "files"]
+                               "calendar", "contacts", "maps", "photos",
+                               "reminders", "files"]
 }

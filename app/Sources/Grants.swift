@@ -300,6 +300,23 @@ final class Grants: ObservableObject {
                                                ofItemAtPath: path.path)
     }
 
+    /// 🛑 `pane` FROM `apple status` IS A HUMAN NAME, NOT A URL FRAGMENT. It
+    /// reads "Full Disk Access + Automation"; `Grants.Entry.pane` next door
+    /// holds "Privacy_Calendars", which IS one. Same field name, two kinds of
+    /// string. Handing the first to `openPane` builds a settings URL that
+    /// opens nothing, so it is mapped here — beside the only function that
+    /// consumes a fragment, rather than in the view that happened to need it.
+    ///
+    /// ⚠️ A pane not on this list gets NO button, never a dead one.
+    static func settingsFragment(for pane: String) -> String? {
+        if pane.contains("Full Disk Access") { return "Privacy_AllFiles" }
+        if pane.contains("Calendars") { return "Privacy_Calendars" }
+        if pane.contains("Reminders") { return "Privacy_Reminders" }
+        if pane.contains("Contacts") { return "Privacy_Contacts" }
+        if pane.contains("Automation") { return "Privacy_Automation" }
+        return nil
+    }
+
     static func openPane(_ pane: String) {
         let url = URL(string: "x-apple.systempreferences:com.apple.settings."
                       + "PrivacySecurity.extension?\(pane)")!

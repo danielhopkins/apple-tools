@@ -4,11 +4,19 @@ CLIs for reading and writing local Apple app data: Notes, Mail, Messages, Phone,
 Maps, Reminders, Calendar, Contacts. Everything runs locally against the user's real data — no
 sync service, no API keys.
 
-🛑 **One exception, and it is opt-in: geocoding.** `apple maps geocode`,
-`apple reminders --at` and `apple calendar --at` resolve a place name through
-Apple Maps, which is a network call. Nothing else in the repo makes one. It
-lives in its own `Geocoding` target so the dependency stays visible, and
-`apple maps geocode --local-only` refuses it outright.
+🛑 **Two exceptions, and both are visible.**
+
+1. **Geocoding, which is opt-in.** `apple maps geocode`, `apple reminders --at`
+   and `apple calendar --at` resolve a place name through Apple Maps. It lives
+   in its own `Geocoding` target so the dependency stays visible, and
+   `apple maps geocode --local-only` refuses it outright.
+2. **The app's Places map.** `AppleTools.app` draws a MapKit map, and MapKit
+   fetches its tiles from Apple every time the map draws. ⚠️ **The places
+   themselves never leave the machine** — MapKit asks for pictures of the
+   world at a region and a zoom, and is not handed the user's coordinates as
+   data. What an observer could infer is the region being looked at. The map
+   is built only while that panel is open, so a window never scrolled that far
+   makes no request. **No CLI makes this call**; it is the app alone.
 
 ## Quick reference
 
@@ -1215,6 +1223,7 @@ FIELDS, shared by `add` and `edit`:
 
 ```
 --first --middle --last --name-prefix --name-suffix --nickname
+--previous-family-name NAME  --company-card | --person-card
 --company --department --job-title
 --birthday YYYY-MM-DD|--MM-DD
 --anniversary YYYY-MM-DD|--MM-DD
@@ -1228,6 +1237,37 @@ FIELDS, shared by `add` and `edit`:
 --note TEXT | --append-note TEXT | --clear-note
 --photo FILE | --clear-photo
 ```
+
+**Person or company.** `--company-card` marks a card as a business,
+`--person-card` marks it as a person, and `get`/`search`/`list --json` report
+`is_company` (absent, never `false`).
+
+```
+apple contacts edit <id> --company-card
+```
+
+🛑 **It is the "Company" tick box in Contacts.app**, and the only reliable way
+to tell PayPal from a person: a company card carries emails, phones and an
+address exactly like anyone else. 71 of the 694 cards here have it set.
+`apple-index people` uses it to keep businesses out of the social graph.
+
+**A name someone used before.** `--previous-family-name` writes it, and
+`get`/`search`/`list --json` report `previous_family_name`.
+
+```
+apple contacts edit <id> --previous-family-name Anderson
+```
+
+- 🛑 **Contacts.app labels this field "Maiden Name". This tool does not**, and
+  the difference is deliberate: the same field carries a name changed by a
+  second marriage, a divorce, an adoption or a deed poll. `CNContact` calls it
+  `previousFamilyName`, which is the accurate word.
+- **`search` matches it, whole**: "Steph Anderson" finds the card that now
+  reads "Stephanie Hopkins". The two halves live in different fields, so
+  neither matches on its own.
+- 🛑 **`apple-index people` uses it to fold one person's two lives together.**
+  Without it a name change is two people in the data, and no amount of address
+  matching finds them. See [`lab/README.md`](lab/README.md).
 
 **Pictures.** `--photo FILE` sets the contact's picture, `--clear-photo` removes
 it, and `get`/`search`/`list --json` report **`has_photo`** (present only when
@@ -1561,6 +1601,10 @@ swift/                    one Swift package, seven binaries
                           than returning when it hits the note wall
   Tests/RemindersTests/ MailTests/ MessagesTests/ PhoneTests/ MapsTests/
         GeocodingTests/ CalendarSyncTests/ ContactsTests/
+lab/photos.py             the Photos reader: tagged faces with their Contacts
+                          id, coordinates, and Apple's stored reverse geocode.
+                          🛑 Reads sqlite directly rather than using osxphotos,
+                          which cannot tell a person from a dog
 notes/                    Python; apple-notes, notestore.py, notestore.proto,
                           mergeable.py (ZMERGEABLEDATA1 reader — recordings,
                           transcripts, summaries, and table cells),
@@ -1601,6 +1645,7 @@ tool you are changing before you change it — every claim in there was paid for
 | `apple-messages-store.md` | chat.db schema, the typedstream body, verified traps |
 | `apple-phone-store.md` | CallHistory schema, the entitlement walls, verified traps |
 | `apple-maps-store.md` | MapsSync schema, why the location table overcounts, and why nothing here writes |
+| `apple-photos-store.md` | who is tagged in a photo and where it was taken; why `osxphotos` is not used, and why the pictures, the OCR and the scene labels are left behind |
 | `apple-geocoding.md` | the one network call: what uses it, the local-first rule, and why reminders cannot read the Maps store |
 | `apple-reminders-tags.md` | tags have no public API at all — the private call that works, and the store behind it |
 | `apple-calendar-eventkit.md` | the four-year fetch clamp, the recurrence spans, the sync join, the `resync` rebuild, and the test-suite rate limit |
@@ -1708,17 +1753,184 @@ above cannot: **searching when you do not know which app holds the answer.**
 🛑 Only the PyTorch-free half ships; `make test` still runs nothing here.
 
 ```
-apple-index search "the greenhouse budget"     # one query across all eight sources
+apple-index search "the greenhouse budget"     # one query across every source
 ```
 
 It builds one SQLite index over mail, messages, notes, calendar, contacts,
-reminders, visited places and any folder you point it at (an Obsidian vault
-is understood natively),
+reminders, visited places, **the Photos library** and any folder you point it
+at (an Obsidian vault is understood natively),
 and searches it with FTS5 plus an `e5-small-v2` embedding. A query takes 70 to
 300 ms against 239,000 chunks. Full detail in
 [`lab/README.md`](lab/README.md); the model comparison is in
 [`lab/MODELS.md`](lab/MODELS.md) and the per-source change signals in
 [`lab/INCREMENTAL.md`](lab/INCREMENTAL.md).
+
+**`apple-index files` names the folders the `files` source reads**, and it is
+the only source that has to be configured — every other one reads a store at a
+known path.
+
+```
+apple-index files                        # what is configured
+apple-index files add ~/notes            # and --name, --exclude a,b
+apple-index files remove ~/notes
+apple-index files --json                 # what the app's window reads
+```
+
+The AppleTools window edits the same list, in the `files` row of its Sources
+panel. 🛑 **Adding a folder does not index it and removing one does not unindex
+it** — `ingest` only ever adds, so a removed folder's records survive until
+`apple-index ingest --source files --full`. 🛑 **`files.json` lives in
+`~/Library/Application Support/apple-tools`**, not beside the index: it followed
+`dirname(DEFAULT_DB)` until 26.827.0, which is inside the encrypted vault
+whenever the app has it mounted, so a folder added from the app disappeared with
+the volume and `apple-index forget` destroyed the configuration with the index.
+
+**`apple-index people` is the one command that is not a search.** It reports who
+the user talks to, who turns up alongside whom, and which emoji they themselves
+type — the data behind the app window's fifth panel.
+
+```
+apple-index people --top 80 | jq '.people[0]'      # always JSON, like `stats`
+apple-index people --refresh                       # recompute rather than read
+```
+
+🛑 **It is computed once a day and stored** in the index (80 ms to read against
+3.6 s to compute), so a stored answer may be up to a day old — every reading
+carries `cached` and `computed`. A `--me` / `--not-a-person` ruling forces the
+recompute it implies rather than waiting for the clock.
+
+- 🛑 **Deciding which handles are the USER is the hard part**, and it takes six
+  rules: the accounts Mail knows, one inferred address, every handle on the card
+  claiming one of those, every address signing itself with a name the card
+  answers to (🛑 by **stem** — the card says "Dan" and old addresses say
+  "Daniel"), the user's own local part at another service, and anything they
+  declare with `people --me <handle>`. 49 handles here. Everything inferred is
+  reported in `me.detected`, `me.by_name`, `me.by_address` and `me.declared` —
+  read it before trusting a ranking.
+- ⚠️ **A bounce path carries the user's own address** (`bounces+…-me=gmail.com@…`)
+  and reads as a person with their name. Excluded with reason `bounce`.
+- 🛑 **THE UNIT IS A DAY, and that is not decoration.** An earlier version
+  summed indexed records and called it "encounters", which reported a spouse of
+  twenty years at 9,059 of nothing in particular. A record is a different size
+  in every source — one email, a block of TEN texts, one event — so the sum
+  means nothing. Read `days`; `channels` carries the item counts, each in its
+  own unit, and **must never be added together**.
+- 🛑 **Being on the same list is not talking.** 53% of the emails naming that
+  spouse were written by a third party to both of them, and a third of the
+  total are `Cc`. Those are counted in `same_list`, never in `days`. A mail to
+  more than 12 people is a list even when the user sent it.
+- **`alone` is the number that answers "surely not"** — the items with nobody
+  else on them, per channel. Three true answers to three different questions:
+  5,927 messages carry her address, 2,625 are one of them writing to the
+  other, 1,336 are just the two of them. Checked against the raw `.emlx`
+  headers, not the index; every line agrees within 1%.
+- ⚠️ **Emoji are only what the user SENT.** Counting the whole store measures
+  what other people type at them, and the two answers look alike.
+- 🛑 **A DAY THAT HAS NOT HAPPENED IS NOT CONTACT.** The calendar adapter
+  fetches a year ahead, so 1,008 events here are in the future. They are
+  counted in `upcoming`, never in `days`.
+- **`directory` is everyone** (4,725 here), for looking one person up and for
+  filtering the timeline. Month series are positions into one shared
+  `months_axis`, so everybody can have one.
+- 🛑 **A BUSINESS IS NOT SOMEBODY YOU TALK TO**, and five rules keep them out.
+  Every exclusion is reported in `excluded` with its reason, never dropped
+  silently: `company` (the card is marked as a business, or names one and no
+  person), `never-answered` (🛑 **40 emails and not one reply** — the only rule that
+  reads the relationship rather than the address, so it catches a sender whose
+  name and address look like a person's; one reply spares them, and it never
+  judges anyone who also texts or calls), `bulk-mail` (12+, never answered, a
+  newsletter footer on half of them, and the address does not carry their own
+  name), `short-code` (an SMS short code — a five-digit number cannot be a
+  person), `no-reply` (an address a machine writes from), `calendar-feed` (a
+  Google Calendar system address), `list` (many display names, none dominant).
+- **Two escape hatches, and which one depends on whether a card exists.**
+  With a card: `apple contacts edit <id> --company-card`, or the "Company" tick
+  box. Without one — Mint ranked 17th here and has no card —
+  `apple-index people --not-a-person team@mint.com`. 🛑 **`--is-a-person`
+  rescues somebody the rules excluded wrongly, and it beats every rule.** That
+  direction matters more: a business left in is visible, a person taken out is
+  not. Rulings live in `~/Library/Application Support/apple-tools/people.json`.
+- ⚠️ **`office@`, `info@` and `contact@` are deliberately NOT excluded.** A
+  small charity's office address really is answered by one person, and two on
+  this store are.
+- 🛑 **The same person is written three ways, and three rules fold them**:
+  words sorted, so "Leopold, Robin" meets "Robin Leopold" (208 pairs here);
+  namesakes with no card folded together, two words minimum (154 groups, 265
+  rows); and the name change below.
+- 🛑 **A NAME CHANGE IS TWO PEOPLE unless the card records the old name.** Fill
+  in `--previous-family-name` and the two rows become one. Measured: one card
+  and one dead address held 8,491 and 568 encounters, meeting exactly where the
+  other began.
+
+**`apple-index places` is the map behind the app's sixth panel** — everywhere
+the user has been, from the two sources that know.
+
+```
+apple-index places --limit 20      # always JSON
+```
+
+🛑 **TWO SOURCES, TWO UNITS, NEVER ADDED.** `maps` records a genuine
+**arrival**, with a start time, out of Maps' Visited Places. `photos` records
+that a camera was somewhere on some **day**. 98 of the 1,487 places here have
+both, and adding them makes a number with no unit — the same mistake `people`
+made once by adding emails to texts. Each row carries `visits` and
+`photo_days` side by side, named after what they count.
+
+- ⚠️ **Neither is "everywhere you have been."** Maps holds 450 arrivals;
+  Photos holds 27,603 located pictures across 21 years. Photos reaches much
+  further back and misses everywhere no picture was taken. Say which one an
+  answer came from.
+- 🛑 **A merged row keeps the name of the source that actually knows the
+  place.** Preferring the Maps name renamed this user's **home** — 1,647 photo
+  days, the largest place in the library — after a charity's office 180 m away
+  with two recorded visits.
+- ⚠️ **`container` means something different in each adapter.** `maps` puts the
+  place category there and `photos` puts a country; reading it as a country
+  for both listed "Dining" and "Transportation" as countries, 65 of them where
+  the honest answer is 8.
+
+**The `photos` source is what put children in the people report.** Every other
+channel needs an address or a number, so it can only see somebody who sends
+things.
+
+- 🛑 **A tagged face joins to Contacts BY ID.** `ZPERSON.ZPERSONURI` holds
+  `UUID:ABPerson`, the exact identifier `apple contacts get` takes; 47 of the
+  63 named people here carry one. ⚠️ **It survives a name change**, which
+  nothing else here does: the library says "Keith Hopkins", the index says
+  "Keith Van Norstrand", and the same id merges them with no
+  `--previous-family-name` needed.
+- 🛑 **Emma is a dog.** `ZDETECTEDFACE.ZDETECTIONTYPE` is 1 for a human face,
+  3 for a dog and 4 for a cat. Seven pets are named here, and without the
+  filter Emma ranks fourth by tagged days. **`osxphotos` does not expose this
+  field**, which is one of three reasons it is not used.
+- ⚠️ **It measures who was PHOTOGRAPHED, not who was there**, and the
+  difference falls on whoever holds the camera. This user appears on 661 days
+  and was present for all 1,378 of his daughter's. That costs nothing in the
+  report, because the user is excluded from their own graph — but never read a
+  photo day count as "days together" without saying whose camera it was.
+- 🛑 **A photo from somebody else's camera is not proof you were there.** 7,460
+  assets belong to the iCloud Shared Library. A day whose *every* photo came
+  from a shared camera is marked `alongside` and counted like a mailing list:
+  an edge in the web, never a day of contact.
+- 🛑 **The user's own face lands on a card with nothing to match on** — the
+  right name, no email, no phone — so no handle rule could claim it and the
+  user was drawn **sixth** in his own list. Photos cannot settle it either:
+  `ZISMECONFIDENCE` is empty on every row. The card is claimed by the same
+  stem rule addresses use, only when it carries no handle of its own, and is
+  reported in `me.by_card`.
+- 🛑 **The pictures, the OCR and Apple's scene labels are deliberately NOT
+  indexed.** 36,341 photos carry 5,349 characters of title and description
+  between them. The OCR covers 5.9% and the store keeps it as a bag of
+  lowercased words with the order destroyed. The scene labels are
+  synonym-inflated to meaninglessness. Measured: `eval.py` scores **MRR 0.538
+  with photos in the index and 0.538 with every photo record deleted.** Full
+  record in [`docs/apple-photos-store.md`](docs/apple-photos-store.md).
+
+⚠️ **OPEN QUESTION, not settled.** `days` is the unit for every channel, so
+somebody you email daily outranks somebody you are physically with. Photos put
+15 people into the directory who appear in no other source — all children and
+family — and they sit below the top forty for that reason. Whether "who you
+talk to" and "who you are with" are one ranking or two has not been decided.
 
 Four rules at the call site:
 
@@ -1746,6 +1958,25 @@ Four rules at the call site:
 
 Install with `brew install apple-tools`, or from a checkout with
 `cd lab && make install install-agent install-skill`.
+
+**Retrieval quality is measured against a PUBLIC corpus**, not only against this
+machine's data. `lab/bench/` builds an index from **EnronQA** — 1,257 real Enron
+emails and 1,254 question/answer pairs — in its own database, and scores it with
+the same `eval.py`. Baseline for `e5-small-coreml`: **MRR 0.780**, two minutes.
+
+```
+cd lab && make bench            # fetch, build and score
+```
+
+- 🛑 **The 29 hand-written cases in `eval.py` cannot decide a model swap.** They
+  separated e5-small from e5-base by 0.012 MRR, which is under one case in
+  fourteen. Anything claiming a two-point gain needs the bigger set.
+- ⚠️ **The bench does not replace them.** Every EnronQA case is a long
+  `descriptive` question written by an LLM from the answer. No short keyword
+  lookups, no calendar, no places, no cross-source fusion.
+- 🛑 **It never touches the real index.** `APPLE_INDEX_DB` moves the database
+  *and* `files.json`, and the builder refuses to run under the real index's
+  directory.
 
 **The embedder is Core ML, in Swift, with no PyTorch.** `e5-small-v2` converted
 to three fixed shapes; 663 chunks/sec on this corpus, byte-identical vectors to

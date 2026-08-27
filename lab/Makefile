@@ -8,7 +8,8 @@ PLIST   := $(HOME)/Library/LaunchAgents/$(AGENT).plist
 UV      := $(shell command -v uv)
 
 .PHONY: build install uninstall install-agent uninstall-agent agent-status \
-        install-skill link-installed-skills uninstall-skill demo status test clean
+        install-skill link-installed-skills uninstall-skill demo status test \
+        test-people test-files test-photos bench bench-compare bench-clean clean
 
 ## Build the Swift embedder (Core ML + Apple's models)
 build:
@@ -114,8 +115,44 @@ status:
 	./bin/apple-index status
 
 test:
+	./test-people.py
+	./test-files.py
+	./test-photos.py
 	./test-incremental.py --source mail,calendar,notes,messages
 	./eval.py
+
+## Retrieval quality against a PUBLIC corpus: EnronQA, 1,254 cases
+##
+## 🛑 The 29 cases in eval.py cannot decide a model swap. See bench/README.md.
+## The first run downloads one Enron inbox; after that it is offline.
+INBOX ?= germany-c
+
+bench:
+	@test -d bench/enron/corpus || ./bench/enronqa.py fetch --user $(INBOX)
+	@test -f bench/enron/enron.db || ./bench/enronqa.py build
+	./bench/enronqa.py score --limit 0
+
+## Every fusion strategy against the same cases (~16 min)
+bench-compare:
+	./bench/enronqa.py score --limit 0 --compare
+
+## Throw the downloaded corpus away
+bench-clean:
+	rm -rf bench/enron
+
+## The `people` identity rules alone. Offline: no index, no Contacts, no
+## network, so this one is safe to run anywhere and takes under a second.
+test-people:
+	./test-people.py
+
+## Where the `files` source keeps its configuration. Offline, and it pins the
+## bug that put it inside the encrypted vault, where an unmount took it away.
+test-files:
+	./test-files.py
+
+## Offline checks for the Photos reader and the Contacts-id handle
+test-photos:
+	./test-photos.py
 
 clean:
 	rm -rf vec/.build

@@ -160,10 +160,41 @@ was stored for. It holds this developer's App Store Connect API key.
 
 ## What it does
 
+🛑 **It makes ONE network call, and until the Places panel it made none.** The
+map is MapKit, and MapKit fetches its tiles from Apple every time it draws.
+Before this panel existed, `apple maps geocode` and the `--at` flags were the
+whole network surface of this repo — in their own `Geocoding` target, opt-in,
+and refusable with `--local-only`.
+
+- ⚠️ **The places themselves never leave the machine.** MapKit asks Apple for
+  pictures of the world at a region and a zoom. It is not handed the user's
+  coordinates as data, and nothing uploads a place, a date or a name. What an
+  observer could infer is the **region being looked at**, which is weaker than
+  the pin list but is not nothing.
+- The map is built only while that panel is on screen, so a window never
+  scrolled that far makes no request at all.
+- **No CLI makes this call.** `apple-index places` is JSON off the index, and
+  it touches nothing.
+
 **It indexes.** `NSBackgroundActivityScheduler` every 5 minutes with 60 seconds
 of tolerance, plus on wake and on unlock, plus once at launch. It runs
 `index.py ingest` per source and then `index.py embed`, as children, so they
 inherit the grant. A full deletion sweep runs weekly, not every cycle.
+
+**It draws a world map of everywhere you have been.** The Places panel reads
+`index.py places`, which merges Maps' visited places with clusters of located
+photographs. 🛑 **The two carry different units and the panel never adds them**:
+a `visit` is an arrival Maps recorded, a `photo day` is a day a picture was
+taken there. The legend and the list say which is which, and the dot is sized
+on `max` of the two — an ordering, never a measurement.
+
+- ⚠️ **The map draws the top 400 places, not all 1,487.** MapKit draws every
+  annotation it is given, and 1,487 pins at world zoom is a smear that says
+  nothing. The badge always shows the full total, so the cap can never read as
+  "this is everywhere".
+- ⚠️ **Pins carry no labels.** Every pin showing its name is unreadable
+  anywhere the user actually spends time, and the names are often street
+  addresses. Tap a place to see it.
 
 **It owns the search endpoint.** It runs `vec daemon` as a child on the same
 Unix socket, so `apple-index search` and the skill work unchanged.
@@ -182,6 +213,187 @@ that, removing the app would leave the machine with no search endpoint at all.
 **It shows status**: per source records, chunks, last read and last error; the
 embed backlog with a rate; permission state per store; the index size; and the
 model, with a warning when rows exist under more than one model name.
+
+🛑 **ONE ROW PER SOURCE, NOT TWO PANELS.** "Permissions" and "Indexed" were the
+same eight names in two lists a screen apart, and the question a person has
+joins them: *mail says 40,000 records — is that everything, or is the grant half
+broken?* Answering that meant scrolling between two panels and matching names by
+eye. Each source is now one row carrying both, and the permission detail and its
+fix appear inside the row rather than as a list of red lines under a grid of
+green ticks.
+
+- ⚠️ **A source with no permission of its own is not a broken one.** `files` has
+  no grant; it reads the folders the user named. It gets a dashed mark, never a
+  red one.
+- ⚠️ **A permission with no source is not a broken one either.** `phone` is read
+  for the people report and never indexed, so its row says so rather than
+  leaving a blank line beside a green tick.
+- 🛑 **`pane` from `apple status` is a HUMAN NAME, not a URL fragment.** It reads
+  `Full Disk Access + Automation`. Handing that to `Grants.openPane` builds a
+  settings URL that opens nothing, so it is mapped, and a pane not on the map
+  gets no button rather than a dead one.
+
+🛑 **`files` LISTS ITS TOP-LEVEL FOLDERS, NOT ITS BIGGEST ONES.** Every other
+source files a record under one flat name — an account, a mailbox, a calendar, a
+list. A file is filed under its whole relative folder, so this vault produced 49
+rows, most of them a subfolder of another row, ordered by size. That answers
+"which folder is biggest", which is nobody's question. `index.py`'s
+`top_level_containers` folds them to the first path segment: 49 rows became 12,
+and a folder now carries its own files plus everything beneath it.
+
+- 🛑 **THE CUT APPLIES AFTER THE FOLD, NEVER BEFORE.** Taking the 60 largest
+  paths first and folding what survives reports a top-level folder short by
+  whatever fell past the cut. A wrong number is worse than a missing row, so the
+  SQL `LIMIT` is dropped for this one source.
+- 🛑 **Only `files` is folded.** Mail's container is `account/mailbox`, and
+  folding that keeps the account and throws away the mailbox — the half that
+  says what is indexed.
+- **Records and chunks, both.** Records alone cannot say why one folder costs
+  more of the index than another: 199 files in `Current Work` are 4,779 chunks,
+  and 306 in `Reading` are 3,232.
+- ⚠️ **Two roots with a folder of the same name merge.** They already did before
+  the fold: a file sitting directly in a root is filed under the ROOT's name,
+  which collides with a top-level folder of that name elsewhere.
+
+**The folders the `files` source reads are edited in that row.** `Add Folder…`
+opens an `NSOpenPanel`; the minus button removes one. Both call `index.py
+files`, and `Sources/Folders.swift` is the model.
+
+- 🛑 **ADDING A FOLDER DOES NOT INDEX IT, AND REMOVING ONE DOES NOT UNINDEX IT.**
+  The next cycle reads an addition. A removal leaves every record already
+  written, because `ingest` only ever adds — those go on the next full rebuild
+  of that source. Neither is guessable from the button that was pressed, so both
+  are printed after the press.
+- 🛑 **`files.json` used to follow the vault.** `dirname(DEFAULT_DB)` is
+  `<support>/mnt` whenever the encrypted image is mounted, so a folder added
+  from the app landed inside the volume, vanished when the app quit, and
+  `apple-index forget` destroyed it with the index. Same trap `people.json`
+  recorded; fixed the same way in 26.827.0, and a copy still at the old path is
+  moved on sight.
+
+🛑 **A STANDING PARAGRAPH IS NOT A WARNING.** This window carried eight of them,
+several in orange, on a machine with nothing wrong — which is how a reader
+learns to scroll past the one line that is really about them. Everything
+permanently true now sits behind an ⓘ button (`Sources/Explain.swift`); what
+stays on the page is what is true right now. The test is: *would this line ever
+go away?* If not, it is background.
+
+- ⚠️ **A POPOVER, NOT A `.help()` TOOLTIP.** macOS draws a tooltip as one
+  unselectable strip, and several of these paragraphs name a command the user is
+  meant to copy. The button carries `.help()` as well, so hovering still works.
+- **The whole window is `.textSelection(.enabled)`.** Half of what it prints is
+  meant to be copied — a path, an address, a command, an error — and marking the
+  handful somebody remembered is how the rest stays unselectable. ⚠️ It does not
+  reach the contact web: that is a `WKWebView` drawing SVG, and its text is not
+  text.
+
+**It shows who is in the data.** A fifth panel draws a web of who turns up
+alongside whom, the emoji the user themselves types, and one row per person
+across the years — who arrived, who faded, who came back. It runs
+`index.py people`, which is described in [`lab/README.md`](../lab/README.md).
+
+**The web is d3, in a `WKWebView`.** `Resources/web/graph.html` plus a vendored
+`d3.min.js`; `Sources/ContactWebView.swift` is the bridge. It replaced a
+hand-written Fruchterman–Reingold layout that worked and was missing the force
+that decides whether a graph is readable: a force-directed model places
+**centres** and has no idea a node is a disc, so it settles two circles a
+comfortable distance apart and draws them overlapping. `d3.forceCollide` is the
+separate pass every real graph library ships for that. Dragging, panning and
+zooming came with it.
+
+🛑 **IT MAKES NO NETWORK REQUESTS, AND THAT IS ENFORCED THREE WAYS.** This app
+holds Full Disk Access, so a web view that could reach the internet would be
+that app phoning home with the user's social graph in memory.
+
+1. d3 is vendored in the bundle — version and sha256 in
+   [`Resources/web/VENDORED.md`](Resources/web/VENDORED.md).
+2. The page declares `default-src 'none'` with `connect-src 'none'`.
+3. `decidePolicyFor` cancels every navigation that is not the one file URL.
+
+⚠️ Any two of those can be got wrong quietly. The third is the one that still
+refuses. The web view also uses a **non-persistent** data store: nothing here
+needs a cookie, and a store is one more place the graph could come to rest.
+
+**Three things that were wrong at first, all invisible in the code:**
+
+- 🛑 **`window.innerHeight` is not the view.** A `WKWebView` inside a SwiftUI
+  frame does not resize its window object to match, so the centring forces
+  pulled everything to a middle *below the bottom edge*: an empty panel with one
+  circle stranded at the base. Measure the SVG's own rectangle, and observe it
+  with a `ResizeObserver` — a window `resize` listener never fires, because the
+  window never resizes.
+- 🛑 **The clamp has to leave room for the LABEL, not the circle.** Names are
+  centred under their node and run well past it, so "Christena Burnham" at the
+  left edge was drawn as "istena Burnham".
+- ⚠️ **The page decides when to re-simulate**, from a `layoutKey` Swift sends.
+  Tracking it on the Swift side too means two places remembering what was last
+  drawn, and they drift the first time a frame is skipped.
+
+**It plays the web through time.** A toggle turns the contact web into a
+rolling year that can be played or scrubbed, so people appear and fade as they
+come and go. 🛑 **The positions never move while it plays.** Re-running the
+simulation per frame makes the whole graph swim, and a viewer reads that
+movement as meaning — people "drifting apart" who did nothing of the kind. The
+layout is all-time and fixed; only presence changes.
+
+**It looks one person up, and the search is a filter.** The web draws a few
+dozen; the search box covers all 4,725, and typing a name redraws the timeline
+below for everyone who matches. 🛑 It filters the DIRECTORY, not the drawn set:
+"show me both Meyers" has one of them in 300th place, so filtering the drawn
+list would answer with one.
+
+🛑 **Everything there is ranked and sized by DAYS in contact**, never by a count
+of items. One mail record is one email and one messages record is a block of
+ten texts, so a sum across sources is meaningless — and the first version
+printed one, reporting a spouse of twenty years at "9,059 encounters". The
+per-channel counts are still shown, each labelled in its own unit.
+
+🛑 **PRECOMPUTED, ONCE A DAY.** The app runs `index.py people --ensure` at the
+end of every indexing cycle. That recomputes the report when the stored one is
+a day old and otherwise costs 80 ms, so opening the window reads a stored
+answer rather than paying 3.6 seconds. The **Recalculate** button forces a
+fresh one.
+
+⚠️ **The daily policy lives in `index.py`, not here.** The scheduler never has
+to know how old anything is, and a second copy of "daily" in Swift is how two
+schedules drift.
+
+⚠️ **NOT A DIAGNOSTIC.** It answers nothing the app needs in order to index or
+to search, its failure is ignored inside the cycle, and a broken report shows
+as an empty panel rather than as a broken index.
+
+## The icon, and the Dock
+
+```
+./make-icon.sh          # rebuilds Icon/AppleTools.icns
+```
+
+🛑 **The source is the website's artwork**, not a second drawing:
+`~/src/websites/boulderhopkins-com/static/images/apple-tools-icon.png`. One
+picture in one place; a hand-made copy here would drift the first time either
+changed.
+
+⚠️ **Apple's grid is 824 in 1024, and the artwork fills all 1024.** Dropped in
+as-is the icon is 24% larger than every Apple icon beside it in the Dock, which
+reads as a badly made app rather than as a big icon. `make-icon.sh` pads it.
+⚠️ `CFBundleIconFile` names the file **without** the extension.
+
+🛑 **`LSUIElement` is an initial policy, not a life sentence.** A background
+indexer with a permanent Dock tile is noise — but a visible window belonging to
+an accessory app cannot be switched back to. It is absent from the Dock, absent
+from ⌘-Tab, and once another window covers it the only way back is the menu bar
+item. `DockPresence` raises the activation policy while a window is open and
+lowers it again afterwards.
+
+- ⚠️ **One runloop later, on both edges.** `willCloseNotification` fires while
+  the window is still in `NSApp.windows`, so counting there finds it and the
+  tile never leaves; and SwiftUI runs a scene's `onAppear` **before** the window
+  is on screen, so counting there finds nothing and the tile never arrives.
+  Measured: the first version called it straight from `onAppear` and the app
+  stayed background-only with its window wide open.
+- ⚠️ **Counted from the windows themselves**, never from a flag toggled on open
+  and close. A flag drifts the first time a window closes by a route nobody
+  thought of, and the app is then either stuck in the Dock or unreachable.
 
 ## Things that are easy to get wrong here
 

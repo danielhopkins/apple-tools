@@ -206,6 +206,20 @@ final class Indexer: ObservableObject {
                 }
             }
 
+            // 🛑 THE DAILY POLICY LIVES IN `index.py`, NOT HERE. `--ensure`
+            // recomputes the people report when the stored one is a day old
+            // and otherwise costs 80 ms, so the scheduler can call it every
+            // cycle and never has to know how old anything is. Keeping a
+            // second copy of "daily" in Swift is how two schedules drift.
+            //
+            // ⚠️ Failure is ignored on purpose. Nothing about indexing or
+            // searching depends on this, and a broken report must never make
+            // a healthy cycle report an error.
+            _ = Child.run(Paths.python,
+                          [script.path, "--db", Paths.database.path,
+                           "people", "--ensure"],
+                          timeout: 600)
+
             Task { @MainActor in
                 self.phase = .reloading
                 // Tell the endpoint the index moved rather than making it wait
