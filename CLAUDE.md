@@ -1903,6 +1903,15 @@ things.
   3 for a dog and 4 for a cat. Seven pets are named here, and without the
   filter Emma ranks fourth by tagged days. **`osxphotos` does not expose this
   field**, which is one of three reasons it is not used.
+- 🛑 **A FACE TAG IS APPLE'S GUESS, NOT GROUND TRUTH.** The clearest evidence
+  is a photograph of somebody taken before they were born: one child here was
+  born 2019-07-07 and carried 13 tagged photos from 2012 to 2017, one dated the
+  exact day *another* child in the library was born. Apple's matcher confuses
+  babies with babies. Measured across everyone with a full birthday on their
+  card: **13 of 15,260 tags, 0.09%**, one person. A photo day dated before the
+  person's birthday no longer counts them, and every dropped tag is **named on
+  stderr**. ⚠️ Only a FULL birthday counts — a `--MM-DD` card cannot date
+  anything, and this must never quietly delete real days.
 - ⚠️ **It measures who was PHOTOGRAPHED, not who was there**, and the
   difference falls on whoever holds the camera. This user appears on 661 days
   and was present for all 1,378 of his daughter's. That costs nothing in the

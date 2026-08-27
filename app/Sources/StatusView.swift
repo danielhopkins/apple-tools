@@ -230,12 +230,34 @@ private struct SourceLine: Identifiable {
     let stat: SourceStat?
     let permission: ToolPermission?
     let error: String?
+    /// The app's own Full Disk Access, for a source whose grant IS that and
+    /// which has no row in `apple status`. Nil for every other source.
+    var appFullDiskAccess: Bool? = nil
 
     /// ⚠️ THREE STATES, NOT TWO. A tool with no permission record is not
     /// broken — `files` has no grant of its own, it reads whatever folders the
     /// user named. Drawing it red would invent a fault.
-    var readable: Bool? { permission?.usable }
+    ///
+    /// 🛑 BUT "NO ROW IN `apple status`" IS NOT THE SAME AS "NEEDS NOTHING",
+    /// and photos was drawn dashed for exactly that reason: there is no
+    /// `apple-photos` binary, so the grant table has nothing to say about it.
+    /// It needs Full Disk Access like `notes`, `messages`, `maps` and `phone`.
+    /// Measured from a launchd job, which has none: the library STATS FINE and
+    /// the sqlite open fails with `authorization denied`. A dashed mark on a
+    /// source that can be genuinely broken hides the breakage.
+    var readable: Bool? { permission?.usable ?? appFullDiskAccess }
+
+    /// What this source's mark is actually about.
+    var grantName: String? {
+        permission != nil ? nil : (appFullDiskAccess != nil
+                                   ? "Full Disk Access" : nil)
+    }
 }
+
+/// Sources with no tool of their own whose grant is the app's Full Disk
+/// Access. ⚠️ `files` is deliberately NOT here: it reads folders the user
+/// named and has no grant to report.
+private let fullDiskAccessSources: Set<String> = ["photos"]
 
 private struct Sources: View {
     @ObservedObject var model: AppModel
@@ -314,9 +336,12 @@ private struct Sources: View {
         var out: [SourceLine] = []
         for source in model.stats.sources {
             seen.insert(source.tool)
-            out.append(SourceLine(tool: source.tool, stat: source,
-                                  permission: permissions[source.tool],
-                                  error: model.indexer.runs[source.tool]?.error))
+            out.append(SourceLine(
+                tool: source.tool, stat: source,
+                permission: permissions[source.tool],
+                error: model.indexer.runs[source.tool]?.error,
+                appFullDiskAccess: fullDiskAccessSources.contains(source.tool)
+                    ? model.diagnostics.latest.appHasFullDiskAccess : nil))
         }
         for tool in model.diagnostics.latest.tools where !seen.contains(tool.tool) {
             out.append(SourceLine(tool: tool.tool, stat: nil,
@@ -403,9 +428,10 @@ private struct SourceRow: View {
             .foregroundStyle(line.readable == false ? Color.orange
                              : line.readable == true ? Color.green : Color.secondary)
             .help(line.readable == false
-                  ? "\(line.permission?.status ?? "no access")"
-                  : line.readable == true ? "readable"
-                  : "no permission of its own")
+                  ? "\(line.permission?.status ?? line.grantName.map { "needs \($0)" } ?? "no access")"
+                  : line.readable == true
+                    ? (line.grantName.map { "readable, via \($0)" } ?? "readable")
+                    : "no permission of its own")
     }
 
     @ViewBuilder

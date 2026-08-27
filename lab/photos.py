@@ -75,10 +75,18 @@ def open_db(library=None):
     try:
         db = sqlite3.connect(
             "file:%s?mode=ro" % urllib.parse.quote(path), uri=True)
-    except sqlite3.OperationalError as exc:
-        # ⚠️ The usual cause is a missing Full Disk Access grant for whatever
-        # launched this, which is the same wall `messages`, `phone` and `maps`
-        # hit. Say so rather than reporting a corrupt library.
+    except sqlite3.Error as exc:
+        # 🛑 `sqlite3.Error`, NOT `OperationalError`. Measured from a launchd
+        # job, which has no Full Disk Access: the library STATS FINE and the
+        # open fails with `DatabaseError: authorization denied`.
+        # `OperationalError` is a SUBCLASS of `DatabaseError`, not its parent,
+        # so catching the narrower one missed the only failure this handler
+        # exists for — a machine without the grant got a raw traceback instead
+        # of the sentence naming it.
+        #
+        # ⚠️ THE PATH EXISTING PROVES NOTHING. TCC lets the directory listing
+        # through and denies the read, so an `os.path.exists` check above is
+        # not the guard; this is.
         raise Unavailable(
             "cannot read %s (%s). This needs Full Disk Access for the "
             "calling process." % (path, exc))

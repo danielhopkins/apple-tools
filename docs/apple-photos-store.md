@@ -327,6 +327,56 @@ are in the index and on the map's labels.
 
 ---
 
+## A face tag is Apple's guess, not ground truth
+
+🛑 **The clearest evidence is a photograph of somebody taken before they were
+born.** This user's daughter was born 2019-07-07 and carried **13 tagged photos
+from 2012 to 2017**, out of 9,416. One of them is dated **the exact day another
+child in this library was born**. Apple's matcher confuses babies with babies,
+and almost every one of the thirteen is a solo close-up.
+
+⚠️ **It is rare, not systemic.** Checked against every tagged person with a full
+birthday on their card:
+
+```
+13 of 15,260 tagged photos predate the person's recorded birthday   0.09%
+```
+
+One person affected. **The reason to drop them is not the count.** It is that
+they set `first` to 2012 for somebody born in 2019, and nothing else in the
+report contradicts that.
+
+`ingest_photos` drops a person from a photo day dated before their birthday,
+behind two fences:
+
+- ⚠️ **Only a FULL birthday counts.** Contacts stores `--MM-DD` when nobody
+  knows the year, and that cannot date anything. A card with no birthday is
+  left alone. This must never become a rule that quietly deletes real days.
+- ⚠️ **Every dropped tag is NAMED on stderr**, not just counted. A face
+  silently removed from somebody's history is exactly what nobody would notice.
+
+🛑 **A FILTER WHOSE RESULT NEVER REACHES THE INDEX IS WORSE THAN NO FILTER.**
+The first version built the record's `rev` from the unfiltered people, so the
+people JSON changed and the rev did not — the ingest reported `+0 ~0 -0` and
+wrote nothing, while stderr said six tags had been dropped.
+
+⚠️ **The mail, messages and calendar channels have no equivalent check**, and
+they do not need one: an address is a claim its owner made, and a face tag is a
+guess a matcher made. Do not generalise this rule to them.
+
+### The day key is UTC, deliberately
+
+⚠️ **19% of tagged photos here land on a different date under UTC than under
+local time**, because this user is at UTC-6 and photographs evenings. The day
+count is barely affected — measured **+1.6% overall**, at most +23 days for one
+person, and negative for two, since two local days can also merge into one UTC
+day.
+
+🛑 **Do not "fix" this in the photos adapter alone.** Every channel in the
+`people` report counts UTC days, so photos is consistent with mail, messages
+and calendar. Changing one source would make its days incomparable with the
+rest, which is the exact mistake the day-unit correction was made to avoid.
+
 ## Detecting a new photo
 
 There is no watermark. `survey()` reads the whole library every run — 2.9 s —

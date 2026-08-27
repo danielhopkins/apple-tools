@@ -1008,6 +1008,25 @@ def ingest_maps(opts):
 # photos — who you were with, and where you have been
 # --------------------------------------------------------------------------
 
+def _card_birthdays():
+    """{contact_id: epoch} for every card carrying a FULL birthday.
+
+    ⚠️ A year is required. Contacts stores `--MM-DD` for a birthday whose year
+    nobody knows, and that cannot date anything.
+    """
+    out = {}
+    for row in apple("contacts", "list", "--limit", 100000, allow_fail=True) or []:
+        value = (row.get("birthday") or "").strip()
+        if len(value) != 10 or not value[:4].isdigit():
+            continue
+        try:
+            out[row["id"]] = datetime.strptime(value, "%Y-%m-%d").replace(
+                tzinfo=timezone.utc).timestamp()
+        except (ValueError, KeyError):
+            continue
+    return out
+
+
 def ingest_photos(opts):
     """Photo days and photo places, from the Photos library.
 
@@ -1049,6 +1068,22 @@ def ingest_photos(opts):
             "  This build shipped without it. Every other source still works.\n"
             % exc)
         return
+    # 🛑 A FACE TAG IS APPLE'S GUESS, NOT GROUND TRUTH, and the clearest
+    # evidence is a photograph of somebody taken before they were born. This
+    # user's daughter was born 2019-07-07 and carried 13 tagged photos from
+    # 2012 to 2017 — one of them dated the exact day ANOTHER child in the
+    # library was born. Apple's matcher confuses babies with babies.
+    #
+    # ⚠️ RARE, AND MEASURED: 13 of 15,260 tagged photos on this library, 0.09%,
+    # all of them one person. The reason to drop them is not the count. It is
+    # that they set `first` to 2012 for somebody born in 2019, and a
+    # relationship that appears to start seven years early is a wrong answer
+    # that nothing else in the report contradicts.
+    #
+    # ⚠️ ONLY A FULL BIRTHDAY COUNTS. A card carrying `--MM-DD` with no year
+    # cannot date anything, and a card with no birthday at all is left alone —
+    # this must never become a rule that quietly deletes real days.
+    born = _card_birthdays()
     try:
         places, days = photo_store.survey()
     except photo_store.Unavailable as exc:
@@ -1096,6 +1131,7 @@ def ingest_photos(opts):
             "rev": rev_of(title, str(spot["photos"]), str(spot["days"])),
         }
 
+    impossible = {}
     for entry in days:
         at = entry["place"]
         spot = places[at] if at is not None else None
@@ -1118,11 +1154,22 @@ def ingest_photos(opts):
         # different number of pictures of each person in it and the channel's
         # unit is one photo. Recomputing it in the report would mean opening
         # the Photos store a second time.
-        people = [{"role": role, "name": who["name"],
-                   "handle": who["contact_id"] or ("photos:" + who["name"]),
-                   "photos": who["photos"]}
-                  for who in entry["people"].values()]
-        names = ", ".join(who["name"] for who in entry["people"].values())
+        people = []
+        for who in entry["people"].values():
+            when_born = born.get(who["contact_id"])
+            if when_born is not None and entry["when"] < when_born:
+                impossible[who["name"]] = impossible.get(who["name"], 0) + 1
+                continue
+            people.append({"role": role, "name": who["name"],
+                           "handle": who["contact_id"] or ("photos:" + who["name"]),
+                           "photos": who["photos"]})
+        # 🛑 BUILT FROM THE FILTERED LIST, NOT THE RAW ONE. `names` feeds both
+        # the body and the `rev`, so building it from `entry["people"]` left
+        # the rev unchanged when a tag was dropped — the record's people JSON
+        # changed and the ingest reported `+0 ~0 -0` and wrote nothing. A
+        # filter whose result never reaches the index is worse than no filter,
+        # because the stderr line says it worked.
+        names = ", ".join(who["name"] for who in people)
         yield {
             "uid": "photos:day:%s:%s" % (entry["day"], key),
             "tool": "photos", "kind": "day",
@@ -1138,6 +1185,13 @@ def ingest_photos(opts):
             "body": "\n".join(x for x in [where, names] if x),
             "rev": rev_of(entry["day"], key, str(entry["photos"]), names),
         }
+
+    # ⚠️ NAMED, NEVER JUST COUNTED. A face quietly removed from somebody's
+    # history is exactly what nobody would notice.
+    for name, count in sorted(impossible.items(), key=lambda kv: -kv[1]):
+        sys.stderr.write(
+            "photos: dropped %d tag%s of %s dated before their birthday\n"
+            % (count, "" if count == 1 else "s", name))
 
 
 def ingest_contacts(opts):

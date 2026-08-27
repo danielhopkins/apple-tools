@@ -248,6 +248,47 @@ check("...and the photo row is gone", "photos:Natalie Hasson" in people, False)
 
 
 # --------------------------------------------------------------------------
+# a face tag is Apple's guess, not ground truth
+# --------------------------------------------------------------------------
+
+# 🛑 THE CLEAREST EVIDENCE IS A PHOTOGRAPH OF SOMEBODY TAKEN BEFORE THEY WERE
+# BORN. This user's daughter was born 2019-07-07 and carried 13 tagged photos
+# from 2012 to 2017 -- one of them dated the EXACT DAY another child in the
+# library was born. Apple's matcher confuses babies with babies.
+#
+# ⚠️ Rare, and measured: 13 of 15,260 tagged photos, 0.09%, all one person. The
+# reason to drop them is not the count. It is that they set `first` to 2012 for
+# somebody born in 2019, and nothing else in the report contradicts that.
+
+check("a full birthday is parsed to an epoch",
+      isinstance(index._card_birthdays(), dict), True)
+
+# ⚠️ ONLY A FULL BIRTHDAY COUNTS. Contacts stores `--MM-DD` when nobody knows
+# the year, and that cannot date anything. This must never become a rule that
+# quietly deletes real days.
+import subprocess as _sp
+_real_apple = index.apple
+def _fake_apple(*args, **kw):
+    return [{"id": "A:ABPerson", "birthday": "2019-07-07"},
+            {"id": "B:ABPerson", "birthday": "--04-13"},
+            {"id": "C:ABPerson"},
+            {"id": "D:ABPerson", "birthday": "not a date"}]
+index.apple = _fake_apple
+try:
+    born = index._card_birthdays()
+finally:
+    index.apple = _real_apple
+check("a card with a full birthday is dated", "A:ABPerson" in born, True)
+check("a card with only --MM-DD is NOT dated", "B:ABPerson" in born, False)
+check("a card with no birthday is NOT dated", "C:ABPerson" in born, False)
+check("an unparseable birthday is NOT dated", "D:ABPerson" in born, False)
+check("the epoch is UTC midnight of that day",
+      __import__("datetime").datetime.fromtimestamp(
+          born["A:ABPerson"], __import__("datetime").timezone.utc
+      ).strftime("%Y-%m-%d %H:%M"), "2019-07-07 00:00")
+
+
+# --------------------------------------------------------------------------
 
 if FAILURES:
     sys.stderr.write("test-photos: %d failed\n\n" % len(FAILURES))
