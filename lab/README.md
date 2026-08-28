@@ -55,6 +55,10 @@ reach.
 index.py          the driver: ingest, chunk, FTS5, fusion, output. Stdlib only.
 photos.py         the Photos reader: tagged faces with their Contacts id,
                   coordinates, and Apple's stored reverse geocode. Stdlib only.
+emoji-versions    fetches unicode.org's own data files and writes the table
+                  below. 🛑 GENERATED, never hand-written. `--check` says stale.
+emoji-versions.txt which emoji arrived in which Emoji version, and the date
+                  that version was published. 1,906 emoji, 16 versions.
 vec/              Swift: the embedding model and the dot products.
 Makefile          build, demo, clean
 index.db          created by `./index.py init`. Not committed.
@@ -396,10 +400,60 @@ Three more rules worth knowing at the call site:
   they never exchanged anything with the user and appear only in somebody
   else's `same_list`.
 
+## Your emoji
+
 Emoji come only from what the user **sent**: a `me:` line in a messages block,
 and a non-quoted line of mail from one of their own addresses. 🛑 Counting
 everything measures what other people type at *them* — 😂 at 200 becomes 😂 at
 1,499, and the two answers look alike.
+
+`emoji.top` ranks them, `emoji.by_year` names the most-used one of each year and
+`emoji.rarest` the least-used. ⚠️ **`rarest` is always something really sent,
+once** — an emoji never sent belongs to no year at all. 🛑 **Ties break on the
+emoji itself.** Most years have dozens used exactly once, and `min` over a dict
+alone picked a different one on every run over identical data.
+
+### How long you take to pick up a new emoji
+
+`emoji.adoption` subtracts two dates. Measured on this store: **median 3.6
+years, 11 of the 168 emoji released since 2020 used, 0 sent early.**
+
+```
+apple-index people | jq '.emoji.adoption | {used, released, median_lag_days}'
+```
+
+🛑 **BOTH DATES COME FROM unicode.org AND NEITHER IS TYPED IN.** A remembered
+release date makes a wrong lag with nothing on screen to show it is wrong,
+which is the same class of error as a mis-decoded table cell.
+
+```
+cd lab && ./emoji-versions            # rewrite emoji-versions.txt
+          ./emoji-versions --check    # exit 1 if a new Emoji version shipped
+```
+
+- **Which version an emoji belongs to** is the `E<version>` field of
+  `emoji-test.txt`. **When that version was published** is the `# Date:` header
+  of *that version's own* data file. ⚠️ Not every version publishes the same
+  files — Emoji 1.0 to 3.0 predate `emoji-test.txt` and 13.0 onward dropped
+  `emoji-data.txt` — so the generator tries each in turn.
+- ⚠️ **E0.6 and E0.7 predate the emoji spec entirely.** They are Unicode 6.0 and
+  7.0, which have no directory under `Public/emoji` at all, and are dated from
+  the UCD ReadMe instead. 2010-10-05 and 2014-06-12.
+- ⚠️ **Skin-tone variants are not new emoji.** 👍🏽 arrived with the modifier, not
+  with 👍, and counting the five tones separately would multiply every
+  person-shaped emoji by five for no answer anybody wants. 1,906 base emoji
+  across 16 versions.
+- ⚠️ **A VENDOR SHIPS THE GLYPH LATER THAN UNICODE PUBLISHES IT**, often by a
+  month or two, and nothing here knows when this keyboard got it. **A lag is an
+  upper bound**, not an exact figure.
+- 🛑 **A NEGATIVE LAG IS REPORTED, NEVER CLAMPED.** It means a record is dated
+  before the emoji existed, which is a wrong date — clamping to zero hides the
+  only sign of it. Counted as `early`, and left out of the median.
+- 🛑 **`emoji-versions.txt` is declared in `index.py`'s `SIBLING_DATA`**, the
+  same one declaration `make dist`, `app/stage.sh` and `apple-index selfcheck`
+  all read. ⚠️ A missing copy degrades **quietly** — no adoption block,
+  everything else unaffected — which is exactly why the build has to refuse it:
+  an install short of the file looks like a user who has never sent a new emoji.
 
 ## Photos: who you were with, and where you have been
 

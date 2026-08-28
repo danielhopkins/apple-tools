@@ -575,6 +575,68 @@ for _ch in ("mail", "messages", "photos", "calendar"):
           _ch in index.WINDOWED_CHANNELS, False)
 
 
+# ---------------------------------------------------------------- emoji
+#
+# 🛑 THE ADOPTION LAG IS A SUBTRACTION BETWEEN TWO DATES, and neither one is
+# visible in the answer. A wrong release table, a wrong epoch, or a clamped
+# negative all produce a plausible number of months. So the arithmetic is
+# pinned here rather than eyeballed on the window.
+
+_VERSIONS, _PUBLISHED = index.emoji_versions()
+
+check("the shipped table names every emoji version's date",
+      sorted(_PUBLISHED) != [], True)
+check("the table covers the versions since 2020",
+      all(v in _PUBLISHED for v in ("13.1", "14.0", "15.0", "15.1", "16.0")),
+      True)
+# ⚠️ A DATE, NOT A VERSION NUMBER. `13.1 > 2020-01-01` compares as a string and
+# is true for the wrong reason, so the cut has to be on what was fetched.
+check("E13.1 was published in September 2020",
+      _PUBLISHED.get("13.1"), "2020-09-12")
+
+# 🛑 SKIN TONES ARE NOT NEW EMOJI. 👍🏽 arrived with the modifier, not with 👍,
+# and counting the five tones separately multiplies every person-shaped emoji
+# by five for no answer anybody wants.
+check("no skin-tone variant is in the table",
+      any("\U0001F3FD" in e for e in _VERSIONS), False)
+
+_epoch = 1609459200.0        # 2021-01-01T00:00:00Z
+
+
+def _adopt(first):
+    return index.adoption_report(first)
+
+
+_report = _adopt({})
+check("nothing sent means nothing used", _report["used"], 0)
+check("...but the releases are still counted", _report["released"] > 100, True)
+check("a median over no lags is absent", _report["median_lag_days"], None)
+
+# 🫠 is Emoji 14.0, published 2021-08-26. One year later is 340 days.
+_one = _adopt({"\U0001FAE0": _epoch + 365 * 86400 * 2})
+_melting = next(e for e in _one["items"] if e["emoji"] == "\U0001FAE0")
+check("a used emoji carries its own first date",
+      _melting["first"], "2023-01-01")
+check("the lag is measured from publication, not from the year",
+      _melting["lag_days"], 493)
+check("one used emoji is counted", _one["used"], 1)
+
+# 🛑 A NEGATIVE LAG IS REPORTED, NEVER CLAMPED. It means a record is dated
+# before the emoji existed, which is a wrong date — and clamping to zero hides
+# the only sign of that. ⚠️ Measured on the real store: 0 of 11.
+_early = _adopt({"\U0001FAE0": _epoch})
+_melting = next(e for e in _early["items"] if e["emoji"] == "\U0001FAE0")
+check("a lag before publication stays negative",
+      _melting["lag_days"] < 0, True)
+check("...and is counted rather than dropped", _early["early"], 1)
+check("...and is left out of the median", _early["median_lag_days"], None)
+
+# ⚠️ AN EMOJI RELEASED BEFORE THE CUT HAS NO ADOPTION TO MEASURE, only a date
+# the user already had. 😂 is E0.6, published 2010.
+check("an emoji older than the cut is not listed",
+      any(e["emoji"] == "\U0001F602" for e in _report["items"]), False)
+
+
 if FAILED:
     print("%d failed\n" % len(FAILED))
     for line in FAILED:

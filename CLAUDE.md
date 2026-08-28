@@ -1601,6 +1601,16 @@ swift/                    one Swift package, seven binaries
                           than returning when it hits the note wall
   Tests/RemindersTests/ MailTests/ MessagesTests/ PhoneTests/ MapsTests/
         GeocodingTests/ CalendarSyncTests/ ContactsTests/
+lab/emoji-versions        fetches unicode.org's own data files and writes
+                          emoji-versions.txt: which emoji arrived in which
+                          Emoji version, and the date that version was
+                          published. 🛑 GENERATED — a remembered release date
+                          makes a wrong adoption lag with nothing on screen to
+                          show it is wrong. `--check` says if it is stale
+lab/emoji-versions.txt    GENERATED. 1,906 emoji across 16 versions. Declared in
+                          index.py's SIBLING_DATA, so `make dist`,
+                          `app/stage.sh` and `apple-index selfcheck` all read
+                          the same one declaration
 lab/photos.py             the Photos reader: tagged faces with their Contacts
                           id, coordinates, and Apple's stored reverse geocode.
                           🛑 Reads sqlite directly rather than using osxphotos,
@@ -1788,7 +1798,7 @@ the volume and `apple-index forget` destroyed the configuration with the index.
 
 **`apple-index people` is the one command that is not a search.** It reports who
 the user talks to, who turns up alongside whom, and which emoji they themselves
-type — the data behind the app window's fifth panel.
+type — the data behind the app window's relationships and emoji panes.
 
 ```
 apple-index people --top 80 | jq '.people[0]'      # always JSON, like `stats`
@@ -1851,6 +1861,26 @@ recompute it implies rather than waiting for the clock.
   headers, not the index; every line agrees within 1%.
 - ⚠️ **Emoji are only what the user SENT.** Counting the whole store measures
   what other people type at them, and the two answers look alike.
+- **`emoji.rarest` is the least-used emoji of each year**, beside
+  `emoji.by_year`'s most-used one. ⚠️ It is always something really sent, once —
+  an emoji never sent belongs to no year at all. 🛑 **Ties break on the emoji
+  itself**, because most years have dozens used exactly once and `min` over a
+  dict alone picked a different one on every run.
+- **`emoji.adoption` says how long the user takes to pick up a new emoji.**
+  Measured here: **median 3.6 years, 11 of the 168 released since 2020 used.**
+  🛑 **BOTH DATES COME FROM unicode.org AND NEITHER IS TYPED IN** — the release
+  date is the `# Date:` header on that Emoji version's own data file, fetched by
+  `lab/emoji-versions`; the first-use date is the earliest record in the index
+  in which the user typed it.
+  - ⚠️ **A vendor ships the glyph later than Unicode publishes it**, and nothing
+    here knows when this keyboard got it. So a lag is an **upper bound**.
+  - 🛑 **A negative lag is reported, never clamped.** It means a record is dated
+    before the emoji existed, which is a wrong date — clamping to zero hides the
+    only sign of it. Counted as `early`, and left out of the median. Zero here.
+  - ⚠️ **A missing `emoji-versions.txt` degrades quietly by design** — no
+    adoption block, everything else unaffected — which is exactly why
+    `apple-index selfcheck` refuses a payload without it. An install short of it
+    would otherwise look like a user who has never sent a new emoji.
 - 🛑 **A DAY THAT HAS NOT HAPPENED IS NOT CONTACT.** The calendar adapter
   fetches a year ahead, so 1,008 events here are in the future. They are
   counted in `upcoming`, never in `days`.
@@ -1887,7 +1917,7 @@ recompute it implies rather than waiting for the clock.
   and one dead address held 8,491 and 568 encounters, meeting exactly where the
   other began.
 
-**`apple-index places` is the map behind the app's sixth panel** — everywhere
+**`apple-index places` is the map behind the app window's places pane** — everywhere
 the user has been, from the two sources that know.
 
 ```

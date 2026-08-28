@@ -1,16 +1,14 @@
-// The window.
+// The two diagnostic panes: what was read, and what it costs.
 //
-// 🛑 A spinner is not indexing status. Three questions, in the order a person
+// 🛑 A spinner is not indexing status. Two questions, in the order a person
 // asks them:
 //
-//   1. can it read my data, and what did it read
-//   2. how is it growing            every input over time, and the size
-//   3. what version am I running    named in the header, not buried
+//   1. can it read my data, and what did it read      Sources
+//   2. how is it growing, and what does it cost       Index size
 //
 // Each exists because its absence produced a wrong answer: a source failing
 // for a week looked like a quiet one, "223k chunks, silent for 60 minutes" was
-// read as a hang, 820 MB of decoded mail was a surprise, and a stale build was
-// diagnosed for an hour as a code bug.
+// read as a hang, and 820 MB of decoded mail was a surprise.
 //
 // 🛑 QUESTION 1 WAS TWO PANELS UNTIL 26.827. "Permissions" listed eight names
 // with ticks and "Indexed" listed the same eight with counts, a screen apart,
@@ -18,207 +16,22 @@
 // everything, or is the grant half broken?* Answering it meant scrolling
 // between two panels and matching names by eye.
 //
-// A fourth section sits below them and is not one of those questions:
-//
-//   4. who is in all this          the web, the emoji, the people over time
-//
-// ⚠️ IT IS NOT A DIAGNOSTIC, and it is last for that reason. Nothing above
-// depends on it, it costs three seconds of subprocess to build, and it is
-// fetched only while the window is open. See `PeopleView.swift`.
-//
 // 🛑 A STANDING PARAGRAPH IS NOT A WARNING, and this window had eight of them
 // — orange text on a machine with nothing wrong. Everything permanently true
 // now lives behind an `Explain` button; what stays on the page is what is true
 // right now. See `Explain.swift`.
+//
+// The window's frame, the rail and the pane header are in `Shell.swift`.
 
 import Charts
 import SwiftUI
 
-struct StatusView: View {
-    @ObservedObject var model: AppModel
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 26) {
-                Header(model: model)
-                if !model.diagnostics.latest.appHasFullDiskAccess { Onboarding() }
-                Sources(model: model)
-                Growth(model: model)
-                Storage(model: model)
-                Advanced(model: model)
-                People(model: model)
-                Places(model: model)
-            }
-            .padding(26)
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .background(Color(nsColor: .windowBackgroundColor))
-        // 🛑 ON THE WHOLE WINDOW. Half of what is written here is meant to be
-        // copied — a path, an address, a command, an error. `textSelection`
-        // travels down the environment, so one line covers every `Text` below
-        // rather than the handful somebody remembered to mark.
-        //
-        // ⚠️ It does not reach the contact web. That is a `WKWebView` drawing
-        // SVG, and its text is not text.
-        .textSelection(.enabled)
-        .onAppear { model.reread(); model.folders.read() }
-    }
-}
-
-// MARK: - header
-
-private struct Header: View {
-    @ObservedObject var model: AppModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .firstTextBaseline, spacing: 10) {
-                Text("AppleTools").font(.system(size: 26, weight: .semibold))
-                // 🛑 THE VERSION, IN THE HEADER. A stale build was diagnosed as
-                // a code bug for an hour because nothing on screen said which
-                // build was running.
-                Text(model.appVersion)
-                    .font(.system(.callout, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 7).padding(.vertical, 2)
-                    .background(.quaternary, in: Capsule())
-                Spacer()
-                StatusPill(model: model)
-            }
-
-            Text(phase)
-                .font(.callout)
-                .foregroundStyle(model.indexer.lastCycleError == nil
-                                 ? Color.secondary : Color.red)
-            if let failure = model.indexer.lastCycleError {
-                Text(failure).font(.caption).foregroundStyle(.red)
-                    .textSelection(.enabled).lineLimit(3)
-            }
-
-            HStack(spacing: 10) {
-                Button(model.indexer.isRunning ? "Indexing…" : "Refresh Now") {
-                    model.indexer.refresh()
-                }
-                .disabled(model.indexer.isRunning)
-                .buttonStyle(.borderedProminent)
-                Toggle("Automatic", isOn: Binding(
-                    get: { model.indexer.automatic },
-                    set: { model.indexer.automatic = $0; model.indexer.saveState() }))
-                Toggle("Start at Login", isOn: Binding(
-                    get: { model.loginItem.state == .enabled },
-                    set: { model.loginItem.set($0) }))
-                Spacer()
-            }
-            if let failure = model.loginItem.failure {
-                Text(failure).font(.caption).foregroundStyle(.red)
-            }
-        }
-    }
-
-    private var phase: String {
-        switch model.indexer.phase {
-        case .ingesting(let source): return "reading \(source)…"
-        case .embedding: return "embedding new chunks…"
-        case .reloading: return "reloading the search endpoint…"
-        case .idle:
-            guard let when = model.indexer.lastCycleFinished else {
-                return "not indexed yet · every 5 minutes once it starts"
-            }
-            return "last indexed \(Format.ago(when)) · every 5 minutes, on wake, on unlock"
-        }
-    }
-}
-
-private struct StatusPill: View {
-    @ObservedObject var model: AppModel
-
-    var body: some View {
-        let ok = model.healthy
-        HStack(spacing: 6) {
-            Circle().fill(ok ? Color.green : Color.orange).frame(width: 8, height: 8)
-            Text(ok ? "Healthy" : "Needs attention").font(.callout.weight(.medium))
-        }
-        .padding(.horizontal, 10).padding(.vertical, 5)
-        .background((ok ? Color.green : Color.orange).opacity(0.14), in: Capsule())
-    }
-}
-
-// MARK: - 3. growth
-
-private struct Growth: View {
-    @ObservedObject var model: AppModel
-    @AppStorage("growthByTool") private var byTool = true
-
-    var body: some View {
-        Panel("Growth", trailing: {
-            Explain("Where the early history comes from", """
-                    A point is recorded on every indexing run. Points from \
-                    before this app existed are derived from when each record \
-                    was last written, so the early part of the curve is an \
-                    approximation rather than a measurement.
-
-                    Chunks, not records: a chunk is what costs storage and \
-                    what gets embedded. The areas are stacked, so they add up \
-                    to the total.
-                    """)
-            Picker("", selection: $byTool) {
-                Text("By source").tag(true)
-                Text("Total").tag(false)
-            }
-            .pickerStyle(.segmented).labelsHidden().frame(width: 168)
-        }) {
-            let stats = model.stats
-            if stats.history.count < 2 {
-                Note("Not enough history yet. A point is recorded on every "
-                     + "indexing run.")
-            } else if byTool {
-                // 🛑 STACKED, so the AREAS sum to the total. Overlaid lines on
-                // one axis let mail's 203k chunks flatten every other source
-                // into the baseline, which is exactly the source you want to
-                // see growing.
-                Chart(stats.history) { point in
-                    AreaMark(x: .value("day", point.date),
-                             y: .value("chunks", point.chunks),
-                             stacking: .standard)
-                        .foregroundStyle(by: .value("source", point.tool))
-                        .interpolationMethod(.monotone)
-                }
-                .chartLegend(position: .bottom, spacing: 10)
-                .chartYAxisLabel("chunks")
-                .frame(height: 210)
-            } else {
-                Chart(stats.totals, id: \.0) { day, chunks in
-                    AreaMark(x: .value("day", day), y: .value("chunks", chunks))
-                        .foregroundStyle(.tint.opacity(0.22))
-                        .interpolationMethod(.monotone)
-                    LineMark(x: .value("day", day), y: .value("chunks", chunks))
-                        .foregroundStyle(.tint)
-                        .interpolationMethod(.monotone)
-                }
-                .chartYAxisLabel("chunks")
-                .frame(height: 210)
-            }
-
-            HStack(spacing: 26) {
-                Stat("chunks", Format.count(stats.chunks))
-                Stat("embedded", Format.count(stats.vectors))
-                Stat("on disk", Format.bytes(stats.bytes))
-                if stats.backlog > 0 {
-                    Stat("to embed", Format.count(stats.backlog), tint: .orange)
-                }
-                Spacer()
-            }
-        }
-    }
-}
-
 // MARK: - 1 and 2, together: can it read this, and what did it read?
 
-// 🛑 ONE PANEL, NOT TWO. "Permissions" and "Indexed" were the same eight names
-// in two lists a screen apart, and the question a person actually has joins
-// them: *mail says 40,000 records — is that everything, or is the grant half
-// broken?* Answering that meant scrolling between two panels and matching
-// names by eye.
+// 🛑 ONE ROW PER SOURCE, NOT TWO LISTS. "Permissions" and "Indexed" were the
+// same eight names in two lists a screen apart, and the question a person
+// actually has joins them: *mail says 40,000 records — is that everything, or
+// is the grant half broken?*
 //
 // So each source is one row: whether it can be read, how much of it was read,
 // and when. The permission detail and the fix appear inside the row they
@@ -252,6 +65,20 @@ private struct SourceLine: Identifiable {
         permission != nil ? nil : (appFullDiskAccess != nil
                                    ? "Full Disk Access" : nil)
     }
+
+    /// The one line of context beside the name. ⚠️ NOT AN EMPTY CELL, and the
+    /// two reasons for one are different: `phone` is read for the people
+    /// report and never indexed, `files` has simply not been given a folder
+    /// yet — and that row exists precisely so it can be.
+    var note: String {
+        if stat != nil { return "" }
+        return tool == "files" ? "no folders added yet — open this row to add one"
+                               : "read on demand, not indexed"
+    }
+
+    var dot: Color {
+        readable == false ? .orange : readable == true ? .green : .secondary
+    }
 }
 
 /// Sources with no tool of their own whose grant is the app's Full Disk
@@ -259,34 +86,32 @@ private struct SourceLine: Identifiable {
 /// named and has no grant to report.
 private let fullDiskAccessSources: Set<String> = ["photos"]
 
-private struct Sources: View {
+/// The one column geometry the header, the rows and the breakdowns all share.
+/// 🛑 THREE COPIES OF THESE WIDTHS DRIFT. A breakdown line indented under a
+/// row has to land in the row's own columns, or the numbers stop being
+/// comparable by eye — which is the entire reason they are in columns.
+private enum Column {
+    static let caret: CGFloat = 14
+    static let name: CGFloat = 96
+    static let records: CGFloat = 78
+    static let chunks: CGFloat = 78
+    static let state: CGFloat = 88
+    static let gap: CGFloat = 10
+}
+
+struct Sources: View {
     @ObservedObject var model: AppModel
-    @State private var open: Set<String> = []
+    /// 🛑 ONE ROW AT A TIME. Several open at once pushed the table's own
+    /// footer off the bottom of the pane, which is the failure the rail was
+    /// built to end.
+    @State private var open: String? = nil
 
     var body: some View {
-        Panel("Sources", trailing: {
-            HStack(spacing: 8) {
+        PaneSection("Sources", subtitle: access, trailing: {
+            HStack(spacing: 12) {
                 Button("Recheck") { model.diagnostics.check() }
                     .disabled(model.diagnostics.busy)
-                    .controlSize(.small)
-                Button(open.isEmpty ? "Expand all" : "Collapse all") {
-                    open = open.isEmpty ? Set(lines.map(\.tool)) : []
-                }
-                .controlSize(.small)
-            }
-        }) {
-            let diagnosis = model.diagnostics.latest
-            // ⚠️ The app's own grant first. Every row below depends on it, and
-            // "children inherit the app's grant" is the measurement the whole
-            // schedule rests on.
-            HStack(spacing: 18) {
-                Badge(label: "Full Disk Access",
-                      ok: diagnosis.appHasFullDiskAccess,
-                      detail: diagnosis.appHasFullDiskAccess ? "granted" : "not granted")
-                Badge(label: "Helpers inherit it",
-                      ok: diagnosis.childHasFullDiskAccess,
-                      detail: diagnosis.inheritance == .yes ? "yes"
-                              : diagnosis.inheritance == .no ? "NO" : "unknown")
+                    .buttonStyle(.link)
                 Explain("How this app reads your data", """
                         macOS charges a privacy request to the responsible \
                         process. For a helper the app starts, that is the app. \
@@ -299,22 +124,25 @@ private struct Sources: View {
                         skipped by the indexer; it is not an error, and \
                         nothing else stops working.
                         """)
-                Spacer()
             }
-
-            if lines.isEmpty {
-                Note("Nothing indexed yet. It builds itself on the first refresh.")
+        }) {
+            // ⚠️ SPACING 0, and its own stack. `PaneSection` puts 12 points
+            // between its children, which between table rows is a gap wide
+            // enough that the columns stop reading as a table.
+            VStack(alignment: .leading, spacing: 0) {
+                header
+                if lines.isEmpty {
+                    Note("Nothing indexed yet. It builds itself on the first "
+                         + "refresh.").padding(.top, 8)
+                }
+                ForEach(lines) { line in
+                    SourceRow(line: line,
+                              expanded: open == line.tool,
+                              toggle: { open = open == line.tool ? nil : line.tool },
+                              folders: model.folders)
+                }
             }
-            ForEach(lines) { line in
-                SourceRow(line: line,
-                          expanded: open.contains(line.tool),
-                          toggle: {
-                              if open.contains(line.tool) { open.remove(line.tool) }
-                              else { open.insert(line.tool) }
-                          },
-                          folders: model.folders)
-            }
-
+            blocked
             // ⚠️ Only a grant nobody has answered yet gets a button out here.
             // Everything else lives in its own row.
             ForEach(model.grants.entries.filter { $0.state == .notDetermined }) { entry in
@@ -325,6 +153,82 @@ private struct Sources: View {
                 }
             }
         }
+    }
+
+    /// The app's own grant, in one line. ⚠️ Every row below depends on it, and
+    /// "children inherit the app's grant" is the measurement the whole
+    /// schedule rests on.
+    private var access: String {
+        let diagnosis = model.diagnostics.latest
+        let mine = diagnosis.appHasFullDiskAccess
+            ? "Full Disk Access granted" : "Full Disk Access NOT granted"
+        switch diagnosis.inheritance {
+        case .yes:     return mine + " · helpers inherit it"
+        case .no:      return mine + " · helpers do NOT inherit it"
+        default:       return mine + " · inheritance unknown"
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: Column.gap) {
+            Color.clear.frame(width: Column.caret, height: 1)
+            // ⚠️ THE DOT'S WIDTH AND ITS GAP, so "source" starts where a
+            // source name starts. Without them the heading sat 13 points to
+            // the left of every value it heads.
+            HStack(spacing: 7) {
+                Color.clear.frame(width: 6, height: 1)
+                Text("source")
+            }
+            .frame(width: Column.name, alignment: .leading)
+            Spacer(minLength: 12)
+            Text("records").frame(width: Column.records, alignment: .trailing)
+            Text("chunks").frame(width: Column.chunks, alignment: .trailing)
+            Text("last read").frame(width: Column.state, alignment: .trailing)
+        }
+        .font(.caption2).foregroundStyle(.tertiary)
+        .padding(.bottom, 2)
+        .overlay(alignment: .bottom) { Divider() }
+    }
+
+    /// 🛑 THE BREAKAGE, WITHOUT OPENING A ROW. A source that cannot be read
+    /// showed its reason only inside its own expanded row, so the one machine
+    /// that needed the message was the one machine nobody had expanded.
+    @ViewBuilder
+    private var blocked: some View {
+        let stuck = lines.filter { $0.readable == false }
+        if !stuck.isEmpty {
+            ForEach(stuck) { line in
+                HStack(spacing: 10) {
+                    Text(reason(for: line))
+                        .font(.caption)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 12)
+                    if let pane = line.permission?.pane,
+                       let fragment = Grants.settingsFragment(for: pane) {
+                        Button("Open Settings…") { Grants.openPane(fragment) }
+                            .controlSize(.small)
+                    } else if line.grantName == "Full Disk Access" {
+                        Button("Open Settings…") {
+                            Diagnostics.openFullDiskAccessPane()
+                        }
+                        .controlSize(.small)
+                    }
+                }
+                .padding(.horizontal, 12).padding(.vertical, 9)
+                .background(Color.orange.opacity(0.12),
+                            in: RoundedRectangle(cornerRadius: 8))
+            }
+        }
+    }
+
+    private func reason(for line: SourceLine) -> String {
+        if let permission = line.permission {
+            return "\(line.tool): \(permission.status). "
+                + "System Settings → \(permission.pane). "
+                + "⚠️ A toggle is the only fix; no retry here can grant it."
+        }
+        return "\(line.tool) can be read by you but not by the indexing job — "
+            + "Full Disk Access is missing for the app."
     }
 
     /// Every source, indexed ones in their own order, then anything that has a
@@ -375,45 +279,30 @@ private struct SourceRow: View {
             // the row in one locked exactly the numbers a person wants to
             // copy, on a window whose whole point is numbers. A tap still
             // toggles; a drag now selects.
-            HStack(spacing: 10) {
+            HStack(spacing: Column.gap) {
                 Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
                     .rotationEffect(.degrees(expanded ? 90 : 0))
-                mark
-                Text(line.tool).font(.body.weight(.medium))
-                    .frame(width: 92, alignment: .leading)
-                if let stat = line.stat {
-                    Text(Format.count(stat.records)).monospacedDigit()
-                        .frame(width: 74, alignment: .trailing)
-                    Text("records").font(.caption).foregroundStyle(.secondary)
-                    Text(Format.count(stat.chunks)).monospacedDigit()
-                        .frame(width: 74, alignment: .trailing)
-                    Text("chunks").font(.caption).foregroundStyle(.secondary)
-                } else {
-                    // 🛑 NOT AN EMPTY ROW, and the two reasons for one are
-                    // different. `phone` is read for the people report and
-                    // never indexed. `files` has simply not been given a
-                    // folder yet — and that row exists precisely so it can be.
-                    // A blank line beside a green tick reads as a failure.
-                    Text(line.tool == "files"
-                         ? "no folders added yet — open this row to add one"
-                         : "read on demand, not indexed")
-                        .font(.caption).foregroundStyle(.secondary)
+                    .frame(width: Column.caret)
+                HStack(spacing: 7) {
+                    Circle().fill(line.dot).frame(width: 6, height: 6)
+                        .help(mark)
+                    Text(line.tool).font(.body.weight(.medium))
                 }
-                Spacer()
-                if let error = line.error {
-                    Label("failing", systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption).foregroundStyle(.red).help(error)
-                } else if line.readable == false {
-                    Text(line.permission?.status ?? "no access")
-                        .font(.caption).foregroundStyle(.orange)
-                } else if let when = line.stat?.updated {
-                    Text(Format.ago(when)).font(.caption).foregroundStyle(.secondary)
-                }
+                .frame(width: Column.name, alignment: .leading)
+                Text(line.note).font(.caption).foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer(minLength: 12)
+                Text(line.stat.map { Format.count($0.records) } ?? "—")
+                    .frame(width: Column.records, alignment: .trailing)
+                Text(line.stat.map { Format.count($0.chunks) } ?? "—")
+                    .frame(width: Column.chunks, alignment: .trailing)
+                state.frame(width: Column.state, alignment: .trailing)
             }
+            .font(.callout).monospacedDigit()
             .contentShape(Rectangle())
-            .padding(.vertical, 5)
+            .padding(.vertical, 6)
             .onTapGesture(perform: toggle)
 
             if expanded { detail }
@@ -421,35 +310,37 @@ private struct SourceRow: View {
         }
     }
 
-    private var mark: some View {
-        Image(systemName: line.readable == false
-              ? "exclamationmark.circle.fill"
-              : line.readable == true ? "checkmark.circle.fill" : "circle.dashed")
-            .foregroundStyle(line.readable == false ? Color.orange
-                             : line.readable == true ? Color.green : Color.secondary)
-            .help(line.readable == false
-                  ? "\(line.permission?.status ?? line.grantName.map { "needs \($0)" } ?? "no access")"
-                  : line.readable == true
-                    ? (line.grantName.map { "readable, via \($0)" } ?? "readable")
-                    : "no permission of its own")
+    @ViewBuilder
+    private var state: some View {
+        if let error = line.error {
+            Text("failing").font(.caption).foregroundStyle(.red).help(error)
+        } else if line.readable == false {
+            Text(line.permission?.status ?? "no access")
+                .font(.caption).foregroundStyle(.orange)
+        } else if let when = line.stat?.updated {
+            Text(Format.ago(when)).font(.caption).foregroundStyle(.secondary)
+        } else {
+            Text("on demand").font(.caption).foregroundStyle(.tertiary)
+        }
+    }
+
+    private var mark: String {
+        if line.readable == false {
+            return line.permission?.status
+                ?? line.grantName.map { "needs \($0)" } ?? "no access"
+        }
+        if line.readable == true {
+            return line.grantName.map { "readable, via \($0)" } ?? "readable"
+        }
+        return "no permission of its own"
     }
 
     @ViewBuilder
     private var detail: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            if let permission = line.permission, !permission.usable {
-                HStack(spacing: 8) {
-                    Note("\(permission.status) — System Settings → "
-                         + "\(permission.pane). ⚠️ A toggle is the only fix; no "
-                         + "retry here can grant it.", tint: .orange)
-                    if let fragment = Grants.settingsFragment(for: permission.pane) {
-                        Button("Open Settings…") { Grants.openPane(fragment) }
-                            .controlSize(.small)
-                    }
-                }
-                if let advice = permission.advice {
-                    Note(advice)
-                }
+        VStack(alignment: .leading, spacing: 7) {
+            if let permission = line.permission, !permission.usable,
+               let advice = permission.advice {
+                Note(advice)
             }
             if let error = line.error {
                 Note(error, tint: .red)
@@ -461,79 +352,101 @@ private struct SourceRow: View {
                 FolderList(folders: folders)
             }
             if let stat = line.stat, !stat.containers.isEmpty {
-                // 🛑 BY ACCOUNT, MAILBOX, LIST OR FOLDER. "40,473 emails" does
-                // not answer "what am I indexing"; "🌈/Archive 18,204" does.
-                //
-                // ⚠️ IN A BOX OF ITS OWN ONCE IT IS LONG. This vault has 60
-                // folders, and expanding one row pushed the next four panels
-                // off the bottom of the window — which reads as the rest of
-                // the window having disappeared.
-                let list = VStack(alignment: .leading, spacing: 3) {
-                    ForEach(stat.containers) { part in
-                        HStack(spacing: 10) {
-                            Text(part.name)
-                                .font(.system(.caption, design: .monospaced))
-                                .lineLimit(1).truncationMode(.middle)
-                            Spacer(minLength: 12)
-                            // ⚠️ BOTH NUMBERS, in the parent row's columns.
-                            // Records alone cannot say why one folder costs
-                            // more of the index than another: 199 files in
-                            // Current Work are 4,779 chunks, and 306 in
-                            // Reading are 3,232.
-                            Text(Format.count(part.records))
-                                .frame(width: 62, alignment: .trailing)
-                            Text("records").foregroundStyle(.secondary)
-                                .frame(width: 48, alignment: .leading)
-                            Text(Format.count(part.chunks))
-                                .frame(width: 62, alignment: .trailing)
-                            Text("chunks").foregroundStyle(.secondary)
-                                .frame(width: 44, alignment: .leading)
-                        }
-                        .font(.caption).monospacedDigit()
-                    }
-                }
-                if stat.containers.count > 12 {
-                    ScrollView { list.padding(.trailing, 8) }
-                        .frame(maxHeight: 220)
-                } else {
-                    list
-                }
-                if line.tool == "files" {
-                    // ⚠️ SAY WHEN IT WAS CUT. The fold happens before the cut,
-                    // so 60 rows means 60 top-level FOLDERS — and a vault with
-                    // more than that reported a short list with nothing on
-                    // screen distinguishing it from a complete one. Same class
-                    // of bug as the silent `--limit` in `apple maps`.
-                    if stat.containers.count >= 60 {
-                        Note("The 60 largest top-level folders. There are more.",
-                             tint: .orange)
-                    }
-                    // 🛑 THE TOP LEVEL, NOT THE BIGGEST FOLDERS. `files` is
-                    // the one source whose container is a PATH rather than a
-                    // flat name, so it listed every subfolder separately,
-                    // ordered by size — 49 rows answering "which folder is
-                    // biggest", which is not a question anybody has. A folder
-                    // now carries its own files and everything under it.
-                    ExplainLabel("Top-level folders", "How a folder is counted", """
-                                 One row per top-level folder in each indexed \
-                                 folder, carrying its own files and everything \
-                                 in its subfolders.
-
-                                 Records are files. Chunks are the pieces they \
-                                 were split into for searching, and they are \
-                                 what the index costs — a folder of long \
-                                 documents can hold fewer files than another \
-                                 and far more of the index.
-
-                                 ⚠️ A file sitting directly in an indexed \
-                                 folder is filed under that folder's own name.
-                                 """)
-                } else if stat.containers.count >= 60 {
-                    Note("The 60 largest.")
-                }
+                breakdown(stat)
             }
         }
-        .padding(.leading, 28).padding(.bottom, 8)
+        .padding(.leading, Column.caret + Column.gap)
+        .padding(.top, 2).padding(.bottom, 10)
+    }
+
+    /// 🛑 BY ACCOUNT, MAILBOX, LIST OR FOLDER. "40,473 emails" does not answer
+    /// "what am I indexing"; "🌈/Archive 18,204" does.
+    ///
+    /// ⚠️ SCROLLS ONCE IT IS LONG. This vault has 60 folders, and expanding one
+    /// row used to push the next four panels off the bottom of the window.
+    @ViewBuilder
+    private func breakdown(_ stat: SourceStat) -> some View {
+        Text(heading).font(.caption2.weight(.semibold))
+            .kerning(0.7).foregroundStyle(.tertiary)
+        let list = VStack(alignment: .leading, spacing: 3) {
+            ForEach(stat.containers) { part in
+                HStack(spacing: Column.gap) {
+                    Text(part.name)
+                        .font(.system(.caption, design: .monospaced))
+                        .lineLimit(1).truncationMode(.middle)
+                    Spacer(minLength: 12)
+                    // ⚠️ BOTH NUMBERS, in the parent row's columns. Records
+                    // alone cannot say why one folder costs more of the index
+                    // than another: 199 files in Current Work are 4,779
+                    // chunks, and 306 in Reading are 3,232.
+                    Text(Format.count(part.records))
+                        .frame(width: Column.records, alignment: .trailing)
+                    Text(Format.count(part.chunks))
+                        .frame(width: Column.chunks, alignment: .trailing)
+                    Color.clear.frame(width: Column.state, height: 1)
+                }
+                .font(.caption).monospacedDigit().foregroundStyle(.secondary)
+            }
+        }
+        if stat.containers.count > 12 {
+            ScrollView { list.padding(.trailing, 8) }.frame(maxHeight: 220)
+        } else {
+            list
+        }
+        if line.tool == "files" {
+            // ⚠️ SAY WHEN IT WAS CUT. The fold happens before the cut, so 60
+            // rows means 60 top-level FOLDERS — and a vault with more than
+            // that reported a short list with nothing on screen distinguishing
+            // it from a complete one. Same class of bug as the silent
+            // `--limit` in `apple maps`.
+            if stat.containers.count >= 60 {
+                Note("The 60 largest top-level folders. There are more.",
+                     tint: .orange)
+            }
+            // 🛑 THE TOP LEVEL, NOT THE BIGGEST FOLDERS. `files` is the one
+            // source whose container is a PATH rather than a flat name, so it
+            // listed every subfolder separately, ordered by size — 49 rows
+            // answering "which folder is biggest", which is not a question
+            // anybody has. A folder now carries its own files and everything
+            // under it.
+            //
+            // ⚠️ THAT IS WHY THESE ARE NOT NESTED UNDER THE FOLDERS ABOVE.
+            // A record's container is its path RELATIVE to whichever root
+            // holds it, with the root's own name where the file sits at the
+            // top — so two roots with a `Reading` folder are already one row
+            // here, and nothing in the stats output says which root a row came
+            // from. Drawing these as children of a configured folder would
+            // attribute somebody else's files to it.
+            ExplainLabel("Top-level folders, across every indexed folder",
+                         "How a folder is counted", """
+                         One row per top-level folder in each indexed folder, \
+                         carrying its own files and everything in its \
+                         subfolders.
+
+                         Records are files. Chunks are the pieces they were \
+                         split into for searching, and they are what the index \
+                         costs — a folder of long documents can hold fewer \
+                         files than another and far more of the index.
+
+                         ⚠️ A file sitting directly in an indexed folder is \
+                         filed under that folder's own name. Two indexed \
+                         folders that each contain a folder of the same name \
+                         are one row here.
+                         """)
+        } else if stat.containers.count >= 60 {
+            Note("The 60 largest.")
+        }
+    }
+
+    private var heading: String {
+        switch line.tool {
+        case "mail":     return "By account and mailbox"
+        case "messages": return "By conversation"
+        case "calendar": return "By calendar"
+        case "files":    return "By folder"
+        case "maps":     return "By category"
+        default:         return "By account"
+        }
     }
 }
 
@@ -544,11 +457,16 @@ private struct FolderList: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
+            Text("Indexed folders").font(.caption2.weight(.semibold))
+                .kerning(0.7).foregroundStyle(.tertiary)
             ForEach(folders.entries) { folder in
                 HStack(spacing: 8) {
                     Image(systemName: folder.kind == "obsidian"
                           ? "book.closed" : "folder")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(folder.kind == "obsidian"
+                                         ? Color.accentColor : Color.secondary)
+                        .help(folder.kind == "obsidian" ? "Obsidian vault"
+                                                        : "Plain folder")
                     VStack(alignment: .leading, spacing: 1) {
                         Text(folder.name).font(.callout)
                         Text(folder.display)
@@ -565,10 +483,8 @@ private struct FolderList: View {
                             .help(folder.exclude.joined(separator: ", "))
                     }
                     Spacer()
-                    Button {
-                        folders.remove(folder)
-                    } label: { Image(systemName: "minus.circle") }
-                        .buttonStyle(.plain).foregroundStyle(.secondary)
+                    Button("Remove") { folders.remove(folder) }
+                        .controlSize(.small)
                         .help("Stop indexing this folder")
                 }
             }
@@ -589,27 +505,248 @@ private struct FolderList: View {
                         Those records go when the files source is rebuilt in \
                         full.
                         """)
+                if let note = folders.lastAction {
+                    Note(note)
+                }
                 Spacer()
-            }
-            if let note = folders.lastAction {
-                Note(note)
             }
             if let failure = folders.failure {
                 Note(failure, tint: .red)
             }
         }
-        .padding(.vertical, 4)
+        .padding(.bottom, 6)
     }
 }
 
-// MARK: - storage and the rest
+// MARK: - 2. how is it growing, and what does it cost
 
-private struct Storage: View {
+struct IndexSize: View {
     @ObservedObject var model: AppModel
+    @AppStorage("growthByTool") private var byTool = true
     @State private var confirming = false
 
     var body: some View {
-        Panel("Storage") {
+        VStack(alignment: .leading, spacing: 30) {
+            growth
+            storage
+        }
+    }
+
+    // MARK: growth
+
+    private var growth: some View {
+        PaneSection("Growth", trailing: {
+            HStack(spacing: 10) {
+                Explain("Where the early history comes from", """
+                        A point is recorded on every indexing run. Points from \
+                        before this app existed are derived from when each \
+                        record was last written, so the early part of the \
+                        curve is an approximation rather than a measurement.
+
+                        Chunks, not records: a chunk is what costs storage and \
+                        what gets embedded. The areas are stacked, so they add \
+                        up to the total.
+                        """)
+                Picker("", selection: $byTool) {
+                    Text("Total").tag(false)
+                    Text("By source").tag(true)
+                }
+                .pickerStyle(.segmented).labelsHidden().frame(width: 160)
+            }
+        }) {
+            HStack(alignment: .top, spacing: 24) {
+                chart
+                sidebar.frame(width: 226)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var chart: some View {
+        let stats = model.stats
+        VStack(alignment: .leading, spacing: 6) {
+            if stats.history.count < 2 {
+                Note("Not enough history yet. A point is recorded on every "
+                     + "indexing run.")
+                    .frame(height: 210, alignment: .top)
+            } else if byTool {
+                // 🛑 STACKED, so the AREAS sum to the total. Overlaid lines on
+                // one axis let mail's 203k chunks flatten every other source
+                // into the baseline, which is exactly the source you want to
+                // see growing.
+                Chart(stats.history) { point in
+                    AreaMark(x: .value("day", point.date),
+                             y: .value("chunks", point.chunks),
+                             stacking: .standard)
+                        .foregroundStyle(by: .value("source", point.tool))
+                        .interpolationMethod(.monotone)
+                }
+                .chartLegend(position: .bottom, spacing: 10)
+                .chartYAxisLabel("chunks")
+                .frame(height: 210)
+            } else {
+                Chart {
+                    ForEach(stats.totals, id: \.0) { day, chunks in
+                        AreaMark(x: .value("day", day), y: .value("chunks", chunks),
+                                 series: .value("series", "measured"))
+                            .foregroundStyle(.tint.opacity(0.22))
+                            .interpolationMethod(.monotone)
+                        LineMark(x: .value("day", day), y: .value("chunks", chunks),
+                                 series: .value("series", "measured"))
+                            .foregroundStyle(.tint)
+                            .interpolationMethod(.monotone)
+                    }
+                    // ⚠️ DASHED, AND ONLY IN THE TOTAL VIEW. It is arithmetic
+                    // on the last 30 days, not a measurement, and a solid line
+                    // would read as one. It cannot be drawn over the stacked
+                    // chart at all: a projection has no source to belong to.
+                    if let ahead = projection {
+                        ForEach(ahead.line, id: \.0) { day, chunks in
+                            LineMark(x: .value("day", day),
+                                     y: .value("chunks", chunks),
+                                     series: .value("series", "projected"))
+                                .foregroundStyle(.tint.opacity(0.55))
+                                .lineStyle(StrokeStyle(lineWidth: 2, dash: [4, 4]))
+                        }
+                    }
+                }
+                .chartYAxisLabel("chunks")
+                .frame(height: 210)
+                // ⚠️ TOP LEADING, NOT TRAILING. Swift Charts puts the value
+                // axis on the trailing edge, so an annotation in that corner
+                // is drawn straight through "2,000,000".
+                .overlay(alignment: .topLeading) {
+                    if let ahead = projection {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("≈ \(Format.bytes(ahead.bytes)) by \(ahead.when)")
+                                .font(.caption)
+                            Text("at the last 30 days' rate")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                        .padding(.leading, 4)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var sidebar: some View {
+        let stats = model.stats
+        return VStack(alignment: .leading, spacing: 14) {
+            // ⚠️ A 2×2 GRID, NOT A ROW. Beside a chart there is no width for
+            // four statistics in a line, and wrapping them silently put "to
+            // embed" on its own where it reads as a heading.
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 12) {
+                GridRow {
+                    Stat("chunks", Format.count(stats.chunks))
+                    Stat("embedded", Format.count(stats.vectors))
+                }
+                GridRow {
+                    Stat("on disk", Format.bytes(stats.bytes))
+                    // 🛑 ALWAYS DRAWN, and grey at zero. It used to appear only
+                    // with a backlog, so the grid changed shape between two
+                    // refreshes a minute apart.
+                    Stat("to embed", Format.count(stats.backlog),
+                         tint: stats.backlog > 0 ? .orange : nil)
+                }
+            }
+            if !quiet.isEmpty {
+                Divider()
+                // 🛑 A SOURCE FAILING FOR A WEEK LOOKS EXACTLY LIKE A QUIET
+                // ONE. Every source is read on every five-minute cycle, so a
+                // last-read date measured in days is not a calm store — it is
+                // a read that has not succeeded since then.
+                HStack(spacing: 6) {
+                    Text("GONE QUIET").font(.caption2.weight(.semibold))
+                        .kerning(0.7).foregroundStyle(.tertiary)
+                    Explain("What this list means", """
+                            Every source is read on every indexing run, so a \
+                            source that was last read days ago is not a store \
+                            with nothing new in it. It is a read that has not \
+                            succeeded since then.
+
+                            A grant that was revoked, a store that moved, or a \
+                            helper that is failing all look like this. Open \
+                            the Sources pane and expand the row to see what it \
+                            said.
+                            """)
+                }
+                ForEach(quiet, id: \.tool) { source in
+                    HStack {
+                        Text(source.tool).font(.callout)
+                        Spacer()
+                        Text(source.updated.map(Format.ago) ?? "never")
+                            .font(.callout).monospacedDigit()
+                            .foregroundStyle(source.stale ? Color.orange
+                                                          : Color.secondary)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sources whose last successful read is older than a day, oldest first.
+    /// ⚠️ A source with no `updated` at all has never been read and is not
+    /// listed here — it has no row in the stats output either.
+    private var quiet: [(tool: String, updated: Date?, stale: Bool)] {
+        let day: TimeInterval = 86_400
+        return model.stats.sources.compactMap { source -> (String, Date?, Bool)? in
+            guard let updated = source.updated,
+                  Date().timeIntervalSince(updated) > day else { return nil }
+            return (source.tool, updated,
+                    Date().timeIntervalSince(updated) > 7 * day)
+        }
+        .sorted { ($0.1 ?? .distantPast) < ($1.1 ?? .distantPast) }
+        .prefix(5)
+        .map { (tool: $0.0, updated: $0.1, stale: $0.2) }
+    }
+
+    /// Where the index lands six months out, at the rate of the last 30 days.
+    ///
+    /// 🛑 ARITHMETIC, NOT A FORECAST, and it says so on the page. It is the
+    /// answer to "is this going to eat my disk", which a curve alone does not
+    /// give: 1.2 GB is unremarkable and 1.2 GB growing at 40 MB a week is not.
+    ///
+    /// ⚠️ NOTHING IS DRAWN unless there are 14 days of history to take a rate
+    /// from and the rate is positive. A projection off three days of history
+    /// is a number with an error bar wider than itself, and a downward one
+    /// would claim the index is about to shrink, which it never does — the
+    /// ingest only ever adds.
+    private var projection: (line: [(Date, Int)], bytes: Int, when: String)? {
+        let totals = model.stats.totals
+        guard let last = totals.last, model.stats.chunks > 0,
+              model.stats.bytes > 0 else { return nil }
+        let window = last.0.addingTimeInterval(-30 * 86_400)
+        guard let first = totals.first(where: { $0.0 >= window }) ?? totals.first
+            else { return nil }
+        let days = last.0.timeIntervalSince(first.0) / 86_400
+        guard days >= 14 else { return nil }
+        let rate = Double(last.1 - first.1) / days
+        guard rate > 0 else { return nil }
+        let ahead = 182.0
+        let target = last.1 + Int(rate * ahead)
+        // 🛑 A RATE THAT PROJECTS A DOUBLING IS THE FIRST INGEST, NOT A TREND.
+        // Measured on a two-day window during development: the line reached
+        // 2,000,000 chunks, the whole measured curve was flattened into a
+        // sliver at the baseline, and the chart stopped answering the question
+        // it exists for. The index only ever appends, so 30 days that added as
+        // much as the previous years is a backfill finishing, and extending it
+        // six months is arithmetic on a transient.
+        guard target < 2 * last.1 else { return nil }
+        let when = last.0.addingTimeInterval(ahead * 86_400)
+        let perChunk = Double(model.stats.bytes) / Double(model.stats.chunks)
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMMM"
+        return ([(last.0, last.1), (when, target)],
+                Int(Double(target) * perChunk),
+                formatter.string(from: when))
+    }
+
+    // MARK: storage
+
+    private var storage: some View {
+        PaneSection("Storage") {
             HStack(spacing: 10) {
                 Image(systemName: model.stats.encrypted ? "lock.fill" : "lock.open.fill")
                     .foregroundStyle(model.stats.encrypted ? Color.green : Color.red)
@@ -668,61 +805,67 @@ private struct Storage: View {
     }
 }
 
-private struct Advanced: View {
+// MARK: - the search endpoint and the proxy switch
+
+struct Advanced: View {
     @ObservedObject var model: AppModel
     @AppStorage("toolProxy") private var proxy = false
 
     var body: some View {
-        Panel("Advanced") {
-            HStack {
-                Text("Search endpoint").frame(width: 150, alignment: .leading)
-                switch model.search.state {
-                case .running(let pid): Text("answering · pid \(pid)")
-                case .stopped: Text("starting…").foregroundStyle(.secondary)
-                case .failed(let why): Text(why).foregroundStyle(.red)
-                }
-                Spacer()
-            }
-            .font(.callout)
-            if let ping = model.search.lastPing, ping["ok"] as? Bool == true {
+        VStack(alignment: .leading, spacing: 30) {
+            PaneSection("Search endpoint") {
                 HStack {
-                    Text("").frame(width: 150)
-                    Text("\(Format.count(ping["vectors"] as? Int ?? 0)) vectors warm · "
-                         + String(format: "%.0f MB", ping["resident_megabytes"] as? Double ?? 0))
-                        .font(.caption).foregroundStyle(.secondary)
+                    Text("State").frame(width: 150, alignment: .leading)
+                    switch model.search.state {
+                    case .running(let pid): Text("answering · pid \(pid)")
+                    case .stopped: Text("starting…").foregroundStyle(.secondary)
+                    case .failed(let why): Text(why).foregroundStyle(.red)
+                    }
                     Spacer()
                 }
+                .font(.callout)
+                if let ping = model.search.lastPing, ping["ok"] as? Bool == true {
+                    HStack {
+                        Text("").frame(width: 150)
+                        Text("\(Format.count(ping["vectors"] as? Int ?? 0)) vectors warm · "
+                             + String(format: "%.0f MB", ping["resident_megabytes"] as? Double ?? 0))
+                            .font(.caption).foregroundStyle(.secondary)
+                        Spacer()
+                    }
+                }
             }
-            Divider().opacity(0.3)
-            HStack(spacing: 8) {
-                Toggle("Let terminals use this app's permissions", isOn: $proxy)
-                    .onChange(of: proxy) { _, _ in model.toolProxy.apply() }
-                Explain("What this switch gives away", """
-                        With this on, the app reads your mail, messages, \
-                        notes, calendar and contacts on behalf of any program \
-                        running as you, with no prompt.
 
-                        🛑 Only a signed AppleTools client is accepted. That \
-                        stops a program speaking the protocol directly. It \
-                        does not stop one from running that client, so treat \
-                        this as granting every process running as you the \
-                        access this app holds.
+            PaneSection("Permission proxy") {
+                HStack(spacing: 8) {
+                    Toggle("Let terminals use this app's permissions", isOn: $proxy)
+                        .onChange(of: proxy) { _, _ in model.toolProxy.apply() }
+                    Explain("What this switch gives away", """
+                            With this on, the app reads your mail, messages, \
+                            notes, calendar and contacts on behalf of any \
+                            program running as you, with no prompt.
 
-                        Every proxied command is written to the log.
-                        """)
-                Spacer()
-            }
-            // ⚠️ ONE LINE, AND ONLY WHILE IT IS ON. The paragraph used to sit
-            // here in orange whether the switch was on or off, which is how a
-            // real warning gets read as decoration.
-            if proxy {
-                Note("On: any program running as you can read your mail, "
-                     + "messages, notes, calendar and contacts through this "
-                     + "app, with no prompt.", tint: .orange)
-            }
-            if model.toolProxy.running, model.toolProxy.served > 0 {
-                Note("\(model.toolProxy.served) commands served."
-                     + (model.toolProxy.lastCommand.map { " Last: \($0)" } ?? ""))
+                            🛑 Only a signed AppleTools client is accepted. \
+                            That stops a program speaking the protocol \
+                            directly. It does not stop one from running that \
+                            client, so treat this as granting every process \
+                            running as you the access this app holds.
+
+                            Every proxied command is written to the log.
+                            """)
+                    Spacer()
+                }
+                // ⚠️ ONE LINE, AND ONLY WHILE IT IS ON. The paragraph used to
+                // sit here in orange whether the switch was on or off, which
+                // is how a real warning gets read as decoration.
+                if proxy {
+                    Note("On: any program running as you can read your mail, "
+                         + "messages, notes, calendar and contacts through this "
+                         + "app, with no prompt.", tint: .orange)
+                }
+                if model.toolProxy.running, model.toolProxy.served > 0 {
+                    Note("\(model.toolProxy.served) commands served."
+                         + (model.toolProxy.lastCommand.map { " Last: \($0)" } ?? ""))
+                }
             }
         }
     }
@@ -730,9 +873,11 @@ private struct Advanced: View {
 
 // MARK: - onboarding
 
-private struct Onboarding: View {
+struct Onboarding: View {
     var body: some View {
-        Panel("This app cannot read your data yet", tint: .orange) {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("This app cannot read your data yet")
+                .font(.headline).foregroundStyle(.orange)
             Text("""
                  It reads your mail, messages, notes, calendar, contacts, call \
                  history and visited places from the stores on this Mac. \
@@ -745,63 +890,14 @@ private struct Onboarding: View {
             Button("Open Full Disk Access…") { Diagnostics.openFullDiskAccessPane() }
                 .buttonStyle(.borderedProminent)
         }
-    }
-}
-
-// MARK: - small pieces
-
-/// ⚠️ NOT `private` any more. `PeopleView.swift` builds its panels out of the
-/// same two pieces, and a second copy of either would drift from this one.
-struct Panel<Content: View, Trailing: View>: View {
-    let title: String
-    var tint: Color? = nil
-    @ViewBuilder let trailing: Trailing
-    @ViewBuilder let content: Content
-
-    init(_ title: String, tint: Color? = nil,
-         @ViewBuilder trailing: () -> Trailing = { EmptyView() },
-         @ViewBuilder content: () -> Content) {
-        self.title = title
-        self.tint = tint
-        self.trailing = trailing()
-        self.content = content()
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text(title.uppercased())
-                    .font(.caption.weight(.semibold))
-                    .kerning(0.8)
-                    .foregroundStyle(tint ?? .secondary)
-                Spacer()
-                trailing
-            }
-            content
-        }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background((tint ?? Color.gray).opacity(tint == nil ? 0.07 : 0.13),
+        .background(Color.orange.opacity(0.13),
                     in: RoundedRectangle(cornerRadius: 11))
     }
 }
 
-private struct Badge: View {
-    let label: String
-    let ok: Bool
-    let detail: String
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: ok ? "checkmark.shield.fill" : "xmark.shield.fill")
-                .foregroundStyle(ok ? Color.green : Color.red)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(label).font(.callout.weight(.medium))
-                Text(detail).font(.caption).foregroundStyle(.secondary)
-            }
-        }
-    }
-}
+// MARK: - small pieces
 
 struct Stat: View {
     let label: String
@@ -819,8 +915,8 @@ struct Stat: View {
     }
 }
 
-/// ⚠️ NOT `private`, for the same reason `Panel` is not: `PlacesView.swift`
-/// says the same kinds of things and a second copy would drift.
+/// ⚠️ NOT `private`: `PlacesView.swift` and `PeopleView.swift` say the same
+/// kinds of things and a second copy would drift.
 struct Note: View {
     let text: String
     var tint: Color = .secondary

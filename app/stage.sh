@@ -55,6 +55,10 @@ cp lab/index.py lab/bin/apple-index "$STAGE/index/"
 cp $(cd lab && /usr/bin/python3 -c \
     "import index; print(' '.join('lab/%s.py' % m for m in index.SIBLING_MODULES))") \
     "$STAGE/index/"
+# 🛑 And the data files it declares, from the same one declaration.
+cp $(cd lab && /usr/bin/python3 -c \
+    "import index; print(' '.join('lab/%s' % f for f in index.SIBLING_DATA))") \
+    "$STAGE/index/"
 # 🛑 Through the shipped wrapper, never `python3 index.py`. Proves the staged
 # copy imports every sibling, before the bundle is signed.
 PYTHONDONTWRITEBYTECODE=1 "$STAGE/index/apple-index" selfcheck \

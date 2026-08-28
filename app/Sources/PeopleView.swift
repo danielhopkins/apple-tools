@@ -68,7 +68,7 @@ enum Channel {
     }
 }
 
-// MARK: - the section
+// MARK: - the pane
 
 struct People: View {
     @ObservedObject var model: AppModel
@@ -79,22 +79,13 @@ struct People: View {
     @State private var query = ""
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 26) {
-            Panel("Who you talk to", trailing: {
-                HStack(spacing: 10) {
-                    // ⚠️ SAY HOW OLD IT IS. A stored answer that cannot be told
-                    // from a fresh one cannot be told from a stale one either,
-                    // and this one is a day old by design.
-                    if let computed = model.people.computed {
-                        Text("computed \(Format.ago(computed))")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    Button(model.peopleBusy ? "Recalculating…" : "Recalculate") {
-                        model.refreshPeople(force: true)
-                    }
-                    .disabled(model.peopleBusy)
-                    .controlSize(.small)
+        VStack(alignment: .leading, spacing: 28) {
+            PaneSection("Who is in all this", subtitle: age, trailing: {
+                Button(model.peopleBusy ? "Recalculating…" : "Recalculate") {
+                    model.refreshPeople(force: true)
                 }
+                .disabled(model.peopleBusy)
+                .buttonStyle(.link)
             }) {
                 let stats = model.people
                 if let failure = stats.error {
@@ -102,46 +93,53 @@ struct People: View {
                 } else if !stats.loaded {
                     PeopleNote("Reading it…")
                 } else {
-                    Summary(stats: stats)
-                    ContactWeb(stats: stats)
+                    // 🛑 THE WEB AND THE SEARCH BOX, SIDE BY SIDE. They were
+                    // two stacked panels, and the box scrolled out of sight
+                    // exactly when the web made you want it: the picture draws
+                    // a few dozen people and the question it provokes is about
+                    // somebody in three-hundredth place.
+                    HStack(alignment: .top, spacing: 22) {
+                        ContactWeb(stats: stats)
+                        Lookup(stats: stats, query: $query).frame(width: 244)
+                    }
+                    Provenance(stats: stats)
                 }
             }
             if model.people.loaded, model.people.error == nil {
-                Lookup(stats: model.people, query: $query)
                 Journey(stats: model.people, query: query)
-                EmojiPanel(report: model.people.emoji)
             }
         }
         .onAppear { model.refreshPeople() }
     }
+
+    /// ⚠️ SAY HOW OLD IT IS. A stored answer that cannot be told from a fresh
+    /// one cannot be told from a stale one either, and this one is a day old
+    /// by design.
+    private var age: String {
+        guard let computed = model.people.computed else {
+            return "not a diagnostic"
+        }
+        return "not a diagnostic — computed \(Format.ago(computed))"
+    }
 }
 
-private struct Summary: View {
+/// Where these numbers came from, and who was left out of them.
+///
+/// ⚠️ IT IS BACKGROUND, NOT NEWS. It was four grey paragraphs under the
+/// numbers, and four paragraphs of standing explanation is a wall people
+/// scroll past — including the one line that is about a mistake they can fix.
+private struct Provenance: View {
     let stats: PeopleStats
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 26) {
-                Stat("people", Format.count(stats.peopleSeen))
-                Stat("shown", Format.count(stats.people.count))
-                Stat("records read", Format.count(stats.records))
-                if let span = stats.span {
-                    Stat("years", "\(Calendar.current.dateComponents([.year], from: span.0, to: span.1).year ?? 0)")
-                }
-                Spacer()
-            }
-            // 🛑 SAY WHAT THE NUMBER IS. Everything below is ranked and sized
-            // by DAYS on which something passed between you, because a count
-            // of items cannot be compared across sources: one email is one
-            // record and ten texts are also one record. Adding them reported
-            // a spouse of twenty years at "9,059 encounters", which is what
-            // made this panel worth doubting.
-            //
-            // ⚠️ IT IS BACKGROUND, NOT NEWS. It was four grey paragraphs under
-            // the numbers, and four paragraphs of standing explanation is a
-            // wall people scroll past — including the one line that is about
-            // a mistake they can fix.
-            HStack(spacing: 12) {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 14) {
+                // 🛑 SAY WHAT THE NUMBER IS. Everything here is ranked and
+                // sized by DAYS on which something passed between you, because
+                // a count of items cannot be compared across sources: one
+                // email is one record and ten texts are also one record.
+                // Adding them reported a spouse of twenty years at "9,059
+                // encounters", which is what made this panel worth doubting.
                 ExplainLabel("Counted in days", "How this is counted", """
                              Everything here is ranked and sized by the number \
                              of days on which something passed between you — \
@@ -260,13 +258,12 @@ private struct ContactWeb: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            // 🛑 THE LEGEND MOVED UNDER THE WEB IN 26.828, and it had to. The
+            // web now shares its row with the lookup column, so four channel
+            // names, a switch, a picker and a button no longer fit on one
+            // line — SwiftUI kept them all by breaking "Through time" into one
+            // letter per line, which is worse than any of them being absent.
             HStack {
-                ForEach(Channel.all, id: \.self) { channel in
-                    HStack(spacing: 5) {
-                        Circle().fill(Channel.color(channel)).frame(width: 8, height: 8)
-                        Text(channel).font(.caption).foregroundStyle(.secondary)
-                    }
-                }
                 Spacer()
                 Toggle("Through time", isOn: $throughTime)
                     .toggleStyle(.switch).controlSize(.small)
@@ -330,6 +327,24 @@ private struct ContactWeb: View {
             .frame(height: 440)
             .background(Color.primary.opacity(0.03),
                         in: RoundedRectangle(cornerRadius: 9))
+            .overlay(alignment: .bottomLeading) {
+                HStack(spacing: 12) {
+                    ForEach(Channel.all, id: \.self) { channel in
+                        HStack(spacing: 5) {
+                            Circle().fill(Channel.color(channel))
+                                .frame(width: 7, height: 7)
+                            Text(channel).font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                // ⚠️ A BACKING, because it is drawn ON the graph. Without one
+                // it lands on whichever name the layout put in that corner and
+                // the two strings interleave.
+                .padding(.horizontal, 9).padding(.vertical, 5)
+                .background(.regularMaterial, in: Capsule())
+                .padding(9)
+            }
 
             if let chosen = stats.people.first(where: { $0.id == selected }) {
                 Detail(person: chosen)
@@ -532,43 +547,61 @@ private struct Detail: View {
     }
 }
 
-// MARK: - looking one person up
+// MARK: - the column beside the web
 
 /// 🛑 THE WEB DRAWS A FEW DOZEN PEOPLE; THIS FINDS ANY OF THE FOUR THOUSAND.
 /// "Who is this person" is a fair question about somebody in 300th place, and
 /// before this the only answer was to re-run the command with a bigger --top.
+///
+/// ⚠️ IT SITS BESIDE THE WEB, NOT UNDER IT. As its own panel it scrolled out
+/// of sight exactly when the picture made somebody want it.
 private struct Lookup: View {
     let stats: PeopleStats
     @Binding var query: String
     @State private var chosen: Person? = nil
 
     var body: some View {
-        Panel("Look someone up", trailing: {
-            Explain("Who is in here", """
-                    Everyone you have exchanged something with, ranked by days \
-                    in contact. The web above draws the busiest few dozen; \
-                    everyone else is here.
+        VStack(alignment: .leading, spacing: 12) {
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 12) {
+                GridRow {
+                    Stat("people", Format.count(stats.peopleSeen))
+                    Stat("shown", Format.count(stats.people.count))
+                }
+                GridRow {
+                    Stat("records read", Format.count(stats.records))
+                    if let span = stats.span {
+                        let years = Calendar.current.dateComponents(
+                            [.year], from: span.0, to: span.1).year ?? 0
+                        Stat("years", "\(years)")
+                    }
+                }
+            }
 
-                    ⚠️ Somebody who only ever appeared beside you on \
-                    somebody else's mail is not in this list. Being on the \
-                    same mailing list is not contact.
-
-                    Typing a name filters the timeline below as well.
-                    """)
-        }) {
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField("name, email address or phone number",
-                          text: $query)
+                TextField("name, email or number", text: $query)
                     .textFieldStyle(.plain)
+                    .onChange(of: query) { _, _ in chosen = nil }
                 if !query.isEmpty {
                     Button {
                         query = ""; chosen = nil
                     } label: { Image(systemName: "xmark.circle.fill") }
                         .buttonStyle(.plain).foregroundStyle(.secondary)
                 }
+                Explain("Who is in here", """
+                        Everyone you have exchanged something with, ranked by \
+                        days in contact. The web beside this draws the busiest \
+                        few dozen; everyone else is here.
+
+                        ⚠️ Somebody who only ever appeared beside you on \
+                        somebody else's mail is not in this list. Being on the \
+                        same mailing list is not contact.
+
+                        Typing a name filters the timeline below as well.
+                        """)
             }
-            .padding(.horizontal, 10).padding(.vertical, 7)
+            .font(.callout)
+            .padding(.horizontal, 9).padding(.vertical, 6)
             .background(Color.primary.opacity(0.05),
                         in: RoundedRectangle(cornerRadius: 7))
 
@@ -581,12 +614,12 @@ private struct Lookup: View {
                 if hits.isEmpty {
                     PeopleNote("Nobody by that name.")
                 } else {
-                    ForEach(hits.prefix(12)) { person in
+                    ForEach(hits.prefix(8)) { person in
                         Button { chosen = person } label: { Row(person: person) }
                             .buttonStyle(.plain)
                     }
-                    if hits.count > 12 {
-                        PeopleNote("\(hits.count - 12) more. Type a little more.")
+                    if hits.count > 8 {
+                        PeopleNote("\(hits.count - 8) more. Type a little more.")
                     }
                 }
             } else {
@@ -596,6 +629,7 @@ private struct Lookup: View {
                                 + "never exchanged anything with you."
                               : ""))
             }
+            Spacer(minLength: 0)
         }
     }
 
@@ -612,110 +646,248 @@ private struct Lookup: View {
     private struct Row: View {
         let person: Person
         var body: some View {
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
+                Circle().fill(Channel.color(person.dominantChannel))
+                    .frame(width: 5, height: 5)
                 Text(person.name).font(.callout)
                     .lineLimit(1).truncationMode(.middle)
-                if !person.known {
-                    Text(person.handle).font(.caption2).foregroundStyle(.secondary)
-                        .lineLimit(1).truncationMode(.middle)
-                }
-                Spacer(minLength: 12)
-                ForEach(Channel.all, id: \.self) { channel in
-                    if let count = person.channels[channel], count > 0 {
-                        Image(systemName: Channel.symbol(channel))
-                            .font(.caption2).foregroundStyle(Channel.color(channel))
-                    }
-                }
+                Spacer(minLength: 8)
                 Text("\(Format.count(person.days)) days")
                     .font(.caption).monospacedDigit().foregroundStyle(.secondary)
-                    .frame(width: 78, alignment: .trailing)
             }
             .contentShape(Rectangle())
-            .padding(.vertical, 3)
+            .padding(.vertical, 2)
         }
     }
 }
 
-// MARK: - emoji
+// MARK: - the emoji pane
 
-private struct EmojiPanel: View {
-    let report: EmojiReport
+/// 🛑 ONLY WHAT THE USER SENT. Counting every emoji in the index measures what
+/// other people type at them, and the two answers look alike.
+struct Emoji: View {
+    @ObservedObject var model: AppModel
+
+    private var report: EmojiReport { model.people.emoji }
 
     var body: some View {
-        Panel("Your emoji", trailing: {
-            // 🛑 The rule, out loud. Counting every emoji in the store
-            // measures what other people type at you, and the two answers
-            // look alike.
-            Explain("What is counted", """
-                    Only what you sent: texts you wrote, and mail from your \
-                    own accounts with the quoted replies stripped out.
+        VStack(alignment: .leading, spacing: 30) {
+            PaneSection("Your emoji", subtitle: "only what you sent", trailing: {
+                Explain("What is counted", """
+                        Only what you sent: texts you wrote, and mail from \
+                        your own accounts with the quoted replies stripped out.
 
-                    🛑 Counting every emoji in the index instead would measure \
-                    what other people type at you. The two answers look alike \
-                    and are not the same question.
-                    """)
-        }) {
-            if report.top.isEmpty {
-                PeopleNote("None found in anything you sent.")
-            } else {
-                let biggest = report.top.first?.count ?? 1
-                HStack(alignment: .bottom, spacing: 14) {
-                    ForEach(report.top.prefix(10)) { entry in
-                        VStack(spacing: 4) {
-                            Text(entry.emoji).font(.system(size: 34))
-                            Text(Format.count(entry.count))
-                                .font(.caption).monospacedDigit()
-                                .foregroundStyle(.secondary)
-                            Capsule().fill(.tint.opacity(0.5))
-                                .frame(width: 26,
-                                       height: 3 + 30 * CGFloat(entry.count) / CGFloat(biggest))
-                        }
-                    }
-                    Spacer()
-                }
-
-                if report.top.count > 10 {
-                    Divider().opacity(0.3)
-                    // The tail, small. It is the long list people scan for one
-                    // they had forgotten they use.
-                    FlowRow(spacing: 9) {
-                        ForEach(report.top.dropFirst(10)) { entry in
-                            HStack(spacing: 3) {
-                                Text(entry.emoji).font(.system(size: 15))
-                                Text("\(entry.count)").font(.caption2)
-                                    .foregroundStyle(.secondary).monospacedDigit()
-                            }
-                        }
+                        🛑 Counting every emoji in the index instead would \
+                        measure what other people type at you. The two answers \
+                        look alike and are not the same question.
+                        """)
+            }) {
+                if let failure = model.people.error {
+                    PeopleNote("Could not read it: \(failure)", tint: .red)
+                } else if !model.people.loaded {
+                    PeopleNote("Reading it…")
+                } else if report.top.isEmpty {
+                    PeopleNote("None found in anything you sent.")
+                } else {
+                    favourites
+                    HStack(spacing: 26) {
+                        Stat("used", Format.count(report.total))
+                        Stat("different ones", Format.count(report.distinct))
+                        Stat("in texts", Format.count(report.fromMessages))
+                        Stat("in mail", Format.count(report.fromMail))
+                        Spacer()
                     }
                 }
+            }
+            if model.people.loaded, !report.byYear.isEmpty {
+                years
+            }
+            if let adoption = report.adoption, !adoption.items.isEmpty {
+                Adoption(adoption: adoption)
+            }
+        }
+        .onAppear { model.refreshPeople() }
+    }
 
-                if !report.byYear.isEmpty {
-                    Divider().opacity(0.3)
-                    Text("EMOJI OF THE YEAR").font(.caption2.weight(.semibold))
-                        .kerning(0.7).foregroundStyle(.secondary)
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(alignment: .top, spacing: 16) {
-                            ForEach(report.byYear) { year in
-                                VStack(spacing: 2) {
-                                    Text(year.emoji).font(.system(size: 21))
-                                    Text(year.year).font(.caption2).monospacedDigit()
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                        .padding(.vertical, 2)
-                    }
+    @ViewBuilder
+    private var favourites: some View {
+        let biggest = report.top.first?.count ?? 1
+        HStack(alignment: .bottom, spacing: 14) {
+            ForEach(report.top.prefix(10)) { entry in
+                VStack(spacing: 4) {
+                    Text(entry.emoji).font(.system(size: 34))
+                    Text(Format.count(entry.count))
+                        .font(.caption).monospacedDigit()
+                        .foregroundStyle(.secondary)
+                    // ⚠️ NARROW. At 26 points wide against 33 tall the tallest
+                    // bar is a circle, and a row of circles carries none of
+                    // the comparison a bar chart exists for.
+                    Capsule().fill(.tint.opacity(0.55))
+                        .frame(width: 9,
+                               height: 4 + 42 * CGFloat(entry.count) / CGFloat(biggest))
                 }
-
-                HStack(spacing: 26) {
-                    Stat("used", Format.count(report.total))
-                    Stat("different ones", Format.count(report.distinct))
-                    Stat("in texts", Format.count(report.fromMessages))
-                    Stat("in mail", Format.count(report.fromMail))
-                    Spacer()
+            }
+            Spacer()
+        }
+        if report.top.count > 10 {
+            // The tail, small. It is the long list people scan for one they
+            // had forgotten they use.
+            FlowRow(spacing: 9) {
+                ForEach(report.top.dropFirst(10)) { entry in
+                    HStack(spacing: 3) {
+                        Text(entry.emoji).font(.system(size: 15))
+                        Text("\(entry.count)").font(.caption2)
+                            .foregroundStyle(.secondary).monospacedDigit()
+                    }
                 }
             }
         }
+    }
+
+    private var years: some View {
+        PaneSection("By year") {
+            Row(title: "Emoji of the year", entries: report.byYear)
+            if !report.rarest.isEmpty {
+                Row(title: "Anti-emoji of the year", entries: report.rarest,
+                    // ⚠️ THE COUNT IS THE POINT DOWN HERE. "😂 2019" and "🧯
+                    // 2019" look identical without it, and one of them
+                    // happened 1,842 times.
+                    showCount: true)
+                PeopleNote("The least-used emoji of each year — one you really "
+                           + "did send, once. An emoji you have never sent "
+                           + "belongs to no year at all.")
+            }
+        }
+    }
+
+    private struct Row: View {
+        let title: String
+        let entries: [EmojiYear]
+        var showCount = false
+
+        var body: some View {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(title.uppercased()).font(.caption2.weight(.semibold))
+                    .kerning(0.7).foregroundStyle(.tertiary)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(alignment: .top, spacing: 16) {
+                        ForEach(entries) { year in
+                            VStack(spacing: 2) {
+                                Text(year.emoji).font(.system(size: 21))
+                                Text(year.year).font(.caption2).monospacedDigit()
+                                    .foregroundStyle(.secondary)
+                                if showCount {
+                                    Text(year.count == 1 ? "once"
+                                                         : "\(year.count)×")
+                                        .font(.caption2).monospacedDigit()
+                                        .foregroundStyle(.tertiary)
+                                }
+                            }
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+        }
+    }
+}
+
+/// How long the user takes to pick up an emoji after it is published.
+///
+/// 🛑 THE RELEASE DATES ARE FETCHED, NOT REMEMBERED. `lab/emoji-versions`
+/// reads them out of unicode.org's own data files. A half-remembered date
+/// produces a wrong lag with nothing on screen to show it is wrong, which is
+/// the same class of error as a mis-decoded table cell.
+private struct Adoption: View {
+    let adoption: EmojiAdoption
+    @State private var showAll = false
+
+    /// ⚠️ THE ONES THEY USE, FIRST. A list ordered by release date alone opens
+    /// on three years of emoji nobody here has ever sent, which reads as a
+    /// broken panel rather than as a slow adopter.
+    private var rows: [EmojiArrival] {
+        let used = adoption.items.filter { $0.first != nil }
+        return showAll ? used + adoption.items.filter { $0.first == nil } : used
+    }
+
+    private var widest: Int {
+        max(1, adoption.items.compactMap(\.lagDays).max() ?? 1)
+    }
+
+    var body: some View {
+        PaneSection("New emoji, and how long you take to pick them up",
+                    subtitle: summary, trailing: {
+            Explain("How this is measured", """
+                    Two dates, and only one of them is yours.
+
+                    The release date is what unicode.org stamped on that Emoji \
+                    version's own data file. The first-use date is the \
+                    earliest record in this index in which you typed it.
+
+                    ⚠️ A VENDOR SHIPS THE GLYPH LATER THAN UNICODE PUBLISHES \
+                    IT, often by a month or two, and nothing here knows when \
+                    your own keyboard got it. So a lag is an upper bound on \
+                    how long you waited, not an exact one.
+
+                    ⚠️ A release you have never sent has no lag, only an \
+                    absence. It is listed with no bar rather than as a zero.
+                    """)
+        }) {
+            ForEach(rows) { item in
+                HStack(spacing: 10) {
+                    Text(item.emoji).font(.system(size: 17)).frame(width: 26)
+                    Text("\(item.version) · \(Format.month(item.released))")
+                        .font(.caption2).monospacedDigit()
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 118, alignment: .leading)
+                    GeometryReader { geometry in
+                        Capsule().fill(Color.primary.opacity(0.07))
+                            .frame(height: 4)
+                            .overlay(alignment: .leading) {
+                                if let lag = item.lagDays, lag > 0 {
+                                    Capsule().fill(.tint.opacity(0.55))
+                                        .frame(width: geometry.size.width
+                                               * CGFloat(lag) / CGFloat(widest),
+                                               height: 4)
+                                }
+                            }
+                            .frame(maxHeight: .infinity, alignment: .center)
+                    }
+                    .frame(height: 14)
+                    Text(item.first.map(Format.month) ?? "not yet")
+                        .font(.caption2).monospacedDigit()
+                        .foregroundStyle(item.first == nil ? .tertiary : .secondary)
+                        .frame(width: 78, alignment: .trailing)
+                    Text(item.lagDays.map(Format.months) ?? "—")
+                        .font(.caption2).monospacedDigit()
+                        .frame(width: 82, alignment: .trailing)
+                }
+            }
+            HStack(spacing: 10) {
+                Button(showAll ? "Only the ones I use"
+                               : "Show the \(adoption.released - adoption.used) "
+                                 + "I have never sent") {
+                    showAll.toggle()
+                }
+                .buttonStyle(.link).font(.caption)
+                Spacer()
+            }
+            if adoption.early > 0 {
+                // 🛑 NOT CLAMPED TO ZERO. A negative lag means a record is
+                // dated before the emoji was published, which is a wrong date
+                // — and hiding it would hide the only sign of that.
+                PeopleNote("\(adoption.early) were sent before Unicode "
+                           + "published them, which means those records carry "
+                           + "a wrong date. They are left out of the median.")
+            }
+        }
+    }
+
+    private var summary: String {
+        let scale = "\(adoption.used) of \(adoption.released) released "
+            + "since 2020 used"
+        guard let median = adoption.medianLagDays else { return scale }
+        return "median \(Format.months(median)) · " + scale
     }
 }
 
@@ -770,7 +942,7 @@ private struct Journey: View {
     @AppStorage("journeyRows") private var rows = 24
 
     var body: some View {
-        Panel(filtering ? "People, over time — \u{201c}\(query)\u{201d}"
+        PaneSection(filtering ? "People, over time — \u{201c}\(query)\u{201d}"
                         : "People, over time", trailing: {
             // 🛑 THE DATES ARE THE SOURCES' DATES, NOT THE FRIENDSHIP'S. Call
             // history is a four-month mirror of the iPhone, so a friend of

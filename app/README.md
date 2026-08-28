@@ -158,9 +158,49 @@ rejected with *"The signature does not include a secure timestamp"*.
 ⚠️ The notarytool keychain profile is named `MiniMusic`, after the first app it
 was stored for. It holds this developer's App Store Connect API key.
 
+## The window: a rail, and one pane at a time
+
+🛑 **PANELS BECAME A RAIL IN 26.828, AND THE REASON IS NOT DECORATION.** The
+window was seven stacked boxes in one scroll view — permissions, sources,
+growth, storage, advanced, people, places — and every one of them was on screen
+whether or not it was the thing being asked about. Two costs came out of that:
+
+1. Expanding one source row pushed the four sections below it off the bottom,
+   which reads as the rest of the window disappearing.
+2. The map and the contact web are the two most expensive things here, and they
+   were built on a window opened to check whether mail indexed.
+
+A rail fixes both by construction. One pane is on screen, so nothing below it
+can be displaced, and a pane nobody selects is never built.
+
+⚠️ **ONE QUESTION PER PANE**, in the order a person asks them: **Sources** (can
+it read my data, and what did it read), **Index size** (how is it growing, what
+does it cost, what can I delete), **Advanced** (the search endpoint and the
+proxy switch) — then, under a divider, **Your relationships**, **Your places**
+and **Your emoji**.
+
+🛑 **THE SECOND GROUP IS NOT A DIAGNOSTIC, AND THE DIVIDER SAYS SO.** Nothing in
+the first group depends on it, each costs seconds of subprocess to build, and
+each is fetched only when its pane is opened.
+
+- **`@AppStorage`, not `@SceneStorage`.** This is an LSUIElement app whose one
+  window is closed far more often than the app is quit, and re-opening it onto
+  Sources every time is what makes a rail feel worse than a scroll view. Scene
+  storage rides the window's restoration state, which macOS drops whenever the
+  app is replaced; a defaults key survives an upgrade.
+- **`PaneSection` is a heading and a hairline, not a box.** Seven tinted
+  rounded rectangles on one window made every section look like a callout,
+  which is how a window teaches people to skip the one section that really is a
+  callout.
+- ⚠️ **The header sits above every pane.** What is happening right now, and
+  whether anything needs attention, outranks whatever the person came to look
+  at. So does the Full Disk Access notice: with no grant nothing on any pane is
+  true, and somebody who opened the window on Places would otherwise be shown
+  an empty map and no reason for it.
+
 ## What it does
 
-🛑 **It makes ONE network call, and until the Places panel it made none.** The
+🛑 **It makes ONE network call, and until the Places pane it made none.** The
 map is MapKit, and MapKit fetches its tiles from Apple every time it draws.
 Before this panel existed, `apple maps geocode` and the `--at` flags were the
 whole network surface of this repo — in their own `Geocoding` target, opt-in,
@@ -171,8 +211,9 @@ and refusable with `--local-only`.
   coordinates as data, and nothing uploads a place, a date or a name. What an
   observer could infer is the **region being looked at**, which is weaker than
   the pin list but is not nothing.
-- The map is built only while that panel is on screen, so a window never
-  scrolled that far makes no request at all.
+- The map is built only while its pane is on screen, so a window whose Places
+  pane is never opened makes no request at all. ⚠️ The rail made that stronger
+  than it was: a scroll view built the map for anyone who scrolled far enough.
 - **No CLI makes this call.** `apple-index places` is JSON off the index, and
   it touches nothing.
 
@@ -181,7 +222,7 @@ of tolerance, plus on wake and on unlock, plus once at launch. It runs
 `index.py ingest` per source and then `index.py embed`, as children, so they
 inherit the grant. A full deletion sweep runs weekly, not every cycle.
 
-**It draws a world map of everywhere you have been.** The Places panel reads
+**It draws a world map of everywhere you have been.** The Places pane reads
 `index.py places`, which merges Maps' visited places with clusters of located
 photographs. 🛑 **The two carry different units and the panel never adds them**:
 a `visit` is an arrival Maps recorded, a `photo day` is a day a picture was
@@ -287,10 +328,24 @@ go away?* If not, it is background.
   reach the contact web: that is a `WKWebView` drawing SVG, and its text is not
   text.
 
-**It shows who is in the data.** A fifth panel draws a web of who turns up
-alongside whom, the emoji the user themselves types, and one row per person
-across the years — who arrived, who faded, who came back. It runs
-`index.py people`, which is described in [`lab/README.md`](../lab/README.md).
+**It shows who is in the data.** The relationships pane draws a web of who turns
+up alongside whom and one row per person across the years — who arrived, who
+faded, who came back. It runs `index.py people`, which is described in
+[`lab/README.md`](../lab/README.md).
+
+- ⚠️ **The search box sits BESIDE the web, not under it.** As its own panel it
+  scrolled out of sight exactly when the picture made somebody want it: the web
+  draws a few dozen people and the question it provokes is about somebody in
+  three-hundredth place.
+- ⚠️ **The channel legend moved INSIDE the web.** Sharing a row with the lookup
+  column, four channel names, a switch, a picker and a button no longer fit on
+  one line — and SwiftUI kept them all by breaking "Through time" into one
+  letter per line, which is worse than any of them being absent.
+
+**The emoji are their own pane.** Top emoji, the most-used and least-used one of
+each year, and how long the user takes to pick up an emoji after Unicode
+publishes it. 🛑 **BOTH DATES IN THAT LAST ANSWER COME FROM unicode.org** —
+`lab/emoji-versions` fetches them; see [`lab/README.md`](../lab/README.md).
 
 **The web is d3, in a `WKWebView`.** `Resources/web/graph.html` plus a vendored
 `d3.min.js`; `Sources/ContactWebView.swift` is the bridge. It replaced a

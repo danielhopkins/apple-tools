@@ -406,6 +406,27 @@ enum Format {
         return formatter.string(from: date)
     }
 
+    /// "Sep 2021". ⚠️ The formatter is built per call, which is wasteful, and
+    /// the alternative — a `static let` — is what the rest of this enum does.
+    /// It is called a few dozen times on one pane, so the waste is invisible
+    /// and the locality is worth more.
+    static func month(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM yyyy"
+        return formatter.string(from: date)
+    }
+
+    /// A span in days, said the way a person says it. ⚠️ "409 days" is a
+    /// number nobody converts in their head; "13 months" is the answer.
+    static func months(_ days: Int) -> String {
+        if days < 0 { return "before it was published" }
+        if days < 45 { return days == 1 ? "1 day" : "\(days) days" }
+        let count = Int((Double(days) / 30.44).rounded())
+        if count < 24 { return count == 1 ? "1 month" : "\(count) months" }
+        let years = Double(days) / 365.25
+        return String(format: "%.1f years", years)
+    }
+
     static func count(_ value: Int) -> String {
         let formatter = NumberFormatter()
         formatter.numberStyle = .decimal

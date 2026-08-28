@@ -38,7 +38,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # ⚠️ Two layouts. In the checkout `vec` is a SwiftPM build product; in an
@@ -384,6 +384,19 @@ SOURCES = ["notes", "mail", "messages", "calendar", "contacts", "maps",
 # `lab/dev/` would make `cp lab/*.py` correct and delete this declaration, at
 # the cost of every documented path in CLAUDE.md and lab/Makefile.
 SIBLING_MODULES = ("photos",)
+
+# Data files that must sit beside `index.py` in a shipped payload.
+#
+# 🛑 DECLARED HERE FOR THE SAME REASON THE MODULES ARE. `make dist` and
+# `app/stage.sh` copy whatever this names, and `selfcheck` refuses a payload
+# missing one — so adding a data file is one edit rather than three, and
+# forgetting the other two is not possible.
+#
+# ⚠️ A MISSING ONE DEGRADES QUIETLY AT RUN TIME BY DESIGN, which is exactly why
+# it has to fail loudly at BUILD time. `emoji_versions()` treats an absent file
+# as "no adoption section", so an install short of it looks like a user who has
+# never sent a new emoji rather than like a broken package.
+SIBLING_DATA = ("emoji-versions.txt",)
 
 # 🛑 ONE PLACE, because two places drift. `refresh` uses these, and so does the
 # app's scheduler, which reads them back through `index.py sources --json`
@@ -3306,6 +3319,16 @@ def cmd_selfcheck(opts):
     """
     problems = []
 
+    for name in SIBLING_DATA:
+        path = os.path.join(HERE, name)
+        if not os.path.exists(path):
+            problems.append(
+                "declared but not shipped: %s\n"
+                "  a copy list did not ship it. Check `make dist` and "
+                "app/stage.sh." % name)
+        elif os.path.getsize(path) == 0:
+            problems.append("declared but empty: %s" % name)
+
     for name in SIBLING_MODULES:
         try:
             importlib.import_module(name)
@@ -3345,7 +3368,8 @@ def cmd_selfcheck(opts):
             sys.stderr.write("selfcheck: %s\n" % problem)
         die("%d problem%s. This payload would fail on an install."
             % (len(problems), "" if len(problems) == 1 else "s"))
-    print("selfcheck: ok (%s)" % ", ".join(SIBLING_MODULES))
+    print("selfcheck: ok (%s)"
+          % ", ".join(list(SIBLING_MODULES) + list(SIBLING_DATA)))
 
 
 def cmd_sources(opts):
@@ -5194,10 +5218,17 @@ def emoji_report(db, mine):
                  what was written at them. 262,027 quoted lines here.
     """
     totals, per_year, by_source = {}, {}, {"messages": 0, "mail": 0}
+    # 🛑 THE EARLIEST TIME THE USER SENT EACH ONE. It is the only half of the
+    # adoption answer that is not in the Unicode tables, and it has to be
+    # collected in the same pass — a second query over 100k records to get it
+    # would cost more than the whole report.
+    first_sent = {}
 
-    def add(cluster, year, source):
+    def add(cluster, year, source, when):
         totals[cluster] = totals.get(cluster, 0) + 1
         by_source[source] += 1
+        if when and (cluster not in first_sent or when < first_sent[cluster]):
+            first_sent[cluster] = when
         if year:
             bucket = per_year.setdefault(year, {})
             bucket[cluster] = bucket.get(cluster, 0) + 1
@@ -5210,7 +5241,7 @@ def emoji_report(db, mine):
             if who != "me":
                 continue
             for cluster in emoji_in(text):
-                add(cluster, year, "messages")
+                add(cluster, year, "messages", row["occurred"])
 
     for row in db.execute("SELECT body, people, occurred FROM record WHERE tool = 'mail'"):
         try:
@@ -5228,20 +5259,120 @@ def emoji_report(db, mine):
             if line.lstrip().startswith(">"):
                 continue
             for cluster in emoji_in(line):
-                add(cluster, year, "mail")
+                add(cluster, year, "mail", row["occurred"])
 
     top = sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))
-    champions = []
+    champions, rarest = [], []
     for year in sorted(per_year):
-        cluster, count = max(per_year[year].items(), key=lambda kv: (kv[1], kv[0]))
+        counts = per_year[year]
+        total = sum(counts.values())
+        cluster, count = max(counts.items(), key=lambda kv: (kv[1], kv[0]))
         champions.append({"year": year, "emoji": cluster, "count": count,
-                          "total": sum(per_year[year].values())})
+                          "total": total})
+        # ⚠️ THE LEAST-USED ONE THAT YEAR, not one you never sent. An emoji
+        # with no uses has no year to belong to, so this is always something
+        # the user really did type — once.
+        #
+        # 🛑 TIES BROKEN ON THE EMOJI ITSELF. Most years have dozens of emoji
+        # used exactly once, and `min` over a dict alone picks whichever the
+        # hash order put first — so the answer changed between two runs over
+        # identical data.
+        cluster, count = min(counts.items(), key=lambda kv: (kv[1], kv[0]))
+        rarest.append({"year": year, "emoji": cluster, "count": count,
+                       "total": total})
     return {
         "total": sum(totals.values()),
         "distinct": len(totals),
         "sources": by_source,
         "top": [{"emoji": e, "count": c} for e, c in top[:48]],
         "by_year": champions,
+        "rarest": rarest,
+        "adoption": adoption_report(first_sent),
+    }
+
+
+# When each emoji arrived, from `lab/emoji-versions.txt`.
+#
+# 🛑 GENERATED FROM unicode.org, NEVER TYPED IN. See `lab/emoji-versions`. A
+# remembered release date produces a wrong lag with nothing on screen to show
+# it is wrong.
+EMOJI_VERSIONS_FILE = os.path.join(HERE, "emoji-versions.txt")
+# Everything published from this date on counts as "new". ⚠️ It is a cut on the
+# RELEASE date, not on the user's history: an emoji released before their
+# earliest record has no adoption lag to measure, only a date they already had.
+ADOPTION_SINCE = "2020-01-01"
+
+
+def emoji_versions():
+    """(emoji -> version, version -> published date), or ({}, {}) if absent.
+
+    ⚠️ A MISSING FILE IS NOT AN ERROR. The table is a convenience the packager
+    may not have shipped; without it the adoption section simply does not
+    appear, and every other emoji answer is unaffected.
+    """
+    versions, published = {}, {}
+    try:
+        with open(EMOJI_VERSIONS_FILE) as handle:
+            for line in handle:
+                if line.startswith("#"):
+                    continue
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) != 3:
+                    continue
+                if parts[0] == "V":
+                    published[parts[1]] = parts[2]
+                elif parts[0] == "E":
+                    versions[parts[1]] = parts[2]
+    except OSError:
+        return {}, {}
+    return versions, published
+
+
+def adoption_report(first_sent):
+    """How long after an emoji was published the user first sent it.
+
+    🛑 TWO DATES, AND ONLY ONE OF THEM IS OURS. The release date is what
+    unicode.org stamped on that version's own data file; the first-use date is
+    the earliest record in this index in which the user typed it.
+
+    ⚠️ A NEGATIVE LAG IS POSSIBLE AND IS REPORTED, NOT CLAMPED. A record with a
+    wrong date, or a vendor that shipped a character before Unicode published
+    the file, both produce one. Clamping to zero would hide the only sign that
+    a date is wrong, so the count is carried as `early` and the median is taken
+    over the rest.
+    """
+    versions, published = emoji_versions()
+    if not versions or not published:
+        return None
+    items, lags, early = [], [], 0
+    for cluster, version in versions.items():
+        released = published.get(version)
+        if not released or released < ADOPTION_SINCE:
+            continue
+        when = first_sent.get(cluster)
+        entry = {"emoji": cluster, "version": version, "released": released}
+        if when:
+            days = (datetime.fromtimestamp(when, timezone.utc).date()
+                    - date.fromisoformat(released)).days
+            entry["first"] = datetime.fromtimestamp(
+                when, timezone.utc).strftime("%Y-%m-%d")
+            entry["lag_days"] = days
+            if days < 0:
+                early += 1
+            else:
+                lags.append(days)
+        items.append(entry)
+    if not items:
+        return None
+    items.sort(key=lambda e: (e["released"], e["emoji"]), reverse=True)
+    ordered = sorted(lags)
+    return {
+        "since": ADOPTION_SINCE,
+        "released": len(items),
+        "used": sum(1 for e in items if "first" in e),
+        "median_lag_days": ordered[len(ordered) // 2] if ordered else None,
+        "early": early,
+        "items": items,
     }
 
 

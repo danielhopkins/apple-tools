@@ -257,6 +257,12 @@ dist: set-version completions
 	cp $$(cd lab && /usr/bin/python3 -c \
 		"import index; print(' '.join('lab/%s.py' % m for m in index.SIBLING_MODULES))") \
 		$(DIST)/index/
+	@# 🛑 AND THE DATA FILES IT DECLARES, from the same one declaration.
+	@# `emoji-versions.txt` degrades quietly when absent — the adoption
+	@# section simply does not draw — so only `selfcheck` below can catch it.
+	cp $$(cd lab && /usr/bin/python3 -c \
+		"import index; print(' '.join('lab/%s' % f for f in index.SIBLING_DATA))") \
+		$(DIST)/index/
 	@# 🛑 THROUGH THE SHIPPED WRAPPER, exactly as apple-notes is proved above,
 	@# and never `python3 index.py` — v26.822.1 broke INSIDE that wrapper's
 	@# relative-symlink resolution, so a check that skips it does not test the

@@ -25,7 +25,7 @@ struct Places: View {
     private var stats: PlacesStats { model.places }
 
     var body: some View {
-        Panel("Places", trailing: {
+        PaneSection("Places", trailing: {
             if stats.loaded {
                 Text("\(stats.total) places · \(stats.countries.count) countries")
                     .font(.system(size: 11))

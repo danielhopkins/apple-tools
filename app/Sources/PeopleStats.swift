@@ -83,6 +83,34 @@ struct EmojiYear: Identifiable, Equatable {
     let total: Int
 }
 
+/// One emoji released since 2020, and when the user first sent it.
+///
+/// 🛑 `released` IS UNICODE'S DATE, NOT APPLE'S. It is the `# Date:` header on
+/// that Emoji version's own data file at unicode.org, fetched by
+/// `lab/emoji-versions`. A vendor ships the glyph some months later, so the
+/// lag is measured from publication, which is the only date with a source.
+struct EmojiArrival: Identifiable, Equatable {
+    var id: String { emoji }
+    let emoji: String
+    let version: String
+    let released: Date
+    /// Nil when the user has never sent it. ⚠️ ABSENT, NOT ZERO: never used
+    /// and used on the day of release are opposite answers.
+    let first: Date?
+    let lagDays: Int?
+}
+
+struct EmojiAdoption: Equatable {
+    var released = 0
+    var used = 0
+    var medianLagDays: Int? = nil
+    /// 🛑 SENT BEFORE UNICODE PUBLISHED IT. A record with a wrong date makes
+    /// one, and so does a vendor that shipped early. Counted rather than
+    /// clamped, because the count is the only sign the dates are off.
+    var early = 0
+    var items: [EmojiArrival] = []
+}
+
 struct EmojiReport: Equatable {
     var total = 0
     var distinct = 0
@@ -90,6 +118,11 @@ struct EmojiReport: Equatable {
     var fromMail = 0
     var top: [EmojiCount] = []
     var byYear: [EmojiYear] = []
+    /// The least-used emoji of each year. ⚠️ Something the user really did
+    /// type, once — an emoji never sent belongs to no year at all.
+    var rarest: [EmojiYear] = []
+    /// Nil when `emoji-versions.txt` was not shipped beside `index.py`.
+    var adoption: EmojiAdoption? = nil
 }
 
 struct PeopleStats: Equatable {
@@ -154,6 +187,21 @@ enum PeopleReader {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         return formatter
     }()
+
+    /// ⚠️ UTC AND `en_US_POSIX`, like `month` above. `index.py` writes a bare
+    /// `YYYY-MM-DD`, and a device set to a non-Gregorian calendar parses that
+    /// into a date centuries away without erroring.
+    private static let dayFormat: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        return formatter
+    }()
+
+    private static func day(_ text: String?) -> Date? {
+        text.flatMap { dayFormat.date(from: $0) }
+    }
 
     /// 🛑 CHEAP UNLESS ASKED. Without `refresh` this reads the stored report —
     /// 80 ms against 3.6 s — and `index.py` recomputes it only when the stored
@@ -264,6 +312,30 @@ enum PeopleReader {
             return EmojiYear(year: year, emoji: glyph,
                              count: $0["count"] as? Int ?? 0,
                              total: $0["total"] as? Int ?? 0)
+        }
+        report.rarest = (emoji["rarest"] as? [[String: Any]] ?? []).compactMap {
+            guard let year = $0["year"] as? String,
+                  let glyph = $0["emoji"] as? String else { return nil }
+            return EmojiYear(year: year, emoji: glyph,
+                             count: $0["count"] as? Int ?? 0,
+                             total: $0["total"] as? Int ?? 0)
+        }
+        if let block = emoji["adoption"] as? [String: Any] {
+            var adoption = EmojiAdoption()
+            adoption.released = block["released"] as? Int ?? 0
+            adoption.used = block["used"] as? Int ?? 0
+            adoption.medianLagDays = block["median_lag_days"] as? Int
+            adoption.early = block["early"] as? Int ?? 0
+            adoption.items = (block["items"] as? [[String: Any]] ?? []).compactMap {
+                guard let glyph = $0["emoji"] as? String,
+                      let released = day($0["released"] as? String) else { return nil }
+                return EmojiArrival(emoji: glyph,
+                                    version: $0["version"] as? String ?? "?",
+                                    released: released,
+                                    first: day($0["first"] as? String),
+                                    lagDays: $0["lag_days"] as? Int)
+            }
+            report.adoption = adoption
         }
         stats.emoji = report
         stats.loaded = true
