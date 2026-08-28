@@ -71,10 +71,20 @@ private struct SourceLine: Identifiable {
     /// report and never indexed, `files` has simply not been given a folder
     /// yet — and that row exists precisely so it can be.
     var note: String {
+        if tool == "files" {
+            if folderCount == 0 {
+                return "no folders added yet — open this row to add one"
+            }
+            return folderCount == 1 ? "1 folder" : "\(folderCount) folders"
+        }
         if stat != nil { return "" }
-        return tool == "files" ? "no folders added yet — open this row to add one"
-                               : "read on demand, not indexed"
+        return "read on demand, not indexed"
     }
+
+    /// How many folders `files` is configured to read. ⚠️ Zero is a real
+    /// answer, not a missing one: the row exists precisely so the first folder
+    /// can be added from it.
+    var folderCount: Int = 0
 
     var dot: Color {
         readable == false ? .orange : readable == true ? .green : .secondary
@@ -261,7 +271,12 @@ struct Sources: View {
             out.append(SourceLine(tool: "files", stat: nil,
                                   permission: nil, error: nil))
         }
-        return out
+        let folders = model.folders.entries.count
+        return out.map { line in
+            var copy = line
+            if line.tool == "files" { copy.folderCount = folders }
+            return copy
+        }
     }
 }
 
@@ -351,12 +366,75 @@ private struct SourceRow: View {
             if line.tool == "files" {
                 FolderList(folders: folders)
             }
+            // 🛑 THE HEADING AND THE FOOTNOTE DO NOT DEPEND ON A BREAKDOWN.
+            // They used to sit inside `if !stat.containers.isEmpty`, so the
+            // two sources that have no containers — `phone`, which is never
+            // indexed, and `photos` when it cannot be read — opened onto
+            // NOTHING AT ALL. An empty row under a caret reads as a fault in
+            // the window rather than as the answer, which for both of those is
+            // "there is nothing here, and here is why".
+            Text(heading).font(.caption2.weight(.semibold))
+                .kerning(0.7).foregroundStyle(.tertiary)
             if let stat = line.stat, !stat.containers.isEmpty {
                 breakdown(stat)
+            }
+            // ⚠️ WHAT A RECORD IS, PER SOURCE. "40,473" and "12,904" are drawn
+            // in the same column in the same font, and they count different
+            // things: one email against a block of consecutive texts. Nothing
+            // else on this window says so.
+            if let footnote {
+                Note(footnote)
             }
         }
         .padding(.leading, Column.caret + Column.gap)
         .padding(.top, 2).padding(.bottom, 10)
+    }
+
+    /// What one record of this source actually is, and the one caveat that
+    /// changes how its number should be read.
+    ///
+    /// 🛑 EVERY LINE HERE IS A MEASURED FACT FROM `index.py`, not a
+    /// description. The kinds are what each adapter emits: `mail` yields one
+    /// `message` per email, `messages` yields one `conversation` per block,
+    /// `maps` yields both a `place` and a `visit`, `photos` yields a `place`
+    /// and a `day`.
+    private var footnote: String? {
+        switch line.tool {
+        case "mail":
+            return "A record is one email. Chunks are the pieces it was split "
+                 + "into for searching, and they are what the index costs."
+        case "messages":
+            return "A record is a block of consecutive texts, not one message."
+        case "calendar":
+            return "A record is one event. An event dated in the future is "
+                 + "indexed, but it is not contact."
+        case "notes":
+            return "A record is one note. A locked note is skipped."
+        case "maps":
+            return "Two kinds in one count: a place you have been, and each "
+                 + "arrival at it."
+        case "photos":
+            // ⚠️ THE FAILURE, ONLY WHILE IT IS FAILING. Measured from a
+            // launchd job, which has no Full Disk Access. Printing it on a
+            // healthy machine would be a standing warning about nothing.
+            if line.readable == false {
+                return "The library stats fine and the sqlite open fails with "
+                     + "`authorization denied`. That needs Full Disk Access "
+                     + "for this app."
+            }
+            return "Two kinds in one count: a place, and a day a camera was "
+                 + "somewhere. Never one photograph."
+        case "contacts": return "A record is one card."
+        case "reminders": return "A record is one reminder."
+        case "phone":
+            return "Call history on a Mac is a relay mirror of the iPhone and "
+                 + "covers only recent months. It is read for the "
+                 + "relationships report and never indexed."
+        case "files":
+            return "Every .md, .markdown and .txt, down through subfolders. A "
+                 + "file over 2 MB is skipped."
+        default: return nil
+        }
     }
 
     /// 🛑 BY ACCOUNT, MAILBOX, LIST OR FOLDER. "40,473 emails" does not answer
@@ -366,8 +444,6 @@ private struct SourceRow: View {
     /// row used to push the next four panels off the bottom of the window.
     @ViewBuilder
     private func breakdown(_ stat: SourceStat) -> some View {
-        Text(heading).font(.caption2.weight(.semibold))
-            .kerning(0.7).foregroundStyle(.tertiary)
         let list = VStack(alignment: .leading, spacing: 3) {
             ForEach(stat.containers) { part in
                 HStack(spacing: Column.gap) {
@@ -439,6 +515,13 @@ private struct SourceRow: View {
     }
 
     private var heading: String {
+        // ⚠️ TWO SOURCES HAVE NOTHING TO BREAK DOWN, and each is a different
+        // kind of nothing. `phone` is read on demand and never indexed;
+        // `photos` that cannot be read has no records at all.
+        if line.tool == "phone" { return "Read for the relationships report only" }
+        if line.stat == nil || line.stat?.containers.isEmpty == true {
+            return line.readable == false ? "Nothing read" : "Nothing indexed yet"
+        }
         switch line.tool {
         case "mail":     return "By account and mailbox"
         case "messages": return "By conversation"
@@ -492,14 +575,15 @@ private struct FolderList: View {
                 Button("Add Folder…") { folders.choose() }
                     .controlSize(.small)
                     .disabled(folders.busy)
-                Explain("What gets read", """
-                        Every .md, .markdown and .txt file in the folder, \
-                        down through its subfolders. An Obsidian vault is \
-                        recognised and its .obsidian folder skipped, along \
-                        with .git, node_modules and any Attachments folder. \
-                        A file over 2 MB is skipped.
+                // ⚠️ WHAT IS READ IS NOW ON THE PAGE, in this row's footnote.
+                // This button keeps the half nobody expects: what pressing it
+                // does NOT do.
+                Explain("What adding and removing a folder do", """
+                        An Obsidian vault is recognised and its .obsidian \
+                        folder skipped, along with .git, node_modules and any \
+                        Attachments folder.
 
-                        Adding a folder does not index it — the next run \
+                        🛑 Adding a folder does not index it — the next run \
                         does. Removing one does not remove what it already \
                         put in the index, because indexing only ever adds. \
                         Those records go when the files source is rebuilt in \
