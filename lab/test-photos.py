@@ -19,6 +19,8 @@ No index, no Photos library, no app, no network. Run it directly:
 
     ./test-photos.py
 """
+import glob
+import os
 import plistlib
 import sys
 
@@ -286,6 +288,38 @@ check("the epoch is UTC midnight of that day",
       __import__("datetime").datetime.fromtimestamp(
           born["A:ABPerson"], __import__("datetime").timezone.utc
       ).strftime("%Y-%m-%d %H:%M"), "2019-07-07 00:00")
+
+
+# --------------------------------------------------------------------------
+# the payload declares its own siblings
+# --------------------------------------------------------------------------
+
+# 🛑 THREE COPY LISTS SHIP THIS PAYLOAD and none of them can see an `import`
+# statement. `make dist`, `app/stage.sh` and the formula's `bin.install` have
+# each been the thing that went out wrong. photos.py was left out of the first
+# two on the day it was written: both artifacts would have shipped an
+# `apple-index` that tracebacks on `--source photos` for every install, while
+# working perfectly from a checkout, because `import photos` lives INSIDE the
+# photos adapter and nothing runs it until an ingest does.
+#
+# index.py now declares SIBLING_MODULES, the build asks it, and `selfcheck`
+# keeps the declaration honest in both directions.
+
+check("photos is declared as a sibling module",
+      "photos" in index.SIBLING_MODULES, True)
+
+# ⚠️ DERIVED FROM THE DIRECTORY, not from a second hand-written list. An
+# earlier version named `eval`, `daemon`, `test-photos` and four more by hand —
+# which restates a listing that drifts, and four of those names contain a
+# hyphen and so could never have been module names at all. Anything importable
+# beside index.py that is not declared is dev-only and must not be declared.
+_here = os.path.dirname(os.path.abspath(index.__file__))
+_beside = {os.path.basename(p)[:-3] for p in glob.glob(os.path.join(_here, "*.py"))}
+_dev_only = _beside - set(index.SIBLING_MODULES) - {"index"}
+check("lab holds dev-only modules, so a glob would ship them",
+      len(_dev_only) > 0, True)
+check("and none of them is declared as shipping",
+      _dev_only & set(index.SIBLING_MODULES), set())
 
 
 # --------------------------------------------------------------------------

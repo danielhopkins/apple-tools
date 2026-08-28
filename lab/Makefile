@@ -115,6 +115,13 @@ status:
 	./bin/apple-index status
 
 test:
+	@# 🛑 FIRST, AND ONLY MEANINGFUL HERE. `selfcheck`'s second direction —
+	@# a sibling imported but never declared — can only fire in a CHECKOUT: in
+	@# a shipped payload that module was never copied, so there is no file to
+	@# find. The build and the formula run it for the other direction. Without
+	@# this line the direction the comment calls "the one that bit" was
+	@# unreachable from every automated path.
+	./index.py selfcheck
 	./test-people.py
 	./test-files.py
 	./test-photos.py

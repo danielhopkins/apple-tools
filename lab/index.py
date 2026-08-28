@@ -25,6 +25,7 @@ ranked list.
 import argparse
 import fcntl
 import hashlib
+import importlib
 import json
 import math
 import os
@@ -358,6 +359,31 @@ def tool_version():
 
 SOURCES = ["notes", "mail", "messages", "calendar", "contacts", "maps",
            "photos", "reminders", "files"]
+
+# 🛑 THE MODULES THIS FILE IMPORTS AS SIBLINGS, DECLARED WHERE THE BUILD CAN
+# READ THEM. Two copy lists ship this payload — `make dist` and `app/stage.sh`
+# — and neither can see an `import` statement.
+#
+# `lab/photos.py` was left out of both on the day it was written. Each artifact
+# would have shipped an `apple-index` that tracebacks on `--source photos` for
+# every install, while working perfectly from a checkout, because `import
+# photos` lives INSIDE the photos adapter and nothing runs it until an ingest
+# does.
+#
+# ⚠️ THE FORMULA IS NOT A THIRD LIST. `libexec.install "index"` moves the whole
+# directory `make dist` already assembled, so it cannot omit a sibling. Its
+# `bin.install` names the Swift binaries, which is a different fact with its
+# own history. The formula runs `selfcheck` for a different reason: it is the
+# only place that exercises brew's RELATIVE SYMLINK layout, which is where
+# v26.822.1 broke.
+#
+# ⚠️ A GLOB WOULD WORK IF THIS DIRECTORY WERE LAID OUT LIKE `notes/`, and that
+# is the alternative declined rather than a property of the problem. `lab/` is
+# flat: `eval.py`, `daemon.py`, `embed_oss.py`, a migration script and four
+# test suites sit beside `index.py`. Moving them into `lab/tests/` and
+# `lab/dev/` would make `cp lab/*.py` correct and delete this declaration, at
+# the cost of every documented path in CLAUDE.md and lab/Makefile.
+SIBLING_MODULES = ("photos",)
 
 # 🛑 ONE PLACE, because two places drift. `refresh` uses these, and so does the
 # app's scheduler, which reads them back through `index.py sources --json`
@@ -3251,6 +3277,77 @@ def cmd_files(opts):
         print("%-10s %-9s %s%s" % (one["name"], one["kind"], one["path"], here))
 
 
+def cmd_selfcheck(opts):
+    """Can this copy of the payload actually import what it needs?
+
+    🛑 THE ONLY CHECK THAT RUNS AGAINST THE SHIPPED LAYOUT. Every other test in
+    this repo runs from a checkout, where a sibling is present whether or not
+    anything copied it. That is precisely the blind spot: a module left out of
+    `make dist` or `app/stage.sh` is invisible until an install tries to use
+    it, and `import photos` lives inside the photos adapter, so even
+    `--version` and `sources` pass without it.
+
+    Two directions, because the declaration can be wrong either way:
+
+      declared but missing    a copy list did not ship a declared module
+      present but undeclared  a sibling was added and nobody told the build
+
+    🛑 THE SECOND DIRECTION ONLY FIRES IN A CHECKOUT, and that is not a
+    weakness so long as something in a checkout runs it. In a shipped payload
+    an undeclared module was never copied, so there is no file to find and the
+    scan is silent by construction. `lab/Makefile`'s `test` target runs this
+    for exactly that reason; the build and the formula run it for the first
+    direction.
+
+    ⚠️ THE SCAN FOLLOWS SIBLINGS TRANSITIVELY. Reading only this file protects
+    the first hop, which is the hop that already burned — but if `photos.py`
+    ever grows a helper, that helper is imported, undeclared, uncopied and
+    invisible to a check written for exactly this bug one level up.
+    """
+    problems = []
+
+    for name in SIBLING_MODULES:
+        try:
+            importlib.import_module(name)
+        except ImportError as exc:
+            problems.append(
+                "declared but not importable: %s (%s)\n"
+                "  a copy list did not ship it. Check `make dist` and "
+                "app/stage.sh." % (name, exc))
+
+    # ⚠️ SCANS SOURCE, not loaded modules. An import inside a function has not
+    # run yet, and those are exactly the ones that hide.
+    declared = set(SIBLING_MODULES)
+    seen, queue = set(), [os.path.join(HERE, os.path.basename(__file__))]
+    while queue:
+        path = queue.pop()
+        if path in seen or not os.path.exists(path):
+            continue
+        seen.add(path)
+        with open(path) as handle:
+            source = handle.read()
+        for match in re.finditer(
+                r"^\s*(?:import|from)\s+([A-Za-z_][A-Za-z0-9_]*)", source, re.M):
+            name = match.group(1)
+            sibling = os.path.join(HERE, name + ".py")
+            if not os.path.exists(sibling):
+                continue        # the standard library, which needs no declaring
+            if name not in declared:
+                problems.append(
+                    "imported but not declared: %s\n"
+                    "  imported by %s. Add it to SIBLING_MODULES in index.py, "
+                    "and it ships automatically."
+                    % (name, os.path.basename(path)))
+            queue.append(sibling)
+
+    if problems:
+        for problem in problems:
+            sys.stderr.write("selfcheck: %s\n" % problem)
+        die("%d problem%s. This payload would fail on an install."
+            % (len(problems), "" if len(problems) == 1 else "s"))
+    print("selfcheck: ok (%s)" % ", ".join(SIBLING_MODULES))
+
+
 def cmd_sources(opts):
     """What refresh runs for each source. The app reads this rather than
     keeping a second copy of REFRESH_ARGS in Swift."""
@@ -5389,6 +5486,10 @@ def main():
     fl.add_argument("--exclude", help="comma separated subdirectory names to skip")
     fl.add_argument("--json", action="store_true")
     fl.set_defaults(func=cmd_files)
+
+    sub.add_parser("selfcheck",
+                   help="can this copy import the modules it ships with?"
+                   ).set_defaults(func=cmd_selfcheck)
 
     pl = sub.add_parser("places",
                         help="everywhere you have been, as JSON")

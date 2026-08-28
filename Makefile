@@ -250,13 +250,25 @@ dist: set-version completions
 		lipo -archs $(DIST)/index/vec | grep -q $$arch \
 			|| { echo "error: index/vec is missing $$arch"; exit 1; }; \
 	done
-	# 🛑 photos.py IS A SIBLING IMPORT, not a nicety. `index.py` does
-	# `import photos` inside the photos adapter, so leaving it out ships an
-	# `apple-index` that tracebacks on `--source photos` for every brew
-	# install while working perfectly from the checkout. Caught before
-	# release, the same way the formula's bin.install list was.
-	cp lab/index.py lab/photos.py lab/bin/apple-index $(DIST)/index/
-	cp lab/README.md lab/SECURITY.md lab/INCREMENTAL.md lab/MODELS.md $(DIST)/index/
+	@# 🛑 THE SIBLING LIST COMES FROM index.py, not from here — see
+	@# SIBLING_MODULES there for why, and for why this is a declaration rather
+	@# than the glob used for notes/ above.
+	cp lab/index.py lab/bin/apple-index $(DIST)/index/
+	cp $$(cd lab && /usr/bin/python3 -c \
+		"import index; print(' '.join('lab/%s.py' % m for m in index.SIBLING_MODULES))") \
+		$(DIST)/index/
+	@# 🛑 THROUGH THE SHIPPED WRAPPER, exactly as apple-notes is proved above,
+	@# and never `python3 index.py` — v26.822.1 broke INSIDE that wrapper's
+	@# relative-symlink resolution, so a check that skips it does not test the
+	@# thing that failed. `selfcheck` is the only command that imports the
+	@# siblings; `--version` and `sources` pass without them.
+	@PYTHONDONTWRITEBYTECODE=1 $(DIST)/index/apple-index selfcheck \
+		|| { echo "error: packaged apple-index is missing a module"; exit 1; }
+	@# All of lab's markdown, not four named files. RANKING.md was missing
+	@# from the literal list while lab/index.py shipped a comment saying "See
+	@# RANKING.md" — the exact failure the docs/ rule above already forbids:
+	@# shipping the link but not the target. lab has no dev-only markdown.
+	cp lab/*.md $(DIST)/index/
 	cp lab/coreml/BAKEOFF.md $(DIST)/index/
 	cp lab/com.boulderhopkins.apple-index.plist.in $(DIST)/index/
 	cp -R lab/skill/apple-index $(DIST)/index/skill/

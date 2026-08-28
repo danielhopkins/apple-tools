@@ -185,6 +185,14 @@ class AppleTools < Formula
     assert_match version.to_s, shell_output("#{bin}/apple-phone --version")
     assert_match version.to_s, shell_output("#{bin}/apple-maps --version")
 
+    # 🛑 THE ONE PLACE THAT EXERCISES BREW'S RELATIVE SYMLINK. `bin/apple-index`
+    # is a link into libexec, and v26.822.1 shipped a wrapper that resolved it
+    # wrongly — working perfectly from the tarball's flat layout and failing on
+    # every install. `selfcheck` is also the only command that imports the
+    # payload's sibling modules: `--version` and `sources` pass without them,
+    # because the photos adapter imports inside itself.
+    assert_match "ok", shell_output("#{bin}/apple-index selfcheck")
+
     # The dispatcher must find each tool as a sibling in bin.
     assert_match "apple-notes", shell_output("#{bin}/apple --which")
 
