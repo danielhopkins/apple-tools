@@ -28,6 +28,8 @@
 
 import SwiftUI
 
+/// 🛑 `String`-backed, because `@AppStorage` stores it directly. Changing a
+/// case's raw value orphans whatever a person had selected.
 enum Pane: String, CaseIterable, Identifiable {
     case sources, size, advanced, people, places, emoji
 
@@ -65,30 +67,27 @@ struct StatusView: View {
     // onto Sources every time is what makes a rail feel worse than a scroll
     // view. Scene storage rides the window's restoration state, which macOS
     // drops whenever the app is replaced; a defaults key survives an upgrade.
-    @AppStorage("pane") private var stored = Pane.sources.rawValue
+    // 🛑 THE STORAGE IS THE SELECTION. `@AppStorage` takes a
+    // `RawRepresentable` whose `RawValue` is `String`, which `Pane` already is,
+    // so the List binds straight to it.
+    //
+    // ⚠️ IT USED TO BE A `String` KEY WITH A HAND-BUILT `Binding<Pane?>` OVER
+    // IT, rebuilt on every pass of `body`. A `List` holds the binding it was
+    // given and writes through it on a click; handing it a fresh closure pair
+    // each pass is the kind of thing that works until it does not, and it was
+    // one of two suspects for a sidebar that would not respond to the mouse.
+    // There is no reason to have the indirection, so it is gone.
+    @AppStorage("pane") private var pane: Pane = .sources
     @State private var columns = NavigationSplitViewVisibility.all
-
-    private var pane: Binding<Pane?> {
-        Binding(get: { Pane(rawValue: stored) ?? .sources },
-                set: { stored = ($0 ?? .sources).rawValue })
-    }
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columns) {
-            Rail(model: model, selection: pane)
+            Rail(model: model, selection: $pane)
                 .navigationSplitViewColumnWidth(min: 196, ideal: 214, max: 260)
         } detail: {
-            Detail(model: model, pane: pane.wrappedValue ?? .sources)
+            Detail(model: model, pane: pane)
         }
         .navigationSplitViewStyle(.balanced)
-        // 🛑 ON THE WHOLE WINDOW. Half of what is written here is meant to be
-        // copied — a path, an address, a command, an error. `textSelection`
-        // travels down the environment, so one line covers every `Text` below
-        // rather than the handful somebody remembered to mark.
-        //
-        // ⚠️ It does not reach the contact web. That is a `WKWebView` drawing
-        // SVG, and its text is not text.
-        .textSelection(.enabled)
         .onAppear { model.reread(); model.folders.read() }
     }
 }
@@ -97,7 +96,10 @@ struct StatusView: View {
 
 private struct Rail: View {
     @ObservedObject var model: AppModel
-    @Binding var selection: Pane?
+    /// ⚠️ NOT OPTIONAL. A sidebar `List` whose selection can be nil has a
+    /// "nothing selected" state, and this window has no such state — closing
+    /// the last pane would leave the detail column empty with no way back.
+    @Binding var selection: Pane
 
     var body: some View {
         List(selection: $selection) {
@@ -112,9 +114,13 @@ private struct Rail: View {
                 // because the header changes with the pane and this does not.
                 VStack(alignment: .leading, spacing: 2) {
                     Text("AppleTools").font(.headline)
+                    // ⚠️ THE ONE SELECTABLE THING IN THE RAIL, and it is safe
+                    // here because a section header is not a selectable row.
+                    // Nothing else in this column may have it: see `Detail`.
                     Text(model.appVersion)
                         .font(.system(.caption, design: .monospaced))
                         .foregroundStyle(.tertiary)
+                        .textSelection(.enabled)
                 }
                 .padding(.bottom, 8)
                 .textCase(nil)
@@ -213,7 +219,51 @@ private struct Detail: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        // 🛑 ON THE PANE, NEVER ON THE WINDOW. Half of what is written here is
+        // meant to be copied — a path, an address, a command, an error — and
+        // `textSelection` travels down the environment, so one line covers
+        // every `Text` below rather than the handful somebody remembered to
+        // mark.
+        //
+        // 🛑 IT MUST NOT REACH THE RAIL, AND THAT COST A RELEASE. Applied to
+        // the whole `NavigationSplitView` it reaches the sidebar `List` too,
+        // and a selectable `Text` CONSUMES THE MOUSE EVENT before the row
+        // under it sees one. Every rail row is a dot and a label, so the label
+        // is most of the row: clicking a pane did nothing at all. It looked
+        // like a broken sidebar, not like text selection.
+        //
+        // ⚠️ NOTHING ON SCREEN DISTINGUISHED THE TWO, and every check missed
+        // it: the panes were set through a defaults key and read back in
+        // screenshots, so no mouse ever went near a row. Accessibility's
+        // `select row` sets the selection directly and worked perfectly, which
+        // is what made the sidebar look innocent.
+        //
+        // ⚠️ It does not reach the contact web either. That is a `WKWebView`
+        // drawing SVG, and its text is not text.
+        .textSelection(.enabled)
         .navigationTitle(pane.title)
+        // 🛑 THE FETCH BELONGS TO THE PANE, NOT TO A VIEW INSIDE IT. Each
+        // statistics pane used to ask for its own data from `.onAppear` on its
+        // root view — and that view is a branch of the `switch` below, inside a
+        // `ScrollView`. Selecting the pane at RUNTIME never fired it, so all
+        // three sat on "Reading it…" for ever while the three diagnostic panes
+        // worked perfectly: those read data the model already holds and ask for
+        // nothing.
+        //
+        // ⚠️ IT WAS INVISIBLE IN TESTING because every check set the pane and
+        // RELAUNCHED, which builds the branch at first layout, where `onAppear`
+        // does fire. Switching panes in a running window is the one path that
+        // was never exercised.
+        //
+        // `.task(id:)` runs on first appearance AND on every change of `pane`,
+        // which is exactly the rule: whoever opens a pane asks for its data.
+        .task(id: pane) {
+            switch pane {
+            case .people, .emoji: model.refreshPeople()
+            case .places:         model.refreshPlaces()
+            case .sources, .size, .advanced: break
+            }
+        }
     }
 
     @ViewBuilder

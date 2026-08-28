@@ -109,7 +109,6 @@ struct People: View {
                 Journey(stats: model.people, query: query)
             }
         }
-        .onAppear { model.refreshPeople() }
     }
 
     /// ⚠️ SAY HOW OLD IT IS. A stored answer that cannot be told from a fresh
@@ -706,7 +705,6 @@ struct Emoji: View {
                 Adoption(adoption: adoption)
             }
         }
-        .onAppear { model.refreshPeople() }
     }
 
     @ViewBuilder

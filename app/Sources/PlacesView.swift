@@ -48,7 +48,6 @@ struct Places: View {
                 TopPlaces(places: stats.places, selected: $selected)
             }
         }
-        .onAppear { model.refreshPlaces() }
     }
 }
 
