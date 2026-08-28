@@ -18,6 +18,14 @@ import index
 FAILED = []
 
 
+def blank_spans():
+    """The per-channel span fields, empty. One place, so the next field added
+    to the collector does not break four fixtures in two files."""
+    return {"channel_first": {}, "channel_last": {},
+            "channel_spoke_days": {}, "channel_spoke_last": {},
+            "spoke_days": set()}
+
+
 def check(name, got, want):
     if got != want:
         FAILED.append("%s\n     got  %r\n     want %r" % (name, got, want))
@@ -76,7 +84,13 @@ def person(pid, name, known, days, first=None, last=None, handles=None,
     days = set(days) if not isinstance(days, int) else {
         "2020-01-%02d" % (i % 28 + 1) for i in range(days)}
     return {"id": pid, "name": name, "known": known, "days": days,
-            "channel_days": {"mail": set(days)}, "same_list": same_list,
+            "channel_days": {"mail": set(days)},
+            # ⚠️ THE COST OF A HAND-ROLLED FIXTURE, paid again. Adding
+            # channel_first/last and the spoke fields to the collector broke
+            # every builder in both suites at once, because each one restates
+            # cmd_people's internal record from memory. `blank_spans()` is one
+            # place to add the next field.
+            **blank_spans(), "same_list": same_list,
             "alone": {}, "upcoming": 0, "rids": [],
             "mail_from": 0, "mail_to": 0, "mail_bulk": 0, "mail_seen": 0,
             "handles": set(handles or [pid]), "channels": dict(channels or {}),
@@ -471,6 +485,94 @@ check("a dingbat with no emoji presentation is not an emoji",
       index.emoji_in("✓ ♦ ™ © 5"), [])
 check("emoji are found among words",
       index.emoji_in("ha 😂 ok 🤣!"), ["😂", "🤣"])
+
+
+# --------------------------------------------------------------------------
+# per-channel spans, and the difference between calling and talking
+# --------------------------------------------------------------------------
+
+# 🛑 `last` IS THE MAXIMUM ACROSS EVERY CHANNEL, which answers a question
+# nobody asked. "When did I last talk to my mother" returned 2026-08-25 — the
+# day she sent a text. The last call they were both on was twelve days earlier,
+# and the last call of any kind was a missed one in between. Three readings of
+# one question, and the report gave the one that was easiest to compute.
+#
+# 🛑 A MISSED CALL IS NOT TALKING, and it is not a rounding error: 183 of 372
+# calls on this store never connected — 49% — and 7 of the 11 with that one
+# person. `days` still counts them, deliberately: somebody reaching for you is
+# contact. The connected count sits beside it rather than replacing it.
+
+def spanned(pid, channel, first, last, spoke_last=None, days=1, spoke=()):
+    entry = person(pid, "A", True, days)
+    entry["channel_first"] = {channel: first}
+    entry["channel_last"] = {channel: last}
+    # ⚠️ SETS OF DAY STRINGS, not counts. `absorb` runs while the collector
+    # still holds days as sets; the conversion to integers happens once, at the
+    # very end. Passing counts here made the fixture lie about the merge.
+    entry["channel_spoke_days"] = {channel: set(spoke)} if spoke else {}
+    entry["channel_spoke_last"] = {channel: spoke_last} if spoke_last else {}
+    return entry
+
+
+# ⚠️ ABSORB TAKES MIN AND MAX, never the second row's value. Folding an old
+# address into a card must WIDEN that channel's span; overwriting it would
+# report a twenty-year correspondence as starting whenever the fold happened.
+_t = spanned("card", "mail", 200, 300)
+index.absorb(_t, spanned("old", "mail", 100, 250))
+check("absorbing widens the channel's first backwards",
+      _t["channel_first"]["mail"], 100)
+check("...and does not shrink its last", _t["channel_last"]["mail"], 300)
+
+_t = spanned("card", "mail", 200, 300)
+index.absorb(_t, spanned("old", "mail", 250, 400))
+check("absorbing extends the channel's last forwards",
+      _t["channel_last"]["mail"], 400)
+check("...and does not move its first", _t["channel_first"]["mail"], 200)
+
+_t = spanned("card", "mail", 200, 300)
+index.absorb(_t, spanned("old", "phone", 50, 60))
+check("a channel only the other row had is carried over",
+      sorted(_t["channel_last"]), ["mail", "phone"])
+
+# ⚠️ THE CONNECTED VARIANT MERGES THE SAME WAY, and separately.
+_t = spanned("card", "phone", 200, 300, spoke_last=250, spoke={"2026-01-01"})
+index.absorb(_t, spanned("old", "phone", 100, 280, spoke_last=270,
+                         spoke={"2026-01-02", "2026-01-03"}))
+check("the last CONNECTED call takes the max too",
+      _t["channel_spoke_last"]["phone"], 270)
+check("...and stays behind the last attempt",
+      _t["channel_spoke_last"]["phone"] < _t["channel_last"]["phone"], True)
+check("distinct connected days accumulate across the fold",
+      len(_t["channel_spoke_days"]["phone"]), 3)
+
+# 🛑 A UNION, NOT A SUM — the same rule `days` already follows. Both rows can
+# hold the SAME day, and adding the counts would report one call twice.
+_t = spanned("card", "phone", 200, 300, spoke={"2026-01-01", "2026-01-02"})
+index.absorb(_t, spanned("old", "phone", 100, 280, spoke={"2026-01-02"}))
+check("a day both rows hold is counted once",
+      len(_t["channel_spoke_days"]["phone"]), 2)
+
+# ⚠️ ABSENT, NOT ZERO. A person with no connected call has no entry rather than
+# a 0 — the shape every optional key in this report uses, so "we never got
+# through" and "there were no calls" stay distinct.
+_t = spanned("card", "phone", 200, 300)
+check("a channel that never connected reports no spoke entry",
+      _t["channel_spoke_last"], {})
+
+# 🛑 A SLIDING WINDOW HAS NO FIRST DATE, and phone is the only channel that is
+# one. CallHistory on a Mac is a relay mirror of the iPhone: 372 calls over 141
+# days here, against years on the phone. The oldest call visible is the edge of
+# the mirror, not the first time two people spoke.
+#
+# ⚠️ Measured before this rule existed: 11 of 137 people with a phone
+# first-date sat within a fortnight of that edge, a spouse of twenty years
+# landed exactly ON it, and 109 people have no other channel at all. It also
+# degrades silently — as the mirror slides the date walks forward and nothing
+# says it moved.
+check("phone is the only windowed channel", index.WINDOWED_CHANNELS, {"phone"})
+for _ch in ("mail", "messages", "photos", "calendar"):
+    check("%s reaches the true start of its own store" % _ch,
+          _ch in index.WINDOWED_CHANNELS, False)
 
 
 if FAILED:

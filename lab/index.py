@@ -4178,8 +4178,22 @@ def absorb(target, entry):
     # name change was announced is exactly such a day — and adding the
     # counts would report it twice.
     target["days"] |= entry["days"]
+    target["spoke_days"] |= entry["spoke_days"]
     for channel, days in entry["channel_days"].items():
         target["channel_days"].setdefault(channel, set()).update(days)
+    # ⚠️ MIN AND MAX, not overwrite. Folding an old address into a card must
+    # widen that channel's span, not replace it with whichever row was second.
+    for channel, when in entry["channel_first"].items():
+        have = target["channel_first"].get(channel)
+        target["channel_first"][channel] = when if have is None else min(have, when)
+    for channel, when in entry["channel_last"].items():
+        target["channel_last"][channel] = max(
+            target["channel_last"].get(channel, when), when)
+    for channel, when in entry["channel_spoke_last"].items():
+        target["channel_spoke_last"][channel] = max(
+            target["channel_spoke_last"].get(channel, when), when)
+    for channel, days in entry["channel_spoke_days"].items():
+        target["channel_spoke_days"].setdefault(channel, set()).update(days)
     for channel, count in entry["channels"].items():
         target["channels"][channel] = target["channels"].get(channel, 0) + count
     for month, days in entry["months"].items():
@@ -4314,6 +4328,26 @@ def is_me_by_name(name, wanted, my_parts):
 # this is a ceiling on staleness rather than a schedule. The app refreshes it
 # after an indexing cycle once a day; a ruling refreshes it at once.
 PEOPLE_MAX_AGE = 24 * 3600
+
+# 🛑 CHANNELS WHOSE HISTORY IS A SLIDING WINDOW, so a FIRST date is unknowable.
+# `CallHistory.storedata` on a Mac is a relay mirror of the iPhone, not the
+# whole history: measured here, 372 calls over 141 days against years on the
+# phone. Old calls fall off the front, so the oldest call visible is the edge
+# of the mirror rather than the first time two people spoke.
+#
+# ⚠️ MEASURED, and it is not a corner case. 11 of the 137 people with a phone
+# first-date sat within a fortnight of that edge — a spouse of twenty years
+# landed exactly on it — and 109 people have NO other channel at all, so their
+# whole span is a window artefact. Worse, it degrades silently: as the mirror
+# slides, the reported "first call" walks forward and nothing says it moved.
+#
+# ⚠️ PHONE IS THE ONLY ONE. mail reaches 2004 here, photos 2004, messages 2017
+# and calendar 2016 — each the true start of its own store.
+#
+# The aggregate `first` already carries this caveat in prose at the call-history
+# read. A per-channel date looks far more precise than prose, so it is omitted
+# rather than qualified: absent beats confidently wrong.
+WINDOWED_CHANNELS = {"phone"}
 
 
 def _duration(seconds):
@@ -4632,6 +4666,28 @@ def cmd_people(opts):
                 "id": pid, "name": known_name or key,
                 "handle": key, "handles": set(), "known": cid is not None,
                 "channels": {}, "days": set(), "channel_days": {},
+                # 🛑 WHEN, PER CHANNEL, and not only in aggregate. `last` is
+                # the maximum across every channel, so "when did I last talk
+                # to my mother" answered 2026-08-25 — the day she sent a text.
+                # The last time they were on the phone was twelve days earlier.
+                # Three readings of one question, and the report gave the one
+                # nobody asked for.
+                "channel_first": {}, "channel_last": {},
+                # 🛑 THE CONNECTED VARIANT, PER CHANNEL. An aggregate
+                # `spoke_days` came out 1,476 against 1,479 for one person and
+                # answered nothing: mail and messages are artefacts that exist
+                # because something was sent, so they are always "spoke", and
+                # they drown the one channel where it varies. Per channel it is
+                # the difference between "we called each other on 10 days" and
+                # "we actually spoke on 4 of them".
+                "channel_spoke_days": {}, "channel_spoke_last": {},
+                # 🛑 A MISSED CALL IS NOT TALKING, and on this store that is
+                # not a rounding error: 183 of 372 calls — 49% — never
+                # connected, and 7 of 11 with that one person. `days` still
+                # counts them, deliberately: somebody reaching for you is
+                # contact. `spoke_days` is the narrower answer beside it, the
+                # way `alone` sits beside `channels`.
+                "spoke_days": set(),
                 "same_list": 0, "alone": {}, "upcoming": 0,
                 # 🛑 RECIPROCITY. Who wrote to whom is the one signal that
                 # separates a correspondent from a sender, and it is free:
@@ -4651,7 +4707,7 @@ def cmd_people(opts):
             entry["name"] = known_name
         return entry
 
-    def touch(entry, tool, when, count=1):
+    def touch(entry, tool, when, count=1, spoke=True):
         """One exchange, on one day, in one channel's own unit."""
         # 🛑 A DAY THAT HAS NOT HAPPENED IS NOT A DAY OF CONTACT. The calendar
         # adapter fetches a YEAR AHEAD — 1,008 of the 12,014 events here are in
@@ -4681,6 +4737,18 @@ def cmd_people(opts):
         # is individual texts, and texts win that comparison every time
         # whatever the truth is.
         entry["channel_days"].setdefault(tool, set()).add(day)
+        if tool not in WINDOWED_CHANNELS:
+            first = entry["channel_first"].get(tool)
+            entry["channel_first"][tool] = when if first is None else min(first, when)
+        entry["channel_last"][tool] = max(entry["channel_last"].get(tool, when), when)
+        # ⚠️ A CONNECTED EXCHANGE, which only `phone` can currently fail to be.
+        # Every other channel is an artefact that exists because something was
+        # actually sent, so `spoke` is true for them by construction.
+        if spoke:
+            entry["spoke_days"].add(day)
+            entry["channel_spoke_days"].setdefault(tool, set()).add(day)
+            entry["channel_spoke_last"][tool] = max(
+                entry["channel_spoke_last"].get(tool, when), when)
         entry["months"].setdefault(stamp.strftime("%Y-%m"), set()).add(day)
 
     def collect(listed):
@@ -4882,7 +4950,11 @@ def cmd_people(opts):
             entry["known"] = True
             if call.get("name"):
                 entry["name"] = call["name"]
-        touch(entry, "phone", when)
+        # 🛑 `connected`, NOT `status`. A call is connected when it has a
+        # duration; `ZANSWERED` means "answered by me" and is 0 on every
+        # outgoing call, so reading direction here would report everything the
+        # user dialled as unanswered.
+        touch(entry, "phone", when, spoke=bool(call.get("connected")))
         if when:
             call_span = (min(call_span[0], when), max(call_span[1], when)) \
                 if call_span else (when, when)
@@ -5033,6 +5105,11 @@ def cmd_people(opts):
         {"id": p["id"], "name": p["name"], "handle": p["handle"],
          "known": p["known"], "days": len(p["days"]), "channels": p["channels"],
          "channel_days": {c: len(d) for c, d in p["channel_days"].items()},
+         "channel_first": p["channel_first"], "channel_last": p["channel_last"],
+         "channel_spoke_days": {c: len(d)
+                                for c, d in p["channel_spoke_days"].items()},
+         "channel_spoke_last": p["channel_spoke_last"],
+         "spoke_days": len(p["spoke_days"]),
          "alone": p["alone"], "same_list": p["same_list"],
          "upcoming": p["upcoming"], "first": p["first"], "last": p["last"],
          "months": series(p)}
@@ -5042,8 +5119,12 @@ def cmd_people(opts):
         entry["handles"] = sorted(entry["handles"])
         entry["months"] = series(entry)
         entry["days"] = len(entry["days"])
+        entry["spoke_days"] = len(entry["spoke_days"])
         entry["channel_days"] = {channel: len(days)
                                  for channel, days in entry["channel_days"].items()}
+        entry["channel_spoke_days"] = {
+            channel: len(days)
+            for channel, days in entry["channel_spoke_days"].items()}
 
     kept_edges = sorted(((a, b, w) for (a, b), w in edges.items()
                          if w >= 2 and a in keep and b in keep),

@@ -189,6 +189,12 @@ def entry(pid, name, channels, known=False):
     return {"id": pid, "name": name, "handle": pid, "known": known,
             "channels": dict(channels), "handles": {pid}, "days": set(),
             "channel_days": {}, "alone": {}, "same_list": 0, "upcoming": 0,
+            # ⚠️ Same shape test-people.py's `blank_spans()` builds. Two files
+            # cannot import each other here — the filenames carry hyphens — so
+            # this is the one duplication the layout forces.
+            "channel_first": {}, "channel_last": {},
+            "channel_spoke_days": {}, "channel_spoke_last": {},
+            "spoke_days": set(),
             "mail_from": 0, "mail_to": 0, "mail_bulk": 0, "mail_seen": 0,
             "rids": [], "first": None, "last": None, "months": {},
             "names": {name: 1}, "card_is_company": False}

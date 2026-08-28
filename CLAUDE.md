@@ -1659,6 +1659,7 @@ tool you are changing before you change it — every claim in there was paid for
 | `todo-deep-links.md` | planned: a `url` on every entity, so anything we name can be opened and cross-linked |
 | `todo-offline-tests.md` | planned: move the Notes suite off live Notes.app so it can run in CI at all |
 | `todo-index-app.md` | planned: a notarized app that holds the grants, the index and the schedule — and why `lab/` cannot ship without one |
+| `todo-call-archive.md` | planned: an archive for call history, because the Mac's store is a 4.6-month sliding mirror. 🛑 The primary key is RECYCLED; `ZUNIQUE_ID` is the only safe key |
 
 ## Building
 
@@ -1815,6 +1816,30 @@ recompute it implies rather than waiting for the clock.
   in every source — one email, a block of TEN texts, one event — so the sum
   means nothing. Read `days`; `channels` carries the item counts, each in its
   own unit, and **must never be added together**.
+- 🛑 **`last` IS THE MAXIMUM ACROSS EVERY CHANNEL, so it answers a question
+  nobody asked.** "When did I last talk to my mother" returned the day she sent
+  a text. Read **`channel_last`** for a channel's own most recent item, and
+  **`channel_spoke_last`** for the last time it actually connected. Three
+  readings of one question, all different: last contact 2026-08-25, last call
+  of any kind 2026-08-17, **last call she picked up 2026-08-13**.
+- 🛑 **A MISSED CALL IS NOT TALKING**, and it is not a rounding error: **183 of
+  372 calls here never connected — 49%**, and 7 of the 11 with one person.
+  `days` still counts them, deliberately — somebody reaching for you is
+  contact — and **`channel_spoke_days`** is the narrower answer beside it, the
+  way `alone` sits beside `channels`. ⚠️ An aggregate `spoke_days` is nearly
+  useless (1,476 against 1,479): mail and messages exist because something was
+  sent, so they are always "spoke" and they drown the one channel where it
+  varies.
+- 🛑 **PHONE HAS NO FIRST DATE, and never will.** `CallHistory.storedata` is a
+  relay mirror of the iPhone — 372 calls over 141 days here — so the oldest
+  call visible is the edge of the mirror, not when two people first spoke.
+  Measured: 11 of 137 phone first-dates sat within a fortnight of that edge, a
+  spouse of twenty years landed exactly ON it, and **109 people have no other
+  channel at all**. Worse, it degrades silently as the window slides. So
+  `WINDOWED_CHANNELS` omits it: **absent beats confidently wrong**. ⚠️ Phone is
+  the only one — mail reaches 2004 here, photos 2004, messages 2017, calendar
+  2016. Fixing this properly needs
+  [`docs/todo-call-archive.md`](docs/todo-call-archive.md).
 - 🛑 **Being on the same list is not talking.** 53% of the emails naming that
   spouse were written by a third party to both of them, and a third of the
   total are `Cc`. Those are counted in `same_list`, never in `days`. A mail to
