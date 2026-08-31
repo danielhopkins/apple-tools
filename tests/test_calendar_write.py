@@ -912,7 +912,13 @@ class TestSeriesTimeEdit(LiveCalendarTest):
             "--start", f"{BASE:%Y-%m}-04 09:00",
             "--repeat", "weekly",
         )
-        moved = f"{BASE:%Y-%m}-11"
+        # ⚠️ NOT the 11th. A weekly series anchored on the 4th already has an
+        # occurrence on the 11th, and EventKit refuses to move the anchor onto
+        # one of its own instances: "Another instance of this event occurs on
+        # this date." The test failed on every binary back to 26.827.1 for that
+        # reason, and the refusal is correct — it was the fixture that was
+        # wrong. The 7th is free.
+        moved = f"{BASE:%Y-%m}-07"
         updated = run_json(
             "edit", event["id"], "--series",
             "--start", f"{moved} 14:00", "--end", f"{moved} 15:00",
