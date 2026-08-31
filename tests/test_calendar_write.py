@@ -201,6 +201,114 @@ class TestEdit(LiveCalendarTest):
         self.assertIn("end time", err.lower())
 
 
+class TestAllDayConversion(LiveCalendarTest):
+    """Moving an event across the all-day boundary.
+
+    🛑 EventKit refuses this in silence. Setting `--start 18:30` on an all-day
+    event leaves `isAllDay` true and pins the dates back to midnight and
+    23:59:59, so `save` reports success and the read-back names a start
+    mismatch — a symptom that reads like a lost write. Measured 2026-08-31 on a
+    real event, which had to be deleted and recreated by hand.
+    """
+
+    def test_a_start_time_converts_an_all_day_event(self):
+        event = self.add("allday-to-timed", "--start", f"{TEST_YEAR}-04-12", "--all-day")
+        self.assertTrue(event["allDay"])
+
+        # 🛑 75 is EX_TEMPFAIL — the server did not confirm in time — and the
+        # write still landed. Only the stderr note and the read-back are the
+        # subject here.
+        _, _, err = run("edit", event["id"], "--start", f"{TEST_YEAR}-04-12 18:30")
+        # The conversion is never silent: it changes what the caller asked for.
+        self.assertIn("all-day", err)
+
+        fetched = self.get(event["id"])
+        self.assertFalse(fetched["allDay"])
+        self.assertTrue(fetched["start"].startswith(f"{TEST_YEAR}-04-12T18:30"))
+        # ⚠️ An all-day end is 23:59:59, which is the end of the day and not an
+        # end time. Carrying it over would make a 5-hour event out of a 6:30
+        # start, so the conversion takes `add`'s one-hour default instead.
+        self.assertTrue(fetched["end"].startswith(f"{TEST_YEAR}-04-12T19:30"))
+
+    def test_an_explicit_end_survives_the_conversion(self):
+        event = self.add("allday-to-timed-end", "--start", f"{TEST_YEAR}-04-13", "--all-day")
+        run(
+            "edit", event["id"],
+            "--start", f"{TEST_YEAR}-04-13 18:30",
+            "--end", f"{TEST_YEAR}-04-13 21:00",
+        )
+        fetched = self.get(event["id"])
+        self.assertFalse(fetched["allDay"])
+        self.assertTrue(fetched["end"].startswith(f"{TEST_YEAR}-04-13T21:00"))
+
+    def test_all_day_flag_converts_a_timed_event(self):
+        event = self.add("timed-to-allday", "--start", f"{TEST_YEAR}-04-14 09:00")
+        self.assertFalse(event["allDay"])
+
+        run("edit", event["id"], "--all-day")
+        fetched = self.get(event["id"])
+        self.assertTrue(fetched["allDay"])
+        # The day it was on is the day it stays on.
+        self.assertTrue(fetched["start"].startswith(f"{TEST_YEAR}-04-14"))
+
+    def test_timed_takes_a_bare_time_on_the_events_own_day(self):
+        # The bare-time rule still applies: '19:00' means this event's day, not
+        # today, which is years away from TEST_YEAR.
+        event = self.add("allday-bare-time", "--start", f"{TEST_YEAR}-04-15", "--all-day")
+        run("edit", event["id"], "--timed", "--start", "19:00", "--end", "21:30")
+        fetched = self.get(event["id"])
+        self.assertFalse(fetched["allDay"])
+        self.assertTrue(fetched["start"].startswith(f"{TEST_YEAR}-04-15T19:00"))
+        self.assertTrue(fetched["end"].startswith(f"{TEST_YEAR}-04-15T21:30"))
+
+    def test_timed_without_a_start_time_is_refused(self):
+        # An all-day event's start is midnight, so there is no clock time to
+        # keep. Refusing beats inventing a midnight event nobody asked for.
+        event = self.add("timed-no-start", "--start", f"{TEST_YEAR}-04-16", "--all-day")
+        code, _, err = run("edit", event["id"], "--timed", check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("needs a start time", err)
+        self.assertTrue(self.get(event["id"])["allDay"])
+
+    def test_a_date_with_no_time_leaves_an_all_day_event_alone(self):
+        # 🛑 Midnight reads as "no time given", so moving an all-day event to
+        # another day must not quietly make it timed.
+        event = self.add("allday-move", "--start", f"{TEST_YEAR}-04-17", "--all-day")
+        run("edit", event["id"], "--start", f"{TEST_YEAR}-04-18")
+        fetched = self.get(event["id"])
+        self.assertTrue(fetched["allDay"])
+        self.assertTrue(fetched["start"].startswith(f"{TEST_YEAR}-04-18"))
+
+    def test_moving_an_all_day_event_keeps_it_all_day_and_one_day_long(self):
+        # 🛑 This used to fail outright. The end stayed on the old day, landing
+        # before the new start, so a request that named no end at all was
+        # refused with "end time must be at or after the start time".
+        event = self.add("allday-move-length", "--start", f"{TEST_YEAR}-04-20", "--all-day")
+        run("edit", event["id"], "--start", f"{TEST_YEAR}-04-21")
+        fetched = self.get(event["id"])
+        self.assertTrue(fetched["allDay"])
+        self.assertTrue(fetched["start"].startswith(f"{TEST_YEAR}-04-21"))
+        self.assertTrue(fetched["end"].startswith(f"{TEST_YEAR}-04-21"))
+
+    def test_moving_a_timed_event_keeps_its_length(self):
+        event = self.add(
+            "timed-move-length",
+            "--start", f"{TEST_YEAR}-04-22 09:00",
+            "--end", f"{TEST_YEAR}-04-22 11:00",
+        )
+        _, _, err = run("edit", event["id"], "--start", f"{TEST_YEAR}-04-22 15:00")
+        self.assertIn("keeps its length", err)
+        fetched = self.get(event["id"])
+        self.assertTrue(fetched["start"].startswith(f"{TEST_YEAR}-04-22T15:00"))
+        self.assertTrue(fetched["end"].startswith(f"{TEST_YEAR}-04-22T17:00"))
+
+    def test_all_day_and_timed_together_are_refused(self):
+        event = self.add("allday-both", "--start", f"{TEST_YEAR}-04-19 09:00")
+        code, _, err = run("edit", event["id"], "--all-day", "--timed", check=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("--timed", err)
+
+
 class TestDelete(LiveCalendarTest):
     def test_delete_removes_the_event(self):
         event = self.add("to-delete", "--start", f"{TEST_YEAR}-05-01 09:00")

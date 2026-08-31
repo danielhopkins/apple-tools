@@ -177,6 +177,47 @@ read of the same event gave `{"frequency": "monthly", "interval": 1, "on_the":
 deleted."` on stderr was the only hint. ⚠️ A non-recurring `add` was never
 affected, which is why it survived a release.
 
+## The all-day boundary
+
+🛑 **`isAllDay` is a shape, not a display option, and `--start` alone cannot
+cross it.** Setting a start with a clock time on an all-day event leaves
+`isAllDay` true, and EventKit pins the pair straight back to midnight and
+23:59:59. `save` returns true. Nothing errors.
+
+Measured 2026-08-31 on a real event, an all-day one that needed a 6:30 pm start:
+
+```
+$ apple calendar edit <id> --start "2026-09-25 18:30" --end "2026-09-25 21:00"
+Error: the save reported success but the store does not hold the change:
+  start is 2026-09-25T00:00:00-06:00, expected 2026-09-25T18:30:00-06:00
+  end is 2026-09-25T23:59:59-06:00, expected 2026-09-25T21:00:00-06:00
+```
+
+The read-back caught it, which is the point of the read-back — but it names the
+symptom. Nothing on screen said `isAllDay` was the reason, and the only route
+left was to delete the event and create it again by hand.
+
+- **The flag is set before the dates, never after.** EventKit snaps a date it is
+  handed while `isAllDay` is still true, so setting the flag second discards the
+  very time the conversion exists to set.
+- **`--all-day` is checked to the DAY on read-back, not to the second**, because
+  EventKit normalises the pair itself. An exact comparison fails every correct
+  conversion.
+- **`IntendedChange` carries `allDay`**, so a refused conversion is reported as
+  "the event is still all-day" rather than as two date mismatches.
+- ⚠️ **Midnight is indistinguishable from "no time given".** `DateArg` parses a
+  bare date to 00:00, and nothing afterwards can tell it from an explicit
+  midnight. So the implicit conversion never fires on a date alone, and an event
+  that really starts at midnight needs `--timed`.
+
+**`--start` alone also used to fail on an ordinary move.** The old end stayed
+where it was, so any start moved later landed after it and the request was
+refused with "end time must be at or after the start time" — naming an end the
+caller never passed. Moving an all-day event to the next day failed every time,
+since its end is 23:59:59 of the old day. `edit` now keeps the event's length
+when only `--start` is given, the way dragging one in a calendar app does, and
+reports the new end on stderr.
+
 ## Recurrence
 
 - 🛑 **A recurrence change must be saved with `EKSpan.futureEvents`.** Saving a

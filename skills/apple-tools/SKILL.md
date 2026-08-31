@@ -127,6 +127,8 @@ apple calendar add "LEC" --start "2027-01-25 18:30" \
 apple calendar edit <id> --series --repeat weekly    # rule changes need --series
 apple calendar edit <id> --series --start 18:30 --end 20:30  # a bare time keeps
                                                     # the anchor day; a full date moves it
+apple calendar edit <id> --start "18:30"            # an all-day event becomes
+                                                    # timed; --all-day goes back
 apple calendar edit <id> --url ""                   # clear a stale meeting link
 apple calendar invitees <id>                        # read-only: who is invited
 apple calendar invite <id> --add a@b.com --dry-run   # ALWAYS dry-run first
@@ -291,6 +293,13 @@ completed. Always re-run `show` immediately before acting on an index.
 `edit` and `delete` refuse to run on a recurring event without either
 `--occurrence` or an explicit `--series`, so if you see that error, do not
 retry with `--series` unless the user meant the whole series.
+
+**An all-day event needs a flag to become a timed one.** `--start "18:30"` on
+an all-day event does it, and says so; `--timed` states it outright and needs a
+start time. `--all-day` goes the other way. ⚠️ A bare date is not a time, so
+`--start 2026-09-26` moves an all-day event and leaves it all day. `--start`
+alone keeps the event's length, so an event moved later no longer collides with
+its own old end.
 
 **Notes with attachments are effectively read-only.** Writing a note's body
 destroys every attachment on it, unrecoverably. These tools do not expose note

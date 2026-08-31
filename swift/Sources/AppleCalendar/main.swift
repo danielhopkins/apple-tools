@@ -125,6 +125,19 @@ struct DateArg: ExpressibleByArgument {
         return nil
     }
 
+    /// True when the argument named a clock time at all — a bare time, or a
+    /// date with an hour on it.
+    ///
+    /// 🛑 **Midnight reads as "no time given".** A date alone parses to 00:00
+    /// and nothing afterwards can tell `2026-09-25` from `2026-09-25 00:00`.
+    /// So an event that really starts at midnight needs an explicit `--timed`.
+    var hasClockTime: Bool {
+        if timeOfDay != nil { return true }
+        let parts = Foundation.Calendar.current.dateComponents(
+            [.hour, .minute, .second], from: date)
+        return (parts.hour ?? 0) != 0 || (parts.minute ?? 0) != 0 || (parts.second ?? 0) != 0
+    }
+
     /// The same clock time, moved onto `day`. Used by `edit` so a bare `--start`
     /// or `--end` changes the time of the event in front of the caller rather
     /// than moving it to today.
@@ -1019,6 +1032,32 @@ struct Add: ParsableCommand {
     }
 }
 
+/// Which way `edit` moves an event across the all-day boundary.
+///
+/// 🛑 **`--start` alone cannot cross it.** EventKit keeps `isAllDay` and pins
+/// the dates back to midnight and 23:59:59, so the save reports success, the
+/// read-back reports a start mismatch, and nothing names the real cause.
+enum DayMode: String, EnumerableFlag {
+    case allDay
+    case timed
+
+    static func name(for value: DayMode) -> NameSpecification {
+        switch value {
+        case .allDay: return .customLong("all-day")
+        case .timed: return .customLong("timed")
+        }
+    }
+
+    static func help(for value: DayMode) -> ArgumentHelp? {
+        switch value {
+        case .allDay:
+            return "Make this an all-day event, keeping the day it is on"
+        case .timed:
+            return "Make an all-day event a timed one. Needs --start with a time."
+        }
+    }
+}
+
 struct Edit: ParsableCommand {
     static let configuration = CommandConfiguration(abstract: "Edit an existing event")
 
@@ -1036,6 +1075,10 @@ struct Edit: ParsableCommand {
 
     @Option(name: .long, help: "New end time. A bare time like '20:30' keeps the event's own day.")
     var end: DateArg?
+
+    /// Absent means "leave it as it is". `--start` with a clock time on an
+    /// all-day event implies `--timed`, since it can mean nothing else.
+    @Flag var dayMode: DayMode?
 
     @Option(name: .long, help: "New location text, written verbatim and never geocoded")
     var location: String?
@@ -1115,9 +1158,11 @@ struct Edit: ParsableCommand {
         }
 
         guard title != nil || start != nil || end != nil || location != nil || notes != nil
-            || urlChange != nil || recurrence.wasSpecified || pin.wasSpecified else {
+            || urlChange != nil || recurrence.wasSpecified || pin.wasSpecified
+            || dayMode != nil else {
             throw ValidationError(
-                "nothing to change; pass at least one of --title/--start/--end/--location/--at/--notes/--url/--repeat")
+                "nothing to change; pass at least one of "
+                + "--title/--start/--end/--all-day/--timed/--location/--at/--notes/--url/--repeat")
         }
 
         // Geocode once, before the first save attempt, so the retry below
@@ -1150,11 +1195,75 @@ struct Edit: ParsableCommand {
             FileHandle.standardError.write(Data((note + "\n").utf8))
         }
 
+        // 🛑 AN ALL-DAY EVENT CANNOT BE GIVEN A TIME BY --start ALONE, and the
+        // failure names the wrong thing. EventKit keeps `isAllDay` and pins the
+        // dates back to midnight and 23:59:59, so `save` reports success and
+        // the read-back reports "start is 00:00, expected 18:30" — a symptom
+        // that reads like a lost write. Measured 2026-08-31 on a real event.
+        //
+        // A --start carrying a clock time on an all-day event can only mean
+        // "give it that time", so it converts, and says so. --all-day and
+        // --timed state it outright.
+        var targetAllDay = dayMode.map { $0 == .allDay }
+        if targetAllDay == nil, match.isAllDay,
+           start?.hasClockTime == true || end?.hasClockTime == true {
+            targetAllDay = false
+            FileHandle.standardError.write(Data((
+                "note: this is an all-day event and --start named a time, "
+                + "so it becomes a timed event. Pass --all-day to keep it all day.\n").utf8))
+        }
+
+        // An all-day event's start is midnight, so there is no clock time to
+        // keep. Refused rather than turned into a midnight event nobody asked
+        // for.
+        if targetAllDay == false, match.isAllDay, start?.hasClockTime != true {
+            throw ValidationError("""
+                --timed needs a start time. This event is all day, so it carries no \
+                clock time to keep. Pass --start '18:30', or a full date and time.
+                """)
+        }
+
+        // ⚠️ An all-day event's end is 23:59:59, which is not an end time — it
+        // is the end of the day. Carrying it over would make a 5-hour event out
+        // of a 6:30 start. So a conversion with no --end takes `add`'s default.
+        var effectiveEnd = resolvedEnd
+        if targetAllDay == false, match.isAllDay, resolvedEnd == nil, let began = resolvedStart {
+            effectiveEnd = began.addingTimeInterval(3600)
+            FileHandle.standardError.write(Data((
+                "note: no --end given, so the event is 1 hour long — the same "
+                + "default `add` uses.\n").utf8))
+        } else if resolvedEnd == nil, let began = resolvedStart,
+                  let wasStart = match.startDate, let wasEnd = match.endDate {
+            // 🛑 --start ALONE USED TO BE AN ERROR whenever it moved an event
+            // later, because the old end stayed put and ended up before the new
+            // start: "end time must be at or after the start time", for a
+            // request that named no end at all. Moving an all-day event to the
+            // next day failed every time.
+            //
+            // Moving an event keeps its length, which is what dragging one in
+            // any calendar app does. The end is only reported when it moves.
+            let length = wasEnd.timeIntervalSince(wasStart)
+            let moved = began.addingTimeInterval(length)
+            if abs(moved.timeIntervalSince(wasEnd)) >= 1 {
+                effectiveEnd = moved
+                let shown = match.isAllDay
+                    ? humanDayFormatter.string(from: moved)
+                    : humanFormatter.string(from: moved)
+                FileHandle.standardError.write(Data((
+                    "note: --start moved the event, so it keeps its length and now "
+                    + "ends \(shown). Pass --end to set the end yourself.\n").utf8))
+            }
+        }
+
         // Applied to the retry target too, so both attempts are identical.
         func apply(to event: EKEvent, warn: Bool) {
             if let title { event.title = title }
+            // 🛑 Before the dates, never after. EventKit snaps a date it is
+            // handed while `isAllDay` is still true, so setting the flag second
+            // discards the very time this conversion exists to set.
+            if let targetAllDay { event.isAllDay = targetAllDay }
             if let resolvedStart { event.startDate = resolvedStart }
-            if let resolvedEnd { event.endDate = resolvedEnd }
+            if let effectiveEnd { event.endDate = effectiveEnd }
             if let location { event.location = location }
             pin.apply(resolvedPin, to: event)
             if let notes { event.notes = notes }
@@ -1209,9 +1318,10 @@ struct Edit: ParsableCommand {
         // just mutated — describes the *request*, so it can never fail. The
         // answer has to come from the store.
         let want = IntendedChange(
-            start: resolvedStart, end: resolvedEnd, title: title,
+            start: resolvedStart, end: effectiveEnd, title: title,
             location: location, notes: notes, url: urlChange,
-            recurs: recurrence.wasSpecified ? recurrence.isRecurring : nil)
+            recurs: recurrence.wasSpecified ? recurrence.isRecurring : nil,
+            allDay: targetAllDay)
         let intendedStart = resolvedStart ?? match.startDate
 
         func readBack() -> EKEvent? {
@@ -1292,10 +1402,16 @@ struct IntendedChange {
     /// True when a recurrence rule should exist afterwards, false when it
     /// should not, nil when recurrence was not part of the request.
     var recurs: Bool?
+    /// True when the event should be all-day afterwards, false when it should
+    /// be timed, nil when neither was asked for.
+    ///
+    /// 🛑 Checked because EventKit refuses the conversion in silence. Without
+    /// this the only sign is a start/end mismatch, which names the symptom.
+    var allDay: Bool?
 
     var isEmpty: Bool {
         start == nil && end == nil && title == nil && location == nil && notes == nil
-            && url == nil && recurs == nil
+            && url == nil && recurs == nil && allDay == nil
     }
 }
 
@@ -1342,8 +1458,18 @@ enum WriteConfirmation {
 
         func compare(_ label: String, _ actual: Date?, _ expected: Date?) {
             guard let expected else { return }
-            // Second granularity: stores round sub-second components.
-            guard let actual, abs(actual.timeIntervalSince(expected)) < 1 else {
+            // ⚠️ An all-day event is checked to the DAY, not the second.
+            // EventKit normalises the pair to midnight and 23:59:59 itself, so
+            // an exact check would fail every correct conversion.
+            let same: Bool
+            if want.allDay == true, let actual {
+                same = Foundation.Calendar.current.isDate(
+                    actual, inSameDayAs: expected)
+            } else {
+                // Second granularity: stores round sub-second components.
+                same = actual.map { abs($0.timeIntervalSince(expected)) < 1 } ?? false
+            }
+            guard same else {
                 problems.append(
                     "\(label) is \(actual.map { iso8601.string(from: $0) } ?? "unset"), "
                     + "expected \(iso8601.string(from: expected))")
@@ -1352,6 +1478,13 @@ enum WriteConfirmation {
         }
         compare("start", event.startDate, want.start)
         compare("end", event.endDate, want.end)
+
+        if let allDay = want.allDay, allDay != event.isAllDay {
+            problems.append(
+                allDay
+                    ? "the event is still timed, but --all-day was asked for"
+                    : "the event is still all-day, but a timed one was asked for")
+        }
 
         func compareText(_ label: String, _ actual: String?, _ expected: String?) {
             guard let expected, (actual ?? "") != expected else { return }

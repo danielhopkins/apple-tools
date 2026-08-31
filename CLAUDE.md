@@ -69,6 +69,7 @@ installed via `make install`.
 | Recurring meeting | `apple calendar add "Board" --start … --repeat monthly --on-the "4th monday"` |
 | ...only some months of the year | `apple calendar add "LEC" … --repeat yearly --on-the "4th monday" --months 1,2,3,4` |
 | Change a series' time, not its date | `apple calendar edit <id> --series --start 18:30 --end 20:30` |
+| Give an all-day event a time | `apple calendar edit <id> --start "18:30"` |
 | Fix a stale meeting link | `apple calendar edit <id> --url ""` |
 | See who is invited | `apple calendar events --days 7 --json` → `attendees`, `organizer`, `my_status` |
 | Did that write reach the server | `apple calendar sync-status <id>` |
@@ -925,8 +926,9 @@ apple calendar add "TITLE" --start DATE [--end DATE | --duration MINUTES]
                           [--calendar NAME] [--all-day] [--location TEXT]
                           [--at PLACE] [--notes TEXT] [--url URL] [--invitee ADDR]...
                           [-r FREQ] [--on-the "4th monday"] [--months 1,2,3,4] [--json]
-apple calendar edit ID [--title T] [--start DATE] [--end DATE] [--location L]
-                       [--notes N] [--url URL|""] [--occurrence DATE | --series] [--future] [--json]
+apple calendar edit ID [--title T] [--start DATE] [--end DATE] [--all-day | --timed]
+                       [--location L] [--notes N] [--url URL|""]
+                       [--occurrence DATE | --series] [--future] [--json]
 apple calendar invitees ID [--occurrence DATE | --series] [--json]   # read-only
 apple calendar invite ID [--add ADDR]... [--remove ADDR]...
                        [--occurrence DATE | --series] [--future] [--dry-run] [--json]
@@ -1095,6 +1097,37 @@ evening, so a series anchored in 2023 would have jumped three years with nothing
 printed. `edit` now re-hangs a bare time on the event's own day and says on
 stderr which day that was. **`add` does not** — a new event has no day to hang a
 time on, and today is the right reading there.
+
+🛑 **An all-day event and a timed one are different shapes, and `--start`
+alone cannot cross between them.** EventKit keeps `isAllDay` and pins the dates
+back to midnight and 23:59:59, so the save reports success while nothing moves.
+Measured 2026-08-31: the read-back caught it and reported `start is
+2026-09-25T00:00:00, expected 18:30`, which names the symptom and not the cause.
+
+```
+apple calendar edit <id> --start "18:30"     # all-day -> 18:30, one hour long
+apple calendar edit <id> --timed --start "18:30" --end "21:00"
+apple calendar edit <id> --all-day           # the other direction
+```
+
+- **A `--start` carrying a clock time on an all-day event converts it**, because
+  it can mean nothing else, and it says so on stderr. `--timed` and `--all-day`
+  state it outright.
+- ⚠️ **Midnight reads as "no time given".** A bare date parses to 00:00 and
+  nothing afterwards can tell `2026-09-25` from `2026-09-25 00:00`, so moving an
+  all-day event to another day keeps it all day. An event that really starts at
+  midnight needs `--timed`.
+- **A conversion with no `--end` runs one hour**, the same default `add` uses.
+  ⚠️ An all-day event's end is 23:59:59, which is the end of the day rather than
+  an end time; carrying it over would make a 5-hour event out of a 6:30 start.
+- 🛑 **`--timed` with nothing to hang a time on is refused.** An all-day event's
+  start is midnight, and inventing a midnight event nobody asked for is worse
+  than an error.
+- **`--start` on its own now keeps the event's length**, the way dragging one in
+  any calendar app does, and reports the new end on stderr. ⚠️ Before 26.831.0
+  the old end stayed put, so moving an event later failed with "end time must be
+  at or after the start time" for a request that named no end at all. Moving an
+  all-day event to the next day failed every time.
 
 🛑 **`--location` is text and gets no map pin; `--at` is the flag that does.**
 EventKit keeps the coordinate on a separate `EKStructuredLocation`, and only that
