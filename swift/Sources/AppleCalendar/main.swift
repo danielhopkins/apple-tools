@@ -203,6 +203,10 @@ struct CalendarInfo: Encodable {
     /// what the server rewrites, whether invitations are sent — so anything
     /// testing or reporting on a calendar needs to know which one it is.
     let type: String
+    /// Which `--availability` values this calendar can carry. A value outside
+    /// the set is dropped on save while the save still reports success, so this
+    /// is what a refusal names.
+    let availabilities: [String]
 }
 
 /// The map pin behind a location string.
@@ -250,6 +254,10 @@ struct EventInfo: Encodable {
     let geo: GeoInfo?
     let notes: String?
     let url: String?
+    /// How the event marks the user's time: busy, free, tentative or
+    /// unavailable. Absent when the calendar carries no availability at all,
+    /// which EventKit reports as `.notSupported`.
+    let availability: String?
     let recurring: Bool
     /// Only set for recurring events: the value to pass back as --occurrence so
     /// show/edit/delete act on this instance rather than the series master.
@@ -278,6 +286,7 @@ struct EventInfo: Encodable {
 
     enum CodingKeys: String, CodingKey {
         case id, title, calendar, start, end, allDay, location, geo, notes, url
+        case availability
         case recurring, occurrence, recurrence, attendees, organizer, sync
         case myStatus = "my_status"
     }
@@ -295,6 +304,7 @@ private func info(_ event: EKEvent, sync: SyncStore.Status? = nil) -> EventInfo 
         geo: GeoInfo(event),
         notes: event.notes,
         url: event.url?.absoluteString,
+        availability: Availability(reading: event.availability)?.rawValue,
         recurring: event.hasRecurrenceRules,
         occurrence: event.hasRecurrenceRules
             ? event.startDate.map { iso8601.string(from: $0) }
@@ -588,7 +598,8 @@ struct Calendars: ParsableCommand {
                     identifier: $0.calendarIdentifier,
                     allowsModification: $0.allowsContentModifications,
                     source: $0.source?.title ?? "<unknown>",
-                    type: $0.source?.sourceType.label ?? "unknown"
+                    type: $0.source?.sourceType.label ?? "unknown",
+                    availabilities: Availability.supported(by: $0).map(\.rawValue)
                 )
             })
         } else {
@@ -783,6 +794,11 @@ struct Show: ParsableCommand {
             printJSON(info(match))
         } else {
             print(describe(match))
+            // Only when it is not the default, so an ordinary event stays one
+            // line. An absent value means the calendar carries no availability.
+            if let availability = Availability(reading: match.availability), availability != .busy {
+                print("Shows as: \(availability.rawValue)")
+            }
             if let list = Attendees.list(match) {
                 print("Invitees:")
                 for attendee in list { print(Attendees.describe(attendee)) }
@@ -831,6 +847,92 @@ enum URLChange {
     }
 }
 
+/// How an event marks the user's time — `EKEvent.availability`, the control
+/// Calendar.app calls "Show As".
+///
+/// 🛑 **A calendar does not carry every value, and EventKit accepts one it does
+/// not carry.** `EKCalendar.supportedEventAvailabilities` is a mask. Measured
+/// 2026-09-02 on a Google calDAV calendar advertising `busy, free`: writing
+/// `tentative` reported success and read back as `tentative` from the local
+/// store. The account does not hold that state, so the value would look right
+/// on this Mac and mean nothing anywhere else. So `add` and `edit` refuse a
+/// value outside the mask.
+///
+/// Measured on this machine: calDAV carries `busy, free`; Exchange carries all
+/// four; a birthday or subscribed calendar carries none.
+enum Availability: String, ExpressibleByArgument, CaseIterable {
+    case busy
+    case free
+    case tentative
+    case unavailable
+
+    /// `nil` for `.notSupported`, which is what a calendar carrying no
+    /// availability reports. An absent key beats a value the store does not
+    /// hold.
+    init?(reading value: EKEventAvailability) {
+        switch value {
+        case .busy: self = .busy
+        case .free: self = .free
+        case .tentative: self = .tentative
+        case .unavailable: self = .unavailable
+        default: return nil
+        }
+    }
+
+    var eventValue: EKEventAvailability {
+        switch self {
+        case .busy: return .busy
+        case .free: return .free
+        case .tentative: return .tentative
+        case .unavailable: return .unavailable
+        }
+    }
+
+    var mask: EKCalendarEventAvailabilityMask {
+        switch self {
+        case .busy: return .busy
+        case .free: return .free
+        case .tentative: return .tentative
+        case .unavailable: return .unavailable
+        }
+    }
+
+    static var flagHelp: String {
+        "Show the time as " + allCases.map(\.rawValue).joined(separator: ", ")
+            + ". Not every calendar carries every value."
+    }
+
+    /// What this calendar can carry, in flag order.
+    static func supported(by calendar: EKCalendar?) -> [Availability] {
+        guard let calendar else { return [] }
+        let mask = calendar.supportedEventAvailabilities
+        return allCases.filter { mask.contains($0.mask) }
+    }
+
+    /// Refuses a value the calendar cannot carry, naming the ones it can.
+    ///
+    /// Without this the save reports success and the event keeps the
+    /// availability it already had, which reads as a lost write.
+    static func check(_ wanted: Availability, on calendar: EKCalendar?) throws {
+        let supported = supported(by: calendar)
+        guard !supported.contains(wanted) else { return }
+        let name = calendar?.title ?? "this calendar"
+        guard !supported.isEmpty else {
+            throw ValidationError("""
+                '\(name)' carries no availability at all. EventKit would store \
+                --availability \(wanted.rawValue) locally and report success, and no \
+                other device would see it.
+                """)
+        }
+        throw ValidationError("""
+            '\(name)' does not carry --availability \(wanted.rawValue). It carries: \
+            \(supported.map(\.rawValue).joined(separator: ", ")). EventKit stores an \
+            unsupported value locally and reports success, so it would read back \
+            correctly here and mean nothing on the account.
+            """)
+    }
+}
+
 struct Add: ParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Create an event",
@@ -875,6 +977,9 @@ struct Add: ParsableCommand {
 
     @Option(name: .long, help: "URL to attach, e.g. a meeting link")
     var url: String?
+
+    @Option(name: .long, help: ArgumentHelp(Availability.flagHelp))
+    var availability: Availability?
 
     @Option(
         name: .long,
@@ -945,6 +1050,12 @@ struct Add: ParsableCommand {
         event.notes = notes
         if let change = try URLChange.parse(url) {
             event.url = change.value
+        }
+        if let availability {
+            // Checked before the save, not after: a value this calendar cannot
+            // carry is dropped silently rather than refused.
+            try Availability.check(availability, on: event.calendar)
+            event.availability = availability.eventValue
         }
 
         if let rule = try recurrence.rule() {
@@ -1091,6 +1202,9 @@ struct Edit: ParsableCommand {
     @Option(name: .long, help: "New URL, or \"\" to clear it (a stale meeting link, say)")
     var url: String?
 
+    @Option(name: .long, help: ArgumentHelp(Availability.flagHelp))
+    var availability: Availability?
+
     @Option(name: .long, help: "Which occurrence to edit (its \"occurrence\" field from `events --json`)")
     var occurrence: DateArg?
 
@@ -1159,10 +1273,15 @@ struct Edit: ParsableCommand {
 
         guard title != nil || start != nil || end != nil || location != nil || notes != nil
             || urlChange != nil || recurrence.wasSpecified || pin.wasSpecified
-            || dayMode != nil else {
+            || dayMode != nil || availability != nil else {
             throw ValidationError(
                 "nothing to change; pass at least one of "
-                + "--title/--start/--end/--all-day/--timed/--location/--at/--notes/--url/--repeat")
+                + "--title/--start/--end/--all-day/--timed/--location/--at/--notes/--url/"
+                + "--availability/--repeat")
+        }
+
+        if let availability {
+            try Availability.check(availability, on: match.calendar)
         }
 
         // Geocode once, before the first save attempt, so the retry below
@@ -1268,6 +1387,7 @@ struct Edit: ParsableCommand {
             pin.apply(resolvedPin, to: event)
             if let notes { event.notes = notes }
             if let urlChange { event.url = urlChange.value }
+            if let availability { event.availability = availability.eventValue }
 
             guard recurrence.wasSpecified else { return }
             if let rule = resolvedRule {
@@ -1320,6 +1440,7 @@ struct Edit: ParsableCommand {
         let want = IntendedChange(
             start: resolvedStart, end: effectiveEnd, title: title,
             location: location, notes: notes, url: urlChange,
+            availability: availability,
             recurs: recurrence.wasSpecified ? recurrence.isRecurring : nil,
             allDay: targetAllDay)
         let intendedStart = resolvedStart ?? match.startDate
@@ -1399,6 +1520,9 @@ struct IntendedChange {
     /// `.set` when a URL should be there afterwards, `.clear` when it should be
     /// gone, nil when the URL was not part of the request.
     var url: URLChange?
+    /// What the event should show the time as afterwards, nil when availability
+    /// was not part of the request.
+    var availability: Availability?
     /// True when a recurrence rule should exist afterwards, false when it
     /// should not, nil when recurrence was not part of the request.
     var recurs: Bool?
@@ -1411,7 +1535,7 @@ struct IntendedChange {
 
     var isEmpty: Bool {
         start == nil && end == nil && title == nil && location == nil && notes == nil
-            && url == nil && recurs == nil && allDay == nil
+            && url == nil && availability == nil && recurs == nil && allDay == nil
     }
 }
 
@@ -1509,6 +1633,15 @@ enum WriteConfirmation {
                 problems.append(
                     "url is \(event.url.map { "'\($0.absoluteString)'" } ?? "unset"), "
                     + "expected '\(expected.absoluteString)'")
+            }
+        }
+
+        if let wanted = want.availability {
+            let actual = Availability(reading: event.availability)
+            if actual != wanted {
+                problems.append(
+                    "availability is \(actual?.rawValue ?? "not supported"), "
+                    + "expected \(wanted.rawValue)")
             }
         }
 

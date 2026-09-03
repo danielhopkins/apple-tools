@@ -71,6 +71,7 @@ installed via `make install`.
 | Change a series' time, not its date | `apple calendar edit <id> --series --start 18:30 --end 20:30` |
 | Give an all-day event a time | `apple calendar edit <id> --start "18:30"` |
 | Fix a stale meeting link | `apple calendar edit <id> --url ""` |
+| Mark time as free, not busy | `apple calendar add "Focus" --start … --availability free` |
 | See who is invited | `apple calendar events --days 7 --json` → `attendees`, `organizer`, `my_status` |
 | Did that write reach the server | `apple calendar sync-status <id>` |
 | Everything the server never took | `apple calendar unsynced` |
@@ -925,9 +926,11 @@ apple calendar show ID [--occurrence DATE] [--json]
 apple calendar add "TITLE" --start DATE [--end DATE | --duration MINUTES]
                           [--calendar NAME] [--all-day] [--location TEXT]
                           [--at PLACE] [--notes TEXT] [--url URL] [--invitee ADDR]...
+                          [--availability busy|free|tentative|unavailable]
                           [-r FREQ] [--on-the "4th monday"] [--months 1,2,3,4] [--json]
 apple calendar edit ID [--title T] [--start DATE] [--end DATE] [--all-day | --timed]
                        [--location L] [--notes N] [--url URL|""]
+                       [--availability busy|free|tentative|unavailable]
                        [--occurrence DATE | --series] [--future] [--json]
 apple calendar invitees ID [--occurrence DATE | --series] [--json]   # read-only
 apple calendar invite ID [--add ADDR]... [--remove ADDR]...
@@ -1166,6 +1169,27 @@ there while `location` holds the current one, and the stale one wins.
 - **A string that is not a URL is refused**, naming it. A scheme is required:
   `example.com` is rejected, `https://example.com` and `zoommtg://…` are taken.
 - A URL in `--location` is fine and stays verbatim, but prefer `--url`.
+
+**`--availability` is the "Show As" field**, on `add` and `edit`. It takes
+`busy`, `free`, `tentative` or `unavailable`, and `events`/`show --json` report
+it as `availability`.
+
+```
+apple calendar add "Focus block" --start "tomorrow 9am" --availability free
+apple calendar edit <id> --availability free
+```
+
+- 🛑 **A calendar does not carry every value, and EventKit accepts one it does
+  not carry.** Measured 2026-09-02 on a Google calDAV calendar carrying `busy,
+  free`: writing `tentative` reported success and read back as `tentative` from
+  the local store, for a state the account does not hold. It would be right on
+  this Mac and absent everywhere else. So `add` and `edit` refuse a value
+  outside the calendar's set, naming what it carries.
+- **`calendars --json` reports `availabilities` per calendar.** Measured here:
+  Exchange carries all four, calDAV carries `busy, free`, and a birthday or
+  subscribed calendar carries none.
+- ⚠️ **An absent `availability` key means the calendar carries none**, which
+  EventKit reports as `notSupported`. Never read the missing key as `busy`.
 
 **Invitees.** `events --json` reports `attendees` (objects, with `name`, `email`,
 `status`, `role`, `type`, `organizer`, `is_me`), a separate `organizer`, and

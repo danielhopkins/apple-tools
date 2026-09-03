@@ -186,6 +186,82 @@ class TestEdit(LiveCalendarTest):
         self.assertNotEqual(code, 0)
         self.assertIn("not a URL", err)
 
+    # --- availability -------------------------------------------------------
+    #
+    # 🛑 The set of values a calendar carries is per backend, so every test here
+    # reads the calendar's own list first. Measured 2026-09-02: calDAV carries
+    # busy and free, Exchange carries all four, a birthday or subscribed
+    # calendar carries none.
+
+    def carried(self):
+        """The --availability values the fixture calendar carries."""
+        for entry in run_json("calendars"):
+            if entry["title"] == self.calendar:
+                return entry["availabilities"]
+        self.fail(f"fixture calendar '{self.calendar}' is not listed")
+
+    def test_calendars_report_which_availabilities_they_carry(self):
+        for entry in run_json("calendars"):
+            self.assertIsInstance(entry["availabilities"], list)
+            for value in entry["availabilities"]:
+                self.assertIn(value, ["busy", "free", "tentative", "unavailable"])
+
+    def test_add_sets_availability(self):
+        if "free" not in self.carried():
+            self.skipTest(f"'{self.calendar}' does not carry 'free'")
+        event = self.add(
+            "availability",
+            "--start", f"{TEST_YEAR}-04-12 09:00",
+            "--availability", "free",
+        )
+        self.assertEqual(event["availability"], "free")
+        self.assertEqual(self.get(event["id"])["availability"], "free")
+
+    def test_edit_changes_availability(self):
+        if "free" not in self.carried():
+            self.skipTest(f"'{self.calendar}' does not carry 'free'")
+        event = self.add(
+            "edit-availability",
+            "--start", f"{TEST_YEAR}-04-13 09:00",
+            "--availability", "free",
+        )
+        run("edit", event["id"], "--availability", "busy")
+        self.assertEqual(self.get(event["id"])["availability"], "busy")
+
+    def test_availability_the_calendar_does_not_carry_is_refused(self):
+        # 🛑 EventKit does NOT refuse this itself. Measured 2026-09-02 on a
+        # Google calDAV calendar carrying busy and free: writing 'tentative'
+        # reported success and read back as 'tentative' from the local store,
+        # while the account holds no such state. The refusal is the only thing
+        # standing between the caller and a value that is right on this Mac
+        # alone.
+        missing = [
+            value for value in ["tentative", "unavailable"]
+            if value not in self.carried()
+        ]
+        if not missing:
+            self.skipTest(f"'{self.calendar}' carries every availability")
+        code, _, err = run(
+            "add", self.title("availability-refused"),
+            "--start", f"{TEST_YEAR}-04-14 09:00",
+            "--calendar", self.calendar,
+            "--availability", missing[0],
+            check=False,
+        )
+        self.assertNotEqual(code, 0)
+        self.assertIn("does not carry", err)
+
+    def test_edit_availability_alone_is_a_change(self):
+        # `edit` refuses a call that changes nothing, and --availability has to
+        # count as a change on its own.
+        if "free" not in self.carried():
+            self.skipTest(f"'{self.calendar}' does not carry 'free'")
+        event = self.add("availability-only", "--start", f"{TEST_YEAR}-04-15 09:00")
+        code, _, err = run(
+            "edit", event["id"], "--availability", "free", check=False
+        )
+        self.assertEqual(code, 0, err)
+
     def test_edit_with_no_changes_is_rejected(self):
         event = self.add("edit-noop", "--start", f"{TEST_YEAR}-04-05 09:00")
         code, _, err = run("edit", event["id"], check=False)

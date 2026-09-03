@@ -362,6 +362,40 @@ missing value` fails with **-1700**; only an empty string works. And Calendar.ap
 cannot be addressed by the EventKit id that `events --json` prints, so matching
 falls back to calendar name plus summary.
 
+## Availability, the "Show As" field
+
+`EKEvent.availability` is what a calendar client shows as busy, free, tentative
+or unavailable, and it is what free/busy lookups read. `--availability` writes
+it on `add` and `edit`; `events`/`show --json` report it as `availability`.
+
+🛑 **A calendar does not carry every value, and EventKit accepts one it does not
+carry.** `EKCalendar.supportedEventAvailabilities` is a mask, and nothing checks
+a write against it. Measured 2026-09-02 on a Google calDAV calendar whose mask
+is `busy, free`: `edit --availability tentative` reported success, and a fresh
+read of the store returned `tentative` for a state the account does not hold.
+The value would be right on this Mac and absent everywhere else, which is the
+same shape of failure as a location that never got a coordinate.
+
+So `add` and `edit` refuse a value outside the mask, naming what the calendar
+does carry. `calendars --json` reports the set as `availabilities`.
+
+Measured across the 14 calendars on this machine:
+
+| backend | carries |
+|---|---|
+| exchange | busy, free, tentative, unavailable |
+| calDAV (Google) | busy, free |
+| birthdays | nothing |
+| subscribed | nothing |
+
+- ⚠️ **An absent `availability` key means the calendar carries none**, which
+  EventKit reports as `.notSupported`. Never read the missing key as `busy`.
+- **A supported value round-trips to the server.** An Exchange `add
+  --availability tentative` reached `sync.state: synced` on the first check.
+- ⚠️ **The read-back check compares the stored value**, like every other field,
+  so a value the store quietly discarded is named rather than reported as
+  success.
+
 ## Who may edit what
 
 🛑 **`edit` refuses an invitation you received.** The test is **"am I an
