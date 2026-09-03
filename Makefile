@@ -243,12 +243,19 @@ dist: set-version completions
 		echo "error: no lab/coreml/build-ship; run 'make -C lab ship-models'"; exit 1; }
 	mkdir -p $(DIST)/index/models $(DIST)/index/skill
 	cd lab/vec && swift build $(SWIFT_UNIV)
+	@# 🛑 TWO BINARIES OUT OF ONE PACKAGE. `doctext` reads PDF, which nothing
+	@# in Python can do here: /usr/bin/python3 is 3.9.6 with no Quartz, and
+	@# `mdimport -t -d3` IS PDFKit at three times the cost. Leaving it out
+	@# costs every PDF in the index with one line on stderr to say so.
 	cp "$$(cd lab/vec && swift build $(SWIFT_UNIV) --show-bin-path)"/vec $(DIST)/index/
+	cp "$$(cd lab/vec && swift build $(SWIFT_UNIV) --show-bin-path)"/doctext $(DIST)/index/
 	@# ⚠️ Universal, like every other binary here. A release that runs only on
 	@# the machine that built it is the bug this check exists to catch.
-	@for arch in arm64 x86_64; do \
-		lipo -archs $(DIST)/index/vec | grep -q $$arch \
-			|| { echo "error: index/vec is missing $$arch"; exit 1; }; \
+	@for binary in vec doctext; do \
+		for arch in arm64 x86_64; do \
+			lipo -archs $(DIST)/index/$$binary | grep -q $$arch \
+				|| { echo "error: index/$$binary is missing $$arch"; exit 1; }; \
+		done; \
 	done
 	@# 🛑 THE SIBLING LIST COMES FROM index.py, not from here — see
 	@# SIBLING_MODULES there for why, and for why this is a declaration rather

@@ -48,6 +48,10 @@ cp notes/apple-notes notes/notestore.proto notes/*.py "$STAGE/notes/"
 echo "==> index"
 [ -x lab/vec/.build/release/vec ] || (cd lab/vec && swift build -c release)
 cp lab/vec/.build/release/vec "$STAGE/index/vec"
+# 🛑 THE SAME PACKAGE BUILDS BOTH, so there is nothing extra to build — but
+# there IS something extra to copy, and forgetting it costs every PDF in the
+# index with only a line on stderr to say so.
+cp lab/vec/.build/release/doctext "$STAGE/index/doctext"
 # 🛑 THE SIBLING LIST COMES FROM index.py, not from here — see SIBLING_MODULES
 # there. A bundle short a sibling cannot ingest that source at all, and the app
 # is what does the ingesting.
@@ -103,7 +107,7 @@ cp notes/shortcuts/*.shortcut "$STAGE/index/shortcuts/" 2>/dev/null || true
 # 🛑 Check what we staged, here and not at run time. A missing helper shows up
 # as "no `apple` dispatcher found on this machine" hours later.
 for required in Helpers/apple Helpers/apple-mail notes/apple-notes \
-                notes/notestore.py notes/notestore.proto index/vec \
+                notes/notestore.py notes/notestore.proto index/vec index/doctext \
                 index/models/vocab.txt \
                 skills/apple-tools/SKILL.md skills/apple-index/SKILL.md; do
   [ -e "$STAGE/$required" ] || { echo "missing: $required"; exit 1; }

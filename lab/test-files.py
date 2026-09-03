@@ -18,9 +18,12 @@ No index, no app, no network. Run it directly:
 """
 import json
 import os
+import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import zipfile
 
 import index
 
@@ -216,6 +219,246 @@ check("a leading separator does not make an empty folder",
       [{"name": "A", "records": 2, "chunks": 2}])
 
 check("nothing in, nothing out", fold([]), [])
+
+
+# --------------------------------------------------------------------------
+# reading the formats that are not text
+# --------------------------------------------------------------------------
+#
+# ⚠️ Fixtures are BUILT here, never checked in. A .docx is a zip of XML, so
+# writing one is three lines, and a binary fixture is a thing nobody can read
+# in a diff when it starts failing.
+
+W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+P = "http://schemas.openxmlformats.org/presentationml/2006/main"
+
+
+def build_docx(path, paragraphs):
+    body = "".join(
+        "<w:p>%s</w:p>" % "".join("<w:r><w:t>%s</w:t></w:r>" % run
+                                  for run in runs)
+        for runs in paragraphs)
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("word/document.xml",
+                         '<?xml version="1.0"?>'
+                         '<w:document xmlns:w="%s"><w:body>%s</w:body>'
+                         '</w:document>' % (W, body))
+    return path
+
+
+def build_pptx(path, slides):
+    with zipfile.ZipFile(path, "w") as archive:
+        for number, lines in slides:
+            body = "".join("<a:p><a:r><a:t>%s</a:t></a:r></a:p>" % line
+                           for line in lines)
+            archive.writestr(
+                "ppt/slides/slide%d.xml" % number,
+                '<?xml version="1.0"?>'
+                '<p:sld xmlns:a="%s" xmlns:p="%s">'
+                '<p:cSld><p:spTree>%s</p:spTree>'
+                '</p:cSld></p:sld>' % (A, P, body))
+    return path
+
+
+work = tempfile.mkdtemp(prefix="apple-index-files-")
+
+check("a Word paragraph comes back as a line",
+      index.office_text(build_docx(os.path.join(work, "a.docx"),
+                                   [["Hello"], ["World"]])),
+      "Hello\nWorld")
+
+# ⚠️ Word splits a sentence across runs whenever formatting changes, so a
+# reader that takes one run per line breaks every bold word onto its own.
+check("runs inside one paragraph join without a break",
+      index.office_text(build_docx(os.path.join(work, "b.docx"),
+                                   [["Big ", "Daddy", " Bagels"]])),
+      "Big Daddy Bagels")
+
+# 🛑 The reason this uses ElementTree and not a regex over the XML.
+check("an XML entity is un-escaped",
+      index.office_text(build_docx(os.path.join(work, "c.docx"),
+                                   [["Ben &amp; Jerry&apos;s"]])),
+      "Ben & Jerry's")
+
+check("an empty paragraph does not become a blank line",
+      index.office_text(build_docx(os.path.join(work, "d.docx"),
+                                   [["One"], [""], ["Two"]])),
+      "One\nTwo")
+
+# 🛑 THE BUG THIS PINS REORDERS EVERY DECK OF TEN OR MORE SLIDES. Sorted as
+# strings, `slide10.xml` comes before `slide2.xml`, so the text reads as
+# nonsense and nothing in the output says why.
+check("slides sort numerically, not alphabetically",
+      index.office_text(build_pptx(os.path.join(work, "e.pptx"),
+                                   [(10, ["ten"]), (2, ["two"]),
+                                    (1, ["one"])])),
+      "one\ntwo\nten")
+
+# ⚠️ Every unreadable shape is one answer, because the caller handles exactly
+# one: there is nothing to index.
+not_a_zip = os.path.join(work, "f.docx")
+with open(not_a_zip, "w") as handle:
+    handle.write("this is not a zip")
+check("something that is not a zip reads as nothing",
+      index.office_text(not_a_zip), None)
+
+empty_zip = os.path.join(work, "g.docx")
+zipfile.ZipFile(empty_zip, "w").close()
+check("a zip with no document.xml reads as nothing",
+      index.office_text(empty_zip), None)
+
+check("a format this does not read is not guessed at",
+      index.office_text(os.path.join(work, "h.rtf")), None)
+
+
+# --------------------------------------------------------------------------
+# the Obsidian deep link
+# --------------------------------------------------------------------------
+#
+# 🛑 THE EXTENSION IS DROPPED ONLY FOR A NOTE. Obsidian addresses markdown
+# without its extension, and everything else WITH it. Stripping `.pdf` yields a
+# link that resolves to nothing and opens the vault at whatever Obsidian
+# decides — a failure with no error and no clue in the output.
+
+root = {"path": "/x/y/work", "name": "work"}
+check("a note loses its extension",
+      index.obsidian_url(root, "notes/Plan.md"),
+      "obsidian://open?vault=work&file=notes/Plan")
+check("a PDF keeps its extension",
+      index.obsidian_url(root, "notes/Budget.pdf"),
+      "obsidian://open?vault=work&file=notes/Budget.pdf")
+check("a Word file keeps its extension",
+      index.obsidian_url(root, "Agenda.docx"),
+      "obsidian://open?vault=work&file=Agenda.docx")
+# ⚠️ A dot in the name is not an extension. `2026.04.13 Agenda.docx` is a real
+# file in this vault, and `splitext` on the wrong half loses half the name.
+check("only the last dot is the extension",
+      index.obsidian_url(root, "2026.04.13 Agenda.docx"),
+      "obsidian://open?vault=work&file=2026.04.13%20Agenda.docx")
+
+
+# --------------------------------------------------------------------------
+# which extensions are read at all
+# --------------------------------------------------------------------------
+
+check("Word and PowerPoint are read", 
+      sorted(index.FILE_OFFICE_EXTENSIONS), [".docx", ".pptx"])
+# ⚠️ Deliberate. A spreadsheet's shared strings are labels and codes, not
+# prose, and 6 files here would add 1.22M characters of them.
+check("a spreadsheet is not", ".xlsx" in index.FILE_EXTENSIONS, False)
+check("PDF is read", ".pdf" in index.FILE_EXTENSIONS, True)
+# 🛑 The cap counts EXTRACTED TEXT. A PDF's bytes are mostly pictures: 30 of
+# the 159 here exceed 2 MB on disk while holding ordinary amounts of text.
+check("the byte guard is far above the text cap",
+      index.FILE_MAX_BYTES > index.FILE_MAX_TEXT * 10, True)
+
+shutil.rmtree(work, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
+# nesting a folder's contents under the folder
+# --------------------------------------------------------------------------
+#
+# 🛑 THE ROOT COMES OUT OF THE `uid`, NOT THE CONTAINER. A record's container
+# is its path RELATIVE to whichever folder holds it, so two configured folders
+# that each hold a `Reading` folder are one row and nothing says which is
+# which. Drawing that under a configured folder would attribute somebody
+# else's files to it. The uid is `files:<name>:<relative>` and carries both.
+
+def store(rows):
+    """An in-memory index holding just what `files_by_root` reads."""
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.execute("CREATE TABLE record (rid INTEGER PRIMARY KEY, uid TEXT, "
+               "tool TEXT, kind TEXT)")
+    db.execute("CREATE TABLE chunk (cid INTEGER PRIMARY KEY, rid INTEGER)")
+    for rid, (uid, kind, chunks) in enumerate(rows, start=1):
+        db.execute("INSERT INTO record VALUES (?,?,?,?)",
+                   (rid, uid, "files", kind))
+        for _ in range(chunks):
+            db.execute("INSERT INTO chunk (rid) VALUES (?)", (rid,))
+    return db
+
+
+def shape(rows):
+    """{root: {folder: records}}, which is what the window draws."""
+    return {r["name"]: {c["name"]: c["records"] for c in r["containers"]}
+            for r in index.files_by_root(store(rows))}
+
+
+check("a file in a subfolder is filed under its top folder",
+      shape([("files:work:Reading/a.md", "note", 1),
+             ("files:work:Reading/deep/b.md", "note", 1)]),
+      {"work": {"Reading": 2}})
+
+# 🛑 THE WHOLE POINT. Both roots have a `Reading`, and the flat list merged
+# them into one row of 3.
+check("two folders with the same subfolder stay apart",
+      shape([("files:work:Reading/a.md", "note", 1),
+             ("files:legal:Reading/b.md", "note", 1),
+             ("files:legal:Reading/c.md", "note", 1)]),
+      {"work": {"Reading": 1}, "legal": {"Reading": 2}})
+
+# 🛑 THE AMBIGUITY THE CONTAINER CANNOT SETTLE. A file directly in root `work`
+# and a file in a SUBFOLDER named `work` inside it both carry the container
+# `work`. In the uid they differ by one slash, so they are two rows.
+check("loose files are not merged with a subfolder of the same name",
+      shape([("files:work:a.md", "note", 1),
+             ("files:work:work/b.md", "note", 1)]),
+      {"work": {"": 1, "work": 1}})
+
+# ⚠️ "" IS A REAL ROW, not a missing one, and the window labels it.
+check("a folder of nothing but loose files has one empty-named row",
+      shape([("files:legal:a.pdf", "pdf", 1),
+             ("files:legal:b.pdf", "pdf", 1)]),
+      {"legal": {"": 2}})
+
+roots = index.files_by_root(store([
+    ("files:work:Reading/a.md", "note", 3),
+    ("files:work:Reading/b.pdf", "pdf", 7),
+    ("files:work:c.docx", "docx", 2),
+]))
+check("a folder totals its own records", roots[0]["records"], 3)
+# ⚠️ Chunks, not records. They are what the index actually costs, and one long
+# document can outweigh a hundred short ones.
+check("and its own chunks", roots[0]["chunks"], 12)
+# 🛑 THE COUNTS ARE PER FORMAT, which is the summary the window draws under
+# each folder. It is the only place the new formats are visible as such.
+check("and says what formats are in there",
+      roots[0]["kinds"], {"note": 1, "pdf": 1, "docx": 1})
+
+# ⚠️ Ties break on the name. Ordered by size alone, two folders of equal size
+# swap places between refreshes, which reads as data changing.
+check("equal folders sort by name, not at random",
+      [c["name"] for c in index.files_by_root(store([
+          ("files:w:b/1.md", "note", 1), ("files:w:a/1.md", "note", 1),
+          ("files:w:c/1.md", "note", 1)]))[0]["containers"]],
+      ["a", "b", "c"])
+
+check("bigger folders come first",
+      [c["name"] for c in index.files_by_root(store([
+          ("files:w:small/1.md", "note", 1),
+          ("files:w:big/1.md", "note", 1), ("files:w:big/2.md", "note", 1)
+      ]))[0]["containers"]],
+      ["big", "small"])
+
+# 🛑 THE CUT IS PER FOLDER AND AFTER THE FOLD. Cutting first and folding what
+# survives reports a folder short by everything past the cut — a wrong number,
+# where a missing row is only a missing row. `truncated` says it happened.
+many = index.files_by_root(store(
+    [("files:w:f%02d/1.md" % n, "note", 1) for n in range(5)]), limit=3)[0]
+check("the cut keeps the largest", len(many["containers"]), 3)
+check("and says it cut", many["truncated"], True)
+check("and stays quiet when it did not",
+      index.files_by_root(store([("files:w:a/1.md", "note", 1)]))[0]["truncated"],
+      False)
+
+# ⚠️ A record whose uid predates the colon guard is charged to `(unknown)`
+# rather than to the wrong folder. `files add` refuses such a name now.
+check("an unparseable id is not charged to a real folder",
+      shape([("files:nocolonhere", "note", 1)]),
+      {"(unknown)": {"": 1}})
 
 
 if FAILED:

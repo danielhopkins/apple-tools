@@ -59,7 +59,14 @@ emoji-versions    fetches unicode.org's own data files and writes the table
                   below. 🛑 GENERATED, never hand-written. `--check` says stale.
 emoji-versions.txt which emoji arrived in which Emoji version, and the date
                   that version was published. 1,906 emoji, 16 versions.
-vec/              Swift: the embedding model and the dot products.
+vec/              Swift, and it builds TWO binaries from one package:
+                  `vec`     the embedding model and the dot products
+                  `doctext` 🛑 the PDF reader. PDF is the one format the index
+                            cannot read in Python: /usr/bin/python3 is 3.9.6
+                            with no Quartz, and `mdimport -t -d3` IS PDFKit
+                            at three times the cost
+test-doctext.py   builds its own PDFs and checks the reader. 🛑 It pins a
+                  REFUSAL: a low-prose page is reported, never dropped
 Makefile          build, demo, clean
 index.db          created by `./index.py init`. Not committed.
 ```
@@ -118,14 +125,125 @@ panel.
 - **An Obsidian vault is recognised**, and `.obsidian` is skipped along with
   `.git`, `node_modules`, `__pycache__` and any `Attachments` folder. On this
   vault those hold 959 MB of binaries next to 5.6 MB of text.
-- Extensions read: `.md`, `.markdown`, `.txt`. A file over 2 MB is skipped, so
-  one runaway export cannot become 40% of the index.
+- Extensions read: `.md`, `.markdown`, `.txt`, `.docx`, `.pptx`, `.pdf`. Text
+  over 2 MB is truncated, so one runaway export cannot become 40% of the index.
+  On this machine the three configured roots hold 9.42M characters of markdown
+  and text, and the new formats add 5.07M more.
+- 🛑 **THE CAP COUNTS EXTRACTED TEXT, NOT FILE BYTES**, and it used to count
+  bytes. A PDF's bytes are mostly pictures: 30 of the 159 PDFs here and 7 of
+  the 61 Office files sit above 2 MB on disk while holding ordinary amounts of
+  text, so a byte cap threw a quarter of the corpus away for the wrong reason.
+  A far higher byte guard remains, so nothing tries to unzip a DVD image that
+  happens to end in `.docx`.
+- **`kind` names the format**: `note` for markdown in a vault, `file` for text
+  outside one, and `pdf`, `docx`, `pptx` for the rest. ⚠️ `search` has no
+  `--kind` flag — it is reported in `--json`, so filter with `jq`.
+- 🛑 **`.xlsx` is deliberately absent.** A spreadsheet's shared-string table is
+  labels and codes rather than prose, and the 6 files here would add 1.22M
+  characters of it. Diluting the ranking is a real cost for a small gain.
+- 🛑 **A SCAN CANNOT BE INDEXED, AND IS REPORTED RATHER THAN FAKED.** 20 of the
+  159 PDFs here have no text layer, and nothing on this machine does OCR.
+  `ingest` names the count on stderr. A record with no words in it would look
+  indexed and could never match.
+
+**Word and PowerPoint need no dependency, and PDF needs a binary.**
+
+A `.docx` is a zip of XML, so `zipfile` and `ElementTree` read it in process:
+55 of 55 files here decoded with no failures in 0.19s. PDF has no such route,
+and all three alternatives were measured and rejected:
+
+| Route | Real text | Time | Size | Runs on `/usr/bin/python3` |
+|---|---|---|---|---|
+| **`doctext`, PDFKit** | 3.99M | **5.3s** | 105 KB | it is Swift |
+| `pypdf`, vendored | 4.87M | 46.3s | 1.9 MB | yes |
+| MarkItDown | 5.30M | 108.8s | 318 MB | 🛑 **no**, it needs 3.10 |
+| `mdimport -t -d3` | identical to PDFKit | ~16s | 0 | yes |
+
+- 🛑 **MarkItDown cannot run here at all.** `bin/apple-index` execs
+  `/usr/bin/python3`, which is **3.9.6**, and MarkItDown needs 3.10 or later.
+  Running it would mean a 318 MB venv inside the Homebrew formula and the app
+  bundle, against a wrapper whose own comment reads "nothing to install".
+- 🛑 **SPOTLIGHT'S PDF IMPORTER *IS* PDFKIT.** `mdimport -e` names it
+  `com.apple.PDFKit.PDFImporter`, living in `PDFKit.framework`. Its text is
+  byte-identical to `doctext`'s, garbling included, at three times the cost.
+  ⚠️ `mdimport -d2` excludes `kMDItemTextContent` by design; `-t -d3` returns
+  it. It is still the only route to `.pages`, `.numbers` and `.key`, which
+  nothing else here reads — see the layered plan at the end of this section.
+- ⚠️ **`mdimport -o` does not write a parseable plist.** It is an old-style
+  ASCII dump containing `{length = 0, bytes = 0x}`, which is `NSData`'s
+  description; both `plutil` and Python's `plistlib` reject it.
+- ⚠️ **The dump also leaks provenance.** Importing one `.docx` here returned
+  `kMDItemOriginApplicationIdentifier = com.apple.mail` and the recipient
+  address, which is more than the file's text.
+
+🛑 **EVERY PDF EXTRACTOR FAILS ON A BROKEN ToUnicode MAP, AND `doctext` DOES
+NOT TRY TO HIDE IT.** One page of a real budget letter, whose true first line
+is "To the Joint Budget Committee and the General Assembly:", comes out three
+different wrong ways:
+
+```
+PDFKit       To e o Be ommee e Geer emb
+pypdf        To WKe -oLQW BXGJeW &ommLWWee DQG WKe GeQerDO $VVembO\
+MarkItDown   (cid:42)(cid:50)(cid:57)(cid:40)(cid:53)(cid:49)(cid:50)(cid:53)
+```
+
+🛑 **`doctext` was built to detect and drop that wreckage, and the measurement
+says it cannot be done.** The signal tried was the rate of common English
+function words, which a broken glyph map destroys. Three confounds killed it,
+each found only by reading real files:
+
+1. **The garbling is per page, not per document.** That letter is 88 pages; one
+   is wrecked. The document scores 0.174, inside the ordinary bottom decile and
+   indistinguishable from a resume at 0.196. So the score went per page.
+2. **The word list is English, so another language scores zero.** "Join PTA
+   Flyer - Spanish.pdf" scores 0.000 and is a perfectly good document. So pages
+   are judged against the other pages of their own document, which cancels the
+   language out.
+3. 🛑 **And then a list scores zero too, which is fatal.** A list is not
+   sentences. Of the 71 pages this flagged across 159 real PDFs, the ones read
+   by hand were a plant list and a page headed CONTACT LIST holding the HOA's
+   insurer, animal control and the police — the most retrievable page in the
+   file.
+
+So **nothing is ever dropped**. `low_prose_pages` is reported and named for
+what it actually measures. ⚠️ **Read it as "a list, a table or another
+language" far more often than as "broken".** It is a hint for a human reading
+the JSON, never a filter. `lab/test-doctext.py` pins the refusal.
+
+**Still to do: `.pages`, `.numbers`, `.key`, `.doc`, `.rtf`, `.odt`.**
+`mdimport -t -d3` is the only route and it works — it read a `.numbers` file
+here that nothing else can — but it costs a parser for that malformed dump.
+27 such files sit on this machine.
 - 🛑 **ADDING A FOLDER DOES NOT INDEX IT, AND REMOVING ONE DOES NOT UNINDEX IT.**
   `ingest` only ever adds, so the records from a removed folder survive until
   `apple-index ingest --source files --full`.
-- 🛑 **`stats` reports this source by TOP-LEVEL FOLDER, alone among the
-  sources.** Its `container` is a whole relative path rather than a flat name,
-  so the raw listing was 49 rows here, most of them a subfolder of another row,
+- 🛑 **`stats` NESTS this source, alone among the sources**, because it is the
+  only one with two levels: the folders the user configured and the folders
+  inside them. `stats` carries a `roots` array beside the flat `containers`
+  one — per configured folder, its own records, chunks, a `kinds` count per
+  format, and its own top-level folders. The window draws `roots`.
+  - 🛑 **THE ROOT COMES OUT OF THE `uid`, NOT THE CONTAINER**, and that is what
+    made nesting possible at all. A container is a path relative to whichever
+    root holds it, so two roots that each hold a `Reading` folder are one row
+    and nothing says which is which — drawing that under a configured folder
+    would attribute somebody else's files to it. The uid is
+    `files:<name>:<relative>` and carries both halves.
+  - 🛑 **IT ALSO SETTLES AN AMBIGUITY THE CONTAINER CANNOT.** A file sitting
+    directly in root `work` is filed under the container `work`, and so is a
+    file in a SUBFOLDER named `work` inside it. In the uid they differ by one
+    slash. Loose files now get their own row, named `""`, which the window
+    labels "files at the top level".
+  - ⚠️ **A ROOT NAME WITH A COLON WOULD BREAK THE SPLIT**, so `files add`
+    refuses one. Anything unparseable lands under `(unknown)` rather than
+    being charged to a real folder.
+  - ⚠️ **The two views do not agree, by design.** `containers` merges roots;
+    `roots` keeps them apart. Read one or the other, never both.
+- 🛑 **A folder removed from the config keeps its records**, so the window
+  lists them under "Still in the index, no longer indexed" rather than letting
+  them vanish from the panel while still costing index space.
+- 🛑 **The flat `containers` list still reports by TOP-LEVEL FOLDER.** Its
+  `container` is a whole relative path rather than a flat name, so the raw
+  listing was 49 rows here, most of them a subfolder of another row,
   ordered by size — an answer to "which folder is biggest", which is nobody's
   question. `top_level_containers` folds them; 49 became 12. ⚠️ **The cut
   applies after the fold**, so the SQL `LIMIT` is dropped for this source:

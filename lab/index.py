@@ -38,6 +38,8 @@ import subprocess
 import sys
 import time
 import urllib.parse
+import zipfile
+import xml.etree.ElementTree as ET
 from datetime import date, datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1411,10 +1413,44 @@ FILE_SKIP_DIRS = {
     "node_modules", "__pycache__", "Attachments", "attachments",
     ".smart-connections", ".makemd",
 }
-FILE_EXTENSIONS = {".md", ".markdown", ".txt"}
+# Read straight off disk as text.
+FILE_TEXT_EXTENSIONS = {".md", ".markdown", ".txt"}
+# 🛑 A zip of XML, so `zipfile` reads it and the stdlib-only rule holds. This
+# is the whole reason Word needs no dependency. MarkItDown extracts 3.5% more
+# text from the same 55 files and costs 318 MB and Python 3.10 to do it, and
+# `/usr/bin/python3` here is 3.9.6.
+FILE_OFFICE_EXTENSIONS = {".docx", ".pptx"}
+# ⚠️ `.xlsx` is deliberately absent. Its shared-string table is mostly labels
+# and codes rather than prose, and 6 files here would add 1.22M characters of
+# it. Diluting the ranking is a real cost for a small gain.
+#
+# 🛑 PDF NEEDS A BINARY, and every other route was measured and rejected:
+# `textutil` does not read PDF, the system Python has no Quartz, and
+# `mdimport -t -d3` IS PDFKit (`mdimport -e` names its importer
+# com.apple.PDFKit.PDFImporter) at three times the cost.
+FILE_PDF_EXTENSIONS = {".pdf"}
+FILE_EXTENSIONS = (FILE_TEXT_EXTENSIONS | FILE_OFFICE_EXTENSIONS
+                   | FILE_PDF_EXTENSIONS)
+
 # ⚠️ A cap, because one runaway export should not become 40% of the index. The
 # largest real note in this vault is 701 KB, so this keeps everything genuine.
-FILE_MAX_BYTES = 2 * 1024 * 1024
+#
+# 🛑 IT COUNTS EXTRACTED TEXT, NOT FILE BYTES, and it used to count bytes. A
+# PDF's bytes are mostly pictures: 30 of the 159 PDFs here and 7 of the 61
+# Office files exceed 2 MB on disk while holding ordinary amounts of text, so
+# a byte cap threw away a quarter of the corpus for the wrong reason.
+FILE_MAX_TEXT = 2 * 1024 * 1024
+# ⚠️ A byte guard remains, far higher, so nothing tries to unzip a DVD image
+# that happens to end in .docx.
+FILE_MAX_BYTES = 200 * 1024 * 1024
+
+# ⚠️ Two layouts, exactly as VEC above: a SwiftPM build product in the
+# checkout, or a sibling in an install.
+DOCTEXT = next((candidate for candidate in
+                (os.path.join(HERE, "vec", ".build", "release", "doctext"),
+                 os.path.join(HERE, "doctext"))
+                if os.path.isfile(candidate)),
+               os.path.join(HERE, "vec", ".build", "release", "doctext"))
 
 
 def files_roots():
@@ -1481,28 +1517,151 @@ def flatten_markdown(text):
     return text
 
 
+# --------------------------------------------------------------------------
+# getting text out of the formats that are not text
+# --------------------------------------------------------------------------
+
+_DOCX_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_PPTX_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+
+
+def _docx_text(path):
+    """A Word document, read straight out of its zip.
+
+    🛑 ElementTree, NOT a regex over the XML. A regex has to un-escape entities
+    by hand, and `&amp;` in a company name is not rare. The parser does it.
+
+    ⚠️ Paragraphs are walked in document order, and a table cell holds ordinary
+    paragraphs, so tables come through without a second code path.
+    """
+    with zipfile.ZipFile(path) as archive:
+        root = ET.fromstring(archive.read("word/document.xml"))
+    lines = []
+    for paragraph in root.iter(_DOCX_NS + "p"):
+        parts = []
+        for element in paragraph.iter():
+            if element.tag == _DOCX_NS + "t":
+                parts.append(element.text or "")
+            elif element.tag == _DOCX_NS + "tab":
+                parts.append("\t")
+            elif element.tag == _DOCX_NS + "br":
+                parts.append("\n")
+        line = "".join(parts).strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _pptx_text(path):
+    """A PowerPoint deck, one slide at a time.
+
+    🛑 SLIDES SORT NUMERICALLY, NOT AS STRINGS. `slide10.xml` sorts before
+    `slide2.xml` alphabetically, which silently reorders any deck of ten or
+    more and makes the text read as nonsense.
+    """
+    def slide_number(name):
+        digits = re.search(r"(\d+)", os.path.basename(name))
+        return int(digits.group(1)) if digits else 0
+
+    with zipfile.ZipFile(path) as archive:
+        names = [n for n in archive.namelist()
+                 if re.match(r"ppt/slides/slide\d+\.xml$", n)]
+        lines = []
+        for name in sorted(names, key=slide_number):
+            root = ET.fromstring(archive.read(name))
+            for paragraph in root.iter(_PPTX_NS + "p"):
+                line = "".join(element.text or ""
+                               for element in paragraph.iter(_PPTX_NS + "t")).strip()
+                if line:
+                    lines.append(line)
+    return "\n".join(lines)
+
+
+def office_text(path):
+    """Text from a .docx or .pptx, or None when it cannot be read.
+
+    ⚠️ Never raises. A corrupt zip, a password-protected document and a file
+    that is not really Office at all all read as "no text", which is the same
+    answer the caller has to handle anyway.
+    """
+    try:
+        if path.lower().endswith(".docx"):
+            return _docx_text(path)
+        if path.lower().endswith(".pptx"):
+            return _pptx_text(path)
+    except (zipfile.BadZipFile, KeyError, ET.ParseError, OSError, ValueError):
+        return None
+    return None
+
+
+def pdf_text(paths):
+    """{path: text} for every PDF `doctext` could read.
+
+    🛑 ONE PROCESS FOR THE WHOLE BATCH. 159 PDFs cost 5.3s in one process, and
+    most of that is the extraction itself; spawning one process per file adds
+    more overhead than the work costs. `doctext -` reads paths from stdin for
+    exactly this.
+
+    ⚠️ A MISSING BINARY IS A WARNING, NOT A FAILURE. Everything else in the
+    source still indexes, the same way an absent `emoji-versions.txt` costs one
+    section rather than the report. It says so once, naming the build command.
+    """
+    if not paths:
+        return {}
+    if not os.path.isfile(DOCTEXT):
+        sys.stderr.write(
+            "doctext is not built, so %d PDF%s will not be indexed.\n"
+            "  build it with:  make -C %s\n"
+            % (len(paths), "" if len(paths) == 1 else "s", HERE))
+        return {}
+    proc = subprocess.run([DOCTEXT, "-"], input="\n".join(paths),
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                          text=True)
+    out, skipped = {}, {}
+    for line in proc.stdout.splitlines():
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if record.get("ok") and record.get("text"):
+            out[record["path"]] = record["text"]
+        else:
+            skipped[record.get("reason", "unknown")] = \
+                skipped.get(record.get("reason", "unknown"), 0) + 1
+    # 🛑 SAY WHAT WAS SKIPPED AND WHY. A scan has no text layer and nothing here
+    # does OCR, so 20 of the 159 PDFs on this machine cannot be indexed at all.
+    # Silence would make that look like they had been indexed and simply never
+    # matched anything.
+    for reason, count in sorted(skipped.items()):
+        sys.stderr.write("skipped %d PDF%s: %s\n"
+                         % (count, "" if count == 1 else "s", reason))
+    return out
+
+
 def obsidian_url(root, relative):
+    """🛑 THE EXTENSION IS DROPPED ONLY FOR A NOTE.
+
+    Obsidian addresses a markdown note without its extension, and that is what
+    this always did. A PDF or a Word file in the same vault needs the FULL
+    name: strip `.pdf` and the link resolves to nothing, silently, opening the
+    vault at whatever Obsidian decides instead of the file that was found.
+    """
+    stem, extension = os.path.splitext(relative)
+    name = stem if extension.lower() in (".md", ".markdown") else relative
     return "obsidian://open?vault=%s&file=%s" % (
         urllib.parse.quote(os.path.basename(root["path"])),
-        urllib.parse.quote(os.path.splitext(relative)[0]))
+        urllib.parse.quote(name))
 
 
-def ingest_files(opts):
-    """Markdown and text files from configured roots, Obsidian understood.
+def files_candidates(roots, limit=0):
+    """Every file the `files` source will read, walked once.
 
-    🛑 THE PATH IS THE DESCRIPTION, and it is stored as `container` rather than
-    smeared into the text. A note in `11 - 🤝 Volunteering/Columbine PTA/` is
-    filed there by the user; that is a real fact about the file. Writing a
-    hand-maintained folder description instead would be a second thing to keep
-    true, and it goes stale silently.
+    🛑 A SEPARATE PASS BECAUSE PDF EXTRACTION IS BATCHED. `doctext` reads a
+    whole list of paths in one process, so the walk has to finish before any
+    PDF can be read, and a generator that yielded as it walked could not do
+    that. Returns a list of (root, path, relative, stat, vault).
     """
-    roots = files_roots()
-    if not roots:
-        sys.stderr.write(
-            "no file roots configured. Add one:\n"
-            "  apple-index files add ~/path/to/vault\n")
-        return
-    seen = 0
+    found = []
     for root in roots:
         base = root["path"]
         if not os.path.isdir(base):
@@ -1522,78 +1681,138 @@ def ingest_files(opts):
                 except OSError:
                     continue
                 if stat.st_size > FILE_MAX_BYTES:
-                    sys.stderr.write("skipping %.1f MB file: %s\n"
+                    sys.stderr.write("skipping %.0f MB file: %s\n"
                                      % (stat.st_size / 1e6, path))
                     continue
-                if opts.limit and seen >= opts.limit:
-                    return
-                seen += 1
-                try:
-                    raw = open(path, encoding="utf-8", errors="replace").read()
-                except OSError:
-                    continue
+                found.append((root, path, os.path.relpath(path, base),
+                              stat, vault))
+                if limit and len(found) >= limit:
+                    return found
+    return found
 
-                relative = os.path.relpath(path, base)
-                fields, body = parse_frontmatter(raw) if vault else ({}, raw)
-                body = flatten_markdown(body)
 
-                # ⚠️ Frontmatter goes in the body as `key: value` lines, because
-                # that is how it is searched. `type: person` is invisible
-                # otherwise — the word "person" appears nowhere in the note.
-                meta_lines = []
-                for key, value in fields.items():
-                    if key in ("cover", "isbn13", "isbn", "goodreads"):
-                        continue      # identifiers, not language
-                    text = ", ".join(value) if isinstance(value, list) else value
-                    if text:
-                        # ⚠️ FLATTEN THESE TOO. Frontmatter carries wikilinks —
-                        # `source: "[[2026-08-22 COPTA BOD Meeting]]"` — and
-                        # flattening only the body left 52 records with raw
-                        # brackets around the very names that make them
-                        # findable.
-                        meta_lines.append("%s: %s"
-                                          % (key, flatten_markdown(text).strip('"')))
+def file_body(path, extension, vault, pdf_texts):
+    """(fields, body, kind) for one file, or None when there is nothing to read.
 
-                title = (fields.get("title") if isinstance(fields.get("title"), str)
-                         else None)
-                if not title:
-                    heading = re.search(r"^#\s+(.+)$", body, re.M)
-                    title = heading.group(1).strip() if heading else \
-                        os.path.splitext(name)[0]
+    ⚠️ ONLY A TEXT FILE HAS FRONTMATTER. A `.docx` beginning with `---` is not
+    an Obsidian note, and parsing one as such would eat its first paragraph.
+    """
+    if extension in FILE_PDF_EXTENSIONS:
+        text = pdf_texts.get(path)
+        return (({}, text, "pdf") if text else None)
+    if extension in FILE_OFFICE_EXTENSIONS:
+        text = office_text(path)
+        if not text:
+            # ⚠️ Named, not silent. An unreadable Office file is rare enough
+            # that seeing it is worth more than a tidy run.
+            sys.stderr.write("skipping unreadable %s: %s\n"
+                             % (extension.lstrip("."), path))
+            return None
+        return {}, text, extension.lstrip(".")
+    try:
+        raw = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return None
+    fields, body = parse_frontmatter(raw) if vault else ({}, raw)
+    return fields, flatten_markdown(body), ("note" if vault else "file")
 
-                folder = os.path.dirname(relative)
-                rendered = ("\n".join(meta_lines) + "\n\n" + body).strip()
-                yield {
-                    "uid": "files:%s:%s" % (root["name"], relative),
-                    "latitude": None, "longitude": None,
-                    "tool": "files",
-                    "kind": "note" if vault else "file",
-                    "native_id": path,
-                    # 🛑 A REAL DEEP LINK, which most sources here cannot offer.
-                    # `obsidian://open` opens the note itself.
-                    "url": obsidian_url(root, relative) if vault else "file://"
-                           + urllib.parse.quote(path),
-                    "title": title,
-                    "container": folder or root["name"],
-                    "created": stat.st_birthtime if hasattr(stat, "st_birthtime")
-                               else stat.st_ctime,
-                    "modified": stat.st_mtime,
-                    # A dated note is dated by its own frontmatter; everything
-                    # else by when it was last written.
-                    "occurred": epoch(fields.get("date") if isinstance(
-                        fields.get("date"), str) else None) or stat.st_mtime,
-                    "people": [],
-                    "body": rendered,
-                    # 🛑 HASH WHAT THIS ADAPTER PRODUCES, not the file's stats.
-                    # A rev of mtime+size tracks the FILE, so improving how the
-                    # adapter renders a note — flattening frontmatter
-                    # wikilinks, say — reaches no existing record: the file did
-                    # not change, so `ingest` reports `+0 ~0 -0` and the fix
-                    # silently never lands. Hashing the rendered body costs
-                    # nothing, because the body is already in memory.
-                    "rev": rev_of(title, folder, rendered),
-                }
 
+def ingest_files(opts):
+    """Text, Markdown, Word, PowerPoint and PDF from the configured roots.
+
+    🛑 THE PATH IS THE DESCRIPTION, and it is stored as `container` rather than
+    smeared into the text. A note in `11 - 🤝 Volunteering/Columbine PTA/` is
+    filed there by the user; that is a real fact about the file. Writing a
+    hand-maintained folder description instead would be a second thing to keep
+    true, and it goes stale silently.
+    """
+    roots = files_roots()
+    if not roots:
+        sys.stderr.write(
+            "no file roots configured. Add one:\n"
+            "  apple-index files add ~/path/to/vault\n")
+        return
+
+    candidates = files_candidates(roots, opts.limit)
+    pdf_texts = pdf_text([path for _, path, _, _, _ in candidates
+                          if path.lower().endswith(".pdf")])
+
+    for root, path, relative, stat, vault in candidates:
+        extension = os.path.splitext(path)[1].lower()
+        read = file_body(path, extension, vault, pdf_texts)
+        if read is None:
+            continue
+        fields, body, kind = read
+
+        # 🛑 THE CAP IS ON EXTRACTED TEXT, NOT ON FILE BYTES. See FILE_MAX_TEXT.
+        if len(body) > FILE_MAX_TEXT:
+            sys.stderr.write("truncating %.1f MB of text: %s\n"
+                             % (len(body) / 1e6, path))
+            body = body[:FILE_MAX_TEXT]
+
+        # ⚠️ Frontmatter goes in the body as `key: value` lines, because
+        # that is how it is searched. `type: person` is invisible
+        # otherwise — the word "person" appears nowhere in the note.
+        meta_lines = []
+        for key, value in fields.items():
+            if key in ("cover", "isbn13", "isbn", "goodreads"):
+                continue      # identifiers, not language
+            text = ", ".join(value) if isinstance(value, list) else value
+            if text:
+                # ⚠️ FLATTEN THESE TOO. Frontmatter carries wikilinks —
+                # `source: "[[2026-08-22 COPTA BOD Meeting]]"` — and
+                # flattening only the body left 52 records with raw
+                # brackets around the very names that make them
+                # findable.
+                meta_lines.append("%s: %s"
+                                  % (key, flatten_markdown(text).strip('"')))
+
+        title = (fields.get("title") if isinstance(fields.get("title"), str)
+                 else None)
+        if not title:
+            # ⚠️ A markdown heading titles a note. It must NOT title a PDF or a
+            # Word file: `# ` is ordinary prose there, and a body that happens
+            # to contain one would be titled by a random line of itself.
+            heading = (re.search(r"^#\s+(.+)$", body, re.M)
+                       if kind in ("note", "file") else None)
+            title = heading.group(1).strip() if heading else \
+                os.path.splitext(os.path.basename(path))[0]
+
+        folder = os.path.dirname(relative)
+        rendered = ("\n".join(meta_lines) + "\n\n" + body).strip()
+        yield {
+            "uid": "files:%s:%s" % (root["name"], relative),
+            "latitude": None, "longitude": None,
+            "tool": "files",
+            # ⚠️ `note` and `file` keep their old meanings so existing records
+            # do not all churn; a PDF, a docx and a pptx are named for what
+            # they are, so `search --kind pdf` works.
+            "kind": kind,
+            "native_id": path,
+            # 🛑 A REAL DEEP LINK, which most sources here cannot offer.
+            # `obsidian://open` opens the note itself.
+            "url": obsidian_url(root, relative) if vault else "file://"
+                   + urllib.parse.quote(path),
+            "title": title,
+            "container": folder or root["name"],
+            "created": stat.st_birthtime if hasattr(stat, "st_birthtime")
+                       else stat.st_ctime,
+            "modified": stat.st_mtime,
+            # A dated note is dated by its own frontmatter; everything
+            # else by when it was last written.
+            "occurred": epoch(fields.get("date") if isinstance(
+                fields.get("date"), str) else None) or stat.st_mtime,
+            "people": [],
+            "body": rendered,
+            # 🛑 HASH WHAT THIS ADAPTER PRODUCES, not the file's stats.
+            # A rev of mtime+size tracks the FILE, so improving how the
+            # adapter renders a note — flattening frontmatter
+            # wikilinks, say — reaches no existing record: the file did
+            # not change, so `ingest` reports `+0 ~0 -0` and the fix
+            # silently never lands. Hashing the rendered body costs
+            # nothing, because the body is already in memory.
+            "rev": rev_of(title, folder, rendered),
+        }
 
 ADAPTERS = {
     "notes": ingest_notes,
@@ -3243,6 +3462,17 @@ def cmd_files(opts):
                 print("already indexed: %s" % path)
             return
         name = opts.name or os.path.basename(path.rstrip("/"))
+        # 🛑 A COLON WOULD BREAK THE `uid`, WHICH IS THE ONLY THING THAT SAYS
+        # WHICH FOLDER A RECORD CAME FROM. A record's uid is
+        # `files:<name>:<relative path>`, and `files_by_root` splits it on the
+        # first colon after `files:` to nest the window's breakdown. A name
+        # holding one would charge every file in this folder to a folder that
+        # does not exist — silently, since the split still succeeds.
+        if ":" in name:
+            die("a folder name cannot contain a colon: %r\n"
+                "  It is the separator inside every record's id.\n"
+                "  Pass a different one:  --name %s"
+                % (name, name.replace(":", "-")))
         roots.append({"path": path, "name": name,
                       "exclude": opts.exclude.split(",") if opts.exclude else []})
         write_files_config(config)
@@ -3496,6 +3726,75 @@ def top_level_containers(parts, limit=None):
     return out[:limit] if limit else out
 
 
+def files_by_root(db, limit=60):
+    """The `files` source broken down by indexed folder, then by top folder.
+
+    🛑 THE ROOT COMES OUT OF THE `uid`, NOT THE CONTAINER, and that is the
+    whole reason this can nest at all. A record's `container` is its path
+    RELATIVE to whichever root holds it, so two roots that each have a
+    `Reading` folder are one row and nothing says which root either came from.
+    Drawing that under a configured folder would attribute somebody else's
+    files to it — which is exactly why the window listed them flat until now.
+
+    The uid is `files:<root name>:<relative path>`, so it carries both halves.
+
+    🛑 IT ALSO SETTLES AN AMBIGUITY THE CONTAINER CANNOT. A file sitting
+    directly in root `work` is filed under the container `work`, and so is a
+    file in a SUBFOLDER named `work` inside it. The two are indistinguishable
+    once you have only the container. In the uid they are not: `files:work:a.md`
+    has no slash after the root and `files:work:work/a.md` does. So a root's
+    own loose files get their own row, named "", rather than being merged with
+    a subfolder that happens to share the root's name.
+
+    ⚠️ A ROOT NAME CONTAINING A COLON WOULD BREAK THE SPLIT, so `files add`
+    refuses one. A record predating that refusal lands under `(unknown)` rather
+    than being charged to the wrong folder.
+
+    Returns a list of roots, each with its own `containers`, `records`,
+    `chunks` and a `kinds` count. Ordered by size, ties broken on the name.
+    """
+    roots = {}
+    for row in db.execute("""
+            SELECT r.uid, r.kind, COUNT(c.cid) chunks
+            FROM record r LEFT JOIN chunk c ON c.rid = r.rid
+            WHERE r.tool = 'files' GROUP BY r.rid"""):
+        # `files:` is 6 characters, so the rest is `<root>:<relative>`.
+        rest = row["uid"][6:] if row["uid"].startswith("files:") else ""
+        name, _, relative = rest.partition(":")
+        if not _:
+            name, relative = "(unknown)", rest
+        root = roots.setdefault(name, {"name": name, "records": 0, "chunks": 0,
+                                       "kinds": {}, "_folders": {}})
+        root["records"] += 1
+        root["chunks"] += row["chunks"]
+        root["kinds"][row["kind"]] = root["kinds"].get(row["kind"], 0) + 1
+        # ⚠️ "" IS A REAL ROW, not a missing one: the root's own loose files.
+        # The caller labels it; inventing a name here would collide with a
+        # subfolder of that name, which is the bug this function exists to fix.
+        head = relative.split("/", 1)[0] if "/" in relative else ""
+        folder = root["_folders"].setdefault(head, {"name": head, "records": 0,
+                                                    "chunks": 0})
+        folder["records"] += 1
+        folder["chunks"] += row["chunks"]
+
+    out = []
+    for root in roots.values():
+        folders = root.pop("_folders")
+        # ⚠️ Ties break on the name. Ordered by size alone, two folders of
+        # equal size swap places between refreshes, which reads as data
+        # changing. Same rule `top_level_containers` uses.
+        root["containers"] = sorted(folders.values(),
+                                    key=lambda f: (-f["records"], f["name"]))
+        # 🛑 THE CUT IS PER ROOT AND AFTER THE FOLD, for the same reason the
+        # flat list's is: folding a truncated list reports a folder short by
+        # whatever fell past the cut, and a wrong number is worse than a
+        # missing row. `truncated` says when it happened.
+        root["truncated"] = len(root["containers"]) > limit
+        root["containers"] = root["containers"][:limit]
+        out.append(root)
+    return sorted(out, key=lambda r: (-r["records"], r["name"]))
+
+
 def cmd_places(opts):
     """Everywhere the user has been, from the two sources that know.
 
@@ -3670,10 +3969,21 @@ def cmd_stats(opts):
             parts = top_level_containers(parts, 60)
         state = db.execute("SELECT updated FROM source_state WHERE tool = ?",
                            (row["tool"],)).fetchone()
-        sources.append({"tool": row["tool"], "records": row["records"],
-                        "chunks": row["chunks"],
-                        "updated": state["updated"] if state else None,
-                        "containers": parts})
+        source = {"tool": row["tool"], "records": row["records"],
+                  "chunks": row["chunks"],
+                  "updated": state["updated"] if state else None,
+                  "containers": parts}
+        # 🛑 `files` ALONE GETS A SECOND, NESTED VIEW, because it is the only
+        # source with two levels: the folders the user configured, and the
+        # folders inside them. `containers` stays exactly as it was so nothing
+        # reading it breaks; `roots` is what the window draws.
+        #
+        # ⚠️ THEY ARE NOT THE SAME NUMBERS AND MUST NOT BE READ AS SUCH. The
+        # flat list merges two roots that each hold a `Reading` folder into one
+        # row; the nested one keeps them apart. See `files_by_root`.
+        if folds:
+            source["roots"] = files_by_root(db)
+        sources.append(source)
 
     history = [{"ts": h["ts"], "tool": h["tool"],
                 "records": h["records"], "chunks": h["chunks"]}

@@ -9,7 +9,7 @@ UV      := $(shell command -v uv)
 
 .PHONY: build install uninstall install-agent uninstall-agent agent-status \
         install-skill link-installed-skills uninstall-skill demo status test \
-        test-people test-files test-photos bench bench-compare bench-clean clean
+        test-people test-files test-doctext test-photos bench bench-compare bench-clean clean
 
 ## Build the Swift embedder (Core ML + Apple's models)
 build:
@@ -124,6 +124,7 @@ test:
 	./index.py selfcheck
 	./test-people.py
 	./test-files.py
+	./test-doctext.py
 	./test-photos.py
 	./test-incremental.py --source mail,calendar,notes,messages
 	./eval.py
@@ -152,10 +153,17 @@ bench-clean:
 test-people:
 	./test-people.py
 
-## Where the `files` source keeps its configuration. Offline, and it pins the
-## bug that put it inside the encrypted vault, where an unmount took it away.
+## Where the `files` source keeps its configuration, and how it reads Word,
+## PowerPoint and the Obsidian deep link. Offline. It pins the bug that put the
+## configuration inside the encrypted vault, where an unmount took it away.
 test-files:
 	./test-files.py
+
+## The PDF reader. Offline: it builds its own PDFs. 🛑 It pins a REFUSAL — that
+## a page carrying little prose is reported and never dropped, because the
+## pages an earlier version wanted to drop were contact lists.
+test-doctext: build
+	./test-doctext.py
 
 ## Offline checks for the Photos reader and the Contacts-id handle
 test-photos:

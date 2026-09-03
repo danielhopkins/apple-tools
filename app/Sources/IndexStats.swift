@@ -14,6 +14,26 @@ struct Container: Identifiable, Equatable {
     let chunks: Int
 }
 
+/// One configured folder of the `files` source, with the folders inside it.
+///
+/// 🛑 `files` IS THE ONLY SOURCE WITH TWO LEVELS. Every other one files a
+/// record under one flat name — an account, a mailbox, a calendar, a list. A
+/// file is filed under a path inside a folder the user chose, so its breakdown
+/// nests and no other source's does.
+struct RootStat: Identifiable, Equatable {
+    var id: String { name }
+    let name: String
+    let records: Int
+    let chunks: Int
+    /// How many records of each `kind`: `note`, `file`, `pdf`, `docx`, `pptx`.
+    let kinds: [String: Int]
+    let containers: [Container]
+    /// ⚠️ Set when this root has more top-level folders than were sent. The cut
+    /// happens per root and AFTER the fold, so a hidden row is a whole missing
+    /// folder rather than a number that is quietly short.
+    let truncated: Bool
+}
+
 struct SourceStat: Identifiable, Equatable {
     var id: String { tool }
     let tool: String
@@ -21,6 +41,8 @@ struct SourceStat: Identifiable, Equatable {
     let chunks: Int
     let updated: Date?
     let containers: [Container]
+    /// `files` only, and empty for every other source.
+    let roots: [RootStat]
 }
 
 struct HistoryPoint: Identifiable, Equatable {
@@ -106,6 +128,24 @@ enum StatsReader {
                     Container(name: $0["name"] as? String ?? "?",
                               records: $0["records"] as? Int ?? 0,
                               chunks: $0["chunks"] as? Int ?? 0)
+                },
+                // ⚠️ Absent for every source but `files`, and absent is not an
+                // error: `roots` is a second view of the same records, not a
+                // field every source has.
+                roots: (entry["roots"] as? [[String: Any]] ?? []).map { root in
+                    RootStat(
+                        name: root["name"] as? String ?? "?",
+                        records: root["records"] as? Int ?? 0,
+                        chunks: root["chunks"] as? Int ?? 0,
+                        kinds: root["kinds"] as? [String: Int] ?? [:],
+                        containers: (root["containers"] as? [[String: Any]] ?? []).map {
+                            // 🛑 AN EMPTY NAME IS A REAL ROW: the folder's own
+                            // loose files. It must not be defaulted to "?".
+                            Container(name: $0["name"] as? String ?? "",
+                                      records: $0["records"] as? Int ?? 0,
+                                      chunks: $0["chunks"] as? Int ?? 0)
+                        },
+                        truncated: root["truncated"] as? Bool ?? false)
                 })
         }
         stats.history = (root["history"] as? [[String: Any]] ?? []).compactMap {

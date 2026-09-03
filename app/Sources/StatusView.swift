@@ -364,7 +364,12 @@ private struct SourceRow: View {
             // the one source whose contents are a decision rather than a store
             // at a fixed path.
             if line.tool == "files" {
-                FolderList(folders: folders)
+                // 🛑 THE BREAKDOWN GOES INSIDE THE EDITOR FOR THIS SOURCE, and
+                // nowhere else. A folder's contents belong under the folder,
+                // and drawing them again in a flat list below would be the
+                // same numbers twice, split differently — see `files_by_root`
+                // in index.py for why the two disagree by design.
+                FolderList(folders: folders, stat: line.stat)
             }
             // 🛑 THE HEADING AND THE FOOTNOTE DO NOT DEPEND ON A BREAKDOWN.
             // They used to sit inside `if !stat.containers.isEmpty`, so the
@@ -373,10 +378,13 @@ private struct SourceRow: View {
             // NOTHING AT ALL. An empty row under a caret reads as a fault in
             // the window rather than as the answer, which for both of those is
             // "there is nothing here, and here is why".
-            Text(heading).font(.caption2.weight(.semibold))
-                .kerning(0.7).foregroundStyle(.tertiary)
-            if let stat = line.stat, !stat.containers.isEmpty {
-                breakdown(stat)
+            // ⚠️ `files` draws its own heading inside FolderList, per folder.
+            if line.tool != "files" {
+                Text(heading).font(.caption2.weight(.semibold))
+                    .kerning(0.7).foregroundStyle(.tertiary)
+                if let stat = line.stat, !stat.containers.isEmpty {
+                    breakdown(stat)
+                }
             }
             // ⚠️ WHAT A RECORD IS, PER SOURCE. "40,473" and "12,904" are drawn
             // in the same column in the same font, and they count different
@@ -431,8 +439,10 @@ private struct SourceRow: View {
                  + "covers only recent months. It is read for the "
                  + "relationships report and never indexed."
         case "files":
-            return "Every .md, .markdown and .txt, down through subfolders. A "
-                 + "file over 2 MB is skipped."
+            return "Every .md, .markdown, .txt, .docx, .pptx and .pdf, down "
+                 + "through subfolders. Text over 2 MB is truncated. A "
+                 + "scanned PDF has no text layer and cannot be indexed at "
+                 + "all; nothing on this Mac does OCR."
         default: return nil
         }
     }
@@ -537,68 +547,261 @@ private struct SourceRow: View {
 
 private struct FolderList: View {
     @ObservedObject var folders: Folders
+    /// ⚠️ Optional, because the window draws before the first `stats` returns
+    /// and a configured folder is real whether or not it has been indexed yet.
+    let stat: SourceStat?
+
+    private func root(named name: String) -> RootStat? {
+        stat?.roots.first { $0.name == name }
+    }
+
+    /// 🛑 EVERY ROOT IN THE INDEX THAT IS NO LONGER A CONFIGURED FOLDER.
+    /// Removing a folder does NOT remove its records — indexing only ever
+    /// adds — so those records keep costing index space with nothing on the
+    /// window to say they are there. They used to vanish from this panel the
+    /// moment the folder was removed, which read as "gone".
+    private var orphans: [RootStat] {
+        let configured = Set(folders.entries.map(\.name))
+        return (stat?.roots ?? []).filter { !configured.contains($0.name) }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Indexed folders").font(.caption2.weight(.semibold))
                 .kerning(0.7).foregroundStyle(.tertiary)
             ForEach(folders.entries) { folder in
-                HStack(spacing: 8) {
-                    Image(systemName: folder.kind == "obsidian"
-                          ? "book.closed" : "folder")
-                        .foregroundStyle(folder.kind == "obsidian"
-                                         ? Color.accentColor : Color.secondary)
-                        .help(folder.kind == "obsidian" ? "Obsidian vault"
-                                                        : "Plain folder")
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(folder.name).font(.callout)
-                        Text(folder.display)
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1).truncationMode(.middle)
+                VStack(alignment: .leading, spacing: 3) {
+                    header(folder)
+                    if let root = root(named: folder.name) {
+                        summary(root)
+                        contents(root)
+                    } else if folder.present {
+                        Text("not indexed yet")
+                            .font(.caption).foregroundStyle(.tertiary)
+                            .padding(.leading, Indent.body)
                     }
-                    if !folder.present {
-                        Text("missing").font(.caption).foregroundStyle(.orange)
-                    }
-                    if !folder.exclude.isEmpty {
-                        Text("\(folder.exclude.count) skipped")
-                            .font(.caption).foregroundStyle(.secondary)
-                            .help(folder.exclude.joined(separator: ", "))
-                    }
-                    Spacer()
-                    Button("Remove") { folders.remove(folder) }
-                        .controlSize(.small)
-                        .help("Stop indexing this folder")
                 }
+                .padding(.bottom, 4)
             }
-            HStack(spacing: 8) {
-                Button("Add Folder…") { folders.choose() }
-                    .controlSize(.small)
-                    .disabled(folders.busy)
-                // ⚠️ WHAT IS READ IS NOW ON THE PAGE, in this row's footnote.
-                // This button keeps the half nobody expects: what pressing it
-                // does NOT do.
-                Explain("What adding and removing a folder do", """
-                        An Obsidian vault is recognised and its .obsidian \
-                        folder skipped, along with .git, node_modules and any \
-                        Attachments folder.
-
-                        🛑 Adding a folder does not index it — the next run \
-                        does. Removing one does not remove what it already \
-                        put in the index, because indexing only ever adds. \
-                        Those records go when the files source is rebuilt in \
-                        full.
-                        """)
-                if let note = folders.lastAction {
-                    Note(note)
-                }
-                Spacer()
+            if !orphans.isEmpty {
+                orphaned
             }
+            controls
             if let failure = folders.failure {
                 Note(failure, tint: .red)
             }
         }
         .padding(.bottom, 6)
+    }
+
+    private enum Indent {
+        /// Clears the icon and its gap, so a child row starts under the name.
+        static let body: CGFloat = 26
+    }
+
+    // MARK: one configured folder
+
+    @ViewBuilder
+    private func header(_ folder: IndexedFolder) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: folder.kind == "obsidian"
+                  ? "book.closed" : "folder")
+                .foregroundStyle(folder.kind == "obsidian"
+                                 ? Color.accentColor : Color.secondary)
+                .help(folder.kind == "obsidian" ? "Obsidian vault"
+                                                : "Plain folder")
+            VStack(alignment: .leading, spacing: 1) {
+                Text(folder.name).font(.callout)
+                Text(folder.display)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.middle)
+            }
+            if !folder.present {
+                Text("missing").font(.caption).foregroundStyle(.orange)
+            }
+            if !folder.exclude.isEmpty {
+                Text("\(folder.exclude.count) skipped")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .help(folder.exclude.joined(separator: ", "))
+            }
+            Spacer(minLength: 12)
+            // ⚠️ THE PARENT ROW'S COLUMNS, so a folder's total sits directly
+            // under the source's total and the two can be read against each
+            // other. Blank rather than zero when nothing has been indexed.
+            if let root = root(named: folder.name) {
+                Text(Format.count(root.records))
+                    .frame(width: Column.records, alignment: .trailing)
+                Text(Format.count(root.chunks))
+                    .frame(width: Column.chunks, alignment: .trailing)
+            } else {
+                Color.clear.frame(width: Column.records + Column.chunks,
+                                  height: 1)
+            }
+            // 🛑 THE STATE COLUMN'S WIDTH, not the button's own. Without the
+            // frame the button sized itself and pushed this row's two numbers
+            // 44px right of the source row's, so a folder's total no longer
+            // sat under the source total it is part of.
+            Button("Remove") { folders.remove(folder) }
+                .controlSize(.small)
+                .help("Stop indexing this folder")
+                .frame(width: Column.state, alignment: .trailing)
+        }
+        .font(.caption).monospacedDigit()
+    }
+
+    /// What is actually in there, by format.
+    ///
+    /// 🛑 THE COUNTS ARE RECORDS, AND A RECORD IS A FILE HERE. It is worth
+    /// saying because the same column means something different on every other
+    /// source — one email, a block of ten texts, one event.
+    @ViewBuilder
+    private func summary(_ root: RootStat) -> some View {
+        let parts = root.kinds
+            .sorted { ($0.value, $1.key) > ($1.value, $0.key) }
+            .map { "\(Format.count($0.value)) \(Self.label($0.key, $0.value))" }
+        if !parts.isEmpty {
+            Text(parts.joined(separator: " · "))
+                .font(.caption).foregroundStyle(.secondary)
+                .padding(.leading, Indent.body)
+        }
+    }
+
+    /// ⚠️ THE LABEL IS WHAT THE USER CALLS IT, not the `kind` the adapter
+    /// emits. `docx` is a file extension; "Word" is the thing on the screen.
+    private static func label(_ kind: String, _ count: Int) -> String {
+        switch kind {
+        case "note":  return count == 1 ? "note" : "notes"
+        case "file":  return count == 1 ? "text file" : "text files"
+        case "pdf":   return "PDF"
+        case "docx":  return "Word"
+        case "pptx":  return "PowerPoint"
+        default:      return kind
+        }
+    }
+
+    /// The top-level folders inside one configured folder.
+    ///
+    /// 🛑 THE TOP LEVEL, NOT THE BIGGEST FOLDERS. `files` is the one source
+    /// whose container is a PATH rather than a flat name, so it once listed
+    /// every subfolder separately, ordered by size — an answer to "which
+    /// folder is biggest", which is nobody's question. A folder carries its
+    /// own files and everything under it.
+    @ViewBuilder
+    private func contents(_ root: RootStat) -> some View {
+        // ⚠️ A FOLDER WITH NOTHING BUT LOOSE FILES NEEDS NO CHILD ROW. Its one
+        // row would repeat the folder's own totals verbatim, which reads as
+        // two facts and is one.
+        let onlyLoose = root.containers.count == 1
+            && root.containers[0].name.isEmpty
+        VStack(alignment: .leading, spacing: 3) {
+            ForEach(onlyLoose ? [] : root.containers) { part in
+                HStack(spacing: Column.gap) {
+                    // 🛑 AN EMPTY NAME IS THE FOLDER'S OWN LOOSE FILES, and it
+                    // is a real row. It used to be filed under the folder's
+                    // NAME, which collided with a subfolder that happened to
+                    // share it — indistinguishable once you had only the
+                    // container. The uid tells them apart. See index.py.
+                    Text(part.name.isEmpty ? "files at the top level" : part.name)
+                        .font(.system(.caption, design: .monospaced))
+                        .italic(part.name.isEmpty)
+                        .lineLimit(1).truncationMode(.middle)
+                    Spacer(minLength: 12)
+                    // ⚠️ BOTH NUMBERS. Records alone cannot say why one folder
+                    // costs more of the index than another: 225 files in
+                    // Current Work are 5,483 chunks, and 306 in Reading are
+                    // 3,232.
+                    Text(Format.count(part.records))
+                        .frame(width: Column.records, alignment: .trailing)
+                    Text(Format.count(part.chunks))
+                        .frame(width: Column.chunks, alignment: .trailing)
+                    Color.clear.frame(width: Column.state, height: 1)
+                }
+                .font(.caption).monospacedDigit().foregroundStyle(.secondary)
+            }
+            if root.truncated {
+                // ⚠️ SAY WHEN IT WAS CUT. The fold happens before the cut, so a
+                // hidden row is a whole top-level folder — and a short list
+                // used to look exactly like a complete one.
+                Note("The 60 largest folders in here. There are more.",
+                     tint: .orange)
+            }
+        }
+        .padding(.leading, Indent.body)
+    }
+
+    // MARK: records from folders that are no longer configured
+
+    @ViewBuilder
+    private var orphaned: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text("Still in the index, no longer indexed")
+                .font(.caption2.weight(.semibold))
+                .kerning(0.7).foregroundStyle(.tertiary)
+            ForEach(orphans) { root in
+                HStack(spacing: Column.gap) {
+                    Image(systemName: "folder.badge.minus")
+                        .foregroundStyle(.orange)
+                    Text(root.name).font(.system(.caption, design: .monospaced))
+                        .lineLimit(1).truncationMode(.middle)
+                    Spacer(minLength: 12)
+                    Text(Format.count(root.records))
+                        .frame(width: Column.records, alignment: .trailing)
+                    Text(Format.count(root.chunks))
+                        .frame(width: Column.chunks, alignment: .trailing)
+                    Color.clear.frame(width: Column.state, height: 1)
+                }
+                .font(.caption).monospacedDigit().foregroundStyle(.secondary)
+            }
+            Note("Removing a folder does not remove what it already put in "
+                 + "the index. These go when the files source is rebuilt in "
+                 + "full.")
+        }
+        .padding(.bottom, 4)
+    }
+
+    // MARK: add, and the half nobody expects
+
+    @ViewBuilder
+    private var controls: some View {
+        HStack(spacing: 8) {
+            Button("Add Folder…") { folders.choose() }
+                .controlSize(.small)
+                .disabled(folders.busy)
+            // ⚠️ WHAT IS READ IS NOW ON THE PAGE, in this row's footnote.
+            // This button keeps the half nobody expects: what pressing it
+            // does NOT do.
+            Explain("What adding and removing a folder do", """
+                    An Obsidian vault is recognised and its .obsidian \
+                    folder skipped, along with .git, node_modules and any \
+                    Attachments folder.
+
+                    🛑 Adding a folder does not index it — the next run \
+                    does. Removing one does not remove what it already \
+                    put in the index, because indexing only ever adds. \
+                    Those records go when the files source is rebuilt in \
+                    full.
+                    """)
+            if let note = folders.lastAction {
+                Note(note)
+            }
+            Spacer()
+            ExplainLabel("Top-level folders inside each indexed folder",
+                         "How a folder is counted", """
+                         One row per top-level folder, carrying its own files \
+                         and everything in its subfolders.
+
+                         Records are files. Chunks are the pieces they were \
+                         split into for searching, and they are what the index \
+                         costs — a folder of long documents can hold fewer \
+                         files than another and far more of the index.
+
+                         ⚠️ A file sitting directly in an indexed folder gets \
+                         its own row, "files at the top level". It is NOT \
+                         merged with a subfolder that happens to share the \
+                         indexed folder's name.
+                         """)
+        }
     }
 }
 

@@ -1668,6 +1668,15 @@ lab/emoji-versions.txt    GENERATED. 1,906 emoji across 16 versions. Declared in
                           index.py's SIBLING_DATA, so `make dist`,
                           `app/stage.sh` and `apple-index selfcheck` all read
                           the same one declaration
+lab/vec/                  Swift, TWO binaries from one package: `vec`, the
+                          embedder, and `doctext`, the PDF reader. 🛑 PDF is
+                          the one format the index cannot read in Python —
+                          /usr/bin/python3 is 3.9.6 with no Quartz, and
+                          `mdimport -t -d3` IS PDFKit at three times the cost
+lab/test-doctext.py       builds its own PDFs and checks the reader. 🛑 Pins a
+                          REFUSAL: a page that looks like wreckage is reported
+                          and NEVER dropped, because the pages an earlier
+                          version wanted to drop were contact lists
 lab/photos.py             the Photos reader: tagged faces with their Contacts
                           id, coordinates, and Apple's stored reverse geocode.
                           🛑 Reads sqlite directly rather than using osxphotos,
@@ -1826,7 +1835,8 @@ apple-index search "the greenhouse budget"     # one query across every source
 
 It builds one SQLite index over mail, messages, notes, calendar, contacts,
 reminders, visited places, **the Photos library** and any folder you point it
-at (an Obsidian vault is understood natively),
+at (an Obsidian vault is understood natively, and Word, PowerPoint and PDF are
+read as well as markdown),
 and searches it with FTS5 plus an `e5-small-v2` embedding. A query takes 70 to
 300 ms against 239,000 chunks. Full detail in
 [`lab/README.md`](lab/README.md); the model comparison is in
@@ -1852,6 +1862,76 @@ it** — `ingest` only ever adds, so a removed folder's records survive until
 `dirname(DEFAULT_DB)` until 26.827.0, which is inside the encrypted vault
 whenever the app has it mounted, so a folder added from the app disappeared with
 the volume and `apple-index forget` destroyed the configuration with the index.
+
+**It reads `.md`, `.markdown`, `.txt`, `.docx`, `.pptx` and `.pdf`.** `kind`
+names the format — `note` for markdown in a vault, `file` for text outside one,
+and `pdf`/`docx`/`pptx` for the rest. ⚠️ **`search` has no `--kind` flag**; the
+value is in `--json`, so filter with `jq`. On this machine the new formats add
+5.07M characters to 9.42M of markdown.
+
+- **Word and PowerPoint cost nothing.** A `.docx` is a zip of XML, so `zipfile`
+  and `ElementTree` read it in process: 55 of 55 files, 0 failures, 0.19s.
+- 🛑 **PDF NEEDS A BINARY, `lab/vec/…/doctext`, and every other route was
+  measured and rejected.** `textutil` does not read PDF. `/usr/bin/python3` is
+  **3.9.6** with no `Quartz`, and **MarkItDown needs 3.10**, so it cannot run
+  in the ingest process at all — shipping it would mean a 318 MB venv in the
+  formula and the app bundle. 🛑 **`mdimport -t -d3` IS PDFKit**: `mdimport -e`
+  names its importer `com.apple.PDFKit.PDFImporter`, and its output is
+  byte-identical at three times the cost. ⚠️ **A missing `doctext` is a warning,
+  not a failure** — every other format still indexes, and the count of skipped
+  PDFs is named on stderr.
+- 🛑 **THE SIZE CAP COUNTS EXTRACTED TEXT, NOT FILE BYTES.** A PDF's bytes are
+  mostly pictures: 30 of the 159 PDFs here and 7 of the 61 Office files exceed
+  2 MB on disk while holding ordinary amounts of text.
+- 🛑 **A SCAN CANNOT BE INDEXED.** 20 of the 159 PDFs here have no text layer
+  and nothing on this Mac does OCR. They are reported on stderr rather than
+  indexed as empty records that look indexed and can never match.
+- 🛑 **`.xlsx` is deliberately absent.** Its shared-string table is labels and
+  codes rather than prose, and 6 files here would add 1.22M characters of it.
+- ⚠️ **An Obsidian deep link drops the extension ONLY for a note.** Obsidian
+  addresses markdown without it and everything else with it, so stripping
+  `.pdf` yields a link that silently resolves to nothing.
+
+🛑 **`doctext` REPORTS BROKEN-LOOKING TEXT AND NEVER DROPS IT, and that
+restraint is the finding.** Every PDF extractor fails on a broken ToUnicode
+map. One page of a real budget letter reading "To the Joint Budget Committee
+and the General Assembly:" comes back as `To e o Be ommee e Geer emb` from
+PDFKit, `To WKe -oLQW BXGJeW &ommLWWee…` from pypdf, and `(cid:42)(cid:50)…`
+from MarkItDown. A detector was built for it and the measurement killed it:
+the signal is the rate of English function words, and **a list scores zero
+just as wreckage does**. Of 71 pages flagged across 159 real PDFs, the ones
+read by hand were a plant list and a page headed CONTACT LIST holding the
+HOA's insurer, animal control and the police. ⚠️ **Read `low_prose_pages` as
+"a list, a table or another language"** far more often than as "broken". It is
+a hint in the JSON, never a filter. `lab/test-doctext.py` pins the refusal.
+
+🛑 **`stats` NESTS this source, alone among the sources.** It is the only one
+with two levels: the folders the user configured and the folders inside them.
+`stats` carries a `roots` array beside the flat `containers` one — per
+configured folder, its records, chunks, a `kinds` count per format, and its own
+top-level folders. The app's window draws `roots`.
+
+- 🛑 **THE ROOT COMES OUT OF THE `uid`, NOT THE CONTAINER.** A container is a
+  path relative to whichever root holds it, so two roots that each hold a
+  `Reading` folder are one row and nothing says which is which. The uid is
+  `files:<name>:<relative>` and carries both halves.
+- 🛑 **That also settles what the container cannot.** A file directly in root
+  `work` and a file in a SUBFOLDER named `work` inside it share the container
+  `work`. In the uid they differ by one slash, so loose files get their own
+  row, named `""`, shown as "files at the top level".
+- ⚠️ **A root name with a colon would break the split**, so `files add` refuses
+  one. Anything unparseable lands under `(unknown)`.
+- ⚠️ **The two views disagree by design.** `containers` merges roots; `roots`
+  keeps them apart. Read one or the other, never both.
+- 🛑 **A folder removed from the config keeps its records**, so the window
+  lists them under "Still in the index, no longer indexed" rather than letting
+  them disappear while still costing index space.
+
+⚠️ **`.pages`, `.numbers`, `.key`, `.doc`, `.rtf` and `.odt` are not read yet.**
+`mdimport -t -d3` is the only route and it works — it read a `.numbers` file
+here that nothing else can — but its `-o` output is an old-style ASCII dump
+containing `{length = 0, bytes = 0x}`, which both `plutil` and `plistlib`
+reject, so it costs a hand-written parser. 27 such files sit on this machine.
 
 **`apple-index people` is the one command that is not a search.** It reports who
 the user talks to, who turns up alongside whom, and which emoji they themselves

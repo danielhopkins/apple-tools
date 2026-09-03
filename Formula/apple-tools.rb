@@ -298,6 +298,9 @@ class AppleTools < Formula
     # `vec` finds the Core ML weights in models/. Any of those moving breaks
     # the lookup at runtime, not at install time.
     assert_path_exists libexec/"index/vec"
+    # 🛑 The PDF reader. Without it every PDF in a configured folder goes
+    # unindexed, and the only sign is a line on stderr during ingest.
+    assert_path_exists libexec/"index/doctext"
     assert_path_exists libexec/"index/models/vocab.txt"
 
     # --help needs no grant and touches no index.
