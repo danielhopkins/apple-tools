@@ -93,6 +93,130 @@ OSS_MODELS = ("e5-base", "e5-small", "minilm")
 COREML_MODELS = ("e5-small-coreml",)
 ALL_MODELS = APPLE_MODELS + OSS_MODELS + COREML_MODELS
 
+# 🛑 THE ROSTER, and why it is not just `ALL_MODELS`.
+#
+# `--model` has always offered six names, and a shipped install can run TWO.
+# `e5-base`, `e5-small` and `minilm` need `uv`, PyTorch and a Hugging Face
+# download, and the Makefile is explicit that none of them ship. `contextual`
+# needs a separate Apple asset download. Nothing told the user any of this: a
+# name that cannot run was accepted, embedded nothing, and left the search
+# answering lexically in silence.
+#
+# So every model carries what it needs, and `apple-index model` reports each
+# one as available or not WITH THE REASON. A name is never hidden — an
+# unreachable model that vanishes from the list looks like a model that was
+# removed.
+#
+# `dim` is what the vector table stores. ⚠️ Three of these are 384, so a
+# mix-up between them is NOT caught by a dimension mismatch. Only the `model`
+# column separates them, which is why the column exists.
+MODEL_INFO = {
+    "e5-small-coreml": {
+        "stored": "e5-small-coreml-v1",
+        "dim": 384,
+        "runner": "vec",
+        "weights": "shipped",
+        "window": 512,
+        "summary": "e5-small-v2, Core ML. The default.",
+    },
+    "sentence": {
+        "stored": "sentence-v1",
+        "dim": 512,
+        "runner": "vec",
+        "weights": "builtin",
+        "window": None,
+        "summary": "Apple NLEmbedding. No weights to install, and far weaker.",
+    },
+    "contextual": {
+        "stored": "contextual-v1",
+        "dim": 512,
+        "runner": "vec",
+        "weights": "apple-asset",
+        "window": None,
+        "summary": "Apple NLContextualEmbedding. Needs `vec assets`.",
+    },
+    "e5-base": {
+        "stored": "e5-base-v1", "dim": 768, "runner": "oss",
+        "weights": "pytorch", "window": 512,
+        "summary": "intfloat/e5-base-v2 through PyTorch. Development only.",
+    },
+    "e5-small": {
+        "stored": "e5-small-v1", "dim": 384, "runner": "oss",
+        "weights": "pytorch", "window": 512,
+        "summary": "intfloat/e5-small-v2 through PyTorch. The reference.",
+    },
+    "minilm": {
+        "stored": "minilm-v1", "dim": 384, "runner": "oss",
+        "weights": "pytorch", "window": 256,
+        "summary": "all-MiniLM-L6-v2 through PyTorch. Development only.",
+    },
+}
+
+DEFAULT_MODEL = "e5-small-coreml"
+
+# Measured chunks/sec, used only to estimate how long an embed will take.
+# ⚠️ Keyed by the STORED name, because that is what `status` groups by.
+EMBED_RATES = {
+    "e5-small-coreml-v1": 1000.0,
+    "e5-small-v1": 450.0,
+    "e5-base-v1": 133.0,
+    "minilm-v1": 450.0,
+    "sentence-v1": 60.0,
+    "contextual-v1": 60.0,
+}
+
+
+def stored_model_name(model):
+    """The name in the `vector.model` column, which is versioned.
+
+    ⚠️ The CLI, the config file and the daemon protocol all use the SHORT
+    name; only the table uses the long one. `BAKEOFF.md` records what mixing
+    them costs: a daemon comparing the stored name declined every request.
+    """
+    info = MODEL_INFO.get(model)
+    return info["stored"] if info else "%s-v1" % model
+
+
+def model_availability(model):
+    """Can this model run here, and if not, why not.
+
+    Returns `(available, reason)`. `reason` is None when it can run.
+    """
+    info = MODEL_INFO.get(model)
+    if info is None:
+        return False, "unknown model"
+    if info["runner"] == "oss":
+        if not os.path.exists(OSS):
+            return False, "needs embed_oss.py, which does not ship"
+        if not shutil.which("uv"):
+            return False, "needs `uv` and PyTorch, which do not ship"
+        return True, None
+    if not VEC or not os.path.exists(VEC):
+        return False, "the `vec` binary is not installed"
+    if info["weights"] == "shipped":
+        return True, None
+    if info["weights"] == "apple-asset":
+        return True, None
+    return True, None
+
+
+def embed_cmd(model, db, batch=None):
+    """The command that embeds every chunk lacking a vector for `model`.
+
+    One definition, because `embed` and a model switch must run the SAME
+    thing. A switch that embedded differently from `embed` would produce a
+    vector set nothing else could reproduce.
+    """
+    if model in COREML_MODELS:
+        return [VEC, "embed", "--db", db, "--model", model]
+    if model in OSS_MODELS:
+        return ["uv", "run", "--quiet", OSS, "embed", "--db", db,
+                "--model", model]
+    cmd = [VEC, "embed", "--db", db, "--model", model]
+    if batch:
+        cmd += ["--batch", str(batch)]
+    return cmd
+
 
 def vector_search_cmd(model, db, query, limit, tool=None):
     if model in COREML_MODELS:
@@ -1376,6 +1500,74 @@ FILES_CONFIG = os.path.join(
 # written, so an install that configured folders before this fix keeps them.
 FILES_CONFIG_LEGACY = os.path.join(os.path.dirname(DEFAULT_DB), "files.json")
 
+# 🛑 WHICH MODEL IS IN USE, and why it is a FILE rather than the vector table.
+#
+# Same path rule as `files.json` and `people.json`, and for the same measured
+# reason: `dirname(DEFAULT_DB)` follows the encrypted vault, so anything
+# written there disappears when the app quits and `apple-index forget`
+# destroys it with the index. The model a user chose must outlive both.
+#
+# ⚠️ NOT INFERRED FROM `vector`. Taking whichever model has the most rows
+# makes the answer change silently part-way through a re-embed — which is
+# exactly the window where a caller most needs a stable answer.
+#
+# 🛑 IT CARRIES SWITCH STATE, NOT JUST A NAME. During a switch two models hold
+# vectors at once, deliberately, because the old set keeps answering searches
+# until the new one is complete. The app already treats "more than one model
+# name" as a fault — "a search that mixes two vector spaces returns confident
+# nonsense" — and that reading is correct EXCEPT during a switch. The database
+# cannot tell the two states apart. This file can.
+MODEL_CONFIG = os.path.join(
+    os.path.dirname(os.path.expanduser(os.environ["APPLE_INDEX_DB"]))
+    if os.environ.get("APPLE_INDEX_DB") else _SUPPORT,
+    "model.json")
+
+
+def read_model_config():
+    """The chosen model and any switch in progress.
+
+    ⚠️ Never raises and never returns None. An install that has never switched
+    has no file, and that is the normal case, not an error.
+    """
+    try:
+        with open(MODEL_CONFIG) as handle:
+            config = json.load(handle)
+    except (OSError, ValueError):
+        config = {}
+    if not isinstance(config, dict):
+        config = {}
+    config.setdefault("model", DEFAULT_MODEL)
+    if config["model"] not in MODEL_INFO:
+        # A model name this build does not know. Say so rather than failing:
+        # a downgrade must not make the tool unusable.
+        config["unknown_model"] = config["model"]
+        config["model"] = DEFAULT_MODEL
+    return config
+
+
+def write_model_config(config):
+    os.makedirs(os.path.dirname(MODEL_CONFIG), mode=0o700, exist_ok=True)
+    with open(MODEL_CONFIG, "w") as handle:
+        json.dump(config, handle, indent=2)
+    os.chmod(MODEL_CONFIG, 0o600)
+
+
+def current_model():
+    """The model every command uses when `--model` is not given."""
+    return read_model_config()["model"]
+
+
+def switch_in_progress():
+    """`(target, started)` while a switch is running, else `(None, None)`.
+
+    The app reads this to tell a switch from a genuinely mixed index.
+    """
+    config = read_model_config()
+    switching = config.get("switching")
+    if not isinstance(switching, dict):
+        return None, None
+    return switching.get("to"), switching.get("started")
+
 
 def read_files_config():
     """The configuration, from the current path or the one it used to use."""
@@ -2279,14 +2471,7 @@ def cmd_embed(opts):
     if not os.path.exists(VEC):
         die("vec is not built. Run: make -C %s" % HERE)
     connect(opts.db).close()
-    if opts.model in COREML_MODELS:
-        cmd = [VEC, "embed", "--db", opts.db, "--model", opts.model]
-    elif opts.model in OSS_MODELS:
-        cmd = ["uv", "run", "--quiet", OSS, "embed", "--db", opts.db,
-               "--model", opts.model]
-    else:
-        cmd = [VEC, "embed", "--db", opts.db, "--batch", str(opts.batch),
-               "--model", opts.model]
+    cmd = embed_cmd(opts.model, opts.db, batch=getattr(opts, "batch", None))
     if opts.limit:
         cmd += ["--limit", str(opts.limit)]
     # 🛑 Do NOT capture stderr here. vec writes its progress there, and
@@ -2429,6 +2614,19 @@ def cmd_search(opts):
     require_index(opts.db)
     warn_if_revoked(opts)
     db = connect(opts.db)
+    # 🛑 SAY SO WHEN THE VECTOR ARM CANNOT CONTRIBUTE. A search whose model has
+    # no vectors matches nothing, prints `[]`, exits 0, and the query silently
+    # becomes lexical-only. ⚠️ The results look fine — the lexical arm alone
+    # scores MRR 0.674 against 0.771 — so nothing on screen says half the
+    # ranking is missing. This is reachable by any user now that the model can
+    # be switched, and it is the guaranteed state for the whole switch window.
+    #
+    # ⚠️ Before the cache check, deliberately. A cached result was produced by
+    # the same incomplete index, so it needs the same warning.
+    embedded, total = vector_coverage(db, opts.model)
+    note = coverage_warning(embedded, total, opts.model)
+    if note:
+        print("index: " + note, file=sys.stderr)
     started = time.time()
     settings = search_settings(opts)
     fingerprint = index_fingerprint(db)
@@ -3602,6 +3800,257 @@ def cmd_selfcheck(opts):
           % ", ".join(list(SIBLING_MODULES) + list(SIBLING_DATA)))
 
 
+def vector_coverage(db, model):
+    """`(embedded, total)` chunks for one model.
+
+    🛑 THE NUMBER A SEARCH HAS TO REPORT. A search whose model has no vectors
+    matches nothing, prints `[]`, exits 0, and the whole query silently
+    becomes lexical-only. That is not obviously broken to a reader: the
+    lexical arm alone scores MRR 0.674 against 0.771 for the hybrid, so the
+    results look plausible and nothing says the vector arm contributed
+    nothing.
+    """
+    stored = stored_model_name(model)
+    total = db.execute("SELECT COUNT(*) FROM chunk").fetchone()[0]
+    embedded = db.execute(
+        "SELECT COUNT(*) FROM vector WHERE model = ?", (stored,)).fetchone()[0]
+    return embedded, total
+
+
+def coverage_warning(embedded, total, model):
+    """The sentence to print, or None when the index is complete.
+
+    ⚠️ Zero and short are the SAME kind of answer, differently worded. The
+    user's ruling was "warn that the index isn't complete", so neither refuses.
+    """
+    if total == 0 or embedded >= total:
+        return None
+    if embedded == 0:
+        return ("no chunks are embedded as %s yet, so this search used words "
+                "only. Run `apple-index embed`." % model)
+    return ("the index is not complete: %s of %s chunks are embedded as %s. "
+            "Results are weighted toward word matches until it finishes."
+            % ("{:,}".format(embedded), "{:,}".format(total), model))
+
+
+def app_owns_socket():
+    """Is AppleTools.app running, and therefore serving the socket?
+
+    🛑 The app unloads the launchd agent when it starts, so the two never both
+    serve — and the app is the only process here with Full Disk Access. A CLI
+    that killed and replaced its daemon would break that rule, and `sudo`
+    makes it worse rather than better: a root daemon loses the user's TCC
+    grants and writes root-owned files into a directory the user owns.
+    """
+    try:
+        found = subprocess.run(["pgrep", "-x", "AppleTools"],
+                               capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return found.returncode == 0
+
+
+def restart_daemon_for_switch(opts, model):
+    """Make the warm daemon serve the model that was just chosen.
+
+    🛑 A switch that leaves the daemon on the old model is a HALF-SWITCH the
+    user cannot see. The daemon pins its model at start and refuses every
+    request for another one; the client treats that refusal as non-fatal and
+    silently re-runs the search out of process. So the search still works, and
+    quietly loses the warm path.
+    """
+    socket_path = getattr(opts, "socket", None) or DEFAULT_SOCKET
+    if not daemon_request({"op": "ping"}, socket_path):
+        return
+    if app_owns_socket():
+        print("⚠️  AppleTools.app owns the search socket, so this cannot "
+              "restart it.")
+        print("    It serves %s until it does, and refuses requests for %s "
+              "meanwhile." % ("the old model", model))
+        print("    Searches still work; they lose the warm path until then.")
+        return
+    subprocess.run(["pkill", "-f", "vec daemon"], capture_output=True)
+    subprocess.run(["pkill", "-f", "daemon.py serve"], capture_output=True)
+    if os.path.exists(socket_path):
+        try:
+            os.remove(socket_path)
+        except OSError:
+            pass
+    print("restarted the daemon on %s" % model)
+
+
+def cmd_model(opts):
+    """Show which embedding model is in use, or change it.
+
+    🛑 CHANGING IT RE-EMBEDS EVERY CHUNK. Two models never share a vector
+    space, so there is no cheaper form of this.
+    """
+    config = read_model_config()
+    active = config["model"]
+    target_name, started = switch_in_progress()
+
+    def roster():
+        rows = []
+        for name in ALL_MODELS:
+            info = MODEL_INFO[name]
+            available, reason = model_availability(name)
+            row = {
+                "model": name,
+                "stored": info["stored"],
+                "dim": info["dim"],
+                "available": available,
+                "current": name == active,
+                "summary": info["summary"],
+            }
+            if info["window"]:
+                row["window"] = info["window"]
+            if reason:
+                row["unavailable_because"] = reason
+            rows.append(row)
+        # ⚠️ The current model first, then what can run, then what cannot.
+        # `ALL_MODELS` is grouped by runner, which puts the DEFAULT LAST — so
+        # a listing in that order buries the one answer most readers want.
+        rows.sort(key=lambda r: (not r["current"], not r["available"], r["model"]))
+        return rows
+
+    if not opts.model:
+        models = roster()
+        if getattr(opts, "json", False):
+            out = {"model": active, "models": models}
+            if config.get("unknown_model"):
+                out["unknown_model"] = config["unknown_model"]
+            if target_name:
+                out["switching"] = {"to": target_name, "started": started}
+            print(json.dumps(out, indent=2))
+            return
+        if config.get("unknown_model"):
+            print("index: the configured model %r is unknown to this build; "
+                  "using %s" % (config["unknown_model"], active),
+                  file=sys.stderr)
+        if target_name:
+            print("switching to %s (started %s)\n" % (target_name, started))
+        width = max(len(r["model"]) for r in models)
+        for row in models:
+            mark = "*" if row["current"] else " "
+            note = row["summary"]
+            if not row["available"]:
+                note = "unavailable — %s" % row["unavailable_because"]
+            print("%s %-*s  %s" % (mark, width, row["model"], note))
+        print("\n* is the model in use. `apple-index model <name>` changes it.")
+        return
+
+    target = opts.model
+    if target not in MODEL_INFO:
+        die("unknown model %r. `apple-index model` lists them." % target)
+    available, reason = model_availability(target)
+    if not available:
+        die("%s cannot run here: %s" % (target, reason))
+
+    require_index(opts.db)
+    db = connect(opts.db)
+    try:
+        embedded, total = vector_coverage(db, target)
+        old_embedded, _ = vector_coverage(db, active)
+    finally:
+        db.close()
+
+    if target == active and not target_name:
+        missing = total - embedded
+        if missing > 0:
+            print("%s is already the model. %s chunks still need embedding; "
+                  "run `apple-index embed`." % (target, "{:,}".format(missing)))
+        else:
+            print("%s is already the model, and the index is complete." % target)
+        return
+
+    # 🛑 SAY WHAT IT COSTS BEFORE ASKING. A switch re-embeds every chunk,
+    # because two models never share a vector space. The estimate comes from
+    # the same measured rates `status` uses.
+    rate = EMBED_RATES.get(stored_model_name(target), 60.0)
+    todo = max(total - embedded, 0)
+    print("Switching the embedding model from %s to %s." % (active, target))
+    if total == 0:
+        print("  the index holds no chunks yet, so there is nothing to embed.")
+    elif todo == 0:
+        # ⚠️ Not a special case for its own sake. Switching BACK to a model
+        # whose vectors were never deleted has nothing to embed, and quoting
+        # an estimate of "about 1 minute" for no work reads as a bug.
+        print("  every chunk is already embedded as %s, so nothing is "
+              "re-embedded." % target)
+    else:
+        seconds = todo / rate if rate else 0
+        if seconds < 90:
+            span = "under two minutes"
+        else:
+            minutes = round(seconds / 60)
+            span = "about %d minutes" % minutes
+        print("  %s chunks to embed, %s at ~%.0f chunks/sec."
+              % ("{:,}".format(todo), span, rate))
+    # ⚠️ Embed FIRST, delete after. The old vectors keep answering searches
+    # for the whole window, and a failure leaves the working model intact.
+    # Same rule `apple contacts move` uses: create the copy before deleting
+    # the original.
+    print("  %s keeps answering searches until the new set is complete."
+          % active)
+    print("  Its %s vectors are deleted only after that."
+          % "{:,}".format(old_embedded))
+
+    # The plan must reach the user before any refusal does. stdout is block
+    # buffered when piped; stderr is not, so without this the error prints
+    # first and the numbers it refers to print after it.
+    sys.stdout.flush()
+    if not opts.yes:
+        if not sys.stdin.isatty():
+            die("this re-embeds every chunk and there is no terminal to ask. "
+                "Pass --yes if you meant it.")
+        try:
+            answer = input("Switch to %s? [y/N] " % target).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer not in ("y", "yes"):
+            print("not switching")
+            return
+
+    # 🛑 Record the switch BEFORE embedding. Two models hold vectors at once
+    # for the whole window, and the app reads "more than one model name" as a
+    # fault. This is the only thing that tells the two states apart.
+    config["switching"] = {"from": active, "to": target,
+                           "started": datetime.now().astimezone().isoformat()}
+    write_model_config(config)
+
+    proc = subprocess.run(embed_cmd(target, opts.db), stdout=subprocess.PIPE,
+                          text=True)
+    if proc.stdout:
+        print(proc.stdout.strip())
+    if proc.returncode != 0:
+        die("embedding failed, so nothing was deleted and %s is still the "
+            "model. Run `apple-index model %s` again to resume."
+            % (active, target))
+
+    db = connect(opts.db)
+    try:
+        embedded, total = vector_coverage(db, target)
+        if total and embedded < total:
+            die("only %s of %s chunks embedded as %s. Nothing was deleted and "
+                "%s is still the model."
+                % ("{:,}".format(embedded), "{:,}".format(total), target,
+                   active))
+        # The new set is complete and counted. Now the old one can go.
+        db.execute("DELETE FROM vector WHERE model = ?",
+                   (stored_model_name(active),))
+        db.commit()
+    finally:
+        db.close()
+
+    config["model"] = target
+    config.pop("switching", None)
+    config.pop("unknown_model", None)
+    write_model_config(config)
+    print("switched to %s (%s chunks embedded)"
+          % (target, "{:,}".format(embedded)))
+    restart_daemon_for_switch(opts, target)
+
+
 def cmd_sources(opts):
     """What refresh runs for each source. The app reads this rather than
     keeping a second copy of REFRESH_ARGS in Swift."""
@@ -3996,12 +4445,32 @@ def cmd_stats(opts):
     total_chunks = db.execute("SELECT COUNT(*) c FROM chunk").fetchone()["c"]
     size = sum(os.path.getsize(opts.db + s)
                for s in ("", "-wal", "-shm") if os.path.exists(opts.db + s))
+    # 🛑 `models` counts vectors; `model` says which one is IN USE. They are
+    # different questions, and only the second one tells a reader which vector
+    # space a search is about to use. The app reads `models`, finds more than
+    # one name, and prints "a search that mixes two vector spaces returns
+    # confident nonsense" — a correct warning that is WRONG during a switch,
+    # because a switch deliberately holds two sets at once. `switching` is
+    # what separates the two states; the vector table alone cannot.
+    config = read_model_config()
+    switching_to, switching_started = switch_in_progress()
+    model_block = {
+        "model": config["model"],
+        "stored": stored_model_name(config["model"]),
+        "embedded": next((m["vectors"] for m in models
+                          if m["model"] == stored_model_name(config["model"])), 0),
+        "chunks": total_chunks,
+    }
+    if switching_to:
+        model_block["switching"] = {"to": switching_to,
+                                    "started": switching_started}
     print(json.dumps({
         "version": tool_version(),
         "db": opts.db,
         "encrypted": index_is_encrypted(opts.db),
         "bytes": size,
         "chunks": total_chunks,
+        "model": model_block,
         "models": models,
         "sources": sources,
         "history": history,
@@ -5734,9 +6203,7 @@ def cmd_status(opts):
     # ⚠️ Quote the rate for the model that is actually behind. A single
     # hardcoded 41 chunks/sec came from Apple's model and told a caller "52
     # minutes" for an e5-small backlog that finished in 5.
-    RATES = {"e5-small-v1": 450.0, "e5-small-coreml-v1": 1000.0,
-             "e5-base-v1": 133.0,
-             "sentence-v1": 60.0, "contextual-v1": 60.0}
+    RATES = EMBED_RATES
     for r in per_model:
         pending = total - r["c"]
         if pending > 0:
@@ -5778,7 +6245,8 @@ def main():
     e = sub.add_parser("embed", help="embed every chunk that has no vector")
     e.add_argument("--limit", type=int)
     e.add_argument("--batch", type=int, default=500)
-    e.add_argument("--model", default="e5-small-coreml", choices=list(ALL_MODELS))
+    e.add_argument("--model", default=None, choices=list(ALL_MODELS),
+               help="default: the model `apple-index model` reports")
     e.set_defaults(func=cmd_embed)
 
     s = sub.add_parser("search", help="hybrid search over everything indexed")
@@ -5808,8 +6276,9 @@ def main():
     # lexical arm dominates and that advantage never reaches the ranking. The
     # 0.012 hybrid gap is under one case in fourteen, so read the quality as a
     # tie and the resources as the deciding factor. See MODELS.md.
-    s.add_argument("--model", default="e5-small-coreml", choices=list(ALL_MODELS),
-                   help="which embedding model's vectors to search")
+    s.add_argument("--model", default=None, choices=list(ALL_MODELS),
+                   help="which embedding model's vectors to search "
+                        "(default: what `apple-index model` reports)")
     # Measured over eval.py's 13 cases (MRR): lexical-only 0.565, semantic-only
     # 0.269, equal 1:1 0.562, 2:1 and 3:1 both 0.602, 5:1 and 10:1 0.563.
     # 🛑 The vector arm earns its place only as a MINORITY vote. Equal weighting
@@ -5936,7 +6405,9 @@ def main():
 
     d = sub.add_parser("daemon", help="start, stop or query the warm daemon")
     d.add_argument("action", choices=["start", "stop", "status"])
-    d.add_argument("--model", default="e5-small-coreml")
+    # ⚠️ `choices` here too. This one had none, so `daemon start --model
+    # sentence` passed argparse and then died inside daemon.py's own parser.
+    d.add_argument("--model", default=None, choices=list(ALL_MODELS))
     d.add_argument("--refresh", type=int, default=300)
     d.add_argument("--socket", default=DEFAULT_SOCKET)
     d.set_defaults(func=cmd_daemon)
@@ -5949,7 +6420,7 @@ def main():
     rf = sub.add_parser("refresh",
                         help="ingest, embed and reload — run this from a terminal")
     rf.add_argument("--source", help="comma separated; default all")
-    rf.add_argument("--model", default="e5-small-coreml", choices=list(ALL_MODELS))
+    rf.add_argument("--model", default=None, choices=list(ALL_MODELS))
     rf.set_defaults(func=cmd_refresh)
 
     fg = sub.add_parser("forget",
@@ -6046,6 +6517,15 @@ def main():
                          "one, an alias, a service endpoint. Repeatable")
     pe.set_defaults(func=cmd_people)
 
+    md = sub.add_parser("model",
+                        help="which embedding model is in use, and change it")
+    md.add_argument("model", nargs="?",
+                    help="switch to this model. 🛑 Re-embeds every chunk.")
+    md.add_argument("--json", action="store_true")
+    md.add_argument("--yes", action="store_true",
+                    help="do not ask. Required when there is no terminal.")
+    md.set_defaults(func=cmd_model)
+
     sub.add_parser("sources",
                    help="the per-source arguments `refresh` uses, as JSON"
                    ).set_defaults(func=cmd_sources)
@@ -6059,6 +6539,18 @@ def main():
     sub.add_parser("status", help="what is indexed").set_defaults(func=cmd_status)
 
     opts = p.parse_args()
+    # 🛑 THE DEFAULT MODEL IS THE CONFIGURED ONE, not a compiled-in constant.
+    # Every `--model` used to default to `e5-small-coreml` in four separate
+    # argparse calls. A switch that changed a config file and left those
+    # defaults alone would change nothing a user could observe: `search` and
+    # `embed` would carry on with the old model, and the only visible effect
+    # would be a listing that disagreed with the tool's behaviour.
+    #
+    # ⚠️ Resolved HERE, once, rather than as an argparse default. An argparse
+    # default is built while the parser is, which happens before anything has
+    # validated the config.
+    if opts.command != "model" and getattr(opts, "model", "") is None:
+        opts.model = current_model()
     opts.func(opts)
 
 
