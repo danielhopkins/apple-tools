@@ -3852,9 +3852,17 @@ def app_owns_socket():
     makes it worse rather than better: a root daemon loses the user's TCC
     grants and writes root-owned files into a directory the user owns.
     """
+    # 🛑 MATCH THE PATH, NOT THE NAME. `pgrep -x AppleTools` finds NOTHING
+    # while the app is running — measured, with the process plainly visible in
+    # `ps` as `/Applications/AppleTools.app/Contents/MacOS/AppleTools`. A bare
+    # `pgrep AppleTools` is worse: it also matches the `apple-proxy` helper,
+    # whose command line carries the same path. Both failures are silent, and
+    # both break the ownership rule in the same direction — the CLI would
+    # decide it owned the socket and kill the daemon the app is serving.
     try:
-        found = subprocess.run(["pgrep", "-x", "AppleTools"],
-                               capture_output=True, text=True, timeout=5)
+        found = subprocess.run(
+            ["pgrep", "-f", "AppleTools.app/Contents/MacOS/AppleTools"],
+            capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
         return False
     return found.returncode == 0
