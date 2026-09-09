@@ -327,6 +327,7 @@ private struct PaneHeader: View {
         switch model.indexer.phase {
         case .ingesting(let source): return "Reading \(source)…"
         case .embedding:             return "Embedding new chunks…"
+        case .switching(let to):     return "Re-embedding everything as \(to)…"
         case .reloading:             return "Reloading the search endpoint…"
         case .idle:
             guard let when = model.indexer.lastCycleFinished else {

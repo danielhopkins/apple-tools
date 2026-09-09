@@ -3817,17 +3817,27 @@ def vector_coverage(db, model):
     return embedded, total
 
 
-def coverage_warning(embedded, total, model):
-    """The sentence to print, or None when the index is complete.
+# 🛑 A SHORTFALL HAS TO BE BIG ENOUGH TO CHANGE AN ANSWER. Every ingest adds
+# chunks that the next embed picks up, so a healthy index sits a few hundred
+# short of complete most of the time. Measured here: 65 missing of 439,869,
+# which is 0.01% — and warning about that on every search is how a tool teaches
+# people to skip its warnings. The app's own code carries the same lesson about
+# an orange paragraph on a healthy machine.
+#
+# ⚠️ Zero is different in kind, not degree, and always warns: with no vectors
+# at all the semantic arm contributes nothing whatever the total is.
+COVERAGE_WARN_FRACTION = 0.01
 
-    ⚠️ Zero and short are the SAME kind of answer, differently worded. The
-    user's ruling was "warn that the index isn't complete", so neither refuses.
-    """
+
+def coverage_warning(embedded, total, model):
+    """The sentence to print, or None when the shortfall does not matter."""
     if total == 0 or embedded >= total:
         return None
     if embedded == 0:
         return ("no chunks are embedded as %s yet, so this search used words "
                 "only. Run `apple-index embed`." % model)
+    if (total - embedded) < total * COVERAGE_WARN_FRACTION:
+        return None
     return ("the index is not complete: %s of %s chunks are embedded as %s. "
             "Results are weighted toward word matches until it finishes."
             % ("{:,}".format(embedded), "{:,}".format(total), model))

@@ -31,6 +31,10 @@ final class Indexer: ObservableObject {
         case idle
         case ingesting(source: String)
         case embedding
+        /// Re-embedding under a new model. ⚠️ Distinct from `.embedding`: an
+        /// ordinary embed adds vectors for new chunks, and this one rebuilds
+        /// every chunk's vector and then deletes the outgoing model's set.
+        case switching(to: String)
         case reloading
     }
 
@@ -51,7 +55,19 @@ final class Indexer: ObservableObject {
 
     private let queue = DispatchQueue(label: "com.boulderhopkins.apple-tools.indexer")
     private var running = false
-    private var current: Process?
+    /// 🛑 Written on the work queue, read from the main actor by `cancel()`.
+    /// A plain property here is a data race, and the symptom would be a
+    /// cancel that sometimes terminates nothing — the exact bug this field
+    /// already had for a different reason.
+    private nonisolated let currentLock = NSLock()
+    /// 🛑 `nonisolated(unsafe)` because the lock above is what makes it safe,
+    /// not the actor. `cancel()` has to be callable from anywhere — a Stop
+    /// button is pressed while the work queue holds the process.
+    private nonisolated(unsafe) var _current: Process?
+    private nonisolated var current: Process? {
+        get { currentLock.lock(); defer { currentLock.unlock() }; return _current }
+        set { currentLock.lock(); _current = newValue; currentLock.unlock() }
+    }
     private var scheduler: NSBackgroundActivityScheduler?
     private let state = Paths.supportDirectory.appendingPathComponent("app-state.json")
 
@@ -175,7 +191,8 @@ final class Indexer: ObservableObject {
                 arguments.append("--accept-risk")
                 if full { arguments.append("--full") }
 
-                let result = Child.run(Paths.python, arguments, timeout: 3600)
+                let result = Child.run(Paths.python, arguments, timeout: 3600,
+                                       onStart: { [weak self] in self?.current = $0 })
                 var run = SourceRun(source: source)
                 run.seconds = result.seconds
                 if result.ok {
@@ -196,10 +213,16 @@ final class Indexer: ObservableObject {
 
             if sawChange {
                 Task { @MainActor in self.phase = .embedding }
+                // 🛑 NO `--model` HERE ANY MORE. It was hard-coded to
+                // `e5-small-coreml`, so the app kept embedding under that name
+                // whatever the user had chosen — and the only visible effect
+                // of a switch would have been a listing that disagreed with
+                // what the app did. `index.py` reads the configured model.
                 let result = Child.run(Paths.python,
                                        [script.path, "--db", Paths.database.path,
-                                        "embed", "--model", "e5-small-coreml"],
-                                       timeout: 6 * 3600)
+                                        "embed"],
+                                       timeout: 6 * 3600,
+                                       onStart: { [weak self] in self?.current = $0 })
                 if !result.ok {
                     failures.append("embed: " + (result.err.split(separator: "\n")
                         .last.map(String.init) ?? "exit \(result.status)"))
@@ -220,6 +243,7 @@ final class Indexer: ObservableObject {
                            "people", "--ensure"],
                           timeout: 600)
 
+            self.current = nil
             Task { @MainActor in
                 self.phase = .reloading
                 // Tell the endpoint the index moved rather than making it wait
@@ -231,6 +255,55 @@ final class Indexer: ObservableObject {
                 self.lastCycleError = failures.isEmpty ? nil : failures.joined(separator: "; ")
                 if full { self.lastFullSweep = Date() }
                 self.saveState()
+                finished?()
+            }
+        }
+    }
+
+    /// Change the embedding model, which re-embeds every chunk.
+    ///
+    /// 🛑 The CLI does the work, not this. `apple-index model <name> --yes`
+    /// embeds the new set first, counts it, and only then deletes the old
+    /// one — so the outgoing model keeps answering searches for the whole
+    /// window and a failure leaves it in place. Duplicating that ordering
+    /// here would be a second implementation of the one rule that makes a
+    /// switch safe to abort.
+    ///
+    /// ⚠️ `--yes` is right here and nowhere else. There is no terminal to ask
+    /// from in a GUI child, and the window asked before calling this.
+    func switchModel(to model: String, then finished: (() -> Void)? = nil) {
+        guard !running else { finished?(); return }
+        guard let script = Paths.indexScript else {
+            lastCycleError = "no index.py found."
+            finished?()
+            return
+        }
+        running = true
+        lastCycleStarted = Date()
+        lastCycleError = nil
+        phase = .switching(to: model)
+
+        queue.async { [weak self] in
+            guard let self else { return }
+            let result = Child.run(
+                Paths.python,
+                [script.path, "--db", Paths.database.path,
+                 "model", model, "--yes"],
+                timeout: 12 * 3600,
+                onStart: { [weak self] in self?.current = $0 })
+            self.current = nil
+            let failure = result.ok ? nil : Self.summarise(result.err, status: result.status)
+            Task { @MainActor in
+                self.phase = .reloading
+                // 🛑 The daemon pins its model at start and refuses every
+                // request for another one, and the client treats that refusal
+                // as non-fatal — so without this a search still works and
+                // silently loses the warm path.
+                SearchService.reload()
+                self.phase = .idle
+                self.running = false
+                self.lastCycleFinished = Date()
+                self.lastCycleError = failure
                 finished?()
             }
         }
@@ -279,8 +352,18 @@ final class Indexer: ObservableObject {
         run.seconds = number(5)
     }
 
-    func cancel() {
-        current?.terminate()
+    /// Stop whatever child is running now.
+    ///
+    /// 🛑 Safe to call at any point of a switch. Vectors are written in
+    /// batches with `INSERT OR REPLACE`, and the outgoing model's set is
+    /// deleted only after the new one is complete and counted — so a killed
+    /// switch leaves the working model intact and the partial new set is
+    /// resumed by running the switch again.
+    nonisolated func cancel() {
+        currentLock.lock()
+        let task = _current
+        currentLock.unlock()
+        task?.terminate()
     }
 
     // MARK: - what survives a restart

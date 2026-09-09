@@ -74,10 +74,20 @@ enum Child {
     /// ⚠️ Reads both pipes on their own threads. Draining stdout first and stderr
     /// afterwards deadlocks as soon as a child writes more than a pipe buffer to
     /// stderr, and `apple mail` does exactly that when it reports a scan depth.
+    /// - Parameter started: called with the live `Process` once it is running,
+    ///   on the caller's thread.
+    ///
+    ///   🛑 THIS IS WHAT MAKES CANCEL POSSIBLE. `Indexer.cancel()` terminates
+    ///   `current`, and `current` was never assigned, because `run` built its
+    ///   own `Process` locally and never handed it back. So `cancel()`
+    ///   terminated nothing, and the only thing that stopped a running embed
+    ///   was the six-hour deadline. Nothing called it either, which is why the
+    ///   dead code was invisible.
     @discardableResult
     static func run(_ executable: URL, _ arguments: [String],
                     extraEnvironment: [String: String] = [:],
-                    timeout: TimeInterval = 900) -> ChildResult {
+                    timeout: TimeInterval = 900,
+                    onStart: ((Process) -> Void)? = nil) -> ChildResult {
         let started = Date()
         let task = Process()
         task.executableURL = executable
@@ -105,6 +115,8 @@ enum Child {
                                err: "cannot run \(executable.path): \(error)",
                                seconds: 0)
         }
+
+        onStart?(task)
 
         // A deadline, because a wedged Mail can hang an Apple Event for minutes
         // and the scheduler must not be held by one.

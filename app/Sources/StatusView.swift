@@ -1078,6 +1078,8 @@ struct IndexSize: View {
                      + "that mixes two vector spaces returns confident nonsense.",
                      tint: .red)
             }
+            Divider()
+            EmbeddingModel(model: model)
             if confirming {
                 Note("This deletes the index and its key. Rebuilding takes "
                      + "about eight minutes.", tint: .red)
@@ -1089,6 +1091,115 @@ struct IndexSize: View {
                 Button("Delete the Index…") { confirming = true }
             }
         }
+    }
+}
+
+/// Which embedding model the index uses, and the control that changes it.
+///
+/// 🛑 CHANGING IT RE-EMBEDS EVERY CHUNK, because two models never share a
+/// vector space. That is why this asks before it acts and shows the count it
+/// is about to work through.
+private struct EmbeddingModel: View {
+    @ObservedObject var model: AppModel
+    @State private var roster: [ModelChoice] = []
+    @State private var choice: String? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Text("EMBEDDING MODEL").font(.caption2.weight(.semibold))
+                    .kerning(0.7).foregroundStyle(.tertiary)
+                Explain("What the embedding model does", """
+                    Search has two arms. One matches words. The other matches \
+                    meaning, and that one needs every chunk turned into a \
+                    vector by an embedding model.
+
+                    🛑 Two models never share a vector space, so changing the \
+                    model re-embeds every chunk. Nothing is lost while it \
+                    runs: the old model keeps answering searches until the \
+                    new set is complete, and only then are its vectors \
+                    deleted. Stopping part-way leaves the old model in place.
+
+                    ⚠️ Until it finishes, searches lean on word matching. \
+                    They still work, and they rank less well.
+                    """)
+            }
+
+            if let to = model.stats.switchingTo {
+                // 🛑 NOT the "more than one model" alarm. A switch holds two
+                // vector sets on purpose, and reporting that as a fault is
+                // what this state exists to prevent.
+                Note("Re-embedding everything as \(to).", tint: .orange)
+                if let p = model.stats.switchProgress, p.total > 0 {
+                    ProgressView(value: Double(p.done), total: Double(p.total))
+                        .frame(maxWidth: 320)
+                    Note("\(Format.count(p.done)) of \(Format.count(p.total)) chunks. "
+                         + "The old model still answers searches until this finishes.")
+                }
+            } else if model.stats.model.isEmpty {
+                Note("This build of index.py does not report its model.")
+            } else {
+                HStack(spacing: 8) {
+                    Text(model.stats.model).font(.body.monospaced())
+                    if let row = roster.first(where: { $0.name == model.stats.model }),
+                       let window = row.window {
+                        Text("· \(window)-token window")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                if let row = roster.first(where: { $0.name == model.stats.model }),
+                   !row.summary.isEmpty {
+                    Note(row.summary)
+                }
+            }
+
+            if model.indexer.isRunning {
+                // The one control that matters while a long job runs. ⚠️ It
+                // stops the child; it never rolls anything back, because a
+                // switch deletes nothing until the new set is complete.
+                Button("Stop") { model.indexer.cancel() }
+            } else if !model.stats.isSwitching {
+                let others = roster.filter { !$0.current }
+                if !others.isEmpty {
+                    HStack(spacing: 8) {
+                        Picker("Change to", selection: $choice) {
+                            Text("Change to…").tag(String?.none)
+                            ForEach(others) { row in
+                                Text(row.available ? row.name
+                                        : "\(row.name) — \(row.unavailableBecause ?? "unavailable")")
+                                    .tag(String?.some(row.name))
+                            }
+                        }
+                        .labelsHidden()
+                        .frame(maxWidth: 320)
+                        .disabled(model.indexer.isRunning)
+                    }
+                }
+                if let picked = choice,
+                   let row = roster.first(where: { $0.name == picked }) {
+                    if !row.available {
+                        Note("🛑 \(row.name) cannot run here: "
+                             + (row.unavailableBecause ?? "unavailable"), tint: .red)
+                    } else {
+                        Note("This re-embeds \(Format.count(model.stats.chunks)) chunks. "
+                             + "\(model.stats.model) keeps answering searches until it "
+                             + "finishes, and its vectors are deleted only after that.",
+                             tint: .orange)
+                        HStack {
+                            Button("Switch to \(row.name)") {
+                                model.indexer.switchModel(to: row.name) {
+                                    model.refreshStats()
+                                }
+                                choice = nil
+                            }
+                            Button("Cancel") { choice = nil }
+                        }
+                    }
+                }
+            }
+        }
+        .task { roster = ModelRoster.read() }
+        .onChange(of: model.stats.model) { _ in roster = ModelRoster.read() }
     }
 }
 

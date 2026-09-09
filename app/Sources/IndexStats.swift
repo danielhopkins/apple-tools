@@ -60,6 +60,13 @@ struct IndexStats: Equatable {
     var bytes = 0
     var chunks = 0
     var models: [(String, Int)] = []
+    /// The model actually in use, from `apple-index model`. ⚠️ NOT the same
+    /// question as `models`, which counts vectors per name. Only this says
+    /// which vector space a search is about to use.
+    var model = ""
+    var modelEmbedded = 0
+    /// The model a switch is moving to, while one is running.
+    var switchingTo: String? = nil
     var sources: [SourceStat] = []
     var history: [HistoryPoint] = []
     var loaded = false
@@ -69,11 +76,30 @@ struct IndexStats: Equatable {
         a.version == b.version && a.bytes == b.bytes && a.chunks == b.chunks
             && a.sources == b.sources && a.history.count == b.history.count
             && a.error == b.error && a.encrypted == b.encrypted
+            && a.model == b.model && a.switchingTo == b.switchingTo
+            && a.modelEmbedded == b.modelEmbedded
     }
 
     /// 🛑 Rows under more than one model name is the failure that returns
     /// confident nonsense: two vector spaces ranked against one query.
-    var mixedModels: Bool { models.filter { $0.1 > 0 }.count > 1 }
+    ///
+    /// 🛑 EXCEPT DURING A SWITCH, WHICH HOLDS TWO SETS ON PURPOSE. A switch
+    /// embeds the new model's vectors BEFORE deleting the old ones, so the
+    /// old set keeps answering searches for the whole window and a failure
+    /// leaves the working model intact. The database cannot tell that from a
+    /// genuine mix — both are simply two names with rows. `switchingTo` is
+    /// the only thing that separates them, which is why the model config
+    /// carries switch state rather than just a name.
+    var mixedModels: Bool {
+        switchingTo == nil && models.filter { $0.1 > 0 }.count > 1
+    }
+    var isSwitching: Bool { switchingTo != nil }
+    /// How far a switch has got. ⚠️ Counts the TARGET model's vectors, not the
+    /// largest count, which during a switch is still the outgoing model's.
+    var switchProgress: (done: Int, total: Int)? {
+        guard switchingTo != nil, chunks > 0 else { return nil }
+        return (modelEmbedded, chunks)
+    }
     var vectors: Int { models.map(\.1).max() ?? 0 }
     var backlog: Int { max(0, chunks - vectors) }
 
@@ -117,6 +143,13 @@ enum StatsReader {
         stats.chunks = root["chunks"] as? Int ?? 0
         stats.models = (root["models"] as? [[String: Any]] ?? []).map {
             ($0["model"] as? String ?? "?", $0["vectors"] as? Int ?? 0)
+        }
+        // ⚠️ Absent on an older index.py, and absent is not an error. The app
+        // ships beside the script but a checkout can hold either.
+        if let block = root["model"] as? [String: Any] {
+            stats.model = block["model"] as? String ?? ""
+            stats.modelEmbedded = block["embedded"] as? Int ?? 0
+            stats.switchingTo = (block["switching"] as? [String: Any])?["to"] as? String
         }
         stats.sources = (root["sources"] as? [[String: Any]] ?? []).map { entry in
             SourceStat(

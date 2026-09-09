@@ -242,6 +242,7 @@ final class AppModel: ObservableObject {
         switch indexer.phase {
         case .ingesting(let source): return "indexing \(source)…"
         case .embedding: return "embedding…"
+        case .switching(let to): return "switching to \(to)…"
         case .reloading: return "reloading…"
         case .idle: break
         }
