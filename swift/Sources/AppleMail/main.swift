@@ -944,7 +944,14 @@ struct Search: AsyncParsableCommand {
 
 struct Export: AsyncParsableCommand {
   static let configuration = CommandConfiguration(
-    abstract: "Export a mail message by message ID"
+    abstract: "Export a mail message by message ID",
+    discussion: """
+      Reports attachment NAMES. It does not carry their bytes — Mail strips \
+      those out of the .emlx and stores them separately, so no form of \
+      `export` can return them.
+
+      To get the files:  apple-mail attachments <message-id> --save <dir>
+      """
   )
 
   @Argument(help: "Message ID (from search results)")
@@ -956,7 +963,11 @@ struct Export: AsyncParsableCommand {
   @Flag(name: .long, help: "Output as JSON")
   var json: Bool = false
 
-  @Flag(name: .long, help: "Print the raw RFC 822 source instead of the rendered message")
+  @Flag(name: .long, help: """
+    Print the raw RFC 822 source instead of the rendered message. \
+    Attachment payloads are NOT inlined — use `apple-mail attachments \
+    <id> --save <dir>`.
+    """)
   var raw: Bool = false
 
   @Option(name: .long, help: "Read engine: auto, filesystem, applescript")
@@ -997,6 +1008,25 @@ struct Export: AsyncParsableCommand {
 
     if raw {
       FileHandle.standardOutput.write(message.source)
+      // 🛑 `--raw` IS A PLAUSIBLE-LOOKING WRONG PATH, and it fails silently.
+      // Mail strips attachment bytes out of the .emlx and writes the file
+      // separately, leaving the MIME part with its `filename=` intact and an
+      // EMPTY body. So the source parses cleanly, every part header looks
+      // right, and each attachment decodes to zero bytes — which reads as
+      // "this message carries no attachment data" rather than "you used the
+      // wrong command". A peer session parsed the MIME, got 0 bytes, and
+      // concluded the data was not in the message.
+      //
+      // ⚠️ Detected on `X-Apple-Content-Length`, which is MAIL'S OWN marker
+      // for a part it stripped, not on "has a filename and an empty body".
+      // The header is the fact; the empty body is a consequence of it.
+      if let text = String(data: message.source, encoding: .utf8)
+          ?? String(data: message.source, encoding: .isoLatin1),
+         text.range(of: "X-Apple-Content-Length", options: .caseInsensitive) != nil {
+        warn("note: Mail stripped the attachment bytes out of this message, "
+             + "so the parts above have empty bodies. To get the files:\n"
+             + "      apple-mail attachments \(messageId) --save <dir>")
+      }
       return
     }
 
