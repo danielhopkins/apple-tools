@@ -1357,3 +1357,254 @@ done
 gh search repos "local semantic search personal data" --limit 30
 gh search repos "apple notes semantic search embeddings" --limit 20
 ```
+
+## Personal timelines — the archive framing
+
+**Gathered 2026-09-14.** The section above asks who else searches across a
+person's local data. This one asks the question the `plugins/` work raised:
+*has anyone built the archive — one store holding every message, photo, place
+and contact, imported from wherever they live, kept after the sources die?*
+An index stores ids and defers to the reader; an archive stores the content.
+So: should apple-tools **(a) read such an archive as a plugin source, (b)
+feed one from `apple-index`, or (c) neither?**
+
+**Short answer: (c), for now, and the reason is structural.**
+[Timelinize](https://github.com/timelinize/timelinize) is the one serious
+archive in the field. It reads three Apple stores itself — carrying two of the
+traps this repo documents — and every source it has that we lack arrives as
+an export nobody here has imported. There is no write path into it short of
+compiling a Go data source into its tree, so (b) is not on offer; (a) is a
+300-line plugin that would ingest zero rows today.
+
+### The field
+
+| Project | Lang | ★ | Pushed | License | Reads Apple stores | Interface |
+|---|---|---|---|---|---|---|
+| [Timelinize](https://github.com/timelinize/timelinize) | Go | 3,664 | 2026-05-22 | **AGPL-3.0** | `chat.db`, `AddressBook-v22.abcddb`, `Photos.sqlite` — from disk, on request | app + HTTP + **symmetric CLI** |
+| [HPI](https://github.com/karlicoss/HPI) | Python | 1,630 | 2026-09-12 | MIT | **none** — modules over exports on disk | `hpi query` → JSON/GPX |
+| [perkeep](https://github.com/perkeep/perkeep) | Go | 7,241 | 2026-02-01 | Apache-2.0 | none | server + `pk` |
+| [monica](https://github.com/monicahq/monica) | PHP | 25,305 | 2026-04-24 | AGPL-3.0 | none (vCard import) | web app |
+| [dawarich](https://github.com/Freika/dawarich) | Ruby | 10,395 | 2026-09-14 | AGPL-3.0 | none (phone GPS) | REST — **already a plugin here** |
+
+Timelinize and HPI were read; the other three are metadata only.
+
+### Timelinize — the archive, read closely
+
+Go, 360 of 407 commits by one author, last release **v0.0.28 on 2025-10-17**.
+The README's own CAUTION: *"The schema is still changing … Expect to delete
+and recreate your timelines."* `timeline/schema.sql` has had 4 commits in the
+last year, the last on 2025-10-24 — calmer than the warning — but the `repo`
+table's `version` key is still `1` and has never moved, so an outside reader
+cannot tell one schema from the next.
+
+*Verified by reading `timeline/schema.sql`, `db.go`, `timeline.go`:*
+
+- **A timeline is a folder**: `timeline.db`, `thumbnails.db`, `data/` (item
+  files by date), `assets/`, a `timelinize_repo.txt` marker. **Plain SQLite,
+  no encryption**: `mattn/go-sqlite3` + `sqlite-vec`, `_journal_mode=wal`, one
+  write pool capped at a single connection, a separate `mode=ro` read pool —
+  **so an outside read-only opener while the app runs is the pattern the app
+  uses on itself.**
+- **`items` is one wide table** — `data_source_id` + `original_id` (`UNIQUE`
+  together), `classification_id`, an owner `attribute_id`, `timestamp` in Unix
+  **milliseconds** with `time_offset_origin`, `data_text` up to **100 KiB**
+  (more, or binary, goes to a file under `data/`), `metadata` JSON,
+  lat/lon/alt, `original_id_hash`, `initial_content_hash`, `modified`,
+  `deleted`. Eleven classifications, `message` through `event`.
+- **Entities are three tables**: `entities` (`person`/`creature`/`place`),
+  `attributes` (`UNIQUE(name, value)`, so one `email_address=a@b.com` row is
+  shared by everyone who has it), `entity_attributes` marking an identity *on
+  a source*. `relationships` links items and attributes by label (`sent`,
+  `attachment`, `reply`, `reacted`); conversations are derived, not stored.
+- 🛑 **No FTS table anywhere.** Text search is `items.data_text LIKE '%' || ?
+  || '%'` (`search.go:573`). `embeddings` is one `BLOB` per item.
+
+*Verified by reading `timeline/datasource.go`, `graph.go`, `interactive.go`,
+`processing.go`, `jobs.go`, `datasources/generic/generic.go`:*
+
+- **A data source is a Go package registered in `init()`**: `Recognize(DirEntry)
+  → {Confidence, DirThreshold}` (filename, header or expected-sibling checks,
+  never a walk) and `FileImport`, which sends `*Graph` values down a channel —
+  one `Item` *or* `Entity`, `Edges` to other graphs, a JSON `Checkpoint` so a
+  paused import resumes. `APIImporter` is marked `TODO: unused?`.
+- 🛑 **No plugin mechanism, no external write path.** `submit-graph` and
+  `next-graph` exist for an "interactive import" and `interactive.go` returns
+  `errors.New("TODO: WIP")`. The `generic` source makes **one item per file**
+  dated by EXIF or mtime; it reads no records. The ways in are a Go source in
+  their tree, or files in a format an existing source recognises (`.ics`,
+  `.vcf`, `.eml`/`.mbox`, GPX, GeoJSON, a Takeout archive).
+- **Re-import is the whole incremental story.** `loadItemRow` matches on
+  `retrieval_key`, then `(data_source_name, original_id)`, then the two hashes
+  for rows the user edited or deleted, then `ItemUniqueConstraints` with
+  **soft nulls** (an incoming NULL means unknown). Existing items are
+  **skipped by default**; `ItemUpdatePreferences` opts into per-field updates.
+  Good dedup. ⚠️ **But no source keeps a watermark** — `imessage` re-reads
+  every row of `chat.db` and relies on the `guid` match — and `jobs.repeat`
+  exists while every `CreateJob` caller passes `0`. Compare
+  [`lab/INCREMENTAL.md`](../lab/INCREMENTAL.md).
+
+*Verified by reading `datasources/imessage/{imessage,appledate,nsstring}.go`,
+`applecontacts/macaddrbook.go`, `applephotos/applephotos.go`,
+`email/email.go`, `calendar/calendar.go`:*
+
+- **Three Apple stores are opened straight off disk, `mode=ro`, no copy** —
+  `chat.db` (Recognize wants an `Attachments` sibling, so `~/Library/Messages`
+  as a folder works), `AddressBook-v22.abcddb` (a walk of the `AddressBook`
+  folder, so `Sources/<uuid>/` accounts are found), `Photos.sqlite` inside a
+  `.photoslibrary`. Nothing in the tree mentions Full Disk Access.
+- 🛑 **`attributedBody` is read — and dates are divided by 1e9
+  unconditionally.** `message.timestamp()` is `CocoaNanoToTime(*m.date)`, the
+  LEANN trap exactly: a pre-10.13 row of whole seconds lands on 2001-01-01.
+  **Two of the three projects in the field that read `chat.db` mis-date the
+  oldest conversations.** The `attributedBody` decoder is a byte pattern scan
+  (find `01 2b`, cut at `86 84`, drop one or three prefix bytes), not a
+  typedstream parser; it cannot be measured from here.
+- ⚠️ **Contacts become entities with no source identity.** `ZUNIQUEID` is
+  never read, so a card with no email or phone can never be matched on
+  re-import. `ZMAIDENNAME` *is* read, which is more than most.
+- 🛑 **Photos faces: `ZDETECTIONTYPE` 1 → `person`, 4 → `creature`, and 3 —
+  a dog, measured here — falls through to the default, which is `person`.**
+  The "Emma is a dog" trap from [`apple-photos-store.md`](apple-photos-store.md),
+  met halfway. `ZPERSONURI`, the `UUID:ABPerson` that joins a face to a card,
+  is kept as a metadata string and never joined.
+- **Not read from any Apple store**: Notes, Mail (`.emlx` is not `.eml`),
+  Calendar (`.ics` files only), Reminders, Maps, CallHistory. The `iphone`
+  source reads a **backup** via `Manifest.db`, and not call history.
+
+*Verified by reading `timeline/search.go`, `ml.go`,
+`tlzapp/python/server/server.py`, `tlzapp/endpoints.go`, `app.go`:*
+
+- **Semantic search is a Flask server on `127.0.0.1:12003` running
+  `google/siglip2-base-patch16-naflex` under PyTorch** (`requires-python
+  ~=3.13.0`). On-device — MPS, CUDA, CPU on OOM — but a second runtime the Go
+  binary spawns; `semantic_text` fails with `python server not ready` without
+  it. **Text and images share one space**, so a text query ranks photos — the
+  omni-macos idea, shipped. ⚠️ **One vector per item over the whole text with
+  `truncation=True`**, no chunking, so a long note is its opening. Ranking is
+  `vec_distance_l2 … ORDER BY distance` — a brute-force scan like ours, with
+  no lexical arm to fuse. *Not verified:* SigLIP2's text token limit.
+- **Thirty-one commands in one table, and the CLI is the API.** `RunCommand`
+  turns argv into the endpoint's JSON (`--data-text x` → `{"data_text":"x"}`),
+  posts to `127.0.0.1:12002/api/<command>` if a server answers and otherwise
+  serves it **in-process** — `timelinize search-items --repo … --data-text
+  budget` works with the app closed and prints `{"items":[{"id",
+  "data_source_name", "classification", "original_id", "timestamp",
+  "data_text", …}]}`. The native id survives as `original_id`; the UI
+  addresses an item at `/items/<repo_id>/<id>`.
+- ⚠️ **The 3D map is Mapbox**, keyed by `mapbox_api_key`, so the map panel
+  sends the viewed region to a third party — the same class of exception as
+  our MapKit panel, and unmentioned in the README.
+
+### HPI — the other framing, and the one closer to ours
+
+*Verified by reading `README.org`, `doc/QUERY.md` and the `src/my/` listing:*
+a Python package named `my`, one module per source, **no database and no
+index** — each module parses an export already on disk, and `hpi query
+my.reddit.all.comments --recent 4w` runs it and prints JSON (GPX for
+locations), with `--order-key`, `--after`/`--before` and `--stream` for `jq
+select`. **That is what `apple <tool> --json` already is**, minus the ordering
+flags. ⚠️ **No Apple module exists**: `smscalls` is Android's SMS Backup &
+Restore XML, `calendar` is public holidays, `photos` is EXIF over folders —
+and `photos/main.py` geocodes a folder's `geo.json` place name through
+**Nominatim**, a network call nothing flags. MIT.
+
+### The other camps
+
+- [perkeep](https://github.com/perkeep/perkeep) keeps blobs by hash with a
+  search index over them; "keep this forever", not "what did they text me".
+- [monica](https://github.com/monicahq/monica) is the `people` report as a
+  hand-entered CRM, with vCard import and no timeline.
+- [dawarich](https://github.com/Freika/dawarich) is already
+  `plugins/dawarich/`. Timelinize's `location` class is the same data with no
+  end time — the one field Dawarich has and Maps lacks.
+
+**Licence.** Timelinize, monica and dawarich are AGPL-3.0. A separate process
+reading `timeline.db`, or calling `127.0.0.1:12002`, is not linking, and
+nothing here would carry their code; a Go source *inside* their tree would be
+a contribution under their licence. That is all that needs saying, and it is
+not legal advice.
+
+### What we have that this camp does not
+
+- **Eight Apple stores read where they live, with the traps measured.**
+  Timelinize reads three and carries two of the traps we documented.
+- **A change signal per source**, against "re-read everything and dedup";
+  **FTS5 and vectors with no second runtime**, against `LIKE` plus a Python
+  3.13 PyTorch server.
+- **Ids, not copies.** Their archive *is* the copy — right for an archive,
+  wrong for an index.
+- **A consent and deletion story, and a plugin manager that names every
+  network host.** Their README does not mention the Mapbox call.
+
+### Read it, feed it, or neither
+
+**(a) A plugin reading `timeline.db`.** ~300 lines of Python on the
+`dawarich` pattern: `manifest` with `path` as its one key, `status` checking
+`repo.version == 1`, `index` selecting from `extended_items` with `mode=ro`;
+`uid = timelinize:<classification_name>:<items.id>`, `native_id = items.id`,
+`url = /items/<repo_id>/<id>`, `occurred = timestamp/1000`, `body =
+data_text`, lat/lon straight across, `people` via `relationships` →
+`entities.name`, `rev = coalesce(modified, stored)`. 🛑 **Two traps.** A
+`location` item has a coordinate and no country, and the `places` rule wants
+the country in `container` — so reverse-geocode (refused; a network call) or
+emit no `place` kind. And **every Apple source they import is one we already
+index**: filter `data_source_name NOT IN ('imessage','apple_contacts',
+'apple_photos','iphone','icloud')`, or the index holds every message twice.
+*What it would answer that we cannot:* Facebook, Instagram, Twitter,
+Telegram, WhatsApp, Google Location and Photos, Strava, Flighty — **if a
+Timelinize repo holding those exists on the machine. None does.** Cost: two
+days; value today: zero rows.
+
+**(b) Feeding it from `apple-index`.** No record-shaped way in. The routes
+are a Go source in their tree — a second copy of every store reader, under
+AGPL — or an exporter writing formats they recognise: `.ics` from Calendar
+(they keep `UID` as `original_id`, so re-export dedups), `.vcf` from Contacts,
+`.eml` from Mail by stripping the `.emlx` byte-count line — ⚠️ with **empty
+attachment parts**, since Mail keeps the bytes outside the file — and GPX
+from Maps visits. Notes, Reminders and CallHistory have **no format they
+read**. *What it would answer:* nothing we cannot; it puts our readers under
+their UI. Cost: a week; value: presentation.
+
+**(c) Neither — the recommendation.** The Apple half we read better, the
+non-Apple half has no data behind it here, and the author says to expect to
+delete and recreate the archive. **Revisit on either trigger:** a Timelinize
+repo on this machine holding a non-Apple source, or `repo.version` moving
+past `1`, which would mean the schema is being versioned for outside readers:
+
+```
+sqlite3 -readonly "<repo>/timeline.db" "SELECT value FROM repo WHERE key='version'"
+```
+
+### Ideas worth taking
+
+- **`time_offset_origin`** — a byte recording *how* a time zone was inferred.
+  Our `messages` reader sniffs a date's magnitude and says nothing about
+  having done so; a provenance field on the record is the honest version.
+- **Soft-null unique constraints** — an incoming NULL means "unknown", not
+  "must match NULL". [`todo-call-archive.md`](todo-call-archive.md) will meet
+  exactly this when a relayed call and an archived one differ only in what
+  one of them lacks.
+- **`initial_content_hash` beside the id hash**, so an item the user edited or
+  deleted is recognised on re-import and not resurrected. Nothing in
+  `apple-index` distinguishes "gone from the source" from "never seen".
+- **Report upstream**: the unconditional 1e9 divide and `ZDETECTIONTYPE 3`.
+  One-line fixes in an active repo, as with LEANN above.
+
+### Refreshing this section
+
+```
+for r in timelinize/timelinize karlicoss/HPI perkeep/perkeep monicahq/monica Freika/dawarich; do
+  gh api "repos/$r" --jq '"\(.full_name)\t★\(.stargazers_count)\tpushed \(.pushed_at[0:10])\t\(.license.spdx_id)\t\(.language)"'
+done
+gh api repos/timelinize/timelinize/releases/latest --jq '"\(.tag_name) \(.published_at[0:10])"'
+gh api 'repos/timelinize/timelinize/commits?path=timeline/schema.sql&per_page=100' --jq 'length'
+for p in timeline/schema.sql timeline/interactive.go tlzapp/python/server/server.py \
+         datasources/imessage/imessage.go datasources/applephotos/applephotos.go; do
+  mkdir -p "$(dirname "$p")"; curl -sfL "https://raw.githubusercontent.com/timelinize/timelinize/main/$p" -o "$p"
+done
+grep -n 'CocoaNanoToTime(\*m.date)' datasources/imessage/imessage.go   # the 1e9 trap: still there?
+grep -n 'case 3:' datasources/applephotos/applephotos.go                # dogs: still persons?
+grep -ci 'fts' timeline/schema.sql                                      # 0 until they add FTS
+grep -n 'TODO: WIP' timeline/interactive.go                             # still no way in?
+grep -n '^MODEL' tlzapp/python/server/server.py                         # still SigLIP2?
+```
