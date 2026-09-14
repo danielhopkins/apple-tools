@@ -61,5 +61,10 @@ echo "  swift/Sources/AppleToolsVersion/Version.swift"
 
 stamp notes/apple-notes '__version__ = "[^"]*"' "__version__ = \"$VERSION\""
 stamp bin/apple 'APPLE_TOOLS_VERSION="[^"]*"' "APPLE_TOOLS_VERSION=\"$VERSION\""
+# The plugins that ship in this repo carry the same version. An external
+# plugin has its own and is not stamped.
+for plugin in plugins/*/apple-plugin-*; do
+    stamp "$plugin" '\nVERSION = "[^"]*"' "\nVERSION = \"$VERSION\""
+done
 
 echo "Done. Rebuild with 'make build'."

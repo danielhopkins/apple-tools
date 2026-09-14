@@ -9,7 +9,7 @@ UV      := $(shell command -v uv)
 
 .PHONY: build install uninstall install-agent uninstall-agent agent-status \
         install-skill link-installed-skills uninstall-skill demo status test \
-        test-people test-files test-doctext test-photos bench bench-compare bench-clean clean
+        test-people test-files test-doctext test-photos test-plugins bench bench-compare bench-clean clean
 
 ## Build the Swift embedder (Core ML + Apple's models)
 build:
@@ -126,6 +126,7 @@ test:
 	./test-files.py
 	./test-doctext.py
 	./test-photos.py
+	./test-plugins.py
 	./test-incremental.py --source mail,calendar,notes,messages
 	./eval.py
 
@@ -156,6 +157,9 @@ test-people:
 ## Where the `files` source keeps its configuration, and how it reads Word,
 ## PowerPoint and the Obsidian deep link. Offline. It pins the bug that put the
 ## configuration inside the encrypted vault, where an unmount took it away.
+test-plugins:
+	./test-plugins.py
+
 test-files:
 	./test-files.py
 

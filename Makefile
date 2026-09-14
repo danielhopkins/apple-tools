@@ -101,6 +101,7 @@ uninstall-skills:
 install: build
 	@mkdir -p $(PREFIX)
 	ln -sf $(ROOT)/bin/apple $(PREFIX)/apple
+	ln -sf $(ROOT)/bin/apple-plugins $(PREFIX)/apple-plugins
 	ln -sf $(ROOT)/notes/apple-notes $(PREFIX)/apple-notes
 	ln -sf $(ROOT)/$(RELEASE_DIR)/apple-contacts $(PREFIX)/apple-contacts
 	ln -sf $(ROOT)/$(RELEASE_DIR)/apple-mail $(PREFIX)/apple-mail
@@ -112,7 +113,7 @@ install: build
 	@echo "Installed to $(PREFIX). Ensure it is on your PATH."
 
 uninstall:
-	rm -f $(PREFIX)/apple $(PREFIX)/apple-notes $(PREFIX)/apple-contacts \
+	rm -f $(PREFIX)/apple $(PREFIX)/apple-plugins $(PREFIX)/apple-notes $(PREFIX)/apple-contacts \
 	      $(PREFIX)/apple-mail $(PREFIX)/apple-calendar $(PREFIX)/reminders \
 	      $(PREFIX)/apple-messages $(PREFIX)/apple-phone $(PREFIX)/apple-maps
 
@@ -166,6 +167,10 @@ dev-off:
 ## Swift unit tests. The Notes suite drives live Notes.app; run notes/run-tests by hand.
 test:
 	cd $(SWIFT_DIR) && swift test
+	@# Every shipped plugin's own suite. Offline: a fake server on 127.0.0.1,
+	@# a temp plugins.json and a temp Keychain file. Nothing here reaches the
+	@# user's configuration or the network.
+	@for t in plugins/*/test-*.py; do /usr/bin/python3 "$$t" || exit 1; done
 
 ## Smoke-check that every tool answers --help and produces JSON
 check: debug
@@ -175,6 +180,7 @@ check: debug
 		printf '%-10s ' "$$tool"; \
 		bin/apple $$tool --help >/dev/null 2>&1 && echo ok || echo FAILED; \
 	done
+	@printf '%-10s ' plugins; bin/apple plugins list >/dev/null 2>&1 && echo ok || echo FAILED
 
 ## Stamp the version from ./VERSION into every tool (or: make set-version V=2026.8.1)
 set-version:
@@ -187,7 +193,7 @@ dist: set-version completions
 	@# partway, which shipped v26.728.2 with bin/apple still on 26.728.1.
 	@# dist re-runs it, so the tarball was right and only the tagged source
 	@# was wrong: silent, and invisible until someone builds from the tag.
-	@for f in bin/apple notes/apple-notes swift/Sources/AppleToolsVersion/Version.swift; do \
+	@for f in bin/apple notes/apple-notes swift/Sources/AppleToolsVersion/Version.swift plugins/*/apple-plugin-*; do \
 		grep -q "$(VERSION)" "$$f" \
 			|| { echo "error: $$f does not carry $(VERSION); run 'make set-version'"; exit 1; }; \
 	done
@@ -209,7 +215,20 @@ dist: set-version completions
 	   "$$(cd $(SWIFT_DIR) && swift build $(SWIFT_UNIV) --show-bin-path)"/apple-phone \
 	   "$$(cd $(SWIFT_DIR) && swift build $(SWIFT_UNIV) --show-bin-path)"/apple-maps \
 	   $(DIST)/
-	cp bin/apple $(DIST)/
+	cp bin/apple bin/apple-plugins $(DIST)/
+	@# The plugins that ship in this repo, one directory each, found by the
+	@# manager as `<root>/plugins/<name>/apple-plugin-<name>`. Same layout in
+	@# the checkout, the tarball and brew's libexec, so discovery has one rule.
+	@# ⚠️ Nothing is enabled by shipping it. `apple plugins enable` is the
+	@# user's decision, and the first plugin here talks to a server.
+	mkdir -p $(DIST)/plugins
+	cp -R plugins/* $(DIST)/plugins/
+	rm -f $(DIST)/plugins/*/test-*.py
+	@# Prove each shipped plugin answers the contract from where it landed.
+	@for plugin in $(DIST)/plugins/*/apple-plugin-*; do \
+		PYTHONDONTWRITEBYTECODE=1 "$$plugin" manifest --json >/dev/null \
+			|| { echo "error: packaged $$plugin does not answer manifest"; exit 1; }; \
+	done
 	@# notes/*.py, never a literal list: apple-notes imports its modules as
 	@# siblings, so a new one (mergeable.py, v26.812.9) that is not copied
 	@# here builds and tests perfectly from the checkout and then dies with

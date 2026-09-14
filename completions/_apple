@@ -18,10 +18,19 @@ _apple() {
         'calendar:Read and write Calendar events'
         'contacts:Query Contacts'
     )
+    # Enabled plugins complete like tools. `apple-plugins enabled` is a
+    # subprocess, so it runs only when the tool position is being completed.
+    local -a plugins
+    if (( $+commands[apple-plugins] )); then
+        plugins=(${(f)"$(apple-plugins enabled 2>/dev/null \
+            | python3 -c 'import json,sys
+for r in json.load(sys.stdin): print("%s:%s" % (r["name"], r["manifest"].get("description","plugin")))' 2>/dev/null)"})
+    fi
 
     local -a top_level
     top_level=(
-        'status:Permission state of every tool, without prompting'
+        'status:Permission state of every tool and enabled plugin, without prompting'
+        'plugins:Find, enable and configure plugins'
         '--help:Show usage'
         '--version:Print the apple-tools version'
         '--which:Print the resolved path of each tool'
@@ -35,6 +44,7 @@ _apple() {
     case $state in
         tool)
             _describe -t tools 'tool' tools
+            (( ${#plugins} )) && _describe -t plugins 'plugin' plugins
             _describe -t options 'option' top_level
             ;;
         args)
@@ -48,6 +58,26 @@ _apple() {
                 reminders) target=reminders ;;
                 calendar)  target=apple-calendar ;;
                 contacts)  target=apple-contacts ;;
+                plugins)
+                    local -a sub
+                    sub=(
+                        'list:Every plugin found or configured'
+                        'enable:Let apple NAME run, and the index read it'
+                        'disable:Make it invisible again'
+                        'config:Show or set key=value; secrets go to the Keychain'
+                        'manifest:Print a plugin manifest'
+                    )
+                    if (( CURRENT == 2 )); then
+                        _describe -t sub 'subcommand' sub
+                    else
+                        local -a names
+                        names=(${(f)"$(apple-plugins list --json 2>/dev/null \
+                            | python3 -c 'import json,sys
+for r in json.load(sys.stdin): print(r["name"])' 2>/dev/null)"})
+                        _describe -t names 'plugin' names
+                    fi
+                    return
+                    ;;
                 *)         return 1 ;;
             esac
 

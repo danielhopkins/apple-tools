@@ -402,6 +402,31 @@ invitation mail, and `phone dial` places a real call — which is why the first 
 Writes to Reminders, Calendar, Contacts and Notes also sync to your own devices,
 because they go through the real apps' stores.
 
+A **plugin** can reach a server, and that is the one thing a plugin has to
+say up front. See [Plugins](#plugins).
+
+## Plugins
+
+A plugin is an external executable, `apple-plugin-<name>`, that reads
+something that is not an Apple store and joins the tools on equal terms:
+`apple <name> …` runs it, `apple status` reports it, and `apple-index`
+indexes what it returns. Nothing runs until you enable it:
+
+```
+apple plugins list                                  # what is installed
+apple plugins config dawarich url=https://… api_key=…   # the key goes to the Keychain
+apple plugins enable dawarich
+apple dawarich visits --since 30 --json             # visits, with how long you stayed
+```
+
+A plugin that makes a connection declares its hosts in its manifest, and
+`apple plugins list`, `apple plugins enable` and `apple status` print them.
+The first plugin, `dawarich`, reads a self-hosted
+[Dawarich](https://dawarich.app) location server: visits with a start **and
+an end** (Maps records the start alone), places with a city and country, and
+the GPS track. The contract for writing one is in
+[`docs/apple-plugins.md`](docs/apple-plugins.md).
+
 ## Geocoding
 
 Three flags resolve a place name into a coordinate, and all three ask Apple Maps.

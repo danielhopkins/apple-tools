@@ -4,7 +4,7 @@ CLIs for reading and writing local Apple app data: Notes, Mail, Messages, Phone,
 Maps, Reminders, Calendar, Contacts. Everything runs locally against the user's real data — no
 sync service, no API keys.
 
-🛑 **Two exceptions, and both are visible.**
+🛑 **Three exceptions, and all three are visible.**
 
 1. **Geocoding, which is opt-in.** `apple maps geocode`, `apple reminders --at`
    and `apple calendar --at` resolve a place name through Apple Maps. It lives
@@ -17,6 +17,12 @@ sync service, no API keys.
    data. What an observer could infer is the region being looked at. The map
    is built only while that panel is open, so a window never scrolled that far
    makes no request. **No CLI makes this call**; it is the app alone.
+3. **Plugins, which are opt-in twice.** A plugin is an external executable
+   that reads something that is not an Apple store — the first, `dawarich`,
+   reads a self-hosted location server. It runs only after `apple plugins
+   enable <name>`, and one that makes a connection has to declare its hosts
+   in its manifest, which `apple plugins list` and `apple status` print.
+   Nothing in this repo enables one. See the Plugins section.
 
 ## Quick reference
 
@@ -92,6 +98,10 @@ installed via `make install`.
 | Move a contact between accounts | `apple contacts move <id> --to "iCloud" --dry-run` |
 | Export contacts | `apple contacts export --group "Family" -o family.vcf` |
 | List contact accounts | `apple contacts containers --json` |
+| Which plugins exist, and which run | `apple plugins list` |
+| Turn one on | `apple plugins config dawarich url=… api_key=…` then `apple plugins enable dawarich` |
+| How long was I at a place (Dawarich) | `apple dawarich visits --since 30 --json` → `duration_seconds` |
+| Where was I at three (Dawarich) | `apple dawarich points --from "2026-09-10 14:00" --to "2026-09-10 16:00" --json` |
 
 **Every tool supports `--json`.** Prefer it — the plain output is for humans and
 its shape is not stable. Use `apple --which` to see which binary each name
@@ -1620,10 +1630,109 @@ apple contacts edit <id> --clear-note           # deletes it
 `get` reports a contact's `groups`; `search` and `list` don't, because Contacts
 has no reverse lookup and it would mean scanning every group per contact.
 
+## Plugins — `apple plugins`, and `apple <plugin>`
+
+A plugin is an executable `apple-plugin-<name>`, in any language, that runs
+out of process the way every tool here does. `apple <name> …` execs it,
+`apple status` asks it `status --json`, and `apple-index` asks it `index` and
+reads NDJSON records back. The contract, the reasons, and what the first one
+measured are in [`docs/apple-plugins.md`](docs/apple-plugins.md).
+
+```
+apple plugins list [--json]                # found, enabled, network hosts, missing config
+apple plugins config NAME [KEY=VALUE]... [--unset KEY] [--reveal] [--json]
+apple plugins enable NAME [--force]        # refuses while a required key is unset
+apple plugins disable NAME
+apple plugins manifest NAME
+apple NAME <its own commands>              # only once enabled
+```
+
+🛑 **Found is not enabled, and only enabled runs.** `list` shows every plugin
+on the machine; none of them is dispatched, reported by `status`, or ingested
+until `enable`. `apple <name>` on an installed-but-disabled plugin exits 1
+naming the fix, which is not "unknown tool". That is the whole reason the
+manager exists rather than `bin/apple` scanning PATH: the first plugin talks
+to a server, and the moment one runs is the moment data may leave the machine.
+
+- 🛑 **Secrets go to the Keychain, never to `plugins.json`.** A key the
+  manifest marks `secret` is stored under service `apple-tools.<name>`;
+  `config --json` prints `•••`, `--reveal` prints it. The file, in
+  `~/Library/Application Support/apple-tools/`, holds `enabled` and the
+  non-secret keys, mode 0600.
+- ⚠️ **An undeclared key is a hard error**, naming the keys the plugin does
+  declare, so a typo cannot produce a configured plugin that never works.
+- **A plugin with `index.kinds` in its manifest is an index source**, listed
+  after the built-in ones by `apple-index sources`, ingested by `refresh`,
+  and shown in the app's Sources panel. One generic adapter serves every
+  plugin and **checks every field of every record** before it is stored; a
+  malformed record fails the whole ingest naming the line.
+- ⚠️ **Disabling does not un-index.** Records stay until a `--full` ingest,
+  the same rule `files remove` has. The `places` report reads plugin tools
+  from the index, not the enabled list, so it never hides what the index holds.
+- 🛑 **A plugin that indexes places puts the COUNTRY in `container`**, the
+  `photos` rule, and gets its own `<name>_visits` and `<name>_suggested`
+  columns in `places`. Three sources, three units, never added.
+
+### dawarich — `apple dawarich`
+
+Reads a self-hosted [Dawarich](https://dawarich.app) server over its REST
+API. 🛑 **Every request goes to the one configured `url` with the configured
+`api_key`, and nothing is ever posted.** Python, stdlib only, in
+`plugins/dawarich/`; tested against a fake server in
+`plugins/dawarich/test-dawarich.py`.
+
+```
+apple dawarich status [--json]
+apple dawarich visits [--since DAYS | --from DATE --to DATE] [--status all|confirmed|suggested]
+                      [--limit N] [--json]
+apple dawarich places [--search TEXT] [--limit N] [--json]
+apple dawarich points [--since DAYS | --from DATE --to DATE] [--limit N] [--json]
+apple dawarich index  [--since DAYS]        # what apple-index calls
+```
+
+What it adds over `apple maps`, and the traps:
+
+- **A visit has an END.** `visits --json` reports `started`, `ended` and
+  `duration_seconds`. `apple maps` cannot say how long the user stayed
+  anywhere; this is the tool that can. ⚠️ Dawarich's own `duration` field is
+  in **minutes** and is computed once at creation; the plugin recomputes it
+  from the two timestamps and never reports the raw one.
+- 🛑 **A visit has three statuses, and `suggested` is the server's GUESS.**
+  `visits` reports both `confirmed` and `suggested` by default with `status`
+  on each row; `--status confirmed` narrows. A `declined` visit is one the
+  user said did not happen and is **never** reported. In the index the two
+  are separate kinds, `visit` and `suggested`.
+- **Points are the GPS track**, the thing Maps never has. `--limit` defaults
+  to 2000 and a cut is said on stderr. They are a CLI command and **not an
+  index kind**: a GPS fix is not a document.
+- ⚠️ **Nothing here knows Maps' visits.** The same afternoon can be a Maps
+  arrival and a Dawarich visit; the `places` report keeps them in separate
+  columns and nothing joins them.
+- **`status` distinguishes `unconfigured`, `unreachable`, `unauthorized` and
+  `ok`**, and `--json` always exits 0 like every tool's status does.
+- 🛑 **On this server every visit is `suggested`** — 6,126 of 6,126, back to
+  2017 — because nobody confirms visits in Dawarich's UI. `--status
+  confirmed` returns nothing here. **28% of visits have no coordinate**
+  (`Unknown Location`); they are in the index by date and duration and
+  absent from `places` and `near`.
+- 🛑 **A suggested visit never anchors a `places` merge.** Dawarich named
+  the user's home `3313`, a house number, and 1,651 guesses out-weighed
+  1,649 photo days on the first ingest. Confirmed visits weigh; suggested
+  ones are counted in `dawarich_suggested` and size nothing.
+- ⚠️ **Until a release ships, the Homebrew `apple` cannot dispatch plugins
+  and the app does not ingest them.** Run from the checkout:
+  `APPLE_PLUGINS_BIN=$PWD/bin/apple-plugins lab/bin/apple-index ingest
+  --source dawarich`, then `embed`.
+
 ## Layout
 
 ```
-bin/apple                 dispatcher — routes to the tools below
+bin/apple                 dispatcher — routes to the tools below, and to
+                          enabled plugins
+bin/apple-plugins         the plugin manager: discovery, enable/disable,
+                          config, and the Keychain for secrets
+plugins/dawarich/         the first plugin, and the reference for the
+                          contract. Python, stdlib only
 swift/                    one Swift package, seven binaries
   Sources/reminders/      + RemindersLibrary/ (+ Tags.swift, the tag read/write
                           face and the per-listing tag cache)
@@ -1721,6 +1830,7 @@ tool you are changing before you change it — every claim in there was paid for
 | `apple-messages-store.md` | chat.db schema, the typedstream body, verified traps |
 | `apple-phone-store.md` | CallHistory schema, the entitlement walls, verified traps |
 | `apple-maps-store.md` | MapsSync schema, why the location table overcounts, and why nothing here writes |
+| `apple-plugins.md` | the plugin contract: manifest, record shape, what the adapter refuses, where config and secrets live, and what Dawarich's API was measured to do |
 | `apple-photos-store.md` | who is tagged in a photo and where it was taken; why `osxphotos` is not used, and why the pictures, the OCR and the scene labels are left behind |
 | `apple-geocoding.md` | the one network call: what uses it, the local-first rule, and why reminders cannot read the Maps store |
 | `apple-reminders-tags.md` | tags have no public API at all — the private call that works, and the store behind it |
@@ -1746,6 +1856,7 @@ make dev        # debug build, shaded ahead of the installed copy — see below
 make check      # smoke-test that every tool responds
 make test       # Swift unit tests (mail, messages, phone, maps, geocoding,
                 #   reminders — all offline; the network geocoder is not exercised)
+                #   + plugins/*/test-*.py, against a fake server on 127.0.0.1
 make bump       # next CalVer for today, stamped into every tool
 make dist       # universal release tarball + sha256 for the Homebrew tap
 ```

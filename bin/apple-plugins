@@ -1,0 +1,490 @@
+#!/usr/bin/env python3
+"""apple-plugins - find, enable and configure external plugins.
+
+A plugin is an executable named `apple-plugin-<name>`, in any language, that
+runs OUT OF PROCESS the way every tool here does. Nothing imports plugin code:
+`apple <name> …` execs it, `apple status` asks it `status --json`, and
+`apple-index` asks it `index --json` and reads records back on stdout. The
+contract is four calls:
+
+    apple-plugin-<name> manifest --json     what it is, what it needs, what it emits
+    apple-plugin-<name> status --json       {status, usable, advice}, like the tools
+    apple-plugin-<name> index [--since N]   NDJSON records in the index record shape
+    apple-plugin-<name> <anything else>     its own subcommands
+
+Full record in docs/apple-plugins.md.
+
+🛑 A PLUGIN THAT IS FOUND IS NOT A PLUGIN THAT RUNS. Discovery reads the disk;
+enabling is a decision the user records here. A disabled plugin is invisible
+everywhere: not dispatched, not in `apple status`, not ingested. That is the
+whole reason this file exists rather than `bin/apple` scanning PATH — the
+first plugin declares a NETWORK host, and the header of CLAUDE.md promises
+that nothing here leaves the machine without saying so.
+
+Configuration lives in `~/Library/Application Support/apple-tools/plugins.json`,
+beside `files.json` and `people.json`. 🛑 SECRETS NEVER GO IN THAT FILE. A key
+the manifest marks `secret` is written to the login Keychain under the service
+`apple-tools.<name>`, and `config --json` prints it as `•••` unless asked to
+`--reveal`. The plugin reads its own secrets back with `--reveal`, which is
+why the file can be 0600 and still not be the thing that matters.
+"""
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+SUPPORT = os.path.expanduser("~/Library/Application Support/apple-tools")
+CONFIG = os.environ.get("APPLE_PLUGINS_CONFIG", os.path.join(SUPPORT, "plugins.json"))
+USER_PLUGINS = os.path.join(SUPPORT, "plugins")
+KEYCHAIN_SERVICE = "apple-tools.%s"
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+ROOT = os.path.dirname(HERE)
+
+
+def die(message, code=1):
+    print("error: %s" % message, file=sys.stderr)
+    sys.exit(code)
+
+
+# --------------------------------------------------------------------------
+# configuration
+# --------------------------------------------------------------------------
+
+def read_config():
+    try:
+        with open(CONFIG) as handle:
+            config = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return config if isinstance(config, dict) else {}
+
+
+def write_config(config):
+    os.makedirs(os.path.dirname(CONFIG), mode=0o700, exist_ok=True)
+    tmp = CONFIG + ".tmp"
+    with open(tmp, "w") as handle:
+        json.dump(config, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CONFIG)
+
+
+# --------------------------------------------------------------------------
+# keychain
+# --------------------------------------------------------------------------
+#
+# ⚠️ `security` is the only route that needs no framework and no signing.
+# `-U` updates in place, so a re-set never leaves two items behind. Tests set
+# APPLE_PLUGINS_KEYCHAIN_FILE to keep secrets in a temp file instead, because a
+# test must never write to the user's real Keychain — and a test that asks the
+# Keychain for a password can hang on a dialog under a non-interactive shell.
+
+def _fake_keychain():
+    return os.environ.get("APPLE_PLUGINS_KEYCHAIN_FILE")
+
+
+def _fake_read():
+    try:
+        with open(_fake_keychain()) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def secret_get(plugin, key):
+    if _fake_keychain():
+        return _fake_read().get("%s/%s" % (plugin, key))
+    proc = subprocess.run(
+        ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE % plugin,
+         "-a", key, "-w"], capture_output=True, text=True)
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.rstrip("\n")
+
+
+def secret_set(plugin, key, value):
+    if _fake_keychain():
+        data = _fake_read()
+        data["%s/%s" % (plugin, key)] = value
+        with open(_fake_keychain(), "w") as handle:
+            json.dump(data, handle)
+        return
+    proc = subprocess.run(
+        ["security", "add-generic-password", "-U", "-s", KEYCHAIN_SERVICE % plugin,
+         "-a", key, "-w", value, "-l", "apple-tools plugin %s: %s" % (plugin, key)],
+        capture_output=True, text=True)
+    if proc.returncode != 0:
+        die("keychain write failed: %s" % proc.stderr.strip())
+
+
+def secret_delete(plugin, key):
+    if _fake_keychain():
+        data = _fake_read()
+        data.pop("%s/%s" % (plugin, key), None)
+        with open(_fake_keychain(), "w") as handle:
+            json.dump(data, handle)
+        return
+    subprocess.run(
+        ["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE % plugin,
+         "-a", key], capture_output=True, text=True)
+
+
+# --------------------------------------------------------------------------
+# discovery
+# --------------------------------------------------------------------------
+#
+# Order of preference, first hit wins:
+#   0. $APPLE_TOOLS_PLUGINS      colon-separated dirs, each holding the executable
+#                                directly or under <name>/
+#   1. ~/Library/Application Support/apple-tools/plugins/<name>/apple-plugin-<name>
+#                                where an externally installed plugin goes
+#   2. alongside this script     an installed layout (Homebrew, make install)
+#   3. <root>/plugins/<name>/apple-plugin-<name>
+#                                the plugins that ship in this repo: the
+#                                checkout, and the release tarball
+#   4. <root>/libexec/plugins/<name>/apple-plugin-<name>
+#                                the same, where brew puts them
+#   5. <root>/Resources/plugins/<name>/apple-plugin-<name>
+#                                the same, inside AppleTools.app, where this
+#                                script sits in Contents/Helpers
+#   6. $PATH
+#
+# ⚠️ Every candidate has to be a regular executable FILE. A directory named
+# apple-plugin-foo is not a plugin, and `os.access(X_OK)` says yes to one.
+
+def candidate_dirs():
+    dirs = []
+    for entry in os.environ.get("APPLE_TOOLS_PLUGINS", "").split(":"):
+        if entry:
+            dirs.append(entry)
+    dirs.append(USER_PLUGINS)
+    dirs.append(HERE)
+    dirs.append(os.path.join(ROOT, "plugins"))
+    dirs.append(os.path.join(ROOT, "libexec", "plugins"))
+    dirs.append(os.path.join(ROOT, "Resources", "plugins"))
+    return dirs
+
+
+def _executable(path):
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def discover():
+    """{name: path} for every plugin executable on the machine."""
+    found = {}
+    for directory in candidate_dirs():
+        try:
+            entries = sorted(os.listdir(directory))
+        except OSError:
+            continue
+        for entry in entries:
+            direct = os.path.join(directory, entry)
+            if entry.startswith("apple-plugin-") and _executable(direct):
+                found.setdefault(entry[len("apple-plugin-"):], direct)
+                continue
+            nested = os.path.join(direct, "apple-plugin-%s" % entry)
+            if os.path.isdir(direct) and _executable(nested):
+                found.setdefault(entry, nested)
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        try:
+            entries = os.listdir(directory)
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.startswith("apple-plugin-") and _executable(os.path.join(directory, entry)):
+                found.setdefault(entry[len("apple-plugin-"):], os.path.join(directory, entry))
+    return found
+
+
+def manifest_of(path):
+    """Ask a plugin what it is. None when it does not answer the contract."""
+    try:
+        proc = subprocess.run([path, "manifest", "--json"], capture_output=True,
+                              text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        manifest = json.loads(proc.stdout)
+    except ValueError:
+        return None
+    if not isinstance(manifest, dict) or not manifest.get("name"):
+        return None
+    return manifest
+
+
+def find_plugin(name):
+    """(path, manifest) for a named plugin, or die naming what exists."""
+    found = discover()
+    if name not in found:
+        known = ", ".join(sorted(found)) or "none"
+        die("no plugin named '%s'. Found: %s" % (name, known), 2)
+    manifest = manifest_of(found[name])
+    if manifest is None:
+        die("'%s' at %s does not answer `manifest --json`" % (name, found[name]), 2)
+    return found[name], manifest
+
+
+def config_fields(manifest):
+    """{key: {secret, required, help}} from a manifest."""
+    fields = {}
+    for field in manifest.get("config") or []:
+        if isinstance(field, dict) and field.get("key"):
+            fields[field["key"]] = field
+    return fields
+
+
+def missing_required(name, manifest, entry):
+    missing = []
+    for key, field in config_fields(manifest).items():
+        if not field.get("required"):
+            continue
+        if field.get("secret"):
+            if not secret_get(name, key):
+                missing.append(key)
+        elif not entry.get(key):
+            missing.append(key)
+    return missing
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+def cmd_list(opts):
+    config = read_config()
+    found = discover()
+    rows = []
+    for name in sorted(set(found) | set(config)):
+        path = found.get(name)
+        manifest = manifest_of(path) if path else None
+        entry = config.get(name) or {}
+        network = (manifest or {}).get("network") or {}
+        row = {
+            "name": name,
+            "path": path,
+            "installed": path is not None,
+            "valid": manifest is not None,
+            "enabled": bool(entry.get("enabled")) and manifest is not None,
+            "version": (manifest or {}).get("version"),
+            "description": (manifest or {}).get("description"),
+            "network": bool(network),
+            "hosts": network.get("hosts") or [],
+            "indexes": (manifest or {}).get("index", {}).get("kinds") or [],
+        }
+        if manifest is not None:
+            row["missing"] = missing_required(name, manifest, entry)
+        rows.append(row)
+
+    if opts.json:
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("no plugins found. Install one under %s, or put an\n"
+              "apple-plugin-<name> executable on PATH." % USER_PLUGINS)
+        return
+    for row in rows:
+        if not row["installed"]:
+            state = "configured but not installed"
+        elif not row["valid"]:
+            state = "installed, does not answer manifest"
+        elif row["enabled"]:
+            state = "enabled"
+        else:
+            state = "installed, not enabled"
+        line = "%-12s %-32s %s" % (row["name"], state, row["path"] or "")
+        print(line)
+        if row.get("hosts"):
+            # 🛑 The one line that says where data goes. Never drop it.
+            print("%-12s network: %s" % ("", ", ".join(row["hosts"])))
+        if row.get("missing"):
+            print("%-12s missing config: %s" % ("", ", ".join(row["missing"])))
+
+
+def cmd_enable(opts):
+    path, manifest = find_plugin(opts.name)
+    config = read_config()
+    entry = config.setdefault(opts.name, {})
+    missing = missing_required(opts.name, manifest, entry)
+    if missing and not opts.force:
+        die("'%s' needs configuration before it can be enabled: %s\n"
+            "Set it with: apple plugins config %s %s"
+            % (opts.name, ", ".join(missing), opts.name,
+               " ".join("%s=…" % key for key in missing)))
+    changed = not entry.get("enabled")
+    entry["enabled"] = True
+    write_config(config)
+    hosts = (manifest.get("network") or {}).get("hosts") or []
+    if opts.json:
+        print(json.dumps({"name": opts.name, "enabled": True, "changed": changed,
+                          "path": path, "hosts": hosts}))
+        return
+    print("enabled %s (%s)" % (opts.name, path))
+    if hosts:
+        print("⚠️  this plugin talks to: %s" % ", ".join(hosts))
+
+
+def cmd_disable(opts):
+    config = read_config()
+    entry = config.get(opts.name)
+    changed = bool(entry and entry.get("enabled"))
+    if entry is None:
+        config[opts.name] = {"enabled": False}
+    else:
+        entry["enabled"] = False
+    write_config(config)
+    if opts.json:
+        print(json.dumps({"name": opts.name, "enabled": False, "changed": changed}))
+    else:
+        print("disabled %s" % opts.name)
+
+
+def cmd_config(opts):
+    path, manifest = find_plugin(opts.name)
+    fields = config_fields(manifest)
+    config = read_config()
+    entry = config.setdefault(opts.name, {})
+
+    changed = False
+    for assignment in opts.assignments:
+        key, sep, value = assignment.partition("=")
+        if not sep or not key:
+            die("expected key=value, got '%s'" % assignment, 64)
+        if key not in fields:
+            # 🛑 A hard error, never a silently stored key. A typo here would
+            # otherwise look like a configured plugin that never works.
+            die("'%s' has no config key '%s'. Keys: %s"
+                % (opts.name, key, ", ".join(sorted(fields)) or "none"), 64)
+        if fields[key].get("secret"):
+            secret_set(opts.name, key, value)
+            entry.pop(key, None)      # never let one linger in the file
+        else:
+            entry[key] = value
+        changed = True
+    for key in opts.unset or []:
+        if key not in fields:
+            die("'%s' has no config key '%s'" % (opts.name, key), 64)
+        if fields[key].get("secret"):
+            secret_delete(opts.name, key)
+        else:
+            entry.pop(key, None)
+        changed = True
+    if changed:
+        write_config(config)
+
+    shown = {}
+    for key, field in fields.items():
+        if field.get("secret"):
+            value = secret_get(opts.name, key)
+            if value is None:
+                shown[key] = None
+            else:
+                shown[key] = value if opts.reveal else "•••"
+        else:
+            shown[key] = entry.get(key)
+    result = {"name": opts.name, "enabled": bool(entry.get("enabled")),
+              "config": shown, "missing": missing_required(opts.name, manifest, entry)}
+    if opts.json:
+        print(json.dumps(result, indent=2))
+        return
+    for key, field in fields.items():
+        mark = " (secret)" if field.get("secret") else ""
+        need = " required" if field.get("required") else ""
+        print("%-12s %s%s%s" % (key, shown[key] if shown[key] is not None else "(unset)",
+                                mark, need))
+        if field.get("help"):
+            print("%-12s %s" % ("", field["help"]))
+    if result["missing"]:
+        print("missing: %s" % ", ".join(result["missing"]))
+
+
+def cmd_manifest(opts):
+    _, manifest = find_plugin(opts.name)
+    print(json.dumps(manifest, indent=2))
+
+
+def cmd_resolve(opts):
+    """Print the executable for an ENABLED plugin. Exit 2 for one that exists
+    but is not enabled, 1 for one that does not exist. `bin/apple` calls this
+    to dispatch `apple <name>`, so the exit codes are its whole vocabulary."""
+    found = discover()
+    if opts.name not in found:
+        sys.exit(1)
+    entry = read_config().get(opts.name) or {}
+    if not entry.get("enabled"):
+        print("plugin '%s' is installed but not enabled. Run: apple plugins enable %s"
+              % (opts.name, opts.name), file=sys.stderr)
+        sys.exit(2)
+    print(found[opts.name])
+
+
+def cmd_enabled(opts):
+    """Every enabled plugin, with its manifest. What `apple status`,
+    `apple --which` and `apple-index` read."""
+    config = read_config()
+    found = discover()
+    rows = []
+    for name in sorted(config):
+        if not config[name].get("enabled") or name not in found:
+            continue
+        manifest = manifest_of(found[name])
+        if manifest is None:
+            continue
+        rows.append({"name": name, "path": found[name], "manifest": manifest})
+    print(json.dumps(rows, indent=2))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="apple plugins",
+                                     description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="command")
+
+    p = sub.add_parser("list", help="every plugin found or configured")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("enable", help="let `apple <name>` run, and the index read it")
+    p.add_argument("name")
+    p.add_argument("--force", action="store_true",
+                   help="enable even with required config missing")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_enable)
+
+    p = sub.add_parser("disable", help="make it invisible again")
+    p.add_argument("name")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_disable)
+
+    p = sub.add_parser("config", help="show or set key=value; secrets go to the Keychain")
+    p.add_argument("name")
+    p.add_argument("assignments", nargs="*", metavar="KEY=VALUE")
+    p.add_argument("--unset", action="append", metavar="KEY")
+    p.add_argument("--reveal", action="store_true", help="print secrets in clear")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_config)
+
+    p = sub.add_parser("manifest", help="print a plugin's manifest")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_manifest)
+
+    p = sub.add_parser("resolve", help="path of an enabled plugin (for bin/apple)")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_resolve)
+
+    p = sub.add_parser("enabled", help="enabled plugins with manifests, as JSON")
+    p.set_defaults(func=cmd_enabled)
+
+    opts = parser.parse_args(argv)
+    if not opts.command:
+        parser.print_help()
+        return 0
+    opts.func(opts)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

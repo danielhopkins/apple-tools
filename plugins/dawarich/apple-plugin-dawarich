@@ -1,0 +1,585 @@
+#!/usr/bin/env python3
+"""apple-plugin-dawarich - visits, places and the GPS track from a Dawarich server.
+
+Dawarich (https://dawarich.app) is a self-hosted location-history server fed
+by a phone app. It holds three things Apple's stores on this Mac do not:
+
+  visits  with a START AND AN END. `apple maps` records an arrival and nothing
+          else, so it cannot say how long you stayed anywhere. Dawarich can.
+  places  with a city and a country.
+  points  the continuous GPS track. Maps sees only where Maps was running.
+
+🛑 THIS PLUGIN TALKS TO A SERVER, and it is the reason the plugin system
+exists. Every request goes to the one host configured as `url`, with the API
+key configured as `api_key`, and nowhere else. It never posts anything. It
+reads no Apple store and needs no grant.
+
+Stdlib only, like apple-notes. Runs on /usr/bin/python3.
+
+    apple plugins config dawarich url=https://dawarich.example.com api_key=…
+    apple plugins enable dawarich
+    apple dawarich status
+    apple dawarich visits --since 30 --json
+    apple dawarich places --json
+    apple dawarich points --since 1 --json
+
+`index` is what `apple-index` calls. It emits one NDJSON record per visit and
+per place, in the index record shape, and nothing per point: a GPS fix is not
+a document, and the visits are what a search can answer with.
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "26.903.0"
+NAME = "dawarich"
+PER_PAGE = 500          # the server caps visits and places at 500 a page
+POINTS_PER_PAGE = 10000  # and points at 10,000
+TIMEOUT = 30
+
+MANIFEST = {
+    "name": NAME,
+    "version": VERSION,
+    "description": "Visits with a duration, places, and the GPS track from a "
+                   "self-hosted Dawarich server",
+    # 🛑 Declared, because CLAUDE.md promises that nothing here leaves the
+    # machine without saying so. `apple plugins list` prints this line and
+    # `apple status` shows it as the plugin's permission.
+    "network": {"hosts": ["the configured url"], "writes": False},
+    "commands": ["status", "visits", "places", "points", "index"],
+    "index": {
+        "kinds": ["visit", "suggested", "place"],
+        # What `apple-index refresh` passes to `index`. Ten years, the same
+        # window the maps adapter uses for visits.
+        "refresh_args": ["--since", "3650"],
+    },
+    "config": [
+        {"key": "url", "required": True, "secret": False,
+         "help": "The server, e.g. https://dawarich.example.com"},
+        {"key": "api_key", "required": True, "secret": True,
+         "help": "From Dawarich: Account → API key"},
+    ],
+}
+
+
+def die(message, code=1):
+    print("error: %s" % message, file=sys.stderr)
+    sys.exit(code)
+
+
+# --------------------------------------------------------------------------
+# configuration
+# --------------------------------------------------------------------------
+#
+# Three sources, most specific first: a flag, an environment variable, then
+# what `apple plugins config` stored. The flags and variables exist so a test
+# can run this against a fake server without touching plugins.json or the
+# Keychain, and so a shell one-liner can point at a second server.
+
+def plugin_manager():
+    if os.environ.get("APPLE_PLUGINS_BIN"):
+        return [os.environ["APPLE_PLUGINS_BIN"]]
+    here = os.path.dirname(os.path.realpath(__file__))
+    # The checkout keeps the manager in bin/; the release tarball keeps it
+    # flat beside `apple`; the app keeps it in Contents/Helpers two levels
+    # above Resources/plugins/<name>; brew puts it on PATH, found below.
+    for candidate in (os.path.join(here, "..", "..", "bin", "apple-plugins"),
+                      os.path.join(here, "..", "..", "apple-plugins"),
+                      os.path.join(here, "..", "..", "..", "Helpers", "apple-plugins")):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return [candidate]
+    found = shutil.which("apple-plugins")
+    if found:
+        return [found]
+    found = shutil.which("apple")
+    if found:
+        return [found, "plugins"]
+    return None
+
+
+def stored_config():
+    manager = plugin_manager()
+    if manager is None:
+        return {}
+    try:
+        proc = subprocess.run(manager + ["config", NAME, "--json", "--reveal"],
+                              capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    try:
+        return json.loads(proc.stdout).get("config") or {}
+    except ValueError:
+        return {}
+
+
+def settings(opts):
+    url = opts.url or os.environ.get("DAWARICH_URL")
+    key = opts.api_key or os.environ.get("DAWARICH_API_KEY")
+    if not url or not key:
+        stored = stored_config()
+        url = url or stored.get("url")
+        key = key or stored.get("api_key")
+    if url:
+        url = url.rstrip("/")
+        if "://" not in url:
+            url = "https://" + url
+    return url, key
+
+
+def require_settings(opts):
+    url, key = settings(opts)
+    missing = [name for name, value in (("url", url), ("api_key", key)) if not value]
+    if missing:
+        die("not configured: %s. Run: apple plugins config dawarich %s"
+            % (", ".join(missing), " ".join("%s=…" % m for m in missing)), 78)
+    return url, key
+
+
+# --------------------------------------------------------------------------
+# http
+# --------------------------------------------------------------------------
+
+class ApiError(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+
+
+def get(url, key, path, params=None):
+    """One GET. Returns (parsed JSON, headers)."""
+    query = urllib.parse.urlencode(params or {})
+    full = "%s/api/v1/%s%s" % (url, path, "?" + query if query else "")
+    request = urllib.request.Request(full, headers={
+        "Authorization": "Bearer %s" % key,
+        "Accept": "application/json",
+        "User-Agent": "apple-plugin-dawarich/%s" % VERSION,
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+            body = response.read().decode("utf-8")
+            return json.loads(body) if body.strip() else None, response.headers
+    except urllib.error.HTTPError as error:
+        text = error.read().decode("utf-8", "replace")[:200]
+        raise ApiError(error.code, "%s %s → HTTP %d %s" % ("GET", path, error.code, text))
+    except urllib.error.URLError as error:
+        raise ApiError(None, "cannot reach %s: %s" % (url, error.reason))
+    except (ValueError, OSError) as error:
+        raise ApiError(None, "%s: %s" % (path, error))
+
+
+def paged(url, key, path, params, per_page):
+    """Every row of a paginated collection.
+
+    ⚠️ The server paginates ONLY when `page` is sent, and then reports
+    `X-Total-Pages`. Without `page` a collection comes back whole, which on a
+    long-lived server is every visit since the beginning in one response. Ask
+    for pages, and stop when the header says so or a page comes back short.
+    """
+    page = 1
+    while True:
+        rows, headers = get(url, key, path, dict(params, page=page, per_page=per_page))
+        rows = rows or []
+        for row in rows:
+            yield row
+        total = headers.get("X-Total-Pages")
+        if total is not None and page >= int(total):
+            return
+        if total is None and len(rows) < per_page:
+            return
+        if not rows:
+            return
+        page += 1
+
+
+# --------------------------------------------------------------------------
+# time
+# --------------------------------------------------------------------------
+
+def parse_when(text):
+    """ISO 8601 → aware datetime. Dawarich sends `2026-09-01T14:03:00.000Z`
+    or an offset; a Unix integer is accepted too."""
+    if text is None:
+        return None
+    if isinstance(text, (int, float)):
+        return dt.datetime.fromtimestamp(text, dt.timezone.utc)
+    text = str(text).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        when = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=dt.timezone.utc)
+    return when
+
+
+def iso(when):
+    return when.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if when else None
+
+
+def window(opts, default_days):
+    """(start, end) from --since / --from / --to."""
+    now = dt.datetime.now(dt.timezone.utc)
+    end = parse_when(opts.to) if getattr(opts, "to", None) else now
+    if getattr(opts, "from_", None):
+        start = parse_when(opts.from_)
+        if start is None:
+            die("--from: not a date: %s" % opts.from_, 64)
+    else:
+        days = opts.since if opts.since is not None else default_days
+        start = end - dt.timedelta(days=days)
+    if end is None:
+        die("--to: not a date: %s" % opts.to, 64)
+    return start, end
+
+
+def local(text):
+    """ISO UTC → `YYYY-MM-DD HH:MM` in the user's zone, for the plain listings.
+    The JSON keeps UTC, the same as `apple maps`."""
+    when = parse_when(text)
+    return when.astimezone().strftime("%Y-%m-%d %H:%M") if when else "?"
+
+
+def human_duration(seconds):
+    if seconds is None:
+        return None
+    seconds = int(seconds)
+    hours, rest = divmod(seconds, 3600)
+    minutes = rest // 60
+    if hours >= 24:
+        days, hours = divmod(hours, 24)
+        return "%dd %dh" % (days, hours)
+    if hours:
+        return "%dh %02dm" % (hours, minutes)
+    return "%dm" % minutes
+
+
+# --------------------------------------------------------------------------
+# shaping
+# --------------------------------------------------------------------------
+
+def shape_visit(row):
+    started = parse_when(row.get("started_at"))
+    ended = parse_when(row.get("ended_at"))
+    # ⚠️ The API's `duration` is in MINUTES, computed at creation. Recompute
+    # from the two timestamps so an edited visit cannot carry a stale one, and
+    # report seconds, which is what every other tool here uses.
+    seconds = int((ended - started).total_seconds()) if started and ended else None
+    place = row.get("place") or {}
+    return {
+        "id": row.get("id"),
+        "name": row.get("name"),
+        "status": row.get("status"),
+        "confidence": row.get("confidence"),
+        "started": iso(started),
+        "ended": iso(ended),
+        "duration_seconds": seconds,
+        "duration": human_duration(seconds),
+        "latitude": _float(place.get("latitude")),
+        "longitude": _float(place.get("longitude")),
+        "place_id": place.get("id"),
+        "area_id": row.get("area_id"),
+    }
+
+
+def shape_place(row):
+    return {
+        "id": row.get("id"),
+        "name": row.get("name"),
+        "city": row.get("city"),
+        "country": row.get("country"),
+        "latitude": _float(row.get("latitude")),
+        "longitude": _float(row.get("longitude")),
+        "source": row.get("source"),
+        "created": row.get("created_at"),
+        "updated": row.get("updated_at"),
+    }
+
+
+def shape_point(row):
+    when = row.get("timestamp")
+    return {
+        "id": row.get("id"),
+        "at": iso(parse_when(when)) if when is not None else None,
+        "latitude": _float(row.get("latitude")),
+        "longitude": _float(row.get("longitude")),
+        "altitude": row.get("altitude"),
+        "accuracy": row.get("accuracy"),
+        "velocity": _float(row.get("velocity")),
+        "battery": row.get("battery"),
+        "city": row.get("city"),
+        "country": row.get("country_name") or row.get("country"),
+    }
+
+
+def _float(value):
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+def cmd_manifest(opts):
+    print(json.dumps(MANIFEST, indent=2))
+
+
+def cmd_status(opts):
+    """Reachable, then authenticated. Never prompts, never writes."""
+    url, key = settings(opts)
+    report = {"tool": NAME, "url": url, "hosts": [urllib.parse.urlsplit(url).netloc] if url else [],
+              "usable": False, "status": "unconfigured", "advice": None, "version": None}
+    if not url or not key:
+        missing = [n for n, v in (("url", url), ("api_key", key)) if not v]
+        report["advice"] = "apple plugins config dawarich %s" % " ".join("%s=…" % m for m in missing)
+    else:
+        try:
+            _, headers = get(url, key, "health")
+            report["version"] = headers.get("X-Dawarich-Version")
+            try:
+                me, _ = get(url, key, "users/me")
+                report["status"] = "ok"
+                report["usable"] = True
+                if isinstance(me, dict):
+                    user = me.get("user") if isinstance(me.get("user"), dict) else me
+                    report["account"] = user.get("email")
+            except ApiError as error:
+                if error.status == 401:
+                    report["status"] = "unauthorized"
+                    report["advice"] = ("the server answered but rejected the API key; "
+                                        "apple plugins config dawarich api_key=…")
+                else:
+                    report["status"] = "error"
+                    report["advice"] = str(error)
+        except ApiError as error:
+            report["status"] = "unreachable"
+            report["advice"] = str(error)
+
+    if opts.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print("dawarich: %s%s" % (report["status"],
+                                  " (%s)" % report["version"] if report["version"] else ""))
+        if url:
+            print("  url: %s" % url)
+        if report.get("account"):
+            print("  account: %s" % report["account"])
+        if report["advice"]:
+            print("  %s" % report["advice"])
+    # ⚠️ `--json` always exits 0, the way every tool's `status --json` does:
+    # `apple status` reads the exit code as "did it answer", and a 1 here
+    # would print "status unavailable" in place of the real state. The plain
+    # form is for a human or a script gate and exits 1 when not usable.
+    sys.exit(0 if report["usable"] or opts.json else 1)
+
+
+def fetch_visits(url, key, start, end, statuses):
+    for row in paged(url, key, "visits",
+                     {"start_at": iso(start), "end_at": iso(end)}, PER_PAGE):
+        visit = shape_visit(row)
+        # 🛑 A DECLINED visit is one the user said did not happen. It is never
+        # reported, whatever --status asks for; the choice is between the ones
+        # they confirmed and the ones the server guessed.
+        if visit["status"] == "declined":
+            continue
+        if statuses != "all" and visit["status"] != statuses:
+            continue
+        yield visit
+
+
+def cmd_visits(opts):
+    url, key = require_settings(opts)
+    start, end = window(opts, 30)
+    try:
+        visits = list(fetch_visits(url, key, start, end, opts.status))
+    except ApiError as error:
+        die(str(error), 69)
+    visits.sort(key=lambda v: v["started"] or "", reverse=True)
+    total = len(visits)
+    if opts.limit:
+        visits = visits[:opts.limit]
+    if total > len(visits):
+        # Same rule as `apple maps`: a cut is said on stderr, never silent.
+        print("showing %d of %d visits" % (len(visits), total), file=sys.stderr)
+    if opts.json:
+        print(json.dumps(visits, indent=2))
+        return
+    if not visits:
+        print("no visits between %s and %s" % (iso(start)[:10], iso(end)[:10]))
+        return
+    for v in visits:
+        flag = "" if v["status"] == "confirmed" else "  (%s)" % v["status"]
+        print("%s  %-8s %s%s" % (local(v["started"]), v["duration"] or "?",
+                                 v["name"] or "?", flag))
+
+
+def cmd_places(opts):
+    url, key = require_settings(opts)
+    try:
+        places = [shape_place(r) for r in paged(url, key, "places", {"filter": "all"}, PER_PAGE)]
+    except ApiError as error:
+        die(str(error), 69)
+    if opts.search:
+        needle = opts.search.lower()
+        places = [p for p in places
+                  if needle in " ".join(str(p.get(k) or "") for k in ("name", "city", "country")).lower()]
+    total = len(places)
+    if opts.limit:
+        places = places[:opts.limit]
+    if total > len(places):
+        print("showing %d of %d places" % (len(places), total), file=sys.stderr)
+    if opts.json:
+        print(json.dumps(places, indent=2))
+        return
+    for p in places:
+        where = ", ".join(x for x in (p["city"], p["country"]) if x)
+        print("%-40s %s" % (p["name"] or "?", where))
+
+
+def cmd_points(opts):
+    url, key = require_settings(opts)
+    start, end = window(opts, 1)
+    params = {"start_at": int(start.timestamp()), "end_at": int(end.timestamp()),
+              "order": "asc"}
+    points = []
+    try:
+        for row in paged(url, key, "points", params, POINTS_PER_PAGE):
+            points.append(shape_point(row))
+            if opts.limit and len(points) >= opts.limit:
+                break
+    except ApiError as error:
+        die(str(error), 69)
+    if opts.limit and len(points) >= opts.limit:
+        print("showing the first %d points; pass --limit 0 for all" % opts.limit,
+              file=sys.stderr)
+    if opts.json:
+        print(json.dumps(points, indent=2))
+        return
+    for p in points:
+        print("%s  %.5f,%.5f  %s" % (local(p["at"]), p["latitude"] or 0,
+                                     p["longitude"] or 0, p["city"] or ""))
+
+
+def cmd_index(opts):
+    """NDJSON records for apple-index, one per line, flushed as they come.
+
+    Kinds: `visit` for a confirmed visit, `suggested` for one the server
+    guessed and nobody confirmed, `place` for a named place. ⚠️ Confirmed and
+    suggested are the same unit — an arrival — at two confidences, so they are
+    two kinds rather than one kind with a flag the record has no column for.
+    The `places` report counts them side by side and never adds them.
+    """
+    url, key = require_settings(opts)
+    start, end = window(opts, 3650)
+    out = sys.stdout
+    try:
+        places = {}
+        for row in paged(url, key, "places", {"filter": "all"}, PER_PAGE):
+            place = shape_place(row)
+            places[place["id"]] = place
+            where = ", ".join(x for x in (place["city"], place["country"]) if x)
+            out.write(json.dumps({
+                "uid": "dawarich:place:%s" % place["id"],
+                "tool": NAME, "kind": "place", "native_id": str(place["id"]),
+                "url": "%s/places/%s" % (url, place["id"]),
+                "title": place["name"] or "",
+                # ⚠️ The country, like `photos`, NOT the category like `maps`.
+                # `cmd_places` in index.py reads it as a country for this tool.
+                "container": place["country"],
+                "created": _epoch(place["created"]), "modified": _epoch(place["updated"]),
+                "occurred": None,
+                "latitude": place["latitude"], "longitude": place["longitude"],
+                "people": [],
+                "body": "\n".join(x for x in (place["name"], where) if x),
+                "rev": "%s|%s" % (place["name"], place["updated"]),
+            }) + "\n")
+
+        for visit in fetch_visits(url, key, start, end, "all"):
+            place = places.get(visit["place_id"]) or {}
+            where = ", ".join(x for x in (place.get("city"), place.get("country")) if x)
+            lines = [visit["name"] or place.get("name") or "",
+                     where,
+                     "stayed %s" % visit["duration"] if visit["duration"] else ""]
+            out.write(json.dumps({
+                "uid": "dawarich:visit:%s" % visit["id"],
+                "tool": NAME,
+                "kind": "visit" if visit["status"] == "confirmed" else "suggested",
+                "native_id": str(visit["id"]),
+                "url": "%s/visits/%s" % (url, visit["id"]),
+                "title": visit["name"] or place.get("name") or "",
+                "container": place.get("country"),
+                "created": None, "modified": None,
+                "occurred": _epoch(visit["started"]),
+                "latitude": visit["latitude"], "longitude": visit["longitude"],
+                "people": [],
+                "body": "\n".join(x for x in lines if x),
+                "rev": "%s|%s|%s|%s" % (visit["name"], visit["started"],
+                                        visit["ended"], visit["status"]),
+            }) + "\n")
+        out.flush()
+    except ApiError as error:
+        die(str(error), 69)
+
+
+def _epoch(text):
+    when = parse_when(text)
+    return when.timestamp() if when else None
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="apple dawarich",
+                                     description=__doc__.split("\n\n")[0])
+    parser.add_argument("--version", action="version", version="apple-plugin-dawarich %s" % VERSION)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--url", help="server, overrides the configured one")
+    common.add_argument("--api-key", help="API key, overrides the Keychain")
+    common.add_argument("--json", action="store_true")
+    ranged = argparse.ArgumentParser(add_help=False)
+    ranged.add_argument("--since", type=int, metavar="DAYS")
+    ranged.add_argument("--from", dest="from_", metavar="DATE")
+    ranged.add_argument("--to", metavar="DATE")
+
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("manifest", parents=[common]).set_defaults(func=cmd_manifest)
+    sub.add_parser("status", parents=[common]).set_defaults(func=cmd_status)
+
+    p = sub.add_parser("visits", parents=[common, ranged], help="stays, with how long")
+    p.add_argument("--status", choices=["all", "confirmed", "suggested"], default="all")
+    p.add_argument("--limit", type=int, default=0)
+    p.set_defaults(func=cmd_visits)
+
+    p = sub.add_parser("places", parents=[common], help="named places")
+    p.add_argument("--search")
+    p.add_argument("--limit", type=int, default=0)
+    p.set_defaults(func=cmd_places)
+
+    p = sub.add_parser("points", parents=[common, ranged], help="the raw GPS track")
+    p.add_argument("--limit", type=int, default=2000)
+    p.set_defaults(func=cmd_points)
+
+    p = sub.add_parser("index", parents=[common, ranged], help="NDJSON records for apple-index")
+    p.set_defaults(func=cmd_index)
+
+    opts = parser.parse_args(argv)
+    if not opts.command:
+        parser.print_help()
+        return 0
+    opts.func(opts)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

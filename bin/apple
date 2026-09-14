@@ -54,8 +54,14 @@ ${H}TOOLS:${R}
 
 Every tool supports --json. Run \`apple <tool> --help\` for its own options.
 
+${H}PLUGINS:${R}
+    ${G}apple plugins list${R}            Plugins found on this machine, and which are enabled
+    ${G}apple plugins enable NAME${R}     Let \`apple NAME …\` run, and the index read it
+    ${G}apple plugins config NAME k=v${R} Configure one; secrets go to the Keychain
+    ${G}apple NAME …${R}                  Run an enabled plugin's own commands
+
 ${H}OTHER:${R}
-    ${G}apple status${R}        Permission state of every tool, without prompting
+    ${G}apple status${R}        Permission state of every tool and enabled plugin, without prompting
     ${G}apple --help${R}        Show this message
     ${G}apple --version${R}     Print the apple-tools version
     ${G}apple --which${R}       Print the resolved path of each tool
@@ -146,6 +152,37 @@ resolve() {
     return 1
 }
 
+# The plugin manager, a Python script that lives beside this one. It is not a
+# tool — it has no grant and reads no store — so it is not in binary_name.
+plugin_manager() {
+    local candidate
+    for candidate in "$BIN_DIR/apple-plugins" "$ROOT/bin/apple-plugins"; do
+        if [ -x "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 🛑 ENABLED PLUGINS ONLY, as name<TAB>path lines. A plugin that is installed
+# but not enabled is invisible here, and that is the contract: enabling is the
+# user's decision, recorded by `apple plugins enable`, not a side effect of
+# something landing on PATH.
+enabled_plugins() {
+    local manager
+    manager="$(plugin_manager)" || return 0
+    "$manager" enabled 2>/dev/null | python3 -c '
+import json, sys
+try:
+    rows = json.load(sys.stdin)
+except ValueError:
+    rows = []
+for row in rows:
+    print("%s\t%s" % (row["name"], row["path"]))
+' 2>/dev/null || true
+}
+
 # Collect every tool's `status --json` and render one report.
 #
 # Each tool answers for itself rather than the dispatcher guessing, so this
@@ -167,6 +204,19 @@ status_report() {
         fi
         payload+="$tool"$'\t'"$js"$'\x1e'
     done
+
+    # Enabled plugins answer the same `status --json` contract. Each row is
+    # prefixed with \x1d so the renderer knows it is a plugin: its permission
+    # column names the network host rather than a System Settings pane.
+    local name path
+    while IFS=$'\t' read -r name path; do
+        [ -n "$name" ] || continue
+        if ! js="$("$path" status --json 2>/dev/null)"; then
+            payload+=$'\x1d'"$name"$'\t'$'\x1f'"status unavailable"$'\x1e'
+            continue
+        fi
+        payload+=$'\x1d'"$name"$'\t'"$js"$'\x1e'
+    done < <(enabled_plugins)
 
     printf '%s' "$payload" | python3 -c '
 import json, os, sys
@@ -206,14 +256,21 @@ records = []
 for chunk in sys.stdin.read().split("\x1e"):
     if not chunk.strip():
         continue
-    name, _, raw = chunk.partition("\t")
+    plugin = chunk.startswith("\x1d")
+    name, _, raw = chunk.lstrip("\x1d").partition("\t")
     if raw.startswith("\x1f"):
-        records.append((name, {"status": raw[1:], "usable": False}))
-        continue
-    try:
-        records.append((name, json.loads(raw)))
-    except ValueError:
-        records.append((name, {"status": "unparseable", "usable": False}))
+        info = {"status": raw[1:], "usable": False}
+    else:
+        try:
+            info = json.loads(raw)
+        except ValueError:
+            info = {"status": "unparseable", "usable": False}
+    if plugin:
+        # A plugin reports its own network host in `hosts`; that is its
+        # "permission", since no System Settings pane governs it.
+        hosts = info.get("hosts") or []
+        META[name] = ("plugin: " + ", ".join(hosts) if hosts else "plugin", "plugin")
+    records.append((name, info))
 
 unusable = [name for name, info in records if info.get("usable") is not True]
 
@@ -282,7 +339,15 @@ main() {
             for tool in notes mail messages phone maps reminders calendar contacts; do
                 printf '%-10s %s\n' "$tool" "$(resolve "$tool" 2>&1 || true)"
             done
+            while IFS=$'\t' read -r name path; do
+                [ -n "$name" ] && printf '%-10s %s  (plugin)\n' "$name" "$path"
+            done < <(enabled_plugins)
             exit 0
+            ;;
+        plugins)
+            shift
+            manager="$(plugin_manager)" || { echo "error: apple-plugins not found beside $BIN_DIR/apple" >&2; exit 1; }
+            exec "$manager" "$@"
             ;;
         status)
             shift
@@ -297,13 +362,26 @@ main() {
     local tool="$1"
     shift
 
-    local target
-    if ! target="$(resolve "$tool")"; then
+    local target manager status
+    if ! binary_name "$tool" >/dev/null; then
+        # Not a built-in tool. An ENABLED plugin of that name runs in its
+        # place. `resolve` exits 2 for one that is installed but not enabled
+        # and prints the fix on stderr, so that case is not "unknown tool".
+        if manager="$(plugin_manager)"; then
+            status=0
+            target="$("$manager" resolve "$tool")" || status=$?
+            if [ "$status" -eq 0 ]; then
+                exec "$target" "$@"
+            elif [ "$status" -eq 2 ]; then
+                exit 1
+            fi
+        fi
         echo "error: unknown tool '$tool'" >&2
         echo >&2
         usage >&2
         exit 1
     fi
+    target="$(resolve "$tool")" || exit 1
 
     # 🛑 THE APP'S GRANTS, ONLY WHEN THIS TERMINAL HAS NONE OF ITS OWN.
     #

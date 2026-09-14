@@ -2020,6 +2020,146 @@ ADAPTERS = {
 
 
 # --------------------------------------------------------------------------
+# plugins — sources that are not Apple's and not in this file
+# --------------------------------------------------------------------------
+#
+# A plugin is an executable `apple-plugin-<name>` that the user ENABLED with
+# `apple plugins enable`. Its manifest says whether it indexes anything; if it
+# does, it is a source here with the same standing as `maps`, and ONE adapter
+# serves every plugin: run `<plugin> index`, read NDJSON records off stdout.
+#
+# 🛑 NOTHING IS IMPORTED. The first plugin talks to a server over the network,
+# and a plugin is somebody else's code. It runs as a child, the way `apple
+# maps` does, and its output is checked field by field before it becomes a
+# record. A plugin that emits garbage fails its own ingest and nothing else.
+#
+# ⚠️ Only ENABLED plugins are sources. `apple plugins list` may show one that
+# is installed and not enabled; that one is invisible here, deliberately — the
+# user decides what talks to what, not what happens to be on PATH.
+
+RECORD_FIELDS = ("uid", "tool", "kind", "native_id", "url", "title", "container",
+                 "created", "modified", "occurred", "latitude", "longitude",
+                 "people", "body", "rev")
+
+_PLUGINS = None
+
+
+def plugin_manager_cmd():
+    """How to reach `apple-plugins`. `APPLE_PLUGINS_BIN` pins it for a test."""
+    if os.environ.get("APPLE_PLUGINS_BIN"):
+        return [os.environ["APPLE_PLUGINS_BIN"]]
+    return ["apple", "plugins"]
+
+
+def enabled_plugins():
+    """{name: {"path", "manifest"}} for every enabled plugin that indexes.
+
+    ⚠️ Cached for the process: `refresh` asks once per source and the answer
+    is a subprocess per plugin. An `apple` too old to know `plugins` answers
+    with an error, which reads as "no plugins" rather than a failure.
+    """
+    global _PLUGINS
+    if _PLUGINS is not None:
+        return _PLUGINS
+    _PLUGINS = {}
+    try:
+        proc = subprocess.run(plugin_manager_cmd() + ["enabled"],
+                              capture_output=True, text=True, timeout=30)
+        rows = json.loads(proc.stdout) if proc.returncode == 0 else []
+    except (OSError, subprocess.SubprocessError, ValueError):
+        rows = []
+    for row in rows:
+        manifest = row.get("manifest") or {}
+        index = manifest.get("index") or {}
+        if not index.get("kinds"):
+            continue
+        name = row["name"]
+        if name in ADAPTERS:
+            # A plugin cannot shadow a built-in source. `maps` means Maps.
+            print("⚠️  plugin '%s' has the name of a built-in source; ignored" % name,
+                  file=sys.stderr)
+            continue
+        _PLUGINS[name] = {"path": row["path"], "manifest": manifest,
+                          "refresh_args": list(index.get("refresh_args") or [])}
+    return _PLUGINS
+
+
+def all_sources():
+    """Built-in sources, then enabled plugins. What `ingest`, `refresh` and
+    `sources` walk when given no `--source`."""
+    return SOURCES + sorted(enabled_plugins())
+
+
+def adapter_for(name):
+    if name in ADAPTERS:
+        return ADAPTERS[name]
+    if name in enabled_plugins():
+        return lambda opts: ingest_plugin(name, opts)
+    return None
+
+
+def refresh_args_for(name):
+    if name in enabled_plugins():
+        return enabled_plugins()[name]["refresh_args"]
+    return REFRESH_ARGS.get(name, [])
+
+
+def ingest_plugin(name, opts):
+    """Run `<plugin> index` and yield its records.
+
+    The plugin gets `--since DAYS` when the ingest was given one, and nothing
+    else: the record shape is the contract, not the flag set. Each line is
+    one JSON object; a blank line is skipped; anything else is an error naming
+    the line, because a plugin that emits a partial record would otherwise
+    index it with the missing fields as NULL and nobody would see.
+    """
+    plugin = enabled_plugins()[name]
+    cmd = [plugin["path"], "index"]
+    if opts.since:
+        cmd += ["--since", str(opts.since)]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True)
+    count = 0
+    for lineno, line in enumerate(proc.stdout, 1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            proc.kill()
+            die("plugin %s: line %d of `index` is not JSON: %s" % (name, lineno, line[:120]))
+        missing = [f for f in RECORD_FIELDS if f not in record]
+        if missing:
+            proc.kill()
+            die("plugin %s: record %d lacks %s" % (name, lineno, ", ".join(missing)))
+        if record["tool"] != name:
+            proc.kill()
+            die("plugin %s: record %d claims tool %r" % (name, lineno, record["tool"]))
+        if not str(record["uid"]).startswith(name + ":"):
+            proc.kill()
+            die("plugin %s: record %d uid %r must start with '%s:'"
+                % (name, lineno, record["uid"], name))
+        for key in ("latitude", "longitude", "created", "modified", "occurred"):
+            if record[key] is not None and not isinstance(record[key], (int, float)):
+                proc.kill()
+                die("plugin %s: record %d %s is not a number: %r"
+                    % (name, lineno, key, record[key]))
+        if not isinstance(record["people"], list):
+            record["people"] = []
+        count += 1
+        if opts.limit and count > opts.limit:
+            proc.kill()
+            break
+        yield record
+    stderr = proc.stderr.read()
+    proc.wait()
+    if proc.returncode not in (0, -9):
+        die("plugin %s `index` exited %d\n%s" % (name, proc.returncode, stderr.strip()))
+    if stderr.strip():
+        print(stderr.rstrip(), file=sys.stderr)
+
+
+# --------------------------------------------------------------------------
 # chunking
 # --------------------------------------------------------------------------
 
@@ -2307,10 +2447,10 @@ def cmd_ingest(opts):
     db = connect(opts.db)
     require_consent(db, opts)
     warn_security(db, opts.db)
-    wanted = opts.source.split(",") if opts.source else SOURCES
+    wanted = opts.source.split(",") if opts.source else all_sources()
     for name in wanted:
-        if name not in ADAPTERS:
-            die("unknown source '%s'. Known: %s" % (name, ", ".join(SOURCES)))
+        if adapter_for(name) is None:
+            die("unknown source '%s'. Known: %s" % (name, ", ".join(all_sources())))
 
     # --full deletes every record the source did not return this run. With a
     # --limit the source returns a slice, so the two together would delete the
@@ -2322,7 +2462,7 @@ def cmd_ingest(opts):
     for name in wanted:
         started = time.time()
         seen, added, updated, duplicates = set(), 0, 0, 0
-        for record in ADAPTERS[name](opts):
+        for record in adapter_for(name)(opts):
             # 🛑 A source can return the same uid more than once with DIFFERENT
             # field values, and then each run writes a different rev and the
             # next run "updates" it back. Measured on mail: 194 Message-IDs
@@ -2435,7 +2575,7 @@ def cmd_rechunk(opts):
     Deleting a chunk cascades to its vector, so the next `embed` refills them.
     """
     db = connect(opts.db)
-    wanted = opts.source.split(",") if opts.source else SOURCES
+    wanted = opts.source.split(",") if opts.source else all_sources()
     for name in wanted:
         started = time.time()
         rows = db.execute(
@@ -3182,7 +3322,7 @@ def cmd_refresh(opts):
     TCC-protected, but it cannot READ the sources. So refreshing is a terminal
     job. Measured: a launchd agent failed on mail, notes and messages alike.
     """
-    sources = opts.source.split(",") if opts.source else SOURCES
+    sources = opts.source.split(",") if opts.source else all_sources()
     changed = False
     for name in sources:
         # 🛑 `.get`, never `[name]`. SOURCES lists six sources and this dict
@@ -3190,7 +3330,8 @@ def cmd_refresh(opts):
         # which killed the run BEFORE the embed step. Every refresh ingested
         # new records and then embedded none of them, and the traceback looked
         # like a maps problem rather than a silent embed skip.
-        extra = REFRESH_ARGS.get(name, [])
+        # `refresh_args_for` keeps that rule and adds a plugin's own args.
+        extra = refresh_args_for(name)
         # ⚠️ --db is a flag on the MAIN parser, so it must come BEFORE the
         # subcommand. Putting it after gives "unrecognized arguments".
         proc = subprocess.run([sys.executable, __file__, "--db", opts.db, "ingest",
@@ -4072,7 +4213,7 @@ def cmd_model(opts):
 def cmd_sources(opts):
     """What refresh runs for each source. The app reads this rather than
     keeping a second copy of REFRESH_ARGS in Swift."""
-    print(json.dumps({name: REFRESH_ARGS.get(name, []) for name in SOURCES},
+    print(json.dumps({name: refresh_args_for(name) for name in all_sources()},
                      indent=2))
 
 
@@ -4285,49 +4426,74 @@ def cmd_places(opts):
     /var/db/locationd/ and no unprivileged process can read.
     """
     db = connect(opts.db)
+
+    # 🛑 A PLUGIN THAT INDEXES PLACES IS A THIRD SOURCE, WITH ITS OWN UNIT.
+    # The first one, dawarich, records an arrival with a start AND an end,
+    # detected by a phone app rather than by Maps — so the same afternoon can
+    # be a Maps visit and a dawarich visit, and adding them counts it twice.
+    # Each plugin gets its own `<plugin>_visits` column (and
+    # `<plugin>_suggested` for the arrivals the server guessed and nobody
+    # confirmed), and nothing here sums across columns.
+    #
+    # ⚠️ Plugins are read from the INDEX, not from the enabled list. A plugin
+    # disabled yesterday still has its records until a `--full` ingest removes
+    # them, and a report that hid them would be lying about what the index
+    # holds.
+    plugin_tools = [r["tool"] for r in db.execute(
+        "SELECT DISTINCT tool FROM record WHERE kind = 'place' "
+        "  AND tool NOT IN ('photos', 'maps')")]
+    place_tools = ["photos", "maps"] + plugin_tools
+    marks = ",".join("?" * len(place_tools))
     rows = list(db.execute(
         "SELECT tool, title, container, body, latitude, longitude, "
         "       created, occurred "
         "  FROM record "
         " WHERE kind = 'place' AND latitude IS NOT NULL "
-        "   AND tool IN ('photos', 'maps')"))
+        "   AND tool IN (%s)" % marks, place_tools))
 
     # A photo place already carries a day count; a maps place carries visits.
     # Neither is stored on the record, so both are counted back off the days
     # and visits that reference them.
-    photo_days = {}
-    for row in db.execute(
-            "SELECT latitude, longitude, occurred FROM record "
-            " WHERE tool = 'photos' AND kind = 'day' AND latitude IS NOT NULL"):
-        key = "%.3f,%.3f" % (row["latitude"], row["longitude"])
-        photo_days[key] = photo_days.get(key, 0) + 1
-    visits = {}
-    for row in db.execute(
-            "SELECT latitude, longitude FROM record "
-            " WHERE tool = 'maps' AND kind = 'visit' AND latitude IS NOT NULL"):
-        key = "%.3f,%.3f" % (row["latitude"], row["longitude"])
-        visits[key] = visits.get(key, 0) + 1
+    def count_by_spot(tool, kind):
+        counts = {}
+        for row in db.execute(
+                "SELECT latitude, longitude FROM record "
+                " WHERE tool = ? AND kind = ? AND latitude IS NOT NULL", (tool, kind)):
+            key = "%.3f,%.3f" % (row["latitude"], row["longitude"])
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    photo_days = count_by_spot("photos", "day")
+    visits = count_by_spot("maps", "visit")
+    plugin_counts = {}
+    for tool in plugin_tools:
+        plugin_counts[tool + "_visits"] = (tool, count_by_spot(tool, "visit"))
+        plugin_counts[tool + "_suggested"] = (tool, count_by_spot(tool, "suggested"))
 
     places = []
     for row in rows:
         key = "%.3f,%.3f" % (row["latitude"], row["longitude"])
         lines = (row["body"] or "").split("\n")
-        places.append({
+        spot = {
             "name": row["title"],
             "where": lines[0] if lines else "",
             # 🛑 `container` MEANS A DIFFERENT THING IN EACH ADAPTER, and
             # reading it as a country for both put "Dining", "Transportation"
             # and "Travel Accommodation" in the country list — 65 countries
             # where the honest answer is 8. `maps` puts the place CATEGORY
-            # there; only `photos` puts a country. A maps-only place has no
-            # country here, and inventing one would be worse than saying so.
-            "country": row["container"] if row["tool"] == "photos" else None,
+            # there; `photos` puts a country, and a plugin is REQUIRED to
+            # (docs/apple-plugins.md). A maps-only place has no country
+            # here, and inventing one would be worse than saying so.
+            "country": row["container"] if row["tool"] != "maps" else None,
             "latitude": row["latitude"], "longitude": row["longitude"],
             "sources": [row["tool"]],
             "photo_days": photo_days.get(key, 0) if row["tool"] == "photos" else 0,
             "visits": visits.get(key, 0) if row["tool"] == "maps" else 0,
             "first": row["created"], "last": row["occurred"],
-        })
+        }
+        for column, (tool, counts) in plugin_counts.items():
+            spot[column] = counts.get(key, 0) if row["tool"] == tool else 0
+        places.append(spot)
 
     # 🛑 ONE DOT PER PLACE. Without this the map drew a Maps pin and a photo
     # pin a few metres apart for every place the user both went to and
@@ -4336,8 +4502,17 @@ def cmd_places(opts):
     # ⚠️ `max`, NEVER `+`. A visit and a photo day are different units and must
     # not be added — this ordering exists only to decide which row anchors a
     # merge and which name survives, and it is not a measurement of anything.
+    # 🛑 A SUGGESTED VISIT NEVER ANCHORS A MERGE. Measured 2026-09-14 on the
+    # first real dawarich ingest: the user's home carried 1,650 suggested
+    # visits against 1,649 photo days, so dawarich's name for it — "3313",
+    # the bare house number its reverse geocoder produced — won the anchor
+    # and renamed the largest place in the library. A count of guesses is
+    # not evidence a source knows a place. Confirmed visits count; suggested
+    # ones are carried in their column and sized by nothing.
     def weight(spot):
-        return max(spot["photo_days"], spot["visits"])
+        return max([spot["photo_days"], spot["visits"]]
+                   + [spot[column] for column in plugin_counts
+                      if not column.endswith("_suggested")])
 
     merged = []
     for spot in sorted(places, key=lambda s: -weight(s)):
@@ -4345,6 +4520,8 @@ def cmd_places(opts):
             if photos_metres(spot, kept) <= 250.0:
                 kept["photo_days"] += spot["photo_days"]
                 kept["visits"] += spot["visits"]
+                for column in plugin_counts:
+                    kept[column] += spot[column]
                 for tool in spot["sources"]:
                     if tool not in kept["sources"]:
                         kept["sources"].append(tool)
@@ -4379,7 +4556,11 @@ def cmd_places(opts):
             "countries": len(countries),
             "from_photos": sum(1 for s in merged if "photos" in s["sources"]),
             "from_maps": sum(1 for s in merged if "maps" in s["sources"]),
+            # ⚠️ `both` predates plugins and keeps its meaning: rows that more
+            # than one source knows. `from_<plugin>` sits beside the other two.
             "both": sum(1 for s in merged if len(s["sources"]) > 1),
+            **{"from_" + tool: sum(1 for s in merged if tool in s["sources"])
+               for tool in plugin_tools},
         },
         "span": {"first": min((s["first"] for s in merged if s["first"]),
                               default=None),

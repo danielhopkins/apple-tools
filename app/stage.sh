@@ -23,6 +23,21 @@ for tool in apple-calendar apple-contacts apple-mail apple-maps \
   cp "swift/.build/release/$tool" "$STAGE/Helpers/$tool"
 done
 cp bin/apple "$STAGE/Helpers/apple"
+# The plugin manager sits beside the dispatcher, where `apple plugins` and
+# index.py's `apple plugins enabled` both find it on the app's PATH.
+cp bin/apple-plugins "$STAGE/Helpers/apple-plugins"
+
+echo "==> plugins"
+# 🛑 UNDER Resources, NOT Helpers, like notes/. A plugin directory holds a
+# README and tests beside its executable, and codesign treats every file under
+# Helpers as code. `apple-plugins` looks in `<Contents>/Resources/plugins`.
+# ⚠️ Shipping a plugin does not enable it; `apple plugins enable` does.
+mkdir -p "$STAGE/plugins"
+for dir in plugins/*/; do
+  name="$(basename "$dir")"
+  mkdir -p "$STAGE/plugins/$name"
+  cp "$dir/apple-plugin-$name" "$STAGE/plugins/$name/"
+done
 # 🛑 The signed proxy client. It is built by the app's own Xcode project, not
 # by `swift build`, because the app checks its code signature on the socket and
 # an ad-hoc or Apple-signed binary would fail that check.
@@ -106,7 +121,8 @@ cp notes/shortcuts/*.shortcut "$STAGE/index/shortcuts/" 2>/dev/null || true
 
 # 🛑 Check what we staged, here and not at run time. A missing helper shows up
 # as "no `apple` dispatcher found on this machine" hours later.
-for required in Helpers/apple Helpers/apple-mail notes/apple-notes \
+for required in Helpers/apple Helpers/apple-plugins Helpers/apple-mail \
+                plugins/dawarich/apple-plugin-dawarich notes/apple-notes \
                 notes/notestore.py notes/notestore.proto index/vec index/doctext \
                 index/models/vocab.txt \
                 skills/apple-tools/SKILL.md skills/apple-index/SKILL.md; do

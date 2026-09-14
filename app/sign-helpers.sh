@@ -15,12 +15,14 @@ CONTENTS="${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}"
 [ -d "$STAGE" ] || { echo "warning: no staged payload; run app/stage.sh"; exit 0; }
 
 rm -rf "${CONTENTS}/Helpers" "${CONTENTS}/Resources/index" \
-       "${CONTENTS}/Resources/notes" "${CONTENTS}/Resources/skills"
+       "${CONTENTS}/Resources/notes" "${CONTENTS}/Resources/skills" \
+       "${CONTENTS}/Resources/plugins"
 mkdir -p "${CONTENTS}/Helpers" "${CONTENTS}/Resources"
 cp -R "$STAGE/Helpers/." "${CONTENTS}/Helpers/"
 cp -R "$STAGE/index" "${CONTENTS}/Resources/index"
 cp -R "$STAGE/notes" "${CONTENTS}/Resources/notes"
 cp -R "$STAGE/skills" "${CONTENTS}/Resources/skills"
+cp -R "$STAGE/plugins" "${CONTENTS}/Resources/plugins"
 
 IDENTITY="${EXPANDED_CODE_SIGN_IDENTITY:-}"
 if [ -z "$IDENTITY" ]; then
@@ -55,7 +57,8 @@ while IFS= read -r -d '' file; do
     codesign --force --options runtime --timestamp \
              --sign "$IDENTITY" "$file" >/dev/null
   fi
-done < <(find "${CONTENTS}/Helpers" "${CONTENTS}/Resources/index" -type f -perm -u+x -print0)
+done < <(find "${CONTENTS}/Helpers" "${CONTENTS}/Resources/index" \
+              "${CONTENTS}/Resources/plugins" -type f -perm -u+x -print0)
 
 # 🛑 RE-SEAL THE OUTER BUNDLE. Xcode signs the app at the END of the build,
 # before this phase adds anything, so the signature it wrote no longer covers
