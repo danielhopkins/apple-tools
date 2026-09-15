@@ -265,6 +265,17 @@ iOS app since 2017-05-21):
   in `lab/test-plugins.py`.
 - **`status` makes two requests and returns in under a second** over
   Tailscale; `visits --since 14` in about the same.
+- 🛑 **THE APP COULD NOT REACH IT, AND THE TERMINAL COULD.** The server
+  resolves to a LAN address. On macOS 15+ a connection to the local network
+  needs the Local Network privacy grant, and a refused one fails with
+  `[Errno 65] No route to host` — a routing error, naming no grant. The
+  terminal held the grant; `AppleTools.app` had never asked, so its first
+  two scheduled ingests failed while `apple dawarich status` in a terminal
+  passed. The app now carries `NSLocalNetworkUsageDescription` so it can
+  ask. ⚠️ **A plugin's `status` cannot see this**: it runs in the caller's
+  process and reports the caller's grant. When an ingest inside the app
+  fails with "No route to host", look in System Settings → Privacy &
+  Security → Local Network before looking at the server.
 
 The plugin is Python, stdlib only, on `/usr/bin/python3`, like `apple-notes`.
 `plugins/dawarich/test-dawarich.py` runs it against a fake server on

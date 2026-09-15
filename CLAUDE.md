@@ -1719,10 +1719,11 @@ What it adds over `apple maps`, and the traps:
   the user's home `3313`, a house number, and 1,651 guesses out-weighed
   1,649 photo days on the first ingest. Confirmed visits weigh; suggested
   ones are counted in `dawarich_suggested` and size nothing.
-- ⚠️ **Until a release ships, the Homebrew `apple` cannot dispatch plugins
-  and the app does not ingest them.** Run from the checkout:
-  `APPLE_PLUGINS_BIN=$PWD/bin/apple-plugins lab/bin/apple-index ingest
-  --source dawarich`, then `embed`.
+- 🛑 **"No route to host" from the APP is the Local Network grant, not the
+  server.** The host is a LAN address, and macOS 15+ refuses one with
+  `EHOSTUNREACH` until the app holds the grant. The terminal has it; the app
+  asks on first use now that it carries `NSLocalNetworkUsageDescription`.
+  `apple dawarich status` in a terminal cannot see the app's state.
 
 ## Layout
 

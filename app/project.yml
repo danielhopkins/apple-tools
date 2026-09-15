@@ -161,3 +161,13 @@ targets:
         NSContactsFullAccessUsageDescription: >-
           AppleTools reads your contacts so `apple contacts` works and so the
           index can find people by name.
+        # 🛑 A PLUGIN THAT REACHES A LAN HOST NEEDS THIS. On macOS 15+ an app
+        # without the Local Network grant gets EHOSTUNREACH — "No route to
+        # host" — for any address on the LAN, and nothing names the grant.
+        # Measured 2026-09-14: the dawarich plugin worked from a terminal and
+        # failed on two app cycles running, because the terminal held the
+        # grant and the app had never asked. Without this key the app cannot
+        # ask; the user has to find the pane by hand.
+        NSLocalNetworkUsageDescription: >-
+          A plugin you enabled reads a server on your local network, such as
+          a self-hosted Dawarich. AppleTools connects to it on your behalf.
