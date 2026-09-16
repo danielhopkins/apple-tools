@@ -70,6 +70,10 @@ row("dawarich:visit:1", "dawarich", "suggested", "Home", "2026-05-21", 8, HOME,
     body="Home\nstayed 1h 30m")
 row("dawarich:visit:2", "dawarich", "suggested", "Home", "2026-05-21", 18, HOME,
     body="Home\nstayed 45m")
+# ...and the same 1h30 stay a third time under a new id, as Dawarich does
+# when it re-detects visits; this copy carries the confidence.
+row("dawarich:visit:9", "dawarich", "suggested", "Home", "2026-05-21", 8, HOME,
+    body="Home\nstayed 1h 30m\nconfidence 60")
 row("maps:visit:1", "maps", "visit", "Corner Shop", "2026-05-21", 12, SHOP)
 # ...and the same swim lesson on two calendars.
 row("calendar:a", "calendar", "event", "Swim lessons", "2026-05-21", 18, SHOP)
@@ -124,15 +128,18 @@ with tempfile.TemporaryDirectory() as tmp:
     check("two records from one source are one source", home["agreement"], 1)
     check("one source is a single claim", home["claim"], "single")
     check("minutes add up across stays", home["evidence"]["dawarich"]["minutes"], 135)
+    check("a re-detected twin is one stay", home["evidence"]["dawarich"]["count"], 2)
+    check("and the twin's confidence is kept",
+          [s["confidence"] for s in home["evidence"]["dawarich"]["stays"]], [60, None])
     shop = [p for p in d["places"] if p["name"] == "Corner Shop"][0]
     check("maps and calendar: one presence, one plan", (shop["agreement"], shop["claim"]),
           (1, "single"))
     check("the same event on two calendars is one plan",
           len(shop["evidence"]["calendar"]["events"]), 1)
     check("a home day is home", d["state"], "home")
-    # 1h30 at default confidence: 0.7 * 0.5 * (0.3 + 0.7*90/180) = 0.2275 → 0.227; the
-    # 45m stay is weaker and does not add — one source, its best evidence.
-    check("several stays are one source at its best", home["weights"]["dawarich"], 0.227)
+    # 1h30 at confidence 60: 0.7 * 0.6 * (0.3 + 0.7*90/180) = 0.273; the 45m
+    # stay is weaker and does not add — one source, its best evidence.
+    check("several stays are one source at its best", home["weights"]["dawarich"], 0.273)
     # maps at 12:00 and the swim lesson at 18:00 are 6 h apart: a plan, unkept.
     check("an unkept plan stays a plan", shop["weights"]["calendar"], 0.2)
     check("shop belief", shop["belief"], 0.88)

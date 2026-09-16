@@ -4813,12 +4813,25 @@ def cmd_whereabouts(opts):
         if source in plugin_tools:
             minutes = _stay_minutes(row["body"])
             confidence = _confidence(row["body"])
+            # ⚠️ Dawarich re-detects visits and mints new ids for the same
+            # stay, so the index can hold one stay several times until a
+            # `--full` ingest drops the old ones. Same start, same length:
+            # one stay, and the copy that carries a confidence wins.
+            twin = next((t for t in ev.get("stays", [])
+                         if t["_start"] == row["occurred"] and t["minutes"] == minutes), None)
+            if twin is not None:
+                if twin["confidence"] is None and confidence is not None:
+                    twin["confidence"] = confidence
+                    twin["weight"] = _stay_weight(minutes, confidence)
+                ev["count"] -= 1
+                continue
             if minutes is not None:
                 ev["minutes"] = ev.get("minutes", 0) + minutes
             ev.setdefault("stays", []).append({"at": when, "minutes": minutes,
                                                "status": row["kind"],
                                                "confidence": confidence,
-                                               "weight": _stay_weight(minutes, confidence)})
+                                               "weight": _stay_weight(minutes, confidence),
+                                               "_start": row["occurred"]})
             ev.setdefault("_times", []).append((row["occurred"],
                                                 row["occurred"] + 60 * (minutes or 0)))
         elif source == "maps":
@@ -4880,6 +4893,8 @@ def cmd_whereabouts(opts):
             place["belief"], place["weights"] = _belief(evidence, plugin_tools)
             for ev in evidence.values():
                 ev.pop("_times", None)
+                for stay in ev.get("stays", []):
+                    stay.pop("_start", None)
             places.append(place)
         # The place believed most first; agreement and time only break ties.
         places.sort(key=lambda p: (-p["belief"], -p["agreement"],

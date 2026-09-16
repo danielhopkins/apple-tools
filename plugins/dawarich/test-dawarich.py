@@ -269,7 +269,7 @@ with tempfile.TemporaryDirectory() as tmp:
     en = js(run([MANAGER, "enabled"], ISOLATED))
     check("enabled lists it with a manifest", [r["name"] for r in en], ["dawarich"])
     check("enabled carries refresh args", en[0]["manifest"]["index"]["refresh_args"],
-          ["--since", "3650"])
+          ["--since", "3650", "--full"])
 
     p = run([MANAGER, "resolve", "dawarich"], ISOLATED)
     check("resolve prints the path", os.path.realpath(p.stdout.strip()), os.path.realpath(PLUGIN))

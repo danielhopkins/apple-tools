@@ -57,8 +57,14 @@ MANIFEST = {
     "index": {
         "kinds": ["visit", "suggested", "place"],
         # What `apple-index refresh` passes to `index`. Ten years, the same
-        # window the maps adapter uses for visits.
-        "refresh_args": ["--since", "3650"],
+        # window the maps adapter uses for visits — and `--full`, because
+        # 🛑 DAWARICH RE-RUNS ITS VISIT DETECTION AND MINTS NEW IDS. Measured
+        # 2026-09-16: one day's stays were replaced, and the index kept the
+        # 19 old copies beside the new ones, so one lunch read as five stays.
+        # `index` returns everything every run, so a full reconcile is safe
+        # and costs nothing extra; an ingest the server cuts short dies
+        # before the reconcile and deletes nothing.
+        "refresh_args": ["--since", "3650", "--full"],
         # What the app's Sources panel says about this source: the heading
         # over its breakdown, since `container` here is a country, and the
         # one line that says what a record is. Nothing else on the window
