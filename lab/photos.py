@@ -369,6 +369,11 @@ def reverse_geocode(blob):
     return {
         "name": name,
         "city": postal.get("_city"),
+        # ⚠️ THE COUNTY IS WHERE THE METRO NAME LIVES. A photo taken in
+        # Irving, The Colony or Grapevine carries `Dallas County` here and
+        # says "Dallas" nowhere else; drop it and a search for Dallas finds
+        # nothing, while every one of those days is in the index.
+        "county": postal.get("_subAdministrativeArea"),
         "state": postal.get("_state"),
         "country": postal.get("_country"),
         "country_code": postal.get("_ISOCountryCode"),
@@ -446,15 +451,15 @@ def survey(include_shared=True, radius_m=CLUSTER_RADIUS_M):
         spot = asset.get("place")
         if not spot:
             return None
-        return (spot.get("name"), spot.get("city"), spot.get("state"),
-                spot.get("country"), spot.get("country_code"))
+        return (spot.get("name"), spot.get("city"), spot.get("county"),
+                spot.get("state"), spot.get("country"), spot.get("country_code"))
 
     points = [(a["latitude"], a["longitude"], a["when"], label_of(a))
               for a in everything if a["latitude"] is not None]
     places = cluster(points, radius_m)
     for spot in places:
-        name, city, state, country, code = spot.pop("label") or (None,) * 5
-        spot.update(name=name, city=city, state=state,
+        name, city, county, state, country, code = spot.pop("label") or (None,) * 6
+        spot.update(name=name, city=city, county=county, state=state,
                     country=country, country_code=code)
     which = assign(places, radius_m)
 

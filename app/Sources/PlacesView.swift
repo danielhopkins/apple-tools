@@ -21,8 +21,19 @@ import MapKit
 struct Places: View {
     @ObservedObject var model: AppModel
     @State private var selected: Place?
+    /// A filter over name and address. ⚠️ It exists because "why don't my
+    /// photos show Dallas" had an answer — three days in Irving, The Colony
+    /// and Grapevine — that no top-twelve list could show.
+    @State private var query = ""
 
     private var stats: PlacesStats { model.places }
+
+    static func color(for place: Place) -> Color {
+        if place.sources.count > 1 { return .purple }
+        if place.sources.contains("maps") { return .orange }
+        if place.sources.contains("photos") { return .blue }
+        return .green
+    }
 
     var body: some View {
         PaneSection("Places", trailing: {
@@ -45,7 +56,7 @@ struct Places: View {
                     .frame(height: 340)
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                 Legend(stats: stats, selected: selected)
-                TopPlaces(places: stats.places, selected: $selected)
+                TopPlaces(places: stats.places, selected: $selected, query: $query)
             }
         }
     }
@@ -62,7 +73,32 @@ private struct WorldMap: View {
     /// top 400 by weight cover every place the user has been more than once,
     /// and the count in the badge is always the full total so the cap can
     /// never read as "this is everywhere".
-    private var drawn: [Place] { Array(places.prefix(400)) }
+    ///
+    /// 🛑 BUT THE CAP MUST NOT ERASE A REGION. The top 400 are almost all
+    /// within an hour of home, so three photo days in Dallas — one day each,
+    /// weight 1, rank ~1,200 — drew nothing at all, and the map said the user
+    /// had never been to Texas. A place is drawn if it is in the top 400 OR
+    /// no drawn place lies within 25 km of it: every region gets a dot, and
+    /// a dense one still does not get a thousand.
+    private var drawn: [Place] {
+        var kept: [Place] = []
+        for (rank, place) in places.enumerated() {
+            if rank < 400 {
+                kept.append(place)
+                continue
+            }
+            let alone = !kept.contains { metres($0, place) < 25_000 }
+            if alone { kept.append(place) }
+        }
+        return kept
+    }
+
+    private func metres(_ a: Place, _ b: Place) -> Double {
+        let lat = (a.latitude + b.latitude) / 2 * .pi / 180
+        let dx = (b.longitude - a.longitude) * .pi / 180 * cos(lat)
+        let dy = (b.latitude - a.latitude) * .pi / 180
+        return 6_371_000 * (dx * dx + dy * dy).squareRoot()
+    }
 
     @State private var camera: MapCameraPosition = .automatic
 
@@ -99,13 +135,9 @@ private struct Dot: View {
         return CGFloat(min(max(scaled * 3.0, 6.0), 22.0))
     }
 
-    /// A place both sources know is drawn differently, because it is the only
-    /// kind whose two numbers can disagree.
-    private var color: Color {
-        place.sources.contains("maps")
-            ? (place.sources.contains("photos") ? .purple : .orange)
-            : .blue
-    }
+    /// One colour per single source, and one for any place more than one
+    /// source knows — those are the places whose numbers can disagree.
+    private var color: Color { Places.color(for: place) }
 
     var body: some View {
         Circle()
@@ -128,10 +160,18 @@ private struct Legend: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
+            // ⚠️ Counted off the rows, not off `counts`: `from_x` overlap and
+            // a legend has to partition the dots it colours.
+            let only = { (source: String) in
+                stats.places.filter { $0.sources == [source] }.count
+            }
             HStack(spacing: 14) {
-                Key(color: .blue, text: "photos only  \(stats.fromPhotos - stats.both)")
-                Key(color: .orange, text: "Maps only  \(stats.fromMaps - stats.both)")
-                Key(color: .purple, text: "both  \(stats.both)")
+                Key(color: .blue, text: "photos only  \(only("photos"))")
+                Key(color: .orange, text: "Maps only  \(only("maps"))")
+                ForEach(stats.fromPlugins.keys.sorted(), id: \.self) { plugin in
+                    Key(color: .green, text: "\(plugin) only  \(only(plugin))")
+                }
+                Key(color: .purple, text: "more than one  \(stats.places.filter { $0.sources.count > 1 }.count)")
             }
             if let place = selected {
                 // 🛑 THE TWO NUMBERS ARE NAMED AND KEPT APART. A visit is an
@@ -161,6 +201,18 @@ private struct Legend: View {
             parts.append("\(place.visits) "
                          + (place.visits == 1 ? "recorded arrival" : "recorded arrivals"))
         }
+        // 🛑 A plugin's stays are its own unit, and a suggested one is a
+        // guess: both are named, and neither is added to anything.
+        for plugin in place.plugins {
+            let confirmed = place.pluginVisits[plugin] ?? 0
+            let guessed = place.pluginSuggested[plugin] ?? 0
+            var piece = "\(plugin): "
+            if confirmed > 0 { piece += "\(confirmed) confirmed " + (confirmed == 1 ? "stay" : "stays") }
+            if guessed > 0 {
+                piece += (confirmed > 0 ? ", " : "") + "\(guessed) suggested"
+            }
+            if confirmed > 0 || guessed > 0 { parts.append(piece) }
+        }
         if !place.where_.isEmpty, place.where_ != place.name {
             parts.append(place.where_)
         }
@@ -186,10 +238,32 @@ private struct Key: View {
 private struct TopPlaces: View {
     let places: [Place]
     @Binding var selected: Place?
+    @Binding var query: String
+
+    /// The top twelve, or everything matching the filter — name or address,
+    /// so "Dallas" finds a place whose city is Irving and county is Dallas.
+    private var shown: [Place] {
+        let needle = query.trimmingCharacters(in: .whitespaces).lowercased()
+        if needle.isEmpty { return Array(places.prefix(12)) }
+        return Array(places.filter {
+            $0.name.lowercased().contains(needle) || $0.where_.lowercased().contains(needle)
+        }.prefix(30))
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            ForEach(places.prefix(12)) { place in
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass").foregroundStyle(.tertiary)
+                    .font(.system(size: 11))
+                TextField("name, city, county or country", text: $query)
+                    .textFieldStyle(.plain).font(.system(size: 11))
+                if !query.isEmpty {
+                    Text("\(shown.count)").font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.vertical, 3)
+            ForEach(shown) { place in
                 HStack(spacing: 8) {
                     Text(place.name.isEmpty ? "unnamed" : place.name)
                         .font(.system(size: 11))
@@ -205,11 +279,19 @@ private struct TopPlaces: View {
                             .font(.system(size: 11, design: .monospaced))
                             .foregroundStyle(.orange)
                     }
+                    let stays = place.pluginVisits.values.reduce(0, +)
+                        + place.pluginSuggested.values.reduce(0, +)
+                    if stays > 0 {
+                        Text("\(stays)s")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(.green)
+                    }
                 }
                 .contentShape(Rectangle())
                 .onTapGesture { selected = place }
             }
-            Text("d = days photographed · v = arrivals Maps recorded. "
+            Text("d = days photographed · v = arrivals Maps recorded · "
+                 + "s = stays a plugin detected, confirmed or guessed. "
                  + "Different units; not comparable.")
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)

@@ -2251,6 +2251,18 @@ made once by adding emails to texts. Each row carries `visits` and
   place category there and `photos` puts a country; reading it as a country
   for both listed "Dining" and "Transportation" as countries, 65 of them where
   the honest answer is 8.
+- 🛑 **A photo place carries city, COUNTY and state, because the metro name
+  lives in the county.** Three photo days in Irving, The Colony and
+  Grapevine said "Dallas" nowhere until `Dallas County` was kept from
+  Apple's placemark (`_subAdministrativeArea`); only Irving is in it — The
+  Colony is Denton County and DFW is Tarrant — and nothing here invents a
+  "Dallas–Fort Worth" the placemark does not carry.
+- 🛑 **The app's map draws the top 400 places by weight AND one dot per
+  region.** The top 400 are almost all within an hour of home, so those
+  same three Dallas days — weight 1, rank ~1,200 — drew nothing and the map
+  said the user had never been to Texas. A place past the cap is drawn when
+  no drawn place lies within 25 km of it. The pane also has a filter over
+  name and address, and shows a plugin's stays in green beside `d` and `v`.
 
 **The `photos` source is what put children in the people report.** Every other
 channel needs an address or a number, so it can only see somebody who sends

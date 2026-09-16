@@ -1278,7 +1278,12 @@ def ingest_photos(opts):
 
     for spot, key in zip(places, keys):
         name = spot.get("name") or ""
-        where = [name, spot.get("city"), spot.get("state"), spot.get("country")]
+        # ⚠️ CITY, COUNTY, STATE, COUNTRY — all of them, because the metro name
+        # a person searches for lives in the county. Three photo days in
+        # Irving, The Colony and Grapevine said "Dallas" nowhere until
+        # `Dallas County` was kept.
+        where = [name, spot.get("city"), spot.get("county"), spot.get("state"),
+                 spot.get("country")]
         title = name or spot.get("city") or "%.4f, %.4f" % (
             spot["latitude"], spot["longitude"])
         yield {
@@ -1293,7 +1298,8 @@ def ingest_photos(opts):
             "latitude": spot["latitude"], "longitude": spot["longitude"],
             "people": [],
             "body": ", ".join(x for x in where if x),
-            "rev": rev_of(title, str(spot["photos"]), str(spot["days"])),
+            "rev": rev_of(title, ", ".join(x for x in where if x),
+                          str(spot["photos"]), str(spot["days"])),
         }
 
     impossible = {}
@@ -1304,6 +1310,7 @@ def ingest_photos(opts):
         where = ""
         if spot:
             where = ", ".join(x for x in [spot.get("name"), spot.get("city"),
+                                          spot.get("county"), spot.get("state"),
                                           spot.get("country")] if x)
         # 🛑 A PHOTO FROM SOMEBODY ELSE'S CAMERA IS NOT PROOF YOU WERE THERE.
         # 7,460 assets here belong to the iCloud Shared Library rather than to
@@ -1355,7 +1362,7 @@ def ingest_photos(opts):
             "longitude": (spot or {}).get("longitude"),
             "people": people,
             "body": "\n".join(x for x in [where, names, camera] if x),
-            "rev": rev_of(entry["day"], key, str(entry["photos"]), names, camera),
+            "rev": rev_of(entry["day"], key, where, str(entry["photos"]), names, camera),
         }
 
     # ⚠️ NAMED, NEVER JUST COUNTED. A face quietly removed from somebody's
