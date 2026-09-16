@@ -130,12 +130,22 @@ with tempfile.TemporaryDirectory() as tmp:
     check("the same event on two calendars is one plan",
           len(shop["evidence"]["calendar"]["events"]), 1)
     check("a home day is home", d["state"], "home")
+    # 1h30 at default confidence: 0.7 * 0.5 * (0.3 + 0.7*90/180) = 0.2275 → 0.227; the
+    # 45m stay is weaker and does not add — one source, its best evidence.
+    check("several stays are one source at its best", home["weights"]["dawarich"], 0.227)
+    # maps at 12:00 and the swim lesson at 18:00 are 6 h apart: a plan, unkept.
+    check("an unkept plan stays a plan", shop["weights"]["calendar"], 0.2)
+    check("shop belief", shop["belief"], 0.88)
 
     d = days["2026-05-22"]
     hotel = d["places"][0]
     check("maps + dawarich corroborate", (hotel["claim"], hotel["agreement"]),
           ("corroborated", 2))
     check("the day is away", d["state"], "away")
+    # belief: maps 0.85, a 9 h stay at default confidence 0.7*0.5*1.0 = 0.35,
+    # both at 20:00 so they overlap: 1 - 0.15*0.65*0.7 = 0.932
+    check("belief is the noisy-OR of the weights", hotel["belief"], 0.932)
+    check("and the weights are printed", sorted(hotel["weights"]), ["dawarich", "maps", "overlap"])
     check("distance is from home", 1200 < d["furthest_km"] < 1500, True)
 
     d = days["2026-05-23"]
@@ -146,6 +156,8 @@ with tempfile.TemporaryDirectory() as tmp:
                                             for p in d["places"] if "photos" in p["evidence"]],
           ["alongside"])
     check("and never sets the day's distance", d["furthest_km"], None)
+    other = [p for p in d["places"] if "photos" in p["evidence"]][0]
+    check("someone else's camera weighs little", other["weights"]["photos"], 0.15)
 
     d = days["2026-05-26"]
     check("a calendar-only day is unknown, not home", d["state"], "unknown")
@@ -163,8 +175,8 @@ with tempfile.TemporaryDirectory() as tmp:
           True)
 
     text = run("--from", "2026-05-21", "--to", "2026-05-27")
-    check("plain output marks agreement", "✓✓ Hotel" in text, True)
-    check("plain output marks a plan", "?  Corner Shop" in text, True)
+    check("plain output marks agreement", "✓✓ 0.9" in text and "Hotel" in text, True)
+    check("plain output marks a plan", "?  0.20 Corner Shop" in text, True)
     check("plain output names the other camera", "someone else's photos" in text, True)
     check("plain output says what places nobody", "(nothing places you)" in text, True)
 

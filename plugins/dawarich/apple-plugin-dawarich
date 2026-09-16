@@ -59,6 +59,15 @@ MANIFEST = {
         # What `apple-index refresh` passes to `index`. Ten years, the same
         # window the maps adapter uses for visits.
         "refresh_args": ["--since", "3650"],
+        # What the app's Sources panel says about this source: the heading
+        # over its breakdown, since `container` here is a country, and the
+        # one line that says what a record is. Nothing else on the window
+        # can know either.
+        "container_label": "By country",
+        "footnote": "A record is a visit, with how long you stayed, or a "
+                    "named place. A visit marked suggested is the server's "
+                    "guess from the GPS track; nobody confirmed it. A visit "
+                    "with no place has no coordinate and no country.",
     },
     "config": [
         {"key": "url", "required": True, "secret": False,
@@ -510,9 +519,14 @@ def cmd_index(opts):
         for visit in fetch_visits(url, key, start, end, "all"):
             place = places.get(visit["place_id"]) or {}
             where = ", ".join(x for x in (place.get("city"), place.get("country")) if x)
+            # ⚠️ The stay's length and the server's confidence ride in the
+            # body, because the record has no other field for them and
+            # `apple-index whereabouts` weighs a stay by both.
             lines = [visit["name"] or place.get("name") or "",
                      where,
-                     "stayed %s" % visit["duration"] if visit["duration"] else ""]
+                     "stayed %s" % visit["duration"] if visit["duration"] else "",
+                     "confidence %d" % visit["confidence"]
+                     if visit.get("confidence") is not None else ""]
             out.write(json.dumps({
                 "uid": "dawarich:visit:%s" % visit["id"],
                 "tool": NAME,
@@ -526,8 +540,9 @@ def cmd_index(opts):
                 "latitude": visit["latitude"], "longitude": visit["longitude"],
                 "people": [],
                 "body": "\n".join(x for x in lines if x),
-                "rev": "%s|%s|%s|%s" % (visit["name"], visit["started"],
-                                        visit["ended"], visit["status"]),
+                "rev": "%s|%s|%s|%s|%s" % (visit["name"], visit["started"],
+                                           visit["ended"], visit["status"],
+                                           visit.get("confidence")),
             }) + "\n")
         out.flush()
     except ApiError as error:

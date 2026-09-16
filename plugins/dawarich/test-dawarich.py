@@ -224,6 +224,8 @@ with tempfile.TemporaryDirectory() as tmp:
           all(need <= set(r) for r in records), True)
     visit = [r for r in records if r["uid"] == "dawarich:visit:1"][0]
     check("visit body carries the stay", "stayed 1h 30m" in visit["body"], True)
+    check("visit body carries the confidence", "confidence 90" in visit["body"], True)
+    check("rev tracks the confidence", visit["rev"].endswith("|90"), True)
     check("visit container is the country", visit["container"], "United States")
     check("visit occurred", visit["occurred"], 1788271200.0)
     check("visit url", visit["url"], "%s/visits/1" % URL)

@@ -64,6 +64,14 @@ Read the marks, not the number of lines: `✓✓` two independent sources agree,
 `✓` one source, `?` a plan, `·` somebody else's camera. **Three dawarich
 stays are one source saying it three times.**
 
+The number after the mark is `belief`, 0 to 1: a noisy-OR over one weight
+per source (maps 0.85, own photo 0.80 or 0.95 with the user in it, a plan
+0.20 or 0.45 when GPS confirms it within 3 h, a dawarich stay up to 0.70 by
+its confidence and length, +0.30 when two sources fall within 3 h). 🛑 **The
+weights are assumed, not measured, and `--json` prints every one under
+`weights`.** Say "0.94: a Maps arrival and a Dawarich stay within three
+hours", never "94% certain".
+
 - `home` is the largest place in the index unless `--home lat,lon` says
   otherwise. A day is `away` when everything that places the user is more
   than `--away-km` (50) from home. Consecutive away days are a **trip**; a

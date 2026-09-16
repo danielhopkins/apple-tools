@@ -2200,6 +2200,27 @@ alone — never a presence), `reported` (somebody else's camera alone).
   sources agree on, then the farthest — so an airport passed through twice
   never names a trip.
 - ⚠️ **The same event arrives once per calendar it is on.** Drawn once.
+- **`belief` is a 0–1 score per place per day, and every weight behind it is
+  printed.** It is a noisy-OR, `1 − Π(1 − w)`, over one weight per source:
+  maps 0.85; the user's own camera 0.80, or 0.95 with the user IN the
+  picture (their handles come from the stored `people` report); somebody
+  else's camera 0.15; a calendar pin 0.20, or 0.45 when GPS puts the user
+  there within 3 h; a dawarich stay up to 0.70 scaled by the server's own
+  confidence and the stay's length (5 min at 42 ≈ 0.09, 6 h at 62 ≈ 0.43);
+  plus 0.30 when two presence sources fall within 3 h of each other. 🛑
+  **THE WEIGHTS ARE ASSUMPTIONS.** No source is ground truth, so what was
+  measured is how often each is *confirmed* by another (maps by dawarich
+  35%, dawarich by maps 28%, an own-camera day by dawarich 48%, a shared
+  day by any GPS 11–14%, a calendar pin by maps 15%), which is agreement,
+  not accuracy. Several stays at one place on one day are ONE source at its
+  best; they never sum. Read `weights`, and repeat them when you report a
+  belief. `claim` stays beside it and is the count of sources.
+- ⚠️ **A dawarich stay's confidence rides in the record body**
+  (`confidence 62`), written by the plugin from 26.914.2. Until the app
+  ships that plugin, its refresh writes the old body and a manual ingest
+  from the checkout writes the new one, and the two rewrite 6,000 records
+  at each other every five minutes. Do not ingest dawarich by hand until the
+  installed app carries the same plugin.
 - Measured on six months here: 7 trips, from a one-day New York flight to
   five days at Disneyland with all three GPS-and-camera sources agreeing.
   `lab/test-whereabouts.py` pins every rule above.

@@ -4610,6 +4610,62 @@ def cmd_places(opts):
 # intent, not presence: it is shown, and it never makes a claim alone.
 
 STAY_RE = re.compile(r"stayed (?:(\d+)d )?(?:(\d+)h )?(?:(\d+)m)?")
+CONFIDENCE_RE = re.compile(r"confidence (\d+)")
+
+# 🛑 THESE WEIGHTS ARE ASSUMPTIONS, AND EVERY REPORT PRINTS THEM. No source
+# here is ground truth, so nothing can measure how often a source is RIGHT;
+# what was measured (2026-09-16, 180 days, same day within 250 m) is how often
+# each is CONFIRMED by another: maps by dawarich 35%, dawarich by maps 28%,
+# an own-camera photo day by dawarich 48%, a shared-camera day by any GPS
+# 11-14%, a calendar pin by maps 15%. That is agreement, not accuracy. The
+# numbers below say how much one source's word is worth on its own, and a
+# `belief` is a noisy-OR over them: 1 - Π(1 - w). Two sources at 0.85 and
+# 0.4 make 0.91; neither is a probability anyone measured.
+BELIEF_WEIGHT = {
+    "maps": 0.85,            # an arrival Apple's detector was sure of
+    "photos": 0.80,          # the user's own camera was there that day
+    "photos_self": 0.95,     # ...and the user is IN the picture
+    "photos_shared": 0.15,   # somebody else's camera: evidence THEY were there
+    "calendar": 0.20,        # a plan
+    "calendar_kept": 0.45,   # a plan with the user's GPS at the place within 3 h
+    "overlap": 0.30,         # two GPS-or-photo sources within 3 h of each other
+}
+# A dawarich stay is worth up to this, scaled by the server's own confidence
+# (0-100; 42-62 on real stays here) and by how long the stay was: a 5-minute
+# stay at 42 is ~0.09, a 6-hour stay at 62 is ~0.43. Several stays at one
+# place on one day are ONE source; the best of them counts, not their sum.
+DAWARICH_BASE = 0.70
+OVERLAP_HOURS = 3
+
+
+def _confidence(body):
+    match = CONFIDENCE_RE.search(body or "")
+    return int(match.group(1)) if match else None
+
+
+def _stay_weight(minutes, confidence):
+    length = 0.3 + 0.7 * min(1.0, (minutes or 0) / 180.0)
+    trust = (confidence if confidence is not None else 50) / 100.0
+    return round(DAWARICH_BASE * trust * length, 3)
+
+
+def _noisy_or(weights):
+    """1 - Π(1 - w): the belief that at least one of several independent
+    witnesses is right. ⚠️ Independence is the assumption."""
+    miss = 1.0
+    for w in weights:
+        miss *= (1.0 - w)
+    return round(1.0 - miss, 3)
+
+
+def _me_handles(db):
+    """The user's own handles from the stored people report, so a photo the
+    user is IN can be told from one they took. Empty when no report exists:
+    the bonus is simply not applied, and nothing pretends otherwise."""
+    report = read_people_cache(db, None)
+    if not report:
+        return set()
+    return set(report.get("me", {}).get("handles") or [])
 
 
 def _stay_minutes(body):
@@ -4623,6 +4679,48 @@ def _stay_minutes(body):
 
 def _local_day(epoch):
     return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d")
+
+
+def _belief(evidence, plugin_tools):
+    """(belief, weights) for one place on one day.
+
+    Each source contributes one weight — its best single piece of evidence,
+    never a sum over records — and the belief is the noisy-OR of them. Two
+    presence sources within OVERLAP_HOURS of each other add `overlap`; a
+    calendar pin with a GPS source within that window is a plan that was
+    kept. Everything that went in is returned, so a report can print it.
+    """
+    weights = {}
+    windows = {}          # source -> [(start, end)] for the overlap test
+    for source, ev in evidence.items():
+        if source in plugin_tools:
+            stays = ev.get("stays") or []
+            weights[source] = max((s["weight"] for s in stays), default=0.0)
+        elif source == "maps":
+            weights["maps"] = BELIEF_WEIGHT["maps"]
+        elif source == "photos":
+            if ev.get("role") == "alongside":
+                weights["photos"] = BELIEF_WEIGHT["photos_shared"]
+            elif ev.get("self"):
+                weights["photos"] = BELIEF_WEIGHT["photos_self"]
+            else:
+                weights["photos"] = BELIEF_WEIGHT["photos"]
+        elif source == "calendar":
+            weights["calendar"] = BELIEF_WEIGHT["calendar"]
+        if ev.get("_times"):
+            windows[source] = ev["_times"]
+
+    def near(a, b):
+        slack = OVERLAP_HOURS * 3600
+        return any(s1 - slack <= e2 and s2 - slack <= e1
+                   for s1, e1 in windows.get(a, []) for s2, e2 in windows.get(b, []))
+
+    gps = [s for s in windows if s != "calendar"]
+    if "calendar" in weights and any(near("calendar", g) for g in gps):
+        weights["calendar"] = BELIEF_WEIGHT["calendar_kept"]
+    if any(near(a, b) for i, a in enumerate(gps) for b in gps[i + 1:]):
+        weights["overlap"] = BELIEF_WEIGHT["overlap"]
+    return _noisy_or(weights.values()), weights
 
 
 def cmd_whereabouts(opts):
@@ -4684,6 +4782,7 @@ def cmd_whereabouts(opts):
         "   AND tool IN (%s) AND kind IN ('visit','suggested','day','event') "
         " ORDER BY occurred" % marks, [start, end] + located_tools).fetchall()
 
+    me = _me_handles(db)
     days = {}
     for row in rows:
         day = days.setdefault(_local_day(row["occurred"]),
@@ -4713,12 +4812,18 @@ def cmd_whereabouts(opts):
         when = datetime.fromtimestamp(row["occurred"]).strftime("%H:%M")
         if source in plugin_tools:
             minutes = _stay_minutes(row["body"])
+            confidence = _confidence(row["body"])
             if minutes is not None:
                 ev["minutes"] = ev.get("minutes", 0) + minutes
             ev.setdefault("stays", []).append({"at": when, "minutes": minutes,
-                                               "status": row["kind"]})
+                                               "status": row["kind"],
+                                               "confidence": confidence,
+                                               "weight": _stay_weight(minutes, confidence)})
+            ev.setdefault("_times", []).append((row["occurred"],
+                                                row["occurred"] + 60 * (minutes or 0)))
         elif source == "maps":
             ev.setdefault("arrivals", []).append(when)
+            ev.setdefault("_times", []).append((row["occurred"], row["occurred"]))
         elif source == "calendar":
             # ⚠️ The same event arrives once per calendar it is on — a shared
             # family calendar and the user's own both carry "Swim lessons".
@@ -4726,14 +4831,19 @@ def cmd_whereabouts(opts):
             event = {"at": when, "title": row["title"]}
             if event not in ev.setdefault("events", []):
                 ev["events"].append(event)
+                ev.setdefault("_times", []).append((row["occurred"], row["occurred"]))
         elif source == "photos":
             try:
-                people = [p.get("name") for p in json.loads(row["people"] or "[]")]
+                tagged = json.loads(row["people"] or "[]")
             except ValueError:
-                people = []
-            for who in people:
-                if who and who not in ev.setdefault("people", []):
-                    ev["people"].append(who)
+                tagged = []
+            for who in tagged:
+                name = who.get("name")
+                if name and name not in ev.setdefault("people", []):
+                    ev["people"].append(name)
+                # The user IN the picture: the strongest presence there is.
+                if who.get("handle") in me:
+                    ev["self"] = True
             # ⚠️ A day whose every photo came from somebody else's camera is
             # evidence that THEY were there. It is kept, named, and never
             # counted as the user's presence — see `ingest_photos`.
@@ -4767,11 +4877,13 @@ def cmd_whereabouts(opts):
                               else "single" if present
                               else "planned" if "calendar" in evidence else "reported")
             place["sources"] = sorted(evidence)
+            place["belief"], place["weights"] = _belief(evidence, plugin_tools)
+            for ev in evidence.values():
+                ev.pop("_times", None)
             places.append(place)
-        # The place with the most agreement first, then the most time.
-        places.sort(key=lambda p: (-p["agreement"],
-                                   -sum(e.get("minutes", 0) for e in p["evidence"].values()),
-                                   -sum(e["count"] for e in p["evidence"].values())))
+        # The place believed most first; agreement and time only break ties.
+        places.sort(key=lambda p: (-p["belief"], -p["agreement"],
+                                   -sum(e.get("minutes", 0) for e in p["evidence"].values())))
         # 🛑 ONLY THE USER'S OWN PRESENCE DECIDES A DAY. A plan and somebody
         # else's photo are drawn; neither says the user was anywhere.
         located = [p for p in places if p["claim"] in ("corroborated", "single")]
@@ -4847,6 +4959,8 @@ def cmd_whereabouts(opts):
         "home": {"name": home["name"], "latitude": home["latitude"],
                  "longitude": home["longitude"], "given": bool(opts.home)},
         "away_km": away_km,
+        "belief_weights": dict(BELIEF_WEIGHT, dawarich_base=DAWARICH_BASE,
+                               overlap_hours=OVERLAP_HOURS),
         "days": out_days,
         "trips": trips,
     }
@@ -4882,7 +4996,7 @@ def cmd_whereabouts(opts):
                         "%s %s" % (e["at"], e["title"]) for e in ev.get("events", [])[:2]))
             mark = {"corroborated": "✓✓", "single": "✓ ", "planned": "? ",
                     "reported": "· "}[p["claim"]]
-            print("  %s %-34s %s" % (mark, p["name"][:34], " · ".join(bits)))
+            print("  %s %.2f %-32s %s" % (mark, p["belief"], p["name"][:32], " · ".join(bits)))
         if d["unplaced_stays"]:
             print("     + %d stay%s with no place" % (d["unplaced_stays"],
                                                        "" if d["unplaced_stays"] == 1 else "s"))
@@ -4899,6 +5013,10 @@ def cmd_whereabouts(opts):
     print()
     print("✓✓ two sources agree   ✓ one source   ? calendar only, a plan not a presence"
           "   · someone else's camera only")
+    print("belief = 1 - Π(1 - w) over: " + ", ".join(
+        "%s %.2f" % (k, v) for k, v in BELIEF_WEIGHT.items())
+          + "; a dawarich stay up to %.2f by its confidence and length. "
+            "Assumed weights, not measured ones." % DAWARICH_BASE)
 
 
 def human_minutes(minutes):
