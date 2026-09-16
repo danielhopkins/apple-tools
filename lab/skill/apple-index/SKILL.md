@@ -22,6 +22,59 @@ the whole reason it exists.
 **Use the `apple` tools directly when you do know**, or when you need the full
 record. `apple mail search --since 7` is the right tool for "my mail this week".
 
+## Where the user WAS — `whereabouts`
+
+🛑 **"Where did I go this week", "was I away in March", "when did we go to
+Disneyland" are NOT searches.** A visit record says "Costco / stayed 1h 30m"
+and carries no words for "this week", and `search --since` filters after
+retrieval, so on a real index it returned **0 hits**. Use `whereabouts`: a
+day-by-day listing of where the user was, across every source that knows,
+with the sources that agree named on every line.
+
+```
+apple-index whereabouts --since 7                    # this week, day by day
+apple-index whereabouts --from 2026-05-20 --to 2026-05-31 --json
+apple-index whereabouts --from 2026-01-01 --to 2026-09-01 | grep ^trip
+```
+
+```
+2026-09-15
+  ✓✓ Waterloo                  maps 08:00 · dawarich 5 stays (6h 45m) · calendar 11:30 Dan / Jeff Lunch
+  ✓  Foothills Community Park  dawarich 2 stays (14m)
+  ?  Boulder Medical Center    calendar 08:15 Labcorp Appointment
+     + 9 stays with no place
+trip 2026-05-24 → 2026-05-28 (5 days): Disneyland Resort, 1331 km out.
+```
+
+Four sources feed it, and each is evidence of a different thing:
+
+- **`maps`**: an arrival Apple's detector was sure of. Sparse, and reliable.
+- **`dawarich`** (a plugin, when enabled): a stay a phone app guessed from
+  the GPS track, with a start AND an end, so it is the one that knows how
+  long. Every stay here is `suggested`; 28% have no place at all and show
+  as "stays with no place".
+- **`photos`**: a camera was there that day, and whose. ⚠️ "someone else's
+  photos" means every picture that day came from the iCloud Shared Library
+  — a relative's camera — and that is evidence THEY were there, not the
+  user. Marked `·`, never counted.
+- **`calendar`**: where the user PLANNED to be. Marked `?`, never a presence
+  on its own. The day a plan is wrong is the day worth knowing about.
+
+Read the marks, not the number of lines: `✓✓` two independent sources agree,
+`✓` one source, `?` a plan, `·` somebody else's camera. **Three dawarich
+stays are one source saying it three times.**
+
+- `home` is the largest place in the index unless `--home lat,lon` says
+  otherwise. A day is `away` when everything that places the user is more
+  than `--away-km` (50) from home. Consecutive away days are a **trip**; a
+  day nothing places does not end one, and `placed on N` says how many of
+  the trip's days any source actually saw.
+- `(nothing places you)` is a real answer: the day exists in the window and
+  no source put the user anywhere. Say so; do not fill it in.
+- 🛑 **Every claim names its sources. Repeat them.** "You were at Waterloo
+  for 6h 45m" is Dawarich's guess corroborated by a Maps arrival and a
+  calendar lunch. Say that, not "you were there".
+
 ## Where things happened
 
 `near` lists everything indexed within a radius of a place. `nearby` groups
@@ -285,8 +338,10 @@ Every search is logged with its results, so a query is not private either.
 compete on wording alone, and the older one often wins because a long archive
 holds more near-misses.
 
-**When the user means something recent, pass `--since`.** It is a filter, so it
-does not fight the ranking:
+**When the user means something recent, pass `--since`.** ⚠️ It filters AFTER
+retrieval, so it works when the words already find the record and the date
+narrows it; it returns nothing when the date IS the question ("what did I do
+last week"). For that, `whereabouts` above. Otherwise:
 
 ```
 apple-index search "board meeting agenda" --since 14

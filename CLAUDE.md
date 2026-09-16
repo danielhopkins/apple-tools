@@ -2166,6 +2166,44 @@ recompute it implies rather than waiting for the clock.
   and one dead address held 8,491 and 568 encounters, meeting exactly where the
   other began.
 
+**`apple-index whereabouts` is where the user WAS, day by day, from every
+source that knows.** The question `search` cannot answer: "where did I go
+this week" retrieves by words, and a visit record has none for "this week",
+so `search --since` returned **0 hits** on a real index. This is a listing
+over a window, not a search.
+
+```
+apple-index whereabouts --since 7                 # this week
+apple-index whereabouts --from 2026-05-20 --to 2026-05-31 --json
+```
+
+🛑 **FOUR SOURCES, AND NONE OF THEM IS THE ANSWER.** `maps` is an arrival
+Apple's detector was sure of; `dawarich` a stay a phone guessed, with a start
+and an end; `photos` a camera on a day; `calendar` a PLAN. Each misses most
+days. Agreement is the signal, and **agreement is counted in sources, never
+in records** — three dawarich stays are one source three times. Every place
+carries `claim`: `corroborated` (two sources), `single`, `planned` (calendar
+alone — never a presence), `reported` (somebody else's camera alone).
+
+- 🛑 **A photo from a shared camera is evidence THEY were there.** On the
+  first real run a relative's photo in Rochester put the user 2,336 km from
+  a Disneyland trip on the day they flew home. `ingest_photos` now writes
+  `from a shared camera` into the body of a day whose every photo came from
+  the iCloud Shared Library, so the flag survives without a tagged face;
+  `whereabouts` reads it and such a day places nobody.
+- **Home is the largest place in `merged_places`**, or `--home lat,lon`. A
+  day is `away` when everything placing the user is over `--away-km` (50)
+  from home; `unknown` when nothing places them; `home` otherwise.
+- **A trip is a run of away days, and a day nothing places does not end
+  it.** `days` is the span, `days_placed` how many any source saw. The
+  centre is the place most distinct days put the user, then the one more
+  sources agree on, then the farthest — so an airport passed through twice
+  never names a trip.
+- ⚠️ **The same event arrives once per calendar it is on.** Drawn once.
+- Measured on six months here: 7 trips, from a one-day New York flight to
+  five days at Disneyland with all three GPS-and-camera sources agreeing.
+  `lab/test-whereabouts.py` pins every rule above.
+
 **`apple-index places` is the map behind the app window's places pane** — everywhere
 the user has been, from the two sources that know.
 

@@ -9,7 +9,7 @@ UV      := $(shell command -v uv)
 
 .PHONY: build install uninstall install-agent uninstall-agent agent-status \
         install-skill link-installed-skills uninstall-skill demo status test \
-        test-people test-files test-doctext test-photos test-plugins bench bench-compare bench-clean clean
+        test-people test-files test-doctext test-photos test-plugins test-whereabouts bench bench-compare bench-clean clean
 
 ## Build the Swift embedder (Core ML + Apple's models)
 build:
@@ -127,6 +127,7 @@ test:
 	./test-doctext.py
 	./test-photos.py
 	./test-plugins.py
+	./test-whereabouts.py
 	./test-incremental.py --source mail,calendar,notes,messages
 	./eval.py
 
@@ -159,6 +160,9 @@ test-people:
 ## configuration inside the encrypted vault, where an unmount took it away.
 test-plugins:
 	./test-plugins.py
+
+test-whereabouts:
+	./test-whereabouts.py
 
 test-files:
 	./test-files.py

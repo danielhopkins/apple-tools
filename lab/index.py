@@ -1335,6 +1335,13 @@ def ingest_photos(opts):
         # filter whose result never reaches the index is worse than no filter,
         # because the stderr line says it worked.
         names = ", ".join(who["name"] for who in people)
+        # 🛑 THE SHARED-CAMERA FACT GOES ON THE RECORD, not only on its people.
+        # A day with no tagged face carried no `alongside` role, so nothing
+        # downstream could tell a grandparent's photo in Rochester from the
+        # user's own — and `whereabouts` put the user 2,336 km from a
+        # Disneyland trip on the day they flew home. The body line is the
+        # only field that can carry it; it is in `rev` so a re-ingest lands it.
+        camera = "from a shared camera" if shared_only else ""
         yield {
             "uid": "photos:day:%s:%s" % (entry["day"], key),
             "tool": "photos", "kind": "day",
@@ -1347,8 +1354,8 @@ def ingest_photos(opts):
             "latitude": (spot or {}).get("latitude"),
             "longitude": (spot or {}).get("longitude"),
             "people": people,
-            "body": "\n".join(x for x in [where, names] if x),
-            "rev": rev_of(entry["day"], key, str(entry["photos"]), names),
+            "body": "\n".join(x for x in [where, names, camera] if x),
+            "rev": rev_of(entry["day"], key, str(entry["photos"]), names, camera),
         }
 
     # ⚠️ NAMED, NEVER JUST COUNTED. A face quietly removed from somebody's
@@ -4403,29 +4410,14 @@ def files_by_root(db, limit=60):
     return sorted(out, key=lambda r: (-r["records"], r["name"]))
 
 
-def cmd_places(opts):
-    """Everywhere the user has been, from the two sources that know.
+def merged_places(db):
+    """Every place across the sources that know one, merged within 250 m.
 
-    🛑 TWO SOURCES, TWO UNITS, NEVER ADDED. `maps` records a genuine ARRIVAL,
-    with a start time, from Maps' Visited Places. `photos` records that a
-    camera was somewhere on some DAY. They measure different things, and the
-    same place usually has both. Summing them would produce a number that means
-    nothing — the same mistake the `people` report made once by adding emails
-    to texts, and it is worse here because the two sources overlap.
-
-    So a row that both sources know carries `visits` and `photo_days` side by
-    side, each named after what it counts, and the caller picks one.
-
-    ⚠️ NEITHER IS "WHERE YOU HAVE BEEN". Maps keeps 450 arrivals here; the
-    photo library holds 27,603 located pictures over twenty-one years. Photos
-    reaches back much further and misses everywhere the user did not take a
-    picture. Maps sees only where Maps was running. Say which one an answer
-    came from.
-
-    ⚠️ THIS IS NOT Significant Locations, which belongs to `routined` under
-    /var/db/locationd/ and no unprivileged process can read.
+    Returns (merged, plugin_tools, weight). The rules — which source names a
+    merged row, why a suggested visit never anchors one, why `container` is
+    a country for every source but `maps` — live here, and `places` and
+    `whereabouts` both read this one list. See `cmd_places` for the units.
     """
-    db = connect(opts.db)
 
     # 🛑 A PLUGIN THAT INDEXES PLACES IS A THIRD SOURCE, WITH ITS OWN UNIT.
     # The first one, dawarich, records an arrival with a start AND an end,
@@ -4543,6 +4535,33 @@ def cmd_places(opts):
                 break
         else:
             merged.append(spot)
+    return merged, plugin_tools, weight
+
+
+def cmd_places(opts):
+    """Everywhere the user has been, from the two sources that know.
+
+    🛑 TWO SOURCES, TWO UNITS, NEVER ADDED. `maps` records a genuine ARRIVAL,
+    with a start time, from Maps' Visited Places. `photos` records that a
+    camera was somewhere on some DAY. They measure different things, and the
+    same place usually has both. Summing them would produce a number that means
+    nothing — the same mistake the `people` report made once by adding emails
+    to texts, and it is worse here because the two sources overlap.
+
+    So a row that both sources know carries `visits` and `photo_days` side by
+    side, each named after what it counts, and the caller picks one.
+
+    ⚠️ NEITHER IS "WHERE YOU HAVE BEEN". Maps keeps 450 arrivals here; the
+    photo library holds 27,603 located pictures over twenty-one years. Photos
+    reaches back much further and misses everywhere the user did not take a
+    picture. Maps sees only where Maps was running. Say which one an answer
+    came from.
+
+    ⚠️ THIS IS NOT Significant Locations, which belongs to `routined` under
+    /var/db/locationd/ and no unprivileged process can read.
+    """
+    db = connect(opts.db)
+    merged, plugin_tools, weight = merged_places(db)
 
     countries = {}
     for spot in merged:
@@ -4572,6 +4591,324 @@ def cmd_places(opts):
             :(opts.limit or 4000)],
     }
     print(json.dumps(report, indent=2))
+
+
+# --------------------------------------------------------------------------
+# whereabouts — where you were, day by day, and which sources agree
+# --------------------------------------------------------------------------
+#
+# 🛑 FOUR SOURCES SAY WHERE THE USER WAS, AND NONE OF THEM IS THE ANSWER.
+# `maps` records an arrival Apple's detector was sure of; `dawarich` records a
+# stay a phone app guessed from the GPS track, with a start AND an end;
+# `photos` records that a camera was somewhere on a day; `calendar` records
+# where the user PLANNED to be. Each misses most days. Together they agree
+# often enough that agreement is the signal: a place two of them put you on
+# the same day is a place you were.
+#
+# ⚠️ AGREEMENT IS COUNTED IN SOURCES, NEVER IN RECORDS. Three dawarich stays
+# at one place are one source saying it three times. A calendar event is
+# intent, not presence: it is shown, and it never makes a claim alone.
+
+STAY_RE = re.compile(r"stayed (?:(\d+)d )?(?:(\d+)h )?(?:(\d+)m)?")
+
+
+def _stay_minutes(body):
+    """Minutes from a dawarich body's `stayed 1h 30m` line, or None."""
+    match = STAY_RE.search(body or "")
+    if not match or not any(match.groups()):
+        return None
+    days, hours, minutes = (int(x or 0) for x in match.groups())
+    return days * 1440 + hours * 60 + minutes
+
+
+def _local_day(epoch):
+    return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d")
+
+
+def cmd_whereabouts(opts):
+    """Where the user was, one day at a time, with the sources that say so.
+
+    Answers "where did I go this week" and "was I away in March" — questions
+    `search` cannot, because a visit record carries no words for "this week"
+    and `--since` runs after retrieval. This is a listing over a window, not
+    a search. See the block comment above for what each source is evidence of.
+
+    Home is the largest place in `merged_places` unless `--home` names one.
+    A day is `away` when every located record on it is more than `--away-km`
+    from home. Consecutive away days are a trip.
+    """
+    db = connect(opts.db)
+    merged, plugin_tools, weight = merged_places(db)
+    if not merged:
+        die("no places in the index; ingest maps, photos or a location plugin first")
+
+    if opts.home:
+        try:
+            lat, lon = (float(x) for x in opts.home.split(","))
+        except ValueError:
+            die("--home takes lat,lon")
+        home = {"name": "home (given)", "latitude": lat, "longitude": lon}
+    else:
+        home = max(merged, key=weight)
+
+    now = time.time()
+    if opts.from_:
+        start = datetime.strptime(opts.from_, "%Y-%m-%d").timestamp()
+    else:
+        start = now - (opts.since or 7) * 86400
+    end = (datetime.strptime(opts.to, "%Y-%m-%d").timestamp() + 86400
+           if opts.to else now)
+
+    # A grid over the merged places, so each record finds its place in a few
+    # comparisons rather than 1,600.
+    grid = {}
+    for spot in merged:
+        grid.setdefault((round(spot["latitude"], 2), round(spot["longitude"], 2)), []).append(spot)
+
+    def place_for(lat, lon):
+        best, best_d = None, 250.0
+        base_lat, base_lon = round(lat, 2), round(lon, 2)
+        for dlat in (-0.01, 0.0, 0.01):
+            for dlon in (-0.01, 0.0, 0.01):
+                for spot in grid.get((round(base_lat + dlat, 2), round(base_lon + dlon, 2)), []):
+                    d = photos_metres({"latitude": lat, "longitude": lon}, spot)
+                    if d < best_d:
+                        best, best_d = spot, d
+        return best
+
+    located_tools = ["maps", "photos", "calendar"] + plugin_tools
+    marks = ",".join("?" * len(located_tools))
+    rows = db.execute(
+        "SELECT tool, kind, title, body, people, occurred, latitude, longitude "
+        "  FROM record WHERE occurred >= ? AND occurred < ? "
+        "   AND tool IN (%s) AND kind IN ('visit','suggested','day','event') "
+        " ORDER BY occurred" % marks, [start, end] + located_tools).fetchall()
+
+    days = {}
+    for row in rows:
+        day = days.setdefault(_local_day(row["occurred"]),
+                              {"date": _local_day(row["occurred"]), "places": {},
+                               "unplaced_stays": 0})
+        if row["latitude"] is None:
+            # A dawarich stay with no place: real time somewhere, and nothing
+            # to put it on. Counted, never placed.
+            if row["tool"] in plugin_tools:
+                day["unplaced_stays"] += 1
+            continue
+        spot = place_for(row["latitude"], row["longitude"])
+        if spot:
+            key = "%.5f,%.5f" % (spot["latitude"], spot["longitude"])
+            name, lat, lon = spot["name"], spot["latitude"], spot["longitude"]
+        else:
+            key = "%.3f,%.3f" % (row["latitude"], row["longitude"])
+            name, lat, lon = row["title"] or key, row["latitude"], row["longitude"]
+        place = day["places"].setdefault(key, {
+            "name": name, "latitude": lat, "longitude": lon,
+            "km_from_home": round(photos_metres(
+                {"latitude": lat, "longitude": lon}, home) / 1000.0, 1),
+            "evidence": {}})
+        source = row["tool"]
+        ev = place["evidence"].setdefault(source, {"count": 0})
+        ev["count"] += 1
+        when = datetime.fromtimestamp(row["occurred"]).strftime("%H:%M")
+        if source in plugin_tools:
+            minutes = _stay_minutes(row["body"])
+            if minutes is not None:
+                ev["minutes"] = ev.get("minutes", 0) + minutes
+            ev.setdefault("stays", []).append({"at": when, "minutes": minutes,
+                                               "status": row["kind"]})
+        elif source == "maps":
+            ev.setdefault("arrivals", []).append(when)
+        elif source == "calendar":
+            # ⚠️ The same event arrives once per calendar it is on — a shared
+            # family calendar and the user's own both carry "Swim lessons".
+            # One plan, drawn once.
+            event = {"at": when, "title": row["title"]}
+            if event not in ev.setdefault("events", []):
+                ev["events"].append(event)
+        elif source == "photos":
+            try:
+                people = [p.get("name") for p in json.loads(row["people"] or "[]")]
+            except ValueError:
+                people = []
+            for who in people:
+                if who and who not in ev.setdefault("people", []):
+                    ev["people"].append(who)
+            # ⚠️ A day whose every photo came from somebody else's camera is
+            # evidence that THEY were there. It is kept, named, and never
+            # counted as the user's presence — see `ingest_photos`.
+            if "from a shared camera" in (row["body"] or ""):
+                ev["shared_camera"] = ev.get("shared_camera", 0) + 1
+            else:
+                ev["own_camera"] = ev.get("own_camera", 0) + 1
+
+    away_km = opts.away_km
+    out_days = []
+    for date in sorted(days):
+        day = days[date]
+        # A date that only ever saw records with no coordinate — an unlocated
+        # calendar event — is not a day with evidence. Nothing to draw.
+        if not day["places"] and not day["unplaced_stays"]:
+            continue
+        places = []
+        for place in day["places"].values():
+            evidence = place["evidence"]
+            photos = evidence.get("photos")
+            if photos and not photos.get("own_camera"):
+                # Somebody else's camera, and nothing of the user's own.
+                photos["role"] = "alongside"
+            present = [s for s in evidence if s != "calendar"
+                       and not (s == "photos" and evidence[s].get("role") == "alongside")]
+            place["agreement"] = len(present)
+            # 🛑 A calendar event alone is a PLAN. It says where the user meant
+            # to be, and the day it is wrong about is exactly the day worth
+            # knowing about. It is drawn, and it claims nothing by itself.
+            place["claim"] = ("corroborated" if len(present) >= 2
+                              else "single" if present
+                              else "planned" if "calendar" in evidence else "reported")
+            place["sources"] = sorted(evidence)
+            places.append(place)
+        # The place with the most agreement first, then the most time.
+        places.sort(key=lambda p: (-p["agreement"],
+                                   -sum(e.get("minutes", 0) for e in p["evidence"].values()),
+                                   -sum(e["count"] for e in p["evidence"].values())))
+        # 🛑 ONLY THE USER'S OWN PRESENCE DECIDES A DAY. A plan and somebody
+        # else's photo are drawn; neither says the user was anywhere.
+        located = [p for p in places if p["claim"] in ("corroborated", "single")]
+        # Three states, not two. A day with nothing but a plan and somebody
+        # else's photo is not a day at home; it is a day nothing places.
+        state = ("unknown" if not located
+                 else "away" if all(p["km_from_home"] > away_km for p in located)
+                 else "home")
+        out_days.append({
+            "date": date,
+            "state": state,
+            "away": state == "away",
+            "furthest_km": max((p["km_from_home"] for p in located), default=None),
+            "places": places,
+            "unplaced_stays": day["unplaced_stays"],
+        })
+
+    # Trips: runs of away days. ⚠️ A day nothing places does not end a trip.
+    # The July trip here had a gap day holding one missed swim lesson and a
+    # relative's photo at the house they were staying in; only a day with the
+    # user's own presence near home ends the run. `days` is the span,
+    # `days_placed` how many of them any source placed the user away.
+    trips = []
+    run = []
+    def close_run():
+        while run and run[-1]["state"] == "unknown":
+            run.pop()
+        if not run:
+            return
+        counts = {}
+        for d in run:
+            for p in d["places"]:
+                if p["claim"] not in ("corroborated", "single"):
+                    continue
+                c = counts.setdefault(p["name"], {"name": p["name"], "dates": set(),
+                                                  "km_from_home": p["km_from_home"],
+                                                  "sources": set()})
+                # ⚠️ DISTINCT DATES. An airport is three merged rows 250 m
+                # apart, so one day there was "3 days" and it named the trip.
+                c["dates"].add(d["date"])
+                c["sources"].update(p["sources"])
+        for c in counts.values():
+            c["days"] = len(c.pop("dates"))
+        # The place most days put the user at; on a tie, the one furthest
+        # from home, so an airport passed through twice never names a trip.
+        centre = (max(counts.values(),
+                      key=lambda c: (c["days"], len(c["sources"]), c["km_from_home"]))
+                  if counts else None)
+        span = (datetime.strptime(run[-1]["date"], "%Y-%m-%d")
+                - datetime.strptime(run[0]["date"], "%Y-%m-%d")).days + 1
+        trips.append({
+            "from": run[0]["date"], "to": run[-1]["date"], "days": span,
+            "days_placed": sum(1 for d in run if d["state"] == "away"),
+            "centre": centre["name"] if centre else None,
+            "furthest_km": max(d["furthest_km"] or 0 for d in run),
+            "places": sorted(({**c, "sources": sorted(c["sources"])}
+                              for c in counts.values()), key=lambda c: -c["days"]),
+        })
+    for d in out_days:
+        if d["state"] == "home":
+            close_run(); run = []
+        elif d["state"] == "away" or run:
+            run.append(d)
+    close_run()
+
+    # Days in the window are LOCAL DATES, not seconds / 86400: `--since 7`
+    # from mid-afternoon touches eight dates, and "8 of 7 days" is nonsense.
+    window_days = len({_local_day(t) for t in range(int(start), int(end), 3600)})
+    report = {
+        "generated": now,
+        "window": {"from": _local_day(start), "to": _local_day(end - 1),
+                   "days": window_days, "days_with_evidence": len(out_days)},
+        "home": {"name": home["name"], "latitude": home["latitude"],
+                 "longitude": home["longitude"], "given": bool(opts.home)},
+        "away_km": away_km,
+        "days": out_days,
+        "trips": trips,
+    }
+    if opts.json:
+        print(json.dumps(report, indent=2))
+        return
+
+    print("home: %s%s" % (home["name"], "" if opts.home else "  (largest place in the index)"))
+    print("%s → %s: %d of %d days have evidence" % (
+        report["window"]["from"], report["window"]["to"], len(out_days), window_days))
+    print()
+    for d in out_days:
+        flag = {"away": "  AWAY, %.0f km" % (d["furthest_km"] or 0),
+                "unknown": "  (nothing places you)", "home": ""}[d["state"]]
+        print("%s%s" % (d["date"], flag))
+        for p in d["places"]:
+            bits = []
+            order = ["maps"] + plugin_tools + ["photos", "calendar"]
+            for source in sorted(p["sources"], key=lambda t: order.index(t) if t in order else 99):
+                ev = p["evidence"][source]
+                if source in plugin_tools:
+                    mins = ev.get("minutes")
+                    bits.append("%s %d stay%s%s" % (source, ev["count"], "" if ev["count"] == 1 else "s",
+                                                   " (%s)" % human_minutes(mins) if mins else ""))
+                elif source == "maps":
+                    bits.append("maps " + ", ".join(ev.get("arrivals", [])))
+                elif source == "photos":
+                    who = ev.get("people") or []
+                    label = "photos" if ev.get("role") != "alongside" else "someone else's photos"
+                    bits.append(label + (" of " + ", ".join(who[:3]) if who else ""))
+                elif source == "calendar":
+                    bits.append("calendar " + "; ".join(
+                        "%s %s" % (e["at"], e["title"]) for e in ev.get("events", [])[:2]))
+            mark = {"corroborated": "✓✓", "single": "✓ ", "planned": "? ",
+                    "reported": "· "}[p["claim"]]
+            print("  %s %-34s %s" % (mark, p["name"][:34], " · ".join(bits)))
+        if d["unplaced_stays"]:
+            print("     + %d stay%s with no place" % (d["unplaced_stays"],
+                                                       "" if d["unplaced_stays"] == 1 else "s"))
+    if trips:
+        print()
+        for t in trips:
+            placed = ("" if t["days_placed"] == t["days"]
+                      else ", placed on %d" % t["days_placed"])
+            print("trip %s → %s (%d day%s%s): %s, %.0f km out. %s" % (
+                t["from"], t["to"], t["days"], "" if t["days"] == 1 else "s", placed,
+                t["centre"] or "?", t["furthest_km"],
+                ", ".join("%s (%s)" % (p["name"][:30], "+".join(p["sources"]))
+                          for p in t["places"][:4])))
+    print()
+    print("✓✓ two sources agree   ✓ one source   ? calendar only, a plan not a presence"
+          "   · someone else's camera only")
+
+
+def human_minutes(minutes):
+    if minutes is None:
+        return "?"
+    hours, rest = divmod(int(minutes), 60)
+    if hours >= 24:
+        days, hours = divmod(hours, 24)
+        return "%dd %dh" % (days, hours)
+    return "%dh %02dm" % (hours, rest) if hours else "%dm" % rest
 
 
 def photos_metres(a, b):
@@ -6687,6 +7024,18 @@ def main():
                         help="everywhere you have been, as JSON")
     pl.add_argument("--limit", type=int, help="how many places to return")
     pl.set_defaults(func=cmd_places)
+
+    wa = sub.add_parser("whereabouts",
+                        help="where you were, day by day, and which sources agree")
+    wa.add_argument("--since", type=int, help="days back (default 7)")
+    wa.add_argument("--from", dest="from_", metavar="DATE", help="YYYY-MM-DD")
+    wa.add_argument("--to", metavar="DATE", help="YYYY-MM-DD, inclusive")
+    wa.add_argument("--home", metavar="LAT,LON",
+                    help="where home is; default: the largest place in the index")
+    wa.add_argument("--away-km", type=float, default=50.0,
+                    help="a day is away when everything on it is further than this")
+    wa.add_argument("--json", action="store_true")
+    wa.set_defaults(func=cmd_whereabouts)
 
     sub.add_parser("stats",
                    help="everything the app's window needs, as JSON"
