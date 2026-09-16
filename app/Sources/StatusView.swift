@@ -71,6 +71,7 @@ private struct SourceLine: Identifiable {
     /// report and never indexed, `files` has simply not been given a folder
     /// yet — and that row exists precisely so it can be.
     var note: String {
+        if let plugin { return plugin.note }
         if tool == "files" {
             if folderCount == 0 {
                 return "no folders added yet — open this row to add one"
@@ -85,6 +86,11 @@ private struct SourceLine: Identifiable {
     /// answer, not a missing one: the row exists precisely so the first folder
     /// can be added from it.
     var folderCount: Int = 0
+
+    /// Set when this source is an enabled plugin. Its row then carries the
+    /// plugin's own panel — status, configuration, the Disable button — the
+    /// way `files` carries its folder editor.
+    var plugin: PluginEntry? = nil
 
     var dot: Color {
         readable == false ? .orange : readable == true ? .green : .secondary
@@ -149,8 +155,12 @@ struct Sources: View {
                     SourceRow(line: line,
                               expanded: open == line.tool,
                               toggle: { open = open == line.tool ? nil : line.tool },
-                              folders: model.folders)
+                              folders: model.folders,
+                              plugins: model.plugins)
                 }
+                // A plugin that is found and not enabled has no row above:
+                // it is not a source yet. This is where it becomes one.
+                AvailablePlugins(plugins: model.plugins)
             }
             blocked
             // ⚠️ Only a grant nobody has answered yet gets a button out here.
@@ -232,6 +242,13 @@ struct Sources: View {
     }
 
     private func reason(for line: SourceLine) -> String {
+        // A plugin has no System Settings pane. What it has is a server, and
+        // its own `status` says why the server did not answer.
+        if let plugin = line.plugin {
+            let why = plugin.status?.advice ?? line.permission?.advice
+            return "\(line.tool): \(line.permission?.status ?? "not answering"). "
+                + (why ?? "Open the row for its configuration.")
+        }
         if let permission = line.permission {
             return "\(line.tool): \(permission.status). "
                 + "System Settings → \(permission.pane). "
@@ -271,10 +288,22 @@ struct Sources: View {
             out.append(SourceLine(tool: "files", stat: nil,
                                   permission: nil, error: nil))
         }
+        // An ENABLED plugin is a source: `apple status` lists it and the
+        // index holds its records, so it already has a row. Attach the
+        // plugin's own entry so the row can draw its panel. ⚠️ Enabled and
+        // not yet checked by `apple status` — the window's first seconds —
+        // still gets a row, so the panel is reachable while the check runs.
+        for plugin in model.plugins.entries where plugin.enabled && !seen.contains(plugin.name) {
+            seen.insert(plugin.name)
+            out.append(SourceLine(tool: plugin.name, stat: nil, permission: nil, error: nil))
+        }
         let folders = model.folders.entries.count
         return out.map { line in
             var copy = line
             if line.tool == "files" { copy.folderCount = folders }
+            if let plugin = model.plugins.entry(line.tool), plugin.enabled {
+                copy.plugin = plugin
+            }
             return copy
         }
     }
@@ -286,6 +315,7 @@ private struct SourceRow: View {
     let toggle: () -> Void
     /// ⚠️ `Folders`, not the whole `AppModel`. The row used one member of it.
     @ObservedObject var folders: Folders
+    @ObservedObject var plugins: Plugins
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -363,6 +393,12 @@ private struct SourceRow: View {
             // 🛑 The folder editor lives in the row it configures. `files` is
             // the one source whose contents are a decision rather than a store
             // at a fixed path.
+            // 🛑 A plugin's panel lives in the row it configures, for the
+            // same reason the folder editor does: the thing being configured
+            // is the source.
+            if let plugin = line.plugin {
+                PluginPanel(plugins: plugins, entry: plugin)
+            }
             if line.tool == "files" {
                 // 🛑 THE BREAKDOWN GOES INSIDE THE EDITOR FOR THIS SOURCE, and
                 // nowhere else. A folder's contents belong under the folder,
@@ -407,6 +443,9 @@ private struct SourceRow: View {
     /// `maps` yields both a `place` and a `visit`, `photos` yields a `place`
     /// and a `day`.
     private var footnote: String? {
+        // A plugin says what its record is in its manifest; nothing in this
+        // file can know.
+        if let plugin = line.plugin { return plugin.footnote }
         switch line.tool {
         case "mail":
             return "A record is one email. Chunks are the pieces it was split "
@@ -532,6 +571,9 @@ private struct SourceRow: View {
         if line.stat == nil || line.stat?.containers.isEmpty == true {
             return line.readable == false ? "Nothing read" : "Nothing indexed yet"
         }
+        // ⚠️ `container` means something different in every adapter, and a
+        // plugin's manifest is the only place that says what its one means.
+        if let label = line.plugin?.containerLabel { return label }
         switch line.tool {
         case "mail":     return "By account and mailbox"
         case "messages": return "By conversation"

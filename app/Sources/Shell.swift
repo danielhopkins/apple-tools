@@ -88,7 +88,7 @@ struct StatusView: View {
             Detail(model: model, pane: pane)
         }
         .navigationSplitViewStyle(.balanced)
-        .onAppear { model.reread(); model.folders.read() }
+        .onAppear { model.reread(); model.folders.read(); model.plugins.read() }
     }
 }
 

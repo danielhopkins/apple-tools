@@ -30,6 +30,10 @@ final class AppModel: ObservableObject {
     /// ticker: it spawns python, and the answer changes only when a person
     /// presses a button.
     let folders = Folders()
+    /// Same rule as `folders`: read when the window opens and after every
+    /// press, never on the ticker. Asking an enabled plugin its status is a
+    /// network call, and the window makes it only when a person is looking.
+    let plugins = Plugins()
 
     @Published private(set) var facts = IndexFacts()
     @Published private(set) var stats = IndexStats()

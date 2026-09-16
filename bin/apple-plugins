@@ -275,6 +275,12 @@ def cmd_list(opts):
             "network": bool(network),
             "hosts": network.get("hosts") or [],
             "indexes": (manifest or {}).get("index", {}).get("kinds") or [],
+            # For the app's window: the config keys it can edit, and the two
+            # labels the Sources panel draws. Redacted values come from
+            # `config NAME --json`, one call per plugin.
+            "config": (manifest or {}).get("config") or [],
+            "container_label": (manifest or {}).get("index", {}).get("container_label"),
+            "footnote": (manifest or {}).get("index", {}).get("footnote"),
         }
         if manifest is not None:
             row["missing"] = missing_required(name, manifest, entry)
