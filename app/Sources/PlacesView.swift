@@ -28,8 +28,15 @@ struct Places: View {
 
     private var stats: PlacesStats { model.places }
 
+    /// 🛑 SOMEBODY ELSE'S CAMERA IS NOT ON THIS MAP. A place only the iCloud
+    /// Shared Library knows is a place a relative photographed; it says
+    /// nothing about where the user has been, and drawing it — even hollow
+    /// — put dots on trips the user did not take. `apple-index places`
+    /// still reports them, under `photo_days_shared`; the window does not.
+    private var mine: [Place] { stats.places.filter { !$0.othersOnly } }
+    private var hidden: Int { stats.places.count - mine.count }
+
     static func color(for place: Place) -> Color {
-        if place.othersOnly { return .gray }
         if place.sources.count > 1 { return .purple }
         if place.sources.contains("maps") { return .orange }
         if place.sources.contains("photos") { return .blue }
@@ -39,7 +46,7 @@ struct Places: View {
     var body: some View {
         PaneSection("Places", trailing: {
             if stats.loaded {
-                Text("\(stats.total) places · \(stats.countries.count) countries")
+                Text("\(mine.count) places · \(stats.countries.count) countries")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
@@ -53,11 +60,13 @@ struct Places: View {
                      + "`apple-index refresh` builds this from the Photos "
                      + "library and the Maps store.")
             } else {
-                WorldMap(places: stats.places, selected: $selected)
+                WorldMap(places: mine, selected: $selected)
                     .frame(height: 340)
                     .clipShape(RoundedRectangle(cornerRadius: 10))
-                Legend(stats: stats, selected: selected)
-                TopPlaces(places: stats.places, selected: $selected, query: $query)
+                Legend(places: mine, plugins: stats.fromPlugins.keys.sorted(),
+                       hidden: hidden, first: stats.first, last: stats.last,
+                       selected: selected)
+                TopPlaces(places: mine, selected: $selected, query: $query)
             }
         }
     }
@@ -141,11 +150,8 @@ private struct Dot: View {
     private var color: Color { Places.color(for: place) }
 
     var body: some View {
-        // ⚠️ HOLLOW for somebody else's camera. A filled dot says "you were
-        // here"; this one says "a photo of yours was taken here by someone
-        // else", which is a different fact and is drawn as one.
         Circle()
-            .fill(color.opacity(place.othersOnly ? 0.0 : 0.55))
+            .fill(color.opacity(0.55))
             .overlay(Circle().strokeBorder(color, lineWidth: isSelected ? 2.5 : 1))
             .frame(width: size, height: size)
             .help(place.name)
@@ -155,7 +161,12 @@ private struct Dot: View {
 // MARK: - what the colours mean, and what is selected
 
 private struct Legend: View {
-    let stats: PlacesStats
+    let places: [Place]
+    let plugins: [String]
+    /// Places left off the map because only somebody else's camera knows them.
+    let hidden: Int
+    let first: Date?
+    let last: Date?
     let selected: Place?
 
     private static let year: DateFormatter = {
@@ -167,17 +178,19 @@ private struct Legend: View {
             // ⚠️ Counted off the rows, not off `counts`: `from_x` overlap and
             // a legend has to partition the dots it colours.
             let only = { (source: String) in
-                stats.places.filter { $0.sources == [source] }.count
+                places.filter { $0.sources == [source] }.count
             }
-            let others = stats.places.filter(\.othersOnly).count
             HStack(spacing: 14) {
-                Key(color: .blue, text: "photos only  \(only("photos") - others)")
+                Key(color: .blue, text: "photos only  \(only("photos"))")
                 Key(color: .orange, text: "Maps only  \(only("maps"))")
-                ForEach(stats.fromPlugins.keys.sorted(), id: \.self) { plugin in
+                ForEach(plugins, id: \.self) { plugin in
                     Key(color: .green, text: "\(plugin) only  \(only(plugin))")
                 }
-                Key(color: .purple, text: "more than one  \(stats.places.filter { $0.sources.count > 1 }.count)")
-                Key(color: .gray, hollow: true, text: "someone else's camera  \(others)")
+                Key(color: .purple, text: "more than one  \(places.filter { $0.sources.count > 1 }.count)")
+                if hidden > 0 {
+                    Text("· \(hidden) from someone else's camera, not shown")
+                        .font(.system(size: 11)).foregroundStyle(.tertiary)
+                }
             }
             if let place = selected {
                 // 🛑 THE TWO NUMBERS ARE NAMED AND KEPT APART. A visit is an
@@ -188,7 +201,7 @@ private struct Legend: View {
                 Text(detail(place))
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
-            } else if let first = stats.first, let last = stats.last {
+            } else if let first, let last {
                 Text("\(Self.year.string(from: first)) to \(Self.year.string(from: last)). "
                      + "Tap a place.")
                     .font(.system(size: 11))
@@ -233,11 +246,10 @@ private struct Legend: View {
 
 private struct Key: View {
     let color: Color
-    var hollow = false
     let text: String
     var body: some View {
         HStack(spacing: 5) {
-            Circle().fill(color.opacity(hollow ? 0 : 0.55))
+            Circle().fill(color.opacity(0.55))
                 .overlay(Circle().strokeBorder(color, lineWidth: 1))
                 .frame(width: 9, height: 9)
             Text(text).font(.system(size: 11)).foregroundStyle(.secondary)

@@ -2260,9 +2260,10 @@ made once by adding emails to texts. Each row carries `visits` and
 - 🛑 **`photo_days` is the user's OWN camera; `photo_days_shared` is
   somebody else's.** A day whose every photo came from the iCloud Shared
   Library is evidence that they were there. Six such photos in London,
-  Ontario, drew this user a dot for a trip a relative took. The app draws a
-  place only such days know as a HOLLOW grey dot with its own legend entry,
-  and it sizes and anchors nothing.
+  Ontario, drew this user a dot for a trip a relative took. **The app does
+  not draw a place only such days know at all** — the legend says how many
+  it left off — and those days size and anchor nothing. The CLI report
+  still carries them, so the data is not lost, only kept off the map.
 - ⚠️ **A photo's coordinate is where the CAMERA was, and a camera can be at
   35,000 feet.** Three Live Photos from a JFK→AMS window seat are tagged
   over Aroostook County, Maine, between one over Long Island and the next
