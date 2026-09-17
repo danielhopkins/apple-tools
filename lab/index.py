@@ -4417,6 +4417,165 @@ def files_by_root(db, limit=60):
     return sorted(out, key=lambda r: (-r["records"], r["name"]))
 
 
+# --------------------------------------------------------------------------
+# who lives there — a place labelled from the address book, with no network
+# --------------------------------------------------------------------------
+#
+# 🛑 NO GEOCODING. A contact's postal address is text, and geocoding it would
+# be a network call per card. What every located source already carries is
+# the address AT the place — Apple's placemark on a photo, Maps' address
+# line, Dawarich's reverse geocode — so a place is matched to a card by the
+# street address both of them spell: house number, first word of the street
+# name, and the city when both sides have one. Measured on this index: 24
+# place records match a card that way, "998 Strong Rd, Victor" among them,
+# and none of it left the machine.
+#
+# ⚠️ SUFFIX AND DIRECTION ARE IGNORED ON PURPOSE. One card says "3130
+# Repplier Dr" and the placemark says "3130 Repplier St"; "9703 N Quay Loop"
+# meets "9703 Quay Loop". The number and the name are what a person
+# remembers, and what both sides get right.
+
+ADDRESS_NOISE = {
+    "st", "street", "rd", "road", "dr", "drive", "ave", "avenue", "pl", "place",
+    "ct", "court", "ln", "lane", "blvd", "boulevard", "way", "cir", "circle",
+    "ter", "terrace", "trl", "trail", "hwy", "highway", "pkwy", "parkway",
+    "loop", "n", "s", "e", "w", "north", "south", "east", "west", "ne", "nw",
+    "se", "sw", "apt", "unit", "suite", "ste",
+}
+
+
+def address_key(street, city=None):
+    """(house number, first real street word) or None; the city rides along."""
+    if not street:
+        return None
+    tokens = street.lower().replace(".", "").replace(",", " ").split()
+    numbers = [t for t in tokens if re.fullmatch(r"\d+[a-z]?", t)]
+    words = [t for t in tokens if not re.fullmatch(r"\d+[a-z]?", t)
+             and t not in ADDRESS_NOISE and not t.startswith("#")]
+    if not numbers or not words:
+        return None
+    return numbers[0], words[0], (city or "").strip().lower() or None
+
+
+def place_address(tool, body):
+    """(street line with the number, city) as the source spelled it.
+
+    Three spellings, one per source. Photos: `4877 Hopkins Pl, Boulder,
+    Boulder County, CO, United States`. Maps: the name on line one and
+    `1600 28th St, Boulder, CO 80301, United States` on line two. Dawarich
+    (Nominatim order): `Name, Street Name, 3313, City, State` — the number
+    FOLLOWS the street, so it is put back in front.
+    """
+    lines = (body or "").split("\n")
+    if tool == "maps":
+        text = lines[1] if len(lines) > 1 else ""
+    else:
+        text = lines[0] if lines else ""
+    parts = [p.strip() for p in text.split(",") if p.strip()]
+    if not parts:
+        return None, None
+    if tool in ("photos", "maps"):
+        return parts[0], (parts[1] if len(parts) > 1 else None)
+    # Dawarich: find "Street, 123," and rebuild "123 Street".
+    for i in range(1, len(parts)):
+        if re.fullmatch(r"\d+[A-Za-z]?", parts[i]) and i + 1 <= len(parts):
+            city = parts[i + 1] if i + 1 < len(parts) else None
+            return "%s %s" % (parts[i], parts[i - 1]), city
+    return None, None
+
+
+def contact_addresses(me_handles=()):
+    """{(number, word): [entry]} for every postal address in Contacts.
+
+    Each entry: {name, contact_id, label, address, city, me, company}. Read
+    through `apple contacts list`, or from `APPLE_INDEX_CONTACTS_JSON` for a
+    test. `me` is decided by the stored people report's handles, so the
+    user's own home says "Home", not "Dan Hopkins's home".
+    """
+    path = os.environ.get("APPLE_INDEX_CONTACTS_JSON")
+    if path:
+        try:
+            with open(path) as handle:
+                rows = json.load(handle)
+        except (OSError, ValueError):
+            rows = []
+    else:
+        rows = apple("contacts", "list", "--limit", 100000, allow_fail=True) or []
+    index = {}
+    for row in rows:
+        cid = row.get("id")
+        name = (row.get("name") or "").strip()
+        if not cid or not name or name == "<unnamed>":
+            continue
+        for address in row.get("addresses") or []:
+            key = address_key(address.get("street"), address.get("city"))
+            if not key:
+                continue
+            index.setdefault(key[:2], []).append({
+                "name": name,
+                "short": (row.get("nickname") or row.get("first_name") or name).strip(),
+                "contact_id": cid,
+                "label": (address.get("label") or "address").replace(" address", ""),
+                "address": ", ".join(x for x in (address.get("street"), address.get("city"),
+                                                  address.get("state")) if x),
+                "city": key[2],
+                "me": cid in me_handles,
+                # A card with no person's name on it is a business, whether
+                # or not the Company box was ticked: "Columbine Elementary
+                # School's work" is not a label anyone wants.
+                "company": bool(row.get("is_company"))
+                           or not (row.get("first_name") or row.get("last_name")),
+            })
+    return index
+
+
+def place_address_from(spot):
+    """(street, city) of a merged-places row, from the address it kept."""
+    parts = [p.strip() for p in (spot.get("address") or "").split(",") if p.strip()]
+    if not parts:
+        return None, None
+    return parts[0], (parts[1] if len(parts) > 1 else None)
+
+
+def people_at(tool, body, addresses):
+    """The cards whose address is this place's address, and the label."""
+    street, city = place_address(tool, body)
+    key = address_key(street, city)
+    if not key:
+        return [], None
+    found = []
+    for entry in addresses.get(key[:2], []):
+        # A city on both sides has to agree; a missing one on either is not
+        # a disagreement.
+        if entry["city"] and key[2] and entry["city"] != key[2]:
+            continue
+        found.append(entry)
+    if not found:
+        return [], None
+    # 🛑 THE USER'S OWN CARD WINS THE LABEL, then anyone else's. "Home" is
+    # the answer for the biggest place in the library, not the name of
+    # whichever relative also lists it.
+    found.sort(key=lambda e: (not e["me"], e["company"], e["name"]))
+    first = found[0]
+    if first["me"]:
+        label = first["label"].capitalize()
+    elif first["company"]:
+        label = first["name"]
+    else:
+        label = "%s's %s" % (first["short"], first["label"])
+    # ⚠️ Two cards for one person — a duplicate card, or a shared family
+    # address entered twice — are one name here.
+    seen, unique = set(), []
+    for e in found:
+        if e["name"] not in seen:
+            seen.add(e["name"]); unique.append(e)
+    others = [e for e in unique[1:] if not e["company"]]
+    if others and not first["me"]:
+        label += " (and %s)" % ", ".join(e["short"] for e in others[:2])
+    return [{"name": e["name"], "contact_id": e["contact_id"], "label": e["label"],
+             "address": e["address"]} for e in unique], label
+
+
 def merged_places(db):
     """Every place across the sources that know one, merged within 250 m.
 
@@ -4483,12 +4642,23 @@ def merged_places(db):
         plugin_counts[tool + "_visits"] = (tool, count_by_spot(tool, "visit"))
         plugin_counts[tool + "_suggested"] = (tool, count_by_spot(tool, "suggested"))
 
+    addresses = contact_addresses(_me_handles(db))
     places = []
     for row in rows:
         key = "%.3f,%.3f" % (row["latitude"], row["longitude"])
         lines = (row["body"] or "").split("\n")
+        who, label = people_at(row["tool"], row["body"], addresses)
+        street, _ = place_address(row["tool"], row["body"])
         spot = {
             "name": row["title"],
+            # ⚠️ `label` is who lives or works here, from the address book.
+            # It is drawn in place of `name` and it never anchors a merge:
+            # the merge picks the source that knows the place, and a card
+            # is not a source of presence.
+            "label": label,
+            "address": ((lines[1] if row["tool"] == "maps" and len(lines) > 1 else lines[0])
+                        if lines else ""),
+            "people_at": who,
             "where": lines[0] if lines else "",
             # 🛑 `container` MEANS A DIFFERENT THING IN EACH ADAPTER, and
             # reading it as a country for both put "Dining", "Transportation"
@@ -4550,6 +4720,28 @@ def merged_places(db):
                 # knows it, and the loop below sorts that source first.
                 if not kept["country"] and spot["country"]:
                     kept["country"] = spot["country"]
+                # 🛑 THE ANCHOR'S OWN ADDRESS LABELS THE MERGED PLACE, and a
+                # merged row's does not: a photo place at somebody's office
+                # merged into "Pearl Street Mall" 200 m away labelled the
+                # whole mall as their work. A row that merges INTO a place
+                # is not that place. ⚠️ ONE EXCEPTION, measured: the same
+                # house under two road names. Apple's placemark put one
+                # relative's house at "8664 Giles Rd" and, 200 m on, at
+                # "8664 Schribner Rd", which is what her card says. The same
+                # house number on both rows is the same building, and the
+                # label carries over. Everyone found is kept either way.
+                if not kept["label"] and spot["label"]:
+                    mine = address_key(*place_address_from(kept))
+                    theirs = address_key(*place_address_from(spot))
+                    nameless = re.fullmatch(r"-?\d+\.\d+, -?\d+\.\d+", kept["name"] or "")
+                    # ⚠️ NOT "the anchor has no number": "Pearl Street Mall"
+                    # and "Sunrise Shopping Center" have none, and neither is
+                    # anybody's house. Only a bare coordinate has no name.
+                    if nameless or (mine and theirs and mine[0] == theirs[0]):
+                        kept["label"] = spot["label"]
+                for person in spot["people_at"]:
+                    if person not in kept["people_at"]:
+                        kept["people_at"].append(person)
                 if spot["first"]:
                     kept["first"] = min(kept["first"] or spot["first"],
                                         spot["first"])
@@ -4821,11 +5013,15 @@ def cmd_whereabouts(opts):
         if spot:
             key = "%.5f,%.5f" % (spot["latitude"], spot["longitude"])
             name, lat, lon = spot["name"], spot["latitude"], spot["longitude"]
+            label = spot.get("label")
         else:
             key = "%.3f,%.3f" % (row["latitude"], row["longitude"])
             name, lat, lon = row["title"] or key, row["latitude"], row["longitude"]
+            label = None
         place = day["places"].setdefault(key, {
-            "name": name, "latitude": lat, "longitude": lon,
+            # `label` is who lives or works here, from the address book;
+            # `name` is what the source called it. Both are reported.
+            "name": name, "label": label, "latitude": lat, "longitude": lon,
             "km_from_home": round(photos_metres(
                 {"latitude": lat, "longitude": lon}, home) / 1000.0, 1),
             "evidence": {}})
@@ -4956,7 +5152,8 @@ def cmd_whereabouts(opts):
             for p in d["places"]:
                 if p["claim"] not in ("corroborated", "single"):
                     continue
-                c = counts.setdefault(p["name"], {"name": p["name"], "dates": set(),
+                c = counts.setdefault(p["label"] or p["name"],
+                                      {"name": p["label"] or p["name"], "dates": set(),
                                                   "km_from_home": p["km_from_home"],
                                                   "sources": set()})
                 # ⚠️ DISTINCT DATES. An airport is three merged rows 250 m
@@ -5034,7 +5231,8 @@ def cmd_whereabouts(opts):
                         "%s %s" % (e["at"], e["title"]) for e in ev.get("events", [])[:2]))
             mark = {"corroborated": "✓✓", "single": "✓ ", "planned": "? ",
                     "reported": "· "}[p["claim"]]
-            print("  %s %.2f %-32s %s" % (mark, p["belief"], p["name"][:32], " · ".join(bits)))
+            shown = p["label"] or p["name"]
+            print("  %s %.2f %-32s %s" % (mark, p["belief"], shown[:32], " · ".join(bits)))
         if d["unplaced_stays"]:
             print("     + %d stay%s with no place" % (d["unplaced_stays"],
                                                        "" if d["unplaced_stays"] == 1 else "s"))

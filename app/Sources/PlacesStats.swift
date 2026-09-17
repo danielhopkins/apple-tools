@@ -13,8 +13,19 @@ import Foundation
 struct Place: Identifiable, Equatable {
     var id: String { "\(latitude),\(longitude)" }
     let name: String
+    /// Who lives or works here, from the address book, matched on the street
+    /// address the source spelled — "Jon's home", "Home", a company. Nil when
+    /// no card claims the address. Drawn in place of `name`; never anchors.
+    let label: String?
+    /// The street address the source wrote, when it wrote one.
+    let address: String
+    /// Every card whose address is this place, by full name.
+    let peopleAt: [String]
     /// The full address or category line, when the source had one.
     let where_: String
+
+    /// What the map and the list call it.
+    var shown: String { label ?? (name.isEmpty ? "unnamed" : name) }
     let country: String?
     let latitude: Double
     let longitude: Double
@@ -137,6 +148,10 @@ enum PlacesReader {
             }
             return Place(
                 name: $0["name"] as? String ?? "",
+                label: $0["label"] as? String,
+                address: $0["address"] as? String ?? "",
+                peopleAt: ($0["people_at"] as? [[String: Any]] ?? [])
+                    .compactMap { $0["name"] as? String },
                 where_: $0["where"] as? String ?? "",
                 country: $0["country"] as? String,
                 latitude: lat, longitude: lon,

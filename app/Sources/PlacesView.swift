@@ -111,14 +111,42 @@ private struct WorldMap: View {
     }
 
     @State private var camera: MapCameraPosition = .automatic
+    /// The span on screen, from the last camera change. Nil until the map has
+    /// drawn once, and then every dot is grouped against it.
+    @State private var region: MKCoordinateRegion? = nil
+
+    /// 🛑 GROUPED BY WHAT IS ON SCREEN, NOT BY A FIXED RADIUS. The 250 m merge
+    /// in `index.py` says what a place IS; this says what can be told apart at
+    /// this zoom. Two places closer than ~28 points become one circle with a
+    /// count, and a tap on it zooms until they separate. Zoomed out, Boulder
+    /// is one circle that says "412"; zoomed in, it is 412 places. Nothing is
+    /// hidden and nothing is smeared.
+    private var groups: [Group] {
+        guard let region else { return drawn.map { Group(places: [$0]) } }
+        // Degrees per point, taking the map as ~700 points wide. Exact width
+        // does not matter: the cell only has to be a few dots across.
+        let cellLat = region.span.latitudeDelta / 340 * 28
+        let cellLon = region.span.longitudeDelta / 700 * 28
+        var cells: [String: [Place]] = [:]
+        for place in drawn {
+            let key = "\(Int((place.latitude / cellLat).rounded(.down))),"
+                    + "\(Int((place.longitude / cellLon).rounded(.down)))"
+            cells[key, default: []].append(place)
+        }
+        return cells.values.map { Group(places: $0.sorted { $0.weight > $1.weight }) }
+    }
 
     var body: some View {
         Map(position: $camera) {
-            ForEach(drawn) { place in
-                Annotation(coordinate: CLLocationCoordinate2D(
-                    latitude: place.latitude, longitude: place.longitude)) {
-                    Dot(place: place, isSelected: selected?.id == place.id)
-                        .onTapGesture { selected = place }
+            ForEach(groups) { group in
+                Annotation(coordinate: group.coordinate) {
+                    if group.places.count == 1, let place = group.places.first {
+                        Dot(place: place, isSelected: selected?.id == place.id)
+                            .onTapGesture { selected = place }
+                    } else {
+                        Cluster(group: group)
+                            .onTapGesture { zoom(into: group) }
+                    }
                 } label: {
                     // ⚠️ NO LABEL BY DEFAULT. Every pin carrying its name is
                     // unreadable anywhere the user actually spends time, and
@@ -129,6 +157,53 @@ private struct WorldMap: View {
         }
         .mapStyle(.standard(elevation: .flat))
         .mapControls { MapZoomStepper(); MapPitchToggle() }
+        .onMapCameraChange(frequency: .onEnd) { context in
+            region = context.region
+        }
+    }
+
+    /// Zoom to the group's own extent, with a margin, so its members fall
+    /// into separate cells on the next pass.
+    private func zoom(into group: Group) {
+        let lats = group.places.map(\.latitude), lons = group.places.map(\.longitude)
+        guard let minLat = lats.min(), let maxLat = lats.max(),
+              let minLon = lons.min(), let maxLon = lons.max() else { return }
+        let span = MKCoordinateSpan(
+            latitudeDelta: max((maxLat - minLat) * 1.6, 0.004),
+            longitudeDelta: max((maxLon - minLon) * 1.6, 0.006))
+        withAnimation {
+            camera = .region(MKCoordinateRegion(center: group.coordinate, span: span))
+        }
+    }
+}
+
+/// Places that share a screen cell at the current zoom.
+private struct Group: Identifiable {
+    let places: [Place]
+    var id: String { places.map(\.id).joined(separator: "|") }
+    /// The weightiest member's spot, so a cluster sits where the place a
+    /// person knows is, not on the centroid of a parking lot and a park.
+    var coordinate: CLLocationCoordinate2D {
+        let lead = places[0]
+        return CLLocationCoordinate2D(latitude: lead.latitude, longitude: lead.longitude)
+    }
+}
+
+private struct Cluster: View {
+    let group: Group
+    private var size: CGFloat {
+        CGFloat(min(max(pow(Double(group.places.count), 0.5) * 8.0, 20.0), 40.0))
+    }
+    var body: some View {
+        ZStack {
+            Circle().fill(Color.purple.opacity(0.35))
+                .overlay(Circle().strokeBorder(Color.purple, lineWidth: 1.5))
+            Text("\(group.places.count)")
+                .font(.system(size: 10, weight: .semibold, design: .rounded))
+                .foregroundStyle(.primary)
+        }
+        .frame(width: size, height: size)
+        .help("\(group.places.count) places, the largest \(group.places[0].shown). Tap to zoom.")
     }
 }
 
@@ -154,7 +229,7 @@ private struct Dot: View {
             .fill(color.opacity(0.55))
             .overlay(Circle().strokeBorder(color, lineWidth: isSelected ? 2.5 : 1))
             .frame(width: size, height: size)
-            .help(place.name)
+            .help(place.shown)
     }
 }
 
@@ -197,7 +272,7 @@ private struct Legend: View {
                 // arrival Maps recorded; a photo day is a day a picture was
                 // taken here. Printing one figure would be printing a number
                 // with no unit.
-                Text(place.name).font(.system(size: 12, weight: .medium))
+                Text(place.shown).font(.system(size: 12, weight: .medium))
                 Text(detail(place))
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
@@ -237,8 +312,15 @@ private struct Legend: View {
             }
             if confirmed > 0 || guessed > 0 { parts.append(piece) }
         }
-        if !place.where_.isEmpty, place.where_ != place.name {
+        if !place.where_.isEmpty, place.where_ != place.shown {
             parts.append(place.where_)
+        }
+        // Everyone the address book puts here, when the label could not
+        // name them all — the second household at one address, or a card
+        // whose office merged into a bigger place nearby.
+        let named = place.peopleAt.filter { !(place.label ?? "").contains($0.split(separator: " ").first ?? "") }
+        if !named.isEmpty {
+            parts.append("also on a card: " + named.joined(separator: ", "))
         }
         return parts.joined(separator: " · ")
     }
@@ -270,7 +352,8 @@ private struct TopPlaces: View {
         let needle = query.trimmingCharacters(in: .whitespaces).lowercased()
         if needle.isEmpty { return Array(places.prefix(12)) }
         return Array(places.filter {
-            $0.name.lowercased().contains(needle) || $0.where_.lowercased().contains(needle)
+            $0.shown.lowercased().contains(needle) || $0.where_.lowercased().contains(needle)
+                || $0.peopleAt.contains { $0.lowercased().contains(needle) }
         }.prefix(30))
     }
 
@@ -289,7 +372,7 @@ private struct TopPlaces: View {
             .padding(.vertical, 3)
             ForEach(shown) { place in
                 HStack(spacing: 8) {
-                    Text(place.name.isEmpty ? "unnamed" : place.name)
+                    Text(place.shown)
                         .font(.system(size: 11))
                         .lineLimit(1)
                     Spacer(minLength: 8)

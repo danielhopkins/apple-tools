@@ -98,9 +98,43 @@ row("calendar:d", "calendar", "event", "Dentist", "2026-05-26", 10, SHOP)
 row("dawarich:visit:5", "dawarich", "suggested", "Unknown Location", "2026-05-27", 9, None,
     body="Unknown Location\nstayed 20m")
 
+# Places named from the address book, by street address and no network:
+# Jon's card spells the road out, the placemark abbreviates it, and the
+# mall row merges a photo place at somebody's office 200 m away.
+CONTACTS = [
+    {"id": "JON:ABPerson", "name": "Jon Aldrich", "first_name": "Jon", "last_name": "Aldrich",
+     "addresses": [{"label": "home", "street": "998 Strong Road", "city": "Victor", "state": "NY"}]},
+    {"id": "NIC:ABPerson", "name": "Nicole Hurdle", "first_name": "Nicole", "last_name": "Hurdle",
+     "addresses": [{"label": "work", "street": "1300 Pearl St", "city": "Boulder", "state": "CO"}]},
+    {"id": "SCHOOL:ABPerson", "name": "Columbine Elementary",
+     "addresses": [{"label": "work", "street": "3130 Repplier Dr", "city": "Boulder"}]},
+]
+JON = (42.982, -77.409)
+MALL = (40.0176, -105.2797)
+OFFICE = (40.0190, -105.2797)      # ~150 m north of the mall
+SCHOOL = (40.0300, -105.2680)
+row("photos:place:jon", "photos", "place", "998 Strong Rd", "2026-05-01", 12, JON,
+    body="998 Strong Rd, Victor, Ontario County, NY, United States")
+row("photos:day:2026-05-28:jon", "photos", "day", "998 Strong Rd", "2026-05-28", 12, JON,
+    body="998 Strong Rd, Victor, Ontario County, NY, United States")
+row("photos:place:mall", "photos", "place", "Pearl Street Mall", "2026-05-01", 12, MALL,
+    body="Pearl Street Mall, Boulder, Boulder County, CO, United States")
+for i in range(3):
+    row("photos:day:2026-05-%02d:mall" % (10 + i), "photos", "day", "Pearl Street Mall",
+        "2026-05-%02d" % (10 + i), 12, MALL, body="Pearl Street Mall, Boulder")
+row("photos:place:office", "photos", "place", "1300 Pearl St", "2026-05-01", 12, OFFICE,
+    body="1300 Pearl St, Boulder, Boulder County, CO, United States")
+row("maps:place:school", "maps", "place", "Columbine Elementary School", "2026-05-01", 12, SCHOOL,
+    body="Columbine Elementary School\n3130 Repplier St, Boulder, CO 80304, United States")
+row("maps:visit:school", "maps", "visit", "Columbine Elementary School", "2026-05-29", 15, SCHOOL)
+
 with tempfile.TemporaryDirectory() as tmp:
     db = os.path.join(tmp, "index.db")
-    env = dict(os.environ, APPLE_INDEX_DB=db, APPLE_PLUGINS_BIN="/usr/bin/false")
+    contacts_path = os.path.join(tmp, "contacts.json")
+    with open(contacts_path, "w") as fh:
+        json.dump(CONTACTS, fh)
+    env = dict(os.environ, APPLE_INDEX_DB=db, APPLE_PLUGINS_BIN="/usr/bin/false",
+               APPLE_INDEX_CONTACTS_JSON=contacts_path)
     subprocess.run([sys.executable, INDEX, "--db", db, "init"], check=True,
                    capture_output=True, env=env)
     con = sqlite3.connect(db)
@@ -186,6 +220,26 @@ with tempfile.TemporaryDirectory() as tmp:
     check("plain output marks a plan", "?  0.20 Corner Shop" in text, True)
     check("plain output names the other camera", "someone else's photos" in text, True)
     check("plain output says what places nobody", "(nothing places you)" in text, True)
+
+    # labels from the address book
+    r = run("--from", "2026-05-28", "--to", "2026-05-29", "--json")
+    days = {d["date"]: d for d in r["days"]}
+    jon = days["2026-05-28"]["places"][0]
+    check("a place is labelled from a card by number, street and city",
+          (jon["name"], jon["label"]), ("998 Strong Rd", "Jon's home"))
+    school = days["2026-05-29"]["places"][0]
+    check("a card with no person's name is a business; Dr matches St",
+          school["label"], "Columbine Elementary")
+    text = run("--from", "2026-05-28", "--to", "2026-05-29")
+    check("plain output shows the label", "Jon's home" in text, True)
+    proc = subprocess.run([sys.executable, INDEX, "--db", db, "places", "--limit", "10000"],
+                          capture_output=True, text=True, env=env)
+    places = {p["name"]: p for p in json.loads(proc.stdout)["places"]}
+    check("the mall is not somebody's work", places["Pearl Street Mall"].get("label"), None)
+    check("but the office merged into it is still listed",
+          [x["name"] for x in places["Pearl Street Mall"]["people_at"]], ["Nicole Hurdle"])
+    check("people_at carries the card", places["998 Strong Rd"]["people_at"][0]["contact_id"],
+          "JON:ABPerson")
 
     r = run("--from", "2026-05-22", "--to", "2026-05-22", "--home", "%s,%s" % FAR, "--json")
     check("--home moves home", r["home"]["given"], True)
