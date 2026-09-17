@@ -1,0 +1,67 @@
+# The iPhone half of the health plugin. xcodegen → Xcode project; see README.md.
+#
+# 🛑 HealthKit exists only on the phone (docs/apple-health.md), so this is
+# an iOS app and nothing else. It reads Health, writes text files into its
+# own iCloud container, and the Mac plugin reads them from
+# ~/Library/Mobile Documents/iCloud~com~boulderhopkins~apple-tools-health/.
+name: AppleToolsHealth
+options:
+  bundleIdPrefix: com.boulderhopkins
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    DEVELOPMENT_TEAM: 25RCAA3JLJ
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.9"
+    MARKETING_VERSION: "26.917.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  AppleToolsHealth:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: AppleTools Health
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSHealthShareUsageDescription: >-
+          AppleTools Health reads your daily activity, heart, sleep, body and
+          workout data to write it into a text file in your own iCloud Drive,
+          where the apple-tools index on your Mac reads it. Nothing is sent
+          anywhere else.
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UIBackgroundModes:
+          - fetch
+          - processing
+        BGTaskSchedulerPermittedIdentifiers:
+          - com.boulderhopkins.apple-tools.health.refresh
+        NSUbiquitousContainers:
+          iCloud.com.boulderhopkins.apple-tools.health:
+            NSUbiquitousContainerIsDocumentScopePublic: true
+            NSUbiquitousContainerName: AppleTools Health
+            NSUbiquitousContainerSupportedFolderLevels: Any
+    entitlements:
+      path: AppleToolsHealth.entitlements
+      properties:
+        com.apple.developer.healthkit: true
+        com.apple.developer.healthkit.access: []
+        com.apple.developer.healthkit.background-delivery: true
+        com.apple.developer.icloud-container-identifiers:
+          - iCloud.com.boulderhopkins.apple-tools.health
+        com.apple.developer.icloud-services:
+          - CloudDocuments
+        com.apple.developer.ubiquity-container-identifiers:
+          - iCloud.com.boulderhopkins.apple-tools.health
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.boulderhopkins.apple-tools.health
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: false
+        ENABLE_PREVIEWS: false

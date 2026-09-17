@@ -49,23 +49,27 @@ SHORTCUT_NAME = "Apple Tools Health Export"
 
 HOME = os.path.expanduser("~")
 ICLOUD = os.path.join(HOME, "Library", "Mobile Documents", "com~apple~CloudDocs")
-# Where the shortcut's Save File lands. ⚠️ Two candidates, because Save File
-# with no destination chosen has written under iCloud Drive's root on some
-# iOS versions and under its `Shortcuts` folder on others. Both are read.
-DEFAULT_FOLDERS = [os.path.join(ICLOUD, "apple-tools", "health"),
+# Where the files land. First the iPhone app's own iCloud container, which
+# is a fixed path; then the two places the shortcut's Save File has been
+# seen to write (iCloud Drive's root on some iOS versions, its `Shortcuts`
+# folder on others). All three are read.
+APP_CONTAINER = os.path.join(HOME, "Library", "Mobile Documents",
+                             "iCloud~com~boulderhopkins~apple-tools-health", "Documents", "health")
+DEFAULT_FOLDERS = [APP_CONTAINER,
+                   os.path.join(ICLOUD, "apple-tools", "health"),
                    os.path.join(ICLOUD, "Shortcuts", "apple-tools", "health")]
 STORE_DIR = os.path.join(HOME, "Library", "Application Support", "apple-tools", "health")
 
 MANIFEST = {
     "name": NAME,
     "version": VERSION,
-    "description": "Daily steps, distance, energy, heart rate, sleep and weight "
-                   "from a shortcut the iPhone runs, and workouts from the "
-                   "Health export archive",
+    "description": "Daily steps, distance, energy, heart rate, sleep, weight and "
+                   "workouts, from the files the AppleTools Health iPhone app "
+                   "writes to iCloud Drive",
     # No hosts. Nothing here connects anywhere; `apple plugins list` prints
     # an empty network line and `apple status` shows the plugin as local.
     "network": {"hosts": [], "writes": False},
-    "commands": ["status", "import", "sync", "days", "workouts", "shortcut", "index"],
+    "commands": ["status", "import", "sync", "days", "workouts", "log", "shortcut", "index"],
     "index": {
         "kinds": ["day", "workout"],
         # `index` reads its own store, so a full run costs nothing; and a
@@ -74,9 +78,10 @@ MANIFEST = {
         "refresh_args": ["--full"],
         "container_label": "By year",
         "footnote": "A record is one day's totals — steps, distance, energy, "
-                    "heart rate, sleep, weight — or one workout. Days come "
-                    "from the shortcut the iPhone runs; workouts only from "
-                    "the Health export archive, which no shortcut can read.",
+                    "heart rate, sleep, weight — or one workout. Both come "
+                    "from the AppleTools Health app on the iPhone, which "
+                    "writes them into its iCloud Drive folder; the Mac "
+                    "cannot read Health itself.",
     },
     "config": [
         {"key": "folder", "required": False, "secret": False,
@@ -349,6 +354,7 @@ def read_daily(path):
     generated = None
     days = {}
     sleep = []
+    workouts = []
     problems = []
     seen = set()
     for lineno, line in enumerate(lines[1:], 2):
@@ -360,6 +366,13 @@ def read_daily(path):
             generated = parse_when(parts[1]) if len(parts) > 1 else None
             continue
         if head == "window":
+            continue
+        if head == "source":
+            continue
+        if head == "workout":
+            w = parse_workout_row(parts, lineno, problems)
+            if w:
+                workouts.append(w)
             continue
         if head not in ("day", "sample"):
             problems.append("line %d: unknown row %r" % (lineno, head))
@@ -411,7 +424,32 @@ def read_daily(path):
         absent.append("Sleep")
     if absent:
         problems.append("no lines for: %s" % ", ".join(absent))
-    return days, sleep, generated, problems
+    return days, sleep, workouts, generated, problems
+
+
+def parse_workout_row(parts, lineno, problems):
+    """`workout <type> <start> <end> <seconds> <metres> <kcal> <bpm> <source> <lat> <lon>`.
+    A number may be empty. The app writes metres, kcal and seconds already,
+    so nothing is converted."""
+    if len(parts) < 11:
+        problems.append("line %d: workout row has %d fields, want 11" % (lineno, len(parts)))
+        return None
+    _, kind, start_text, end_text, seconds, metres, kcal, bpm, source, lat, lon = parts[:11]
+    start, end = parse_when(start_text), parse_when(end_text)
+    if start is None or end is None:
+        problems.append("line %d: bad date %r / %r" % (lineno, start_text, end_text))
+        return None
+    def opt(text):
+        return number(text) if text.strip() else None
+    duration = opt(seconds)
+    if duration is None:
+        duration = (end - start).total_seconds()
+    return {
+        "id": "%s|%s|%s" % (kind, iso(start), source),
+        "type": kind, "start": iso(start), "end": iso(end), "duration": duration,
+        "distance": opt(metres), "energy": opt(kcal), "heart_rate": opt(bpm),
+        "source": source, "latitude": opt(lat), "longitude": opt(lon), "route": None,
+    }
 
 
 def nights(samples):
@@ -447,6 +485,16 @@ def nights(samples):
             continue
         out[date] = dict(night, asleep=asleep)
     return out
+
+
+def store_workouts(db, path, workouts):
+    for w in workouts:
+        db.execute("INSERT OR REPLACE INTO workout (id, type, start, \"end\", duration, distance, "
+                   "energy, heart_rate, source, latitude, longitude, route, file) "
+                   "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (w["id"], w["type"], w["start"], w["end"], w["duration"], w["distance"],
+                    w["energy"], w["heart_rate"], w["source"], w["latitude"], w["longitude"],
+                    w.get("route"), path))
 
 
 def store_daily(db, path, days, sleep_samples, source):
@@ -503,23 +551,27 @@ def sync(db, opts, quiet=False):
         if not unread(db, path, "daily"):
             continue
         try:
-            days, sleep_samples, generated, problems = read_daily(path)
+            days, sleep_samples, workouts, generated, problems = read_daily(path)
         except (OSError, ValueError) as error:
             report["problems"].append("%s: %s" % (os.path.basename(path), error))
             continue
         # Files are read oldest first by name, and a file is (re)read when
-        # it changes, so the newest run always writes last.
+        # it changes, so the newest run always writes last. ⚠️ The app's
+        # yearly history files sort before its daily ones (`health-2024.txt`
+        # < `health-2026-09-17.txt`), so a daily file always wins a day.
         n_nights = store_daily(db, path, days, sleep_samples, "shortcut")
+        store_workouts(db, path, workouts)
         dates = sorted({d for d, _ in days} | set(nights(sleep_samples)))
-        mark_read(db, path, "daily", lines=len(days) + len(sleep_samples),
-                  days=len(dates))
+        mark_read(db, path, "daily", lines=len(days) + len(sleep_samples) + len(workouts),
+                  days=len(dates), workouts=len(workouts))
         db.commit()
         report["files"].append({"path": path, "days": len(dates), "nights": n_nights,
-                                "generated": iso(generated),
+                                "workouts": len(workouts), "generated": iso(generated),
                                 "first": dates[0] if dates else None,
                                 "last": dates[-1] if dates else None})
         report["days"] += len(dates)
         report["nights"] += n_nights
+        report["workouts"] = report.get("workouts", 0) + len(workouts)
         for problem in problems:
             report["problems"].append("%s: %s" % (os.path.basename(path), problem))
     if not quiet:
@@ -706,13 +758,7 @@ def import_export(db, path, opts):
                     night["rem"] or None, night["awake"] or None, night["samples"], "export", path))
         n_nights += 1
 
-    for w in workouts:
-        db.execute("INSERT OR REPLACE INTO workout (id, type, start, \"end\", duration, distance, "
-                   "energy, heart_rate, source, latitude, longitude, route, file) "
-                   "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                   (w["id"], w["type"], w["start"], w["end"], w["duration"], w["distance"],
-                    w["energy"], w["heart_rate"], w["source"], w["latitude"], w["longitude"],
-                    w["route"], path))
+    store_workouts(db, path, workouts)
     mark_read(db, path, "export", lines=records, days=written, workouts=len(workouts))
     db.commit()
     if archive is not None:
@@ -964,9 +1010,10 @@ def cmd_status(opts):
         if not files and not report.get("exports"):
             report["status"] = "ok"
     if not files:
-        report["advice"] = ("no daily file yet. Install the shortcut (apple health shortcut) and "
-                            "run it on the iPhone; it saves into iCloud Drive/%s. "
-                            "For the history, apple health import export.zip." % "apple-tools/health")
+        report["advice"] = ("no file from the iPhone yet. Open AppleTools Health on the phone "
+                            "and tap Export; the file appears in iCloud Drive within a minute. "
+                            "The shortcut (apple health shortcut) and apple health import "
+                            "export.zip are the other two routes.")
         if not report["days"]:
             report["status"] = "unconfigured"
             report["usable"] = False
@@ -1010,8 +1057,9 @@ def cmd_sync(opts):
     if not report["files"]:
         print("nothing new in %s" % ", ".join(report["folders"]))
     for f in report["files"]:
-        print("read %s: %d days (%s – %s), %d nights" % (
-            os.path.basename(f["path"]), f["days"], f["first"], f["last"], f["nights"]))
+        print("read %s: %d days (%s – %s), %d nights, %d workouts" % (
+            os.path.basename(f["path"]), f["days"], f["first"], f["last"], f["nights"],
+            f["workouts"]))
 
 
 def cmd_days(opts):
@@ -1042,7 +1090,7 @@ def cmd_workouts(opts):
     if not rows:
         print("no workouts between %s and %s%s" % (
             start, end, "" if db.execute("SELECT count(*) FROM workout").fetchone()[0]
-            else " — workouts come only from the export archive: apple health import export.zip"))
+            else " — run an export in the AppleTools Health app, or apple health import export.zip"))
         return
     total_m = sum(w["distance"] or 0 for w in rows)
     for w in rows:
@@ -1070,6 +1118,30 @@ def cmd_shortcut(opts):
     print("copied to %s" % target)
     print("On the iPhone: open Files → iCloud Drive → apple-tools, tap the file, tap Add Shortcut.")
     print("Then run it. It saves health-<date>.txt into iCloud Drive/apple-tools/health.")
+
+
+def cmd_log(opts):
+    """The iPhone app's own log, mirrored into its container as log.txt."""
+    paths = [os.path.join(f, "log.txt") for f in folders(opts)]
+    found = [p for p in paths if os.path.isfile(p)]
+    if not found:
+        die("no log.txt from the app in %s" % ", ".join(folders(opts)), 66)
+    lines = []
+    for p in found:
+        with open(p, encoding="utf-8", errors="replace") as f:
+            lines += [l.rstrip("\n") for l in f if l.strip()]
+    if opts.tail:
+        lines = lines[-opts.tail:]
+    if opts.json:
+        rows = []
+        for l in lines:
+            parts = l.split("\t", 2)
+            rows.append({"when": parts[0], "level": parts[1] if len(parts) > 1 else None,
+                         "text": parts[2] if len(parts) > 2 else l})
+        print(json.dumps(rows, indent=2))
+        return
+    for l in lines:
+        print(l)
 
 
 def _epoch_noon(date):
@@ -1149,6 +1221,10 @@ def main(argv=None):
     p = sub.add_parser("workouts", parents=[common, ranged], help="workouts from the export")
     p.add_argument("--type", help="only workouts whose type contains this")
     p.set_defaults(func=cmd_workouts)
+
+    p = sub.add_parser("log", parents=[common], help="the iPhone app's log, as it wrote it")
+    p.add_argument("--tail", type=int, default=50, metavar="N", help="last N lines; 0 for all")
+    p.set_defaults(func=cmd_log)
 
     p = sub.add_parser("shortcut", parents=[common], help="put the iPhone shortcut where you can install it")
     p.add_argument("--to", help="directory; default iCloud Drive/apple-tools")

@@ -205,11 +205,11 @@ apple health days --since 7 --json            # steps, distance, sleep, heart ra
 apple health workouts --since 90 --type cycling --json
 ```
 
-- 🛑 **Workouts exist only if the export archive was imported.** The daily
-  file the phone writes cannot carry them. If `workouts` says the store has
-  none, say that the user has to export from the Health app, and do not
-  substitute `cycling_distance` days as workouts — they are Health's daily
-  distance total, which includes rides with no workout recorded.
+- 🛑 **Workouts exist only if the iPhone app exported them** (or the export
+  archive was imported). If `workouts` says the store has none, say so, and
+  do not substitute `cycling_distance` days as workouts — they are Health's
+  daily distance total, which includes rides with no workout recorded.
+  `apple health log` shows what the phone app last did.
 - **Today is partial** until tomorrow's file. Read `partial` before quoting
   today's steps.
 - **Distances are stored in metres, weight in kg**; `days` prints km and mi

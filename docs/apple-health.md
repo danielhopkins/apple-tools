@@ -104,12 +104,40 @@ This user's synced shortcut **Record Drink** contains the action identifier
 `~/Library/Shortcuts/Shortcuts.sqlite` (`ZSHORTCUTACTIONS.ZDATA`, a binary
 plist). It syncs to the Mac through iCloud and belongs to the iPhone.
 
+## The route that was built: an iPhone app
+
+`plugins/health/ios/` is **AppleTools Health**, a small SwiftUI app with the
+HealthKit entitlement, built with xcodegen and installed on the phone over
+the Mac's pairing (`xcrun devicectl device install app`). It is the phone
+half of the plugin; the routes below are what it replaced or kept.
+
+- **It has the entitlement a Mac cannot**, so the section above stops
+  mattering on the phone: `HKStatisticsCollectionQuery` gives Health's own
+  daily totals, `HKSampleQuery` gives sleep stages and workouts,
+  `HKWorkoutRouteQuery` gives a route's first point.
+- **It writes into its own iCloud container**, a fixed path on the Mac
+  (`iCloud~com~boulderhopkins~apple-tools-health/Documents/health/`), where
+  the shortcut's Save File could land in two places or, measured
+  2026-09-17, nowhere visible.
+- **It keeps a log** in the app and in `log.txt` beside the files, which is
+  the thing a shortcut cannot do: the one run of the shortcut here "ran, no
+  error, no file", and nothing could say why.
+- **Full history in one tap**, one file per year, so the export archive
+  (route B) is optional rather than required.
+- `-allowProvisioningUpdates` registered the App ID with HealthKit and the
+  iCloud container on the first build. The install needs the phone
+  unlocked.
+
 ## The four remaining routes
 
 None of these reads a local store, because there is none. Each one moves data
 from the iPhone to a file this Mac can read.
 
-### A. An iPhone Shortcut writes a file — BUILT
+### A. An iPhone Shortcut writes a file — BUILT, then superseded
+
+⚠️ **Kept as a fallback for a phone that cannot take the app.** Its one run
+here produced no file and no error, and nothing about it can be measured
+from a Mac. The app above is the route.
 
 `plugins/health/build-shortcut.py` builds and signs **Apple Tools Health
 Export.shortcut**. On the phone, "Find Health Samples" reads a fixed set of

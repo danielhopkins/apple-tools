@@ -41,6 +41,9 @@ def run(args, env, expect=0):
 DAILY = """apple-tools health 1
 generated\t2026-09-16 07:02:11 -0600
 window\t8
+source\tapp
+workout\tCycling\t2026-09-15 17:00:00 -0600\t2026-09-15 17:45:30 -0600\t2730\t18200\t540\t138\tWatch\t40.015\t-105.2705
+workout\tYoga\t2026-09-14 07:00:00 -0600\t2026-09-14 07:30:00 -0600\t\t\t\t\tiPhone\t\t
 day\tSteps\t2026-09-14 00:00:00 -0600\t2026-09-15 00:00:00 -0600\t8,412\tcount
 day\tSteps\t2026-09-15 00:00:00 -0600\t2026-09-16 00:00:00 -0600\t10,015\tcount
 day\tSteps\t2026-09-16 00:00:00 -0600\t2026-09-17 00:00:00 -0600\t612\tcount
@@ -162,6 +165,11 @@ def main():
     check("one file read", len(report["files"]), 1)
     check("three days", report["files"][0]["days"], 3)   # 14, 15, 16; the 13th has only a bad line
     check("one night", report["nights"], 1)
+    check("two workouts from the app file", report["files"][0]["workouts"], 2)
+    app_workouts = json.loads(run(["workouts", "--from", "2026-09-01", "--to", "2026-09-30", "--json"], env).stdout)
+    check("app workout fields", (app_workouts[1]["type"], app_workouts[1]["distance"], app_workouts[1]["heart_rate"],
+                                 app_workouts[1]["latitude"]), ("Cycling", 18200.0, 138.0, 40.015))
+    check("empty numbers are None, duration from the span", (app_workouts[0]["distance"], app_workouts[0]["duration"]), (None, 1800.0))
     problems = "\n".join(report["problems"])
     check("bad number is named", "not a number" in problems, True)
     check("bad unit is named", "furlongs" in problems, True)
@@ -214,7 +222,7 @@ def main():
     check("in bed from the watch source only", night["in_bed"], None)
 
     workouts = json.loads(run(["workouts", "--from", "2026-01-01", "--to", "2026-12-31", "--json"], env).stdout)
-    check("workouts sorted", [w["type"] for w in workouts], ["Running", "Cycling"])
+    check("workouts sorted", [w["type"] for w in workouts], ["Running", "Cycling", "Yoga", "Cycling"])
     ride = workouts[1]
     check("statistics child distance", ride["distance"], 20500.0)
     check("statistics energy", ride["energy"], 612.0)
@@ -225,12 +233,12 @@ def main():
     check("attribute distance in miles", run_["distance"], round(3.1 * 1609.344, 10))
     check("no route, no coordinate", run_["latitude"], None)
     only = json.loads(run(["workouts", "--from", "2026-01-01", "--to", "2026-12-31", "--type", "cycl", "--json"], env).stdout)
-    check("--type filters", len(only), 1)
+    check("--type filters", len(only), 2)
 
     # Importing the same archive twice does not double anything.
     run(["import", archive, "--json"], env)
     workouts = json.loads(run(["workouts", "--from", "2026-01-01", "--to", "2026-12-31", "--json"], env).stdout)
-    check("import is idempotent", len(workouts), 2)
+    check("import is idempotent", len(workouts), 4)
 
     # -- index -----------------------------------------------------------------
     lines = [json.loads(l) for l in run(["index"], env).stdout.splitlines() if l.strip()]
@@ -243,13 +251,13 @@ def main():
     for rec in lines:
         kinds[rec["kind"]] = kinds.get(rec["kind"], 0) + 1
     check("day records", kinds.get("day"), 4)      # 10, 14, 15, 16
-    check("workout records", kinds.get("workout"), 2)
+    check("workout records", kinds.get("workout"), 4)
     day15 = next(r for r in lines if r["uid"] == "health:day:2026-09-15")
     check("container is the year", day15["container"], "2026")
     check("title names the day", day15["title"].startswith("Tue 15 Sep 2026: 10,015 steps"), True)
     check("body carries the ride", "cycled 20.1 km (12.5 mi)" in day15["body"], True)
     check("body carries sleep", "slept 7h 30m" in day15["body"], True)
-    ride = next(r for r in lines if r["kind"] == "workout" and "Cycling" in r["title"])
+    ride = next(r for r in lines if r["kind"] == "workout" and "20.5 km" in r["title"])
     check("workout has a coordinate", ride["latitude"], 40.015)
     check("workout title", ride["title"], "Cycling, 1h 02m, 20.5 km")
     since = [json.loads(l) for l in run(["index", "--since", "3"], env).stdout.splitlines() if l.strip()]
@@ -257,7 +265,11 @@ def main():
 
     status = json.loads(run(["status", "--json"], env).stdout)
     check("status ok", (status["status"], status["usable"]), ("ok", True))
-    check("status counts workouts", status["workouts"], 2)
+    check("status counts workouts", status["workouts"], 4)
+    with open(os.path.join(folder, "log.txt"), "w") as f:
+        f.write("2026-09-16 07:02:11 -0600\tinfo\tlaunched\n2026-09-16 07:02:30 -0600\terror\tSleep: denied\n")
+    logged = json.loads(run(["log", "--json"], env).stdout)
+    check("log read", (len(logged), logged[1]["level"], logged[1]["text"]), (2, "error", "Sleep: denied"))
 
     if FAILED:
         print("FAILED %d:" % len(FAILED))

@@ -106,8 +106,8 @@ installed via `make install`.
 | Where was I at three (Dawarich) | `apple dawarich points --from "2026-09-10 14:00" --to "2026-09-10 16:00" --json` |
 | Steps, sleep, heart rate by day (Health) | `apple health days --since 14 --json` |
 | How far did I bike (Health) | `apple health workouts --since 90 --type cycling --json` |
-| Get the iPhone half of Health | `apple health shortcut` then run it on the phone |
-| Load the Health history | `apple health import ~/Downloads/export.zip` |
+| What the Health app on the phone did | `apple health log` |
+| Load the Health history | Export everything in AppleTools Health, or `apple health import export.zip` |
 
 **Every tool supports `--json`.** Prefer it — the plain output is for humans and
 its shape is not stable. Use `apple --which` to see which binary each name
@@ -1741,29 +1741,30 @@ store, and makes no connection at all. Python, stdlib only, in
 `plugins/health/`; tested offline by `plugins/health/test-health.py`.
 
 ```
-apple health shortcut [--to DIR]       # the signed iPhone shortcut, into iCloud Drive
-apple health import export.zip         # the Health export archive: history + workouts
-apple health sync [--json]             # read new daily files the shortcut wrote
+apple health sync [--json]             # read new files the iPhone app wrote
+apple health log [--tail N] [--json]   # the iPhone app's own log, as it wrote it
+apple health import export.zip         # the Health export archive, the optional route
+apple health shortcut [--to DIR]       # the fallback shortcut, into iCloud Drive
 apple health days [--since DAYS | --from DATE --to DATE] [--json]
 apple health workouts [--since DAYS | --from DATE --to DATE] [--type TEXT] [--json]
 apple health status [--json]
 apple health index [--since DAYS]      # what apple-index calls; runs sync first
 ```
 
-- 🛑 **The daily file comes from a shortcut the USER runs on the phone.**
-  `plugins/health/build-shortcut.py` builds and signs "Apple Tools Health
-  Export"; it reads Health's own daily totals for 14 types plus raw Sleep
-  samples for the last 8 days and saves `health-<date>.txt` into iCloud
-  Drive → `apple-tools/health/`. Nothing on a Mac can trigger it. The
-  serialization was read out of a real iOS export and the iOS 27 ActionKit
-  binary in the simulator runtime, never run here — the doc says what was
-  and was not measured.
-- 🛑 **No shortcut can read WORKOUTS.** The Shortcuts health sample wraps a
-  quantity or a category sample and nothing else; the picker has no
-  Workouts row (list read in full from the binary). Workouts come only from
-  the export archive: Health → profile → Export All Health Data → AirDrop
-  `export.zip` → `apple health import`. `workouts` says so when the store
-  has none.
+- 🛑 **The files come from the AppleTools Health app on the iPhone**,
+  `plugins/health/ios/`, a SwiftUI app with the HealthKit entitlement that
+  the Mac cannot hold. It writes `health-<date>.txt` (last 8 days) and
+  `health-<year>.txt` (everything) into its own iCloud container, plus a
+  `log.txt` that `apple health log` prints. Built with xcodegen, installed
+  over the pairing with `devicectl`; the phone must be unlocked. Nothing on
+  a Mac can trigger a run; the app's background toggle runs one a day.
+- ⚠️ **A shortcut was built first and is kept as a fallback**
+  (`build-shortcut.py`, `apple health shortcut`). Its one run produced no
+  file and no error, which is why the app exists. No shortcut can read
+  workouts at all: the Shortcuts health sample wraps a quantity or a
+  category sample and nothing else (picker list read in full from the iOS
+  27 binary). The export archive (`apple health import export.zip`) is the
+  third route and is now optional.
 - 🛑 **A day's steps in the export are NOT the sum of its step records.**
   The iPhone and the Watch both count the same walk. `import` sums per
   source per day and takes the largest source; the shortcut's number is
@@ -1793,11 +1794,12 @@ bin/apple-plugins         the plugin manager: discovery, enable/disable,
                           config, and the Keychain for secrets
 plugins/dawarich/         the first plugin, and the reference for the
                           contract. Python, stdlib only
-plugins/health/           the second: reads the files an iPhone shortcut and
-                          the Health export write, keeps its own store.
-                          build-shortcut.py makes the signed .shortcut that
-                          ships beside it — 🛑 the only Health data a Mac
-                          ever sees is what the phone writes to iCloud Drive
+plugins/health/           the second: reads the files the iPhone writes,
+                          keeps its own store. ios/ is the iPhone app that
+                          writes them (HealthKit entitlement, xcodegen,
+                          not shipped); build-shortcut.py the fallback
+                          shortcut — 🛑 the only Health data a Mac ever
+                          sees is what the phone writes to iCloud Drive
 swift/                    one Swift package, seven binaries
   Sources/reminders/      + RemindersLibrary/ (+ Tags.swift, the tag read/write
                           face and the per-listing tag cache)
