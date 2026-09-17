@@ -38,7 +38,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "26.916.2"
+VERSION = "26.917.0"
 NAME = "dawarich"
 PER_PAGE = 500          # the server caps visits and places at 500 a page
 POINTS_PER_PAGE = 10000  # and points at 10,000
