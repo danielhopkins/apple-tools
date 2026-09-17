@@ -23,6 +23,7 @@ targets:
     platform: iOS
     sources:
       - Sources
+      - Assets.xcassets
     info:
       path: Info.plist
       properties:
@@ -64,4 +65,5 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.boulderhopkins.apple-tools.health
         TARGETED_DEVICE_FAMILY: "1"
         GENERATE_INFOPLIST_FILE: false
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ENABLE_PREVIEWS: false

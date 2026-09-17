@@ -33,6 +33,14 @@ The file format is defined once, on the Mac side, in
 `apple-plugin-health` (`METRICS`, `SLEEP_STAGES`, `parse_workout_row`).
 `Sources/Format.swift` writes those labels and units verbatim.
 
+## The icon
+
+`make-icon.py` draws `Assets.xcassets/AppIcon.appiconset/AppIcon-1024.png`
+from the Mac app's own artwork (`app/Icon/AppIcon.png`): the same apple
+glyph and gradient, the words APPLE / HEALTH, and a heart. One picture in
+one place, so the two apps stay one family. Run it after the Mac icon
+changes.
+
 ## Build and install
 
 ```
