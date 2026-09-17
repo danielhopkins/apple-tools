@@ -192,6 +192,31 @@ locally from the index and touches nothing. Any other name goes to Apple Maps.
 - **Anything about a place with no visit.** A place is a location row that HAS
   a visit.
 
+## Health — steps, sleep, heart rate, workouts
+
+When the `health` plugin is enabled, the index holds one record per day
+(`tool health`, `kind day`) and one per workout (`kind workout`). A question
+like "how did I sleep last week" or "how far did I bike this summer" is a
+**listing over dates, not a search** — the same rule as `whereabouts` — so
+ask the plugin, never `search`:
+
+```
+apple health days --since 7 --json            # steps, distance, sleep, heart rate, weight
+apple health workouts --since 90 --type cycling --json
+```
+
+- 🛑 **Workouts exist only if the export archive was imported.** The daily
+  file the phone writes cannot carry them. If `workouts` says the store has
+  none, say that the user has to export from the Health app, and do not
+  substitute `cycling_distance` days as workouts — they are Health's daily
+  distance total, which includes rides with no workout recorded.
+- **Today is partial** until tomorrow's file. Read `partial` before quoting
+  today's steps.
+- **Distances are stored in metres, weight in kg**; `days` prints km and mi
+  together. Say which.
+- **A night is on its wake-up day.** "Slept 7h 30m" on the 15th is the
+  night of the 14th to the 15th.
+
 ## 🛑 The index stores ids. Always read the real record.
 
 A hit gives you a `uid`, a `tool` and a native `id`. **Read the record back

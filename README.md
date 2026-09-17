@@ -424,8 +424,18 @@ A plugin that makes a connection declares its hosts in its manifest, and
 The first plugin, `dawarich`, reads a self-hosted
 [Dawarich](https://dawarich.app) location server: visits with a start **and
 an end** (Maps records the start alone), places with a city and country, and
-the GPS track. The contract for writing one is in
+the GPS track. The second, `health`, makes no connection at all: it reads
+the files an iPhone shortcut and the Health export archive put in iCloud
+Drive, because there is no Health data on a Mac, and indexes one record per
+day and one per workout. The contract for writing one is in
 [`docs/apple-plugins.md`](docs/apple-plugins.md).
+
+```
+apple plugins enable health
+apple health shortcut                  # the iPhone shortcut, into iCloud Drive
+apple health import ~/Downloads/export.zip   # the history, and the workouts
+apple health days --since 14
+```
 
 ## Geocoding
 

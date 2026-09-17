@@ -37,6 +37,10 @@ for dir in plugins/*/; do
   name="$(basename "$dir")"
   mkdir -p "$STAGE/plugins/$name"
   cp "$dir/apple-plugin-$name" "$STAGE/plugins/$name/"
+  # A plugin may ship a signed .shortcut beside it: the iPhone half of
+  # `health`, which `apple health shortcut` copies out for the user.
+  cp "$dir"/*.shortcut "$STAGE/plugins/$name/" 2>/dev/null || true
+  rm -f "$STAGE/plugins/$name"/*.unsigned.shortcut
 done
 # 🛑 The signed proxy client. It is built by the app's own Xcode project, not
 # by `swift build`, because the app checks its code signature on the socket and
@@ -122,7 +126,9 @@ cp notes/shortcuts/*.shortcut "$STAGE/index/shortcuts/" 2>/dev/null || true
 # 🛑 Check what we staged, here and not at run time. A missing helper shows up
 # as "no `apple` dispatcher found on this machine" hours later.
 for required in Helpers/apple Helpers/apple-plugins Helpers/apple-mail \
-                plugins/dawarich/apple-plugin-dawarich notes/apple-notes \
+                plugins/dawarich/apple-plugin-dawarich \
+                plugins/health/apple-plugin-health \
+                "plugins/health/Apple Tools Health Export.shortcut" notes/apple-notes \
                 notes/notestore.py notes/notestore.proto index/vec index/doctext \
                 index/models/vocab.txt \
                 skills/apple-tools/SKILL.md skills/apple-index/SKILL.md; do

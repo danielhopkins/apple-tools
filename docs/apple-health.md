@@ -2,7 +2,8 @@
 
 **There is no Health data on this Mac, and no signing trick changes that.**
 HealthKit links on macOS and refuses every call. This file records what was
-measured, why the obvious routes are closed, and which three routes remain.
+measured, why the obvious routes are closed, which routes remain, and what
+the `health` plugin built on two of them (2026-09-17).
 
 Measured on macOS 27.0 (build `26A5416b`, 2026-08-20), Xcode-beta SDK.
 
@@ -108,30 +109,130 @@ plist). It syncs to the Mac through iCloud and belongs to the iPhone.
 None of these reads a local store, because there is none. Each one moves data
 from the iPhone to a file this Mac can read.
 
-### A. An iPhone Shortcut writes a file
+### A. An iPhone Shortcut writes a file — BUILT
 
-An iOS Personal Automation runs on a schedule. "Find Health Samples" reads the
-types you choose. The shortcut writes JSON to iCloud Drive. The Mac reads that
-file.
+`plugins/health/build-shortcut.py` builds and signs **Apple Tools Health
+Export.shortcut**. On the phone, "Find Health Samples" reads a fixed set of
+types for the last eight days, grouped by day, and Save File writes one
+tab-separated text file into iCloud Drive → `apple-tools/health/`. The Mac
+reads it with `apple health sync`, which `index` runs first.
 
-- Gives fresh data without a manual step after setup.
-- Covers only the types the shortcut asks for, not everything.
+- Covers 14 daily types (steps, walking/cycling/swimming distance, active
+  calories, exercise and stand minutes, flights, resting and walking heart
+  rate, HRV, oxygen saturation, VO2 max, weight) plus raw Sleep samples.
 - 🛑 **The Mac cannot trigger the refresh.** There is no API to run a shortcut
-  on another device.
-- Matches the Shortcuts write path this repo already uses for Notes.
-- ⚠️ Unverified from this Mac. The iOS action list and its output shape were
-  not measured here.
+  on another device. The user runs it, or sets a Personal Automation.
+- 🛑 **No shortcut can read workouts.** See "What the shortcut can read".
 
-### B. The Health export archive
+#### What the shortcut can read, and how that was found
+
+Nothing on a Mac runs the Health actions, so the serialization was read
+from three sources rather than measured here:
+
+1. A real iOS export of a heart-rate shortcut (public,
+   `suliveevil/My-Siri-Shortcuts`, `Heart Rate Data.txt`): the
+   `filter.health.quantity` → `repeat.each` → `properties.health.quantity`
+   → `format.date` → `gettext` → `text.combine` chain, copied shape for
+   shape.
+2. The **iOS 27 simulator runtime** on this Mac
+   (`/Library/Developer/CoreSimulator/Volumes/iOS_24A5390f/…/RuntimeRoot/
+   System/Library/PrivateFrameworks/ActionKit.framework/ActionKit`), which
+   is a real file rather than a dyld-cache stub. `strings` on it gives the
+   parameter keys (`WFHKSampleFilteringGroupBy`, `…FillMissing`, `…Unit`),
+   the group-by values (Minute, Hour, Day, Week, Month, 3 Months, Year), the
+   seven detail names of `WFHKSampleContentItem` (Type, Value, Unit, Start
+   Date, End Date, Duration, Source) and the **full picker label list**.
+3. `viticci/shortcuts-playground-plugin`'s HealthKit reference, from
+   anonymised iOS 26.2 exports: the `Type is …` row uses `Values.Enumeration`
+   with `WFStringSubstitutableState`, and the label for Sleep Analysis is
+   **`Sleep`**.
+
+What those settled:
+
+- 🛑 **`WFHKSampleContentItem` wraps an `HKQuantitySample` or an
+  `HKCategorySample` and nothing else.** The two constructors in ActionKit
+  take exactly those, and the picker list — read in full — has no "Workouts"
+  row. `WFHKWorkoutContentItem` exists for *logging* a workout. So workouts
+  come from the export archive only.
+- ⚠️ **The picker labels are ActionKit's readable names for HealthKit
+  identifiers, not the Health app's display names.** `Active Calories` for
+  ActiveEnergyBurned, `Exercise Time` for AppleExerciseTime, `Heart Rate
+  Variability` for HeartRateVariabilitySDNN. The full list is in the binary,
+  in HealthKit-identifier order; the plugin's `METRICS` table carries the
+  ones used.
+- **`Group by Day` returns Health's own daily totals**, deduplicated across
+  the iPhone and the Watch, which raw samples are not. The action's own help
+  string: "grouping by day gives you only the daily totals". Sleep is left
+  raw because a night starting at 23:00 would land on the wrong day.
+- **The date filter row** is `Operator 1001` ("is in the last"), `Unit 16`
+  (day), `Number` N — from the real export, which used exactly that for
+  "in the last 2 days".
+- **`Format Date` with the ICU pattern `yyyy-MM-dd HH:mm:ss Z`** writes
+  `2026-09-15 07:25:44 -0600`, the same shape `export.xml` uses, so the
+  plugin has one date parser.
+- ⚠️ **A number coerced to text is in the phone's locale.** `8,412` on an
+  en_US phone. The plugin strips commas and nothing else.
+- ⚠️ **The unit follows the phone's settings.** `mi` here, `km` elsewhere.
+  The plugin converts to metres, kcal, minutes, bpm, ms and kg, and a unit it
+  does not know fails that line naming it rather than storing a number with
+  no unit.
+
+⚠️ **Not yet measured on a phone:** whether iOS 27 accepts `"Day"` as the
+group-by value as serialized, and whether `Sleep` is still the label. The
+first run on the phone is the test; a wrong label shows as an empty Type in
+the editor and produces no lines for that type, and the plugin's `sync`
+report names every type it did not see.
+
+The file format, version 1:
+
+```
+apple-tools health 1
+generated	2026-09-16 07:02:11 -0600
+window	8
+day	Steps	2026-09-15 00:00:00 -0600	2026-09-16 00:00:00 -0600	10,015	count
+day	Cycling Distance	2026-09-15 00:00:00 -0600	2026-09-16 00:00:00 -0600	12.5	mi
+sample	Sleep	2026-09-14 23:10:00 -0600	2026-09-15 00:40:00 -0600	Asleep Deep	count
+```
+
+A `day` row spans the phone's local day; a `sample` row is one raw sample.
+A day is `partial` when the file was generated before the day ended, and
+the next run's file replaces it. `plugins/health/test-health.py` rebuilds
+the shortcut unsigned and checks every label in it against the plugin's
+table, so the two halves cannot drift.
+
+### B. The Health export archive — BUILT
 
 Health app → profile → Export All Health Data → `export.zip`, containing
-`export.xml`. AirDrop it to the Mac and parse it.
+`export.xml`. AirDrop it to the Mac and `apple health import export.zip`.
 
-- Complete history in one file, fully local.
-- One snapshot. It goes stale immediately.
-- ⚠️ **Nothing here has been measured.** No export exists on this Mac, so the
-  file size, the record count and the parse time are all unknown. Do not quote
-  a number until one is made.
+- Complete history in one file, fully local. **The only route to workouts.**
+- One snapshot. It goes stale immediately; route A keeps it current.
+- ⚠️ **Nothing here has been measured on a real archive.** No export exists
+  on this Mac yet, so the file size, the record count and the parse time are
+  unknown. The reader is exercised on a synthetic archive only. Replace this
+  line when a real one is imported.
+
+How `import` reads it:
+
+- 🛑 **A day's steps are not the sum of every step record.** The iPhone and
+  the Watch both count the same walk; Health shows one of them, the export
+  carries both. A cumulative type is summed per source per day and the day
+  takes the **largest source's** total — near what Health shows, never
+  twice it. A discrete type (resting heart rate, HRV, SpO2, VO2 max) is the
+  day's mean; weight is the last reading of the day.
+- **A day the shortcut wrote is kept**, because the shortcut's number *is*
+  what Health shows. The export fills only the days it does not have.
+- **Sleep takes one source per night**, the one with the most asleep
+  minutes, so a Watch and a sleep app do not double a night. A night is
+  filed under its wake-up day: the date of the sample's end shifted six
+  hours forward, which is Health's own 18:00-to-18:00 sleep day.
+- **Workouts, both shapes.** Before iOS 16 `totalDistance` and
+  `totalEnergyBurned` were attributes; since then they are
+  `<WorkoutStatistics>` children with a `sum`. Both are read, the child
+  wins. Average heart rate comes from the HeartRate statistics child. The
+  first `<trkpt>` of the route's GPX gives the workout a coordinate.
+- **The same archive imported twice changes nothing.** Workouts key on
+  type, start and source; days and nights on their date.
 
 ### How the built-in export works
 
@@ -211,9 +312,9 @@ This is route A with the shortcut already written, and it costs money.
 
 ### Which to pick
 
-**B loads the history. A or D keeps it current.** B gives every record ever,
-once, and then goes stale. A and D give a chosen set of types on a schedule.
-Run B once, then A or D, and one store holds both.
+**B loads the history. A keeps it current.** That is what the plugin does:
+`import` for B, `sync` for A, one store for both. D would be A with the
+shortcut already written, for money; nothing reads its format.
 
 ## What is already on this Mac
 

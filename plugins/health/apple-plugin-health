@@ -1,0 +1,1170 @@
+#!/usr/bin/env python3
+"""apple-plugin-health - daily Health totals and workouts, from files the iPhone writes.
+
+🛑 THERE IS NO HEALTH DATA ON A MAC. HealthKit links on macOS and refuses
+every call, no signing or entitlement changes that, and no local store
+exists (docs/apple-health.md, measured). So this plugin reads no Apple
+store: it reads two kinds of file that the iPhone puts in iCloud Drive, and
+keeps what it read in its own SQLite store so a day is never parsed twice.
+
+  the daily file    written by the "Apple Tools Health Export" shortcut
+                    (plugins/health/build-shortcut.py): one line per day
+                    per type, Health's own totals, for the last few days.
+                    The user runs it on the phone; the Mac cannot.
+  the export        Health app → profile → Export All Health Data →
+                    export.zip. Every record ever, and the WORKOUTS, which
+                    no shortcut can read. `apple health import export.zip`.
+
+It makes no connection, needs no grant and reads nothing outside the
+configured folders and the files named on its command line.
+
+    apple plugins enable health
+    apple health import ~/Downloads/export.zip     # once, the history
+    apple health sync                              # read new daily files
+    apple health days --since 14
+    apple health workouts --since 90 --json
+    apple health shortcut --to ~/Downloads         # the file to install
+
+`index` is what apple-index calls: it syncs, then emits one record per day
+and one per workout. A raw sample — one heart-rate reading — is not a
+document and is never indexed, the same rule Dawarich's GPS points follow.
+"""
+import argparse
+import datetime as dt
+import glob
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+import zipfile
+
+VERSION = "26.917.0"
+NAME = "health"
+FORMAT_VERSION = "1"
+SHORTCUT_NAME = "Apple Tools Health Export"
+
+HOME = os.path.expanduser("~")
+ICLOUD = os.path.join(HOME, "Library", "Mobile Documents", "com~apple~CloudDocs")
+# Where the shortcut's Save File lands. ⚠️ Two candidates, because Save File
+# with no destination chosen has written under iCloud Drive's root on some
+# iOS versions and under its `Shortcuts` folder on others. Both are read.
+DEFAULT_FOLDERS = [os.path.join(ICLOUD, "apple-tools", "health"),
+                   os.path.join(ICLOUD, "Shortcuts", "apple-tools", "health")]
+STORE_DIR = os.path.join(HOME, "Library", "Application Support", "apple-tools", "health")
+
+MANIFEST = {
+    "name": NAME,
+    "version": VERSION,
+    "description": "Daily steps, distance, energy, heart rate, sleep and weight "
+                   "from a shortcut the iPhone runs, and workouts from the "
+                   "Health export archive",
+    # No hosts. Nothing here connects anywhere; `apple plugins list` prints
+    # an empty network line and `apple status` shows the plugin as local.
+    "network": {"hosts": [], "writes": False},
+    "commands": ["status", "import", "sync", "days", "workouts", "shortcut", "index"],
+    "index": {
+        "kinds": ["day", "workout"],
+        # `index` reads its own store, so a full run costs nothing; and a
+        # day's totals change when a later daily file carries the same day
+        # (today is partial until tomorrow's run), so a reconcile is right.
+        "refresh_args": ["--full"],
+        "container_label": "By year",
+        "footnote": "A record is one day's totals — steps, distance, energy, "
+                    "heart rate, sleep, weight — or one workout. Days come "
+                    "from the shortcut the iPhone runs; workouts only from "
+                    "the Health export archive, which no shortcut can read.",
+    },
+    "config": [
+        {"key": "folder", "required": False, "secret": False,
+         "help": "Where the shortcut saves its files. Default: iCloud Drive/apple-tools/health"},
+    ],
+}
+
+# What the daily file's labels and the export's identifiers both map to.
+# (key, the Find Health Samples label, the HealthKit identifier, how a day
+# is made from raw records: sum or mean or last, canonical unit)
+METRICS = [
+    ("steps", "Steps", "HKQuantityTypeIdentifierStepCount", "sum", "count"),
+    ("walk_run_distance", "Walking + Running Distance", "HKQuantityTypeIdentifierDistanceWalkingRunning", "sum", "m"),
+    ("cycling_distance", "Cycling Distance", "HKQuantityTypeIdentifierDistanceCycling", "sum", "m"),
+    ("swimming_distance", "Swimming Distance", "HKQuantityTypeIdentifierDistanceSwimming", "sum", "m"),
+    ("active_energy", "Active Calories", "HKQuantityTypeIdentifierActiveEnergyBurned", "sum", "kcal"),
+    ("exercise_minutes", "Exercise Time", "HKQuantityTypeIdentifierAppleExerciseTime", "sum", "min"),
+    ("stand_minutes", "Stand Time", "HKQuantityTypeIdentifierAppleStandTime", "sum", "min"),
+    ("flights", "Flights Climbed", "HKQuantityTypeIdentifierFlightsClimbed", "sum", "count"),
+    ("resting_heart_rate", "Resting Heart Rate", "HKQuantityTypeIdentifierRestingHeartRate", "mean", "bpm"),
+    ("hrv", "Heart Rate Variability", "HKQuantityTypeIdentifierHeartRateVariabilitySDNN", "mean", "ms"),
+    ("walking_heart_rate", "Walking Heart Rate Average", "HKQuantityTypeIdentifierWalkingHeartRateAverage", "mean", "bpm"),
+    ("oxygen_saturation", "Oxygen Saturation", "HKQuantityTypeIdentifierOxygenSaturation", "mean", "%"),
+    ("vo2_max", "VO2 Max", "HKQuantityTypeIdentifierVO2Max", "mean", "mL/min·kg"),
+    ("weight", "Weight", "HKQuantityTypeIdentifierBodyMass", "last", "kg"),
+]
+BY_LABEL = {label: (key, rule, unit) for key, label, _, rule, unit in METRICS}
+BY_HK = {hk: (key, rule, unit) for key, _, hk, rule, unit in METRICS}
+SLEEP_HK = "HKCategoryTypeIdentifierSleepAnalysis"
+
+# Every unit either source has been seen to use, to the canonical one.
+# ⚠️ The daily file reports Health's display unit, which follows the
+# phone's settings: "mi" on this phone, "km" on another. Nothing here
+# guesses; an unknown unit fails the line, naming it.
+UNITS = {
+    "count": ("count", 1.0), "steps": ("count", 1.0), "flights": ("count", 1.0),
+    "m": ("m", 1.0), "km": ("m", 1000.0), "mi": ("m", 1609.344), "ft": ("m", 0.3048),
+    "yd": ("m", 0.9144),
+    "kcal": ("kcal", 1.0), "Cal": ("kcal", 1.0), "cal": ("kcal", 0.001), "kJ": ("kcal", 0.239006),
+    "min": ("min", 1.0), "hr": ("min", 60.0), "h": ("min", 60.0), "s": ("min", 1 / 60.0),
+    "count/min": ("bpm", 1.0), "bpm": ("bpm", 1.0),
+    "ms": ("ms", 1.0), "s (hrv)": ("ms", 1000.0),
+    "%": ("%", 1.0),
+    "mL/min·kg": ("mL/min·kg", 1.0), "mL/min*kg": ("mL/min·kg", 1.0), "ml/(kg*min)": ("mL/min·kg", 1.0),
+    "mL/kg·min": ("mL/min·kg", 1.0), "ml/kg/min": ("mL/min·kg", 1.0),
+    "kg": ("kg", 1.0), "lb": ("kg", 0.453592), "lbs": ("kg", 0.453592), "st": ("kg", 6.35029), "g": ("kg", 0.001),
+}
+# The Sleep sample's `Value` in the daily file, and the export's category
+# value, to a stage. Asleep stages add up to "asleep"; In Bed is separate.
+SLEEP_STAGES = {
+    "In Bed": "in_bed", "HKCategoryValueSleepAnalysisInBed": "in_bed",
+    "Asleep": "asleep", "Asleep Unspecified": "asleep", "HKCategoryValueSleepAnalysisAsleep": "asleep",
+    "HKCategoryValueSleepAnalysisAsleepUnspecified": "asleep",
+    "Core": "core", "Asleep Core": "core", "HKCategoryValueSleepAnalysisAsleepCore": "core",
+    "Deep": "deep", "Asleep Deep": "deep", "HKCategoryValueSleepAnalysisAsleepDeep": "deep",
+    "REM": "rem", "Asleep REM": "rem", "HKCategoryValueSleepAnalysisAsleepREM": "rem",
+    "Awake": "awake", "HKCategoryValueSleepAnalysisAwake": "awake",
+}
+ASLEEP = ("asleep", "core", "deep", "rem")
+
+
+def die(message, code=1):
+    print("error: %s" % message, file=sys.stderr)
+    sys.exit(code)
+
+
+def note(message):
+    print(message, file=sys.stderr)
+
+
+# --------------------------------------------------------------------------
+# configuration
+# --------------------------------------------------------------------------
+
+def plugin_manager():
+    if os.environ.get("APPLE_PLUGINS_BIN"):
+        return [os.environ["APPLE_PLUGINS_BIN"]]
+    here = os.path.dirname(os.path.realpath(__file__))
+    for candidate in (os.path.join(here, "..", "..", "bin", "apple-plugins"),
+                      os.path.join(here, "..", "..", "apple-plugins"),
+                      os.path.join(here, "..", "..", "..", "Helpers", "apple-plugins")):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return [candidate]
+    found = shutil.which("apple-plugins")
+    if found:
+        return [found]
+    found = shutil.which("apple")
+    if found:
+        return [found, "plugins"]
+    return None
+
+
+def stored_config():
+    manager = plugin_manager()
+    if manager is None:
+        return {}
+    try:
+        proc = subprocess.run(manager + ["config", NAME, "--json"],
+                              capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    try:
+        return json.loads(proc.stdout).get("config") or {}
+    except ValueError:
+        return {}
+
+
+def folders(opts):
+    """The directories the daily files are read from, most specific first.
+    A flag, then the environment, then the stored config, then both
+    iCloud Drive candidates."""
+    chosen = getattr(opts, "folder", None) or os.environ.get("APPLE_HEALTH_FOLDER")
+    if not chosen:
+        chosen = stored_config().get("folder")
+    if chosen:
+        return [os.path.expanduser(chosen)]
+    return DEFAULT_FOLDERS
+
+
+def store_path():
+    return os.environ.get("APPLE_HEALTH_STORE") or os.path.join(STORE_DIR, "health.sqlite")
+
+
+# --------------------------------------------------------------------------
+# the store
+# --------------------------------------------------------------------------
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS day (
+    date    TEXT NOT NULL,        -- YYYY-MM-DD, the phone's local day
+    metric  TEXT NOT NULL,
+    value   REAL NOT NULL,        -- in the canonical unit for the metric
+    unit    TEXT NOT NULL,
+    source  TEXT NOT NULL,        -- 'shortcut' or 'export'
+    file    TEXT NOT NULL,
+    partial INTEGER NOT NULL DEFAULT 0,   -- the day was not over when written
+    PRIMARY KEY (date, metric)
+);
+CREATE TABLE IF NOT EXISTS sleep (
+    date     TEXT PRIMARY KEY,    -- the wake-up day
+    start    TEXT, "end" TEXT,    -- ISO with offset, the night's span
+    asleep   REAL NOT NULL,       -- minutes, every asleep stage together
+    in_bed   REAL, core REAL, deep REAL, rem REAL, awake REAL,
+    samples  INTEGER NOT NULL,
+    source   TEXT NOT NULL, file TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS workout (
+    id        TEXT PRIMARY KEY,   -- type|start|source
+    type      TEXT NOT NULL,      -- Cycling, Running …
+    start     TEXT NOT NULL, "end" TEXT NOT NULL,
+    duration  REAL,               -- seconds
+    distance  REAL,               -- metres
+    energy    REAL,               -- kcal
+    heart_rate REAL,              -- average bpm, when the export carries it
+    source    TEXT,
+    latitude  REAL, longitude REAL,   -- the route's first point, when there is one
+    route     TEXT,               -- the GPX path inside the archive
+    file      TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS file (
+    path     TEXT PRIMARY KEY,
+    mtime    REAL NOT NULL, size INTEGER NOT NULL,
+    kind     TEXT NOT NULL,       -- 'daily' or 'export'
+    read_at  TEXT NOT NULL,
+    lines    INTEGER, days INTEGER, workouts INTEGER
+);
+"""
+
+
+def open_store():
+    path = store_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    db = sqlite3.connect(path)
+    db.row_factory = sqlite3.Row
+    db.executescript(SCHEMA)
+    return db
+
+
+# --------------------------------------------------------------------------
+# time and units
+# --------------------------------------------------------------------------
+
+def parse_when(text):
+    """`2026-09-15 07:25:44 -0600` (both the export and the shortcut write
+    this) or ISO 8601 → aware datetime, or None."""
+    if not text:
+        return None
+    text = str(text).strip()
+    for pattern in ("%Y-%m-%d %H:%M:%S %z", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S%z"):
+        try:
+            return dt.datetime.strptime(text.replace("Z", "+0000"), pattern)
+        except ValueError:
+            pass
+    try:
+        when = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return when if when.tzinfo else when.replace(tzinfo=dt.timezone.utc)
+    except ValueError:
+        return None
+
+
+def local_day(when):
+    """The date in the sample's OWN offset — the phone's day, not this
+    Mac's. A night's sleep that ends at 06:12 -0600 belongs to that day
+    wherever the Mac is."""
+    return when.strftime("%Y-%m-%d")
+
+
+def number(text):
+    """`8,412` → 8412.0. The shortcut coerces a number to text in the
+    phone's locale; en_US puts a comma every three digits."""
+    if text is None:
+        return None
+    cleaned = str(text).strip().replace(",", "")
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def canonical(value, unit, want):
+    """Convert `value unit` to the metric's canonical unit, or raise."""
+    unit = (unit or "").strip()
+    if unit == "s" and want == "ms":
+        unit = "s (hrv)"
+    if unit not in UNITS:
+        raise ValueError("unknown unit %r" % unit)
+    to, factor = UNITS[unit]
+    if to != want:
+        raise ValueError("unit %r is not a %s" % (unit, want))
+    return value * factor
+
+
+def iso(when):
+    return when.isoformat() if when else None
+
+
+def human_minutes(minutes):
+    if minutes is None:
+        return None
+    minutes = int(round(minutes))
+    hours, rest = divmod(minutes, 60)
+    return "%dh %02dm" % (hours, rest) if hours else "%dm" % rest
+
+
+def km_mi(metres):
+    return "%.1f km (%.1f mi)" % (metres / 1000.0, metres / 1609.344)
+
+
+# --------------------------------------------------------------------------
+# the daily file
+# --------------------------------------------------------------------------
+
+def read_daily(path):
+    """Parse one file the shortcut wrote. Returns (days, sleep_samples,
+    generated, problems), where days is {(date, metric): (value, unit,
+    partial)} and sleep_samples is [(start, end, stage)].
+
+    The first line names the format; a file that does not start with it is
+    refused, so a stray text file in the folder cannot become a day.
+    """
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    if not lines or not lines[0].startswith("apple-tools health "):
+        raise ValueError("not a health export: first line is %r" % (lines[0][:40] if lines else ""))
+    version = lines[0].split()[-1]
+    if version != FORMAT_VERSION:
+        raise ValueError("format %s; this plugin reads %s" % (version, FORMAT_VERSION))
+    generated = None
+    days = {}
+    sleep = []
+    problems = []
+    seen = set()
+    for lineno, line in enumerate(lines[1:], 2):
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        head = parts[0]
+        if head == "generated":
+            generated = parse_when(parts[1]) if len(parts) > 1 else None
+            continue
+        if head == "window":
+            continue
+        if head not in ("day", "sample"):
+            problems.append("line %d: unknown row %r" % (lineno, head))
+            continue
+        if len(parts) < 6:
+            problems.append("line %d: %d fields, want 6" % (lineno, len(parts)))
+            continue
+        _, label, start_text, end_text, value_text, unit = parts[:6]
+        seen.add(label)
+        start, end = parse_when(start_text), parse_when(end_text)
+        if start is None or end is None:
+            problems.append("line %d: bad date %r / %r" % (lineno, start_text, end_text))
+            continue
+        if head == "sample":
+            if label != "Sleep":
+                problems.append("line %d: raw samples of %r are not read" % (lineno, label))
+                continue
+            stage = SLEEP_STAGES.get(value_text.strip())
+            if stage is None:
+                problems.append("line %d: sleep value %r" % (lineno, value_text))
+                continue
+            sleep.append((start, end, stage))
+            continue
+        if label not in BY_LABEL:
+            problems.append("line %d: type %r is not one this plugin stores" % (lineno, label))
+            continue
+        key, _, want = BY_LABEL[label]
+        value = number(value_text)
+        if value is None:
+            problems.append("line %d: value %r" % (lineno, value_text))
+            continue
+        try:
+            value = canonical(value, unit, want)
+        except ValueError as error:
+            problems.append("line %d: %s: %s" % (lineno, label, error))
+            continue
+        # A grouped-by-day sample spans the whole day; the day it names is
+        # its start. It is partial when the file was generated before that
+        # day ended.
+        date = local_day(start)
+        partial = 1 if generated is not None and local_day(generated) <= date else 0
+        days[(date, key)] = (value, want, partial)
+    # ⚠️ A type the phone never wrote a line for is either one the user has
+    # no data for, or one whose label the shortcut got wrong — the editor
+    # shows an empty Type, and the run produces nothing for it. Named, so a
+    # wrong label is visible on the Mac.
+    absent = [label for _, label, _, _, _ in METRICS if label not in seen]
+    if "Sleep" not in seen:
+        absent.append("Sleep")
+    if absent:
+        problems.append("no lines for: %s" % ", ".join(absent))
+    return days, sleep, generated, problems
+
+
+def nights(samples):
+    """Sleep samples → {wake-up date: totals}.
+
+    🛑 A NIGHT BELONGS TO THE MORNING, and the day of the sample's end is
+    not enough to say so: a stage that ends at 23:10 is part of the night
+    that ends at 06:30 the next day. Health's own rule is that a sleep day
+    runs from 18:00 to 18:00, so a sample is filed under the date of its
+    end SHIFTED SIX HOURS FORWARD — 23:10 becomes 05:10 tomorrow, 06:30
+    stays today, and a nap ending at 15:00 stays today.
+
+    Stages from every source add up per stage; ⚠️ if two sources both
+    record the same night (a Watch and a third-party app), the total is
+    twice the truth. Health itself picks one source; `import_export` keeps
+    one source per night for that reason, and the shortcut's file carries
+    whatever Health returned."""
+    by_day = {}
+    for start, end, stage in samples:
+        date = local_day(end + dt.timedelta(hours=6))
+        night = by_day.setdefault(date, {"start": start, "end": end, "samples": 0,
+                                         "in_bed": 0.0, "asleep": 0.0, "core": 0.0,
+                                         "deep": 0.0, "rem": 0.0, "awake": 0.0})
+        minutes = max(0.0, (end - start).total_seconds() / 60.0)
+        night[stage] += minutes
+        night["samples"] += 1
+        night["start"] = min(night["start"], start)
+        night["end"] = max(night["end"], end)
+    out = {}
+    for date, night in by_day.items():
+        asleep = sum(night[s] for s in ASLEEP)
+        if asleep <= 0 and night["in_bed"] <= 0:
+            continue
+        out[date] = dict(night, asleep=asleep)
+    return out
+
+
+def store_daily(db, path, days, sleep_samples, source):
+    """Write one file's days over what is there. The newest file wins for a
+    day it carries, because a later run of the shortcut has the whole day
+    where an earlier one had part of it."""
+    for (date, metric), (value, unit, partial) in days.items():
+        db.execute("INSERT OR REPLACE INTO day (date, metric, value, unit, source, file, partial) "
+                   "VALUES (?, ?, ?, ?, ?, ?, ?)", (date, metric, value, unit, source, path, partial))
+    stored = 0
+    for date, night in nights(sleep_samples).items():
+        db.execute("INSERT OR REPLACE INTO sleep (date, start, \"end\", asleep, in_bed, core, "
+                   "deep, rem, awake, samples, source, file) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (date, iso(night["start"]), iso(night["end"]), night["asleep"],
+                    night["in_bed"] or None, night["core"] or None, night["deep"] or None,
+                    night["rem"] or None, night["awake"] or None, night["samples"], source, path))
+        stored += 1
+    return stored
+
+
+def daily_files(opts):
+    found = []
+    for folder in folders(opts):
+        if os.path.isdir(folder):
+            found += sorted(glob.glob(os.path.join(folder, "health-*.txt")))
+            found += sorted(glob.glob(os.path.join(folder, "health*.txt")))
+    seen, out = set(), []
+    for path in found:
+        if path not in seen:
+            seen.add(path)
+            out.append(path)
+    return out
+
+
+def unread(db, path, kind):
+    """True when the file is new or changed since it was last read."""
+    st = os.stat(path)
+    row = db.execute("SELECT mtime, size FROM file WHERE path = ?", (path,)).fetchone()
+    return row is None or row["mtime"] != st.st_mtime or row["size"] != st.st_size
+
+
+def mark_read(db, path, kind, **counts):
+    st = os.stat(path)
+    db.execute("INSERT OR REPLACE INTO file (path, mtime, size, kind, read_at, lines, days, workouts) "
+               "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+               (path, st.st_mtime, st.st_size, kind, dt.datetime.now().isoformat(timespec="seconds"),
+                counts.get("lines"), counts.get("days"), counts.get("workouts")))
+
+
+def sync(db, opts, quiet=False):
+    """Read every daily file not read yet. Returns a report dict."""
+    report = {"folders": folders(opts), "files": [], "days": 0, "nights": 0, "problems": []}
+    for path in daily_files(opts):
+        if not unread(db, path, "daily"):
+            continue
+        try:
+            days, sleep_samples, generated, problems = read_daily(path)
+        except (OSError, ValueError) as error:
+            report["problems"].append("%s: %s" % (os.path.basename(path), error))
+            continue
+        # Files are read oldest first by name, and a file is (re)read when
+        # it changes, so the newest run always writes last.
+        n_nights = store_daily(db, path, days, sleep_samples, "shortcut")
+        dates = sorted({d for d, _ in days} | set(nights(sleep_samples)))
+        mark_read(db, path, "daily", lines=len(days) + len(sleep_samples),
+                  days=len(dates))
+        db.commit()
+        report["files"].append({"path": path, "days": len(dates), "nights": n_nights,
+                                "generated": iso(generated),
+                                "first": dates[0] if dates else None,
+                                "last": dates[-1] if dates else None})
+        report["days"] += len(dates)
+        report["nights"] += n_nights
+        for problem in problems:
+            report["problems"].append("%s: %s" % (os.path.basename(path), problem))
+    if not quiet:
+        for problem in report["problems"]:
+            note("⚠️  " + problem)
+    return report
+
+
+# --------------------------------------------------------------------------
+# the export archive
+# --------------------------------------------------------------------------
+
+def open_export(path):
+    """(a file object for export.xml, a zipfile or None, the member name).
+
+    🛑 The folder and file names inside the archive vary by locale and iOS
+    version, so nothing here looks for `apple_health_export/export.xml`.
+    Any .xml whose first kilobyte carries `<HealthData` is the one — the
+    rule healthkit-to-sqlite uses.
+    """
+    if os.path.isdir(path):
+        for name in sorted(os.listdir(path)):
+            full = os.path.join(path, name)
+            if name.endswith(".xml") and _is_health_xml(open(full, "rb")):
+                return open(full, "rb"), None, full
+        raise ValueError("no HealthData .xml in %s" % path)
+    if path.endswith(".xml"):
+        f = open(path, "rb")
+        if not _is_health_xml(f):
+            raise ValueError("%s does not start with <HealthData" % path)
+        f.seek(0)
+        return f, None, path
+    archive = zipfile.ZipFile(path)
+    for info in archive.infolist():
+        if info.filename.endswith(".xml") and info.filename.count("/") <= 1 \
+                and not info.filename.endswith("export_cda.xml"):
+            with archive.open(info) as f:
+                if _is_health_xml(f):
+                    return archive.open(info), archive, info.filename
+    raise ValueError("no HealthData .xml in %s" % path)
+
+
+def _is_health_xml(f):
+    head = f.read(2048)
+    return b"<!DOCTYPE HealthData" in head or b"<HealthData" in head
+
+
+def first_route_point(archive, base_dir, route_path):
+    """The first <trkpt> of a workout's GPX, so the workout has a place.
+    ⚠️ GPX dates are ISO 8601 with a Z, unlike the export's own; only the
+    coordinate is read here."""
+    if not route_path:
+        return None, None
+    try:
+        if archive is not None:
+            member = next((n for n in archive.namelist() if n.endswith(route_path.lstrip("/"))), None)
+            if member is None:
+                return None, None
+            f = archive.open(member)
+        else:
+            full = os.path.join(base_dir, route_path.lstrip("/"))
+            if not os.path.isfile(full):
+                return None, None
+            f = open(full, "rb")
+        with f:
+            for _, elem in ET.iterparse(f, events=("start",)):
+                if elem.tag.endswith("trkpt"):
+                    return float(elem.get("lat")), float(elem.get("lon"))
+    except (OSError, ValueError, ET.ParseError, zipfile.BadZipFile):
+        return None, None
+    return None, None
+
+
+def import_export(db, path, opts):
+    """Stream export.xml into the store. Returns a report.
+
+    🛑 THE FILE IS TOO BIG TO LOAD — hundreds of MB to a few GB unzipped —
+    so it is streamed with iterparse and every element is cleared once
+    read. Measured on the first real archive: see docs/apple-health.md.
+
+    Days come out of Records, with one rule that matters: 🛑 A DAY'S STEPS
+    ARE NOT THE SUM OF EVERY STEP RECORD. The iPhone and the Watch both
+    count the same walk, and Health shows one of them. The export carries
+    both. So a cumulative metric is summed PER SOURCE per day, and the day
+    takes the largest source's total — nearly what Health shows, never
+    twice it. A day the shortcut has written keeps the shortcut's number,
+    which IS what Health shows.
+    """
+    f, archive, member = open_export(path)
+    base_dir = path if os.path.isdir(path) else os.path.dirname(path)
+    # (date, metric) → {source: sum} for sums; → [values] for means;
+    # → (when, value) for last.
+    sums, means, lasts = {}, {}, {}
+    sleep_samples = []
+    workouts = []
+    records = 0
+    skipped_units = {}
+    with f:
+        for event, elem in ET.iterparse(f, events=("end",)):
+            tag = elem.tag
+            if tag == "Record":
+                records += 1
+                hk = elem.get("type")
+                if hk == SLEEP_HK:
+                    start, end = parse_when(elem.get("startDate")), parse_when(elem.get("endDate"))
+                    stage = SLEEP_STAGES.get(elem.get("value") or "")
+                    if start and end and stage:
+                        sleep_samples.append((start, end, stage, elem.get("sourceName") or ""))
+                elif hk in BY_HK:
+                    key, rule, want = BY_HK[hk]
+                    value = number(elem.get("value"))
+                    start = parse_when(elem.get("startDate"))
+                    if value is not None and start is not None:
+                        try:
+                            value = canonical(value, elem.get("unit"), want)
+                        except ValueError:
+                            skipped_units[(hk, elem.get("unit"))] = skipped_units.get((hk, elem.get("unit")), 0) + 1
+                            elem.clear()
+                            continue
+                        date = local_day(start)
+                        source = elem.get("sourceName") or ""
+                        if rule == "sum":
+                            sums.setdefault((date, key), {})
+                            sums[(date, key)][source] = sums[(date, key)].get(source, 0.0) + value
+                        elif rule == "mean":
+                            means.setdefault((date, key), []).append(value)
+                        else:
+                            prior = lasts.get((date, key))
+                            if prior is None or start >= prior[0]:
+                                lasts[(date, key)] = (start, value)
+                elem.clear()
+            elif tag == "Workout":
+                workouts.append(shape_workout(elem, archive, base_dir))
+                elem.clear()
+            elif tag in ("ActivitySummary", "Me", "ExportDate"):
+                elem.clear()
+
+    # Days from the export never overwrite a day the shortcut wrote.
+    written = 0
+    have = {(r["date"], r["metric"]) for r in db.execute(
+        "SELECT date, metric FROM day WHERE source = 'shortcut'")}
+    units = {key: unit for key, _, _, _, unit in METRICS}
+    for (date, key), by_source in sums.items():
+        if (date, key) in have:
+            continue
+        db.execute("INSERT OR REPLACE INTO day (date, metric, value, unit, source, file, partial) "
+                   "VALUES (?, ?, ?, ?, 'export', ?, 0)",
+                   (date, key, max(by_source.values()), units[key], path))
+        written += 1
+    for (date, key), values in means.items():
+        if (date, key) in have:
+            continue
+        db.execute("INSERT OR REPLACE INTO day (date, metric, value, unit, source, file, partial) "
+                   "VALUES (?, ?, ?, ?, 'export', ?, 0)",
+                   (date, key, sum(values) / len(values), units[key], path))
+        written += 1
+    for (date, key), (_, value) in lasts.items():
+        if (date, key) in have:
+            continue
+        db.execute("INSERT OR REPLACE INTO day (date, metric, value, unit, source, file, partial) "
+                   "VALUES (?, ?, ?, ?, 'export', ?, 0)", (date, key, value, units[key], path))
+        written += 1
+
+    # Sleep: one source per night, the one with the most asleep minutes,
+    # so a Watch and a sleep app recording the same night do not double it.
+    have_sleep = {r["date"] for r in db.execute("SELECT date FROM sleep WHERE source = 'shortcut'")}
+    by_source = {}
+    for start, end, stage, source in sleep_samples:
+        by_source.setdefault(source, []).append((start, end, stage))
+    per_night = {}
+    for source, samples in by_source.items():
+        for date, night in nights(samples).items():
+            best = per_night.get(date)
+            if best is None or night["asleep"] > best["asleep"]:
+                per_night[date] = night
+    n_nights = 0
+    for date, night in per_night.items():
+        if date in have_sleep:
+            continue
+        db.execute("INSERT OR REPLACE INTO sleep (date, start, \"end\", asleep, in_bed, core, "
+                   "deep, rem, awake, samples, source, file) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (date, iso(night["start"]), iso(night["end"]), night["asleep"],
+                    night["in_bed"] or None, night["core"] or None, night["deep"] or None,
+                    night["rem"] or None, night["awake"] or None, night["samples"], "export", path))
+        n_nights += 1
+
+    for w in workouts:
+        db.execute("INSERT OR REPLACE INTO workout (id, type, start, \"end\", duration, distance, "
+                   "energy, heart_rate, source, latitude, longitude, route, file) "
+                   "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (w["id"], w["type"], w["start"], w["end"], w["duration"], w["distance"],
+                    w["energy"], w["heart_rate"], w["source"], w["latitude"], w["longitude"],
+                    w["route"], path))
+    mark_read(db, path, "export", lines=records, days=written, workouts=len(workouts))
+    db.commit()
+    if archive is not None:
+        archive.close()
+    return {"path": path, "member": member, "records": records, "days_written": written,
+            "days_kept_from_shortcut": len(have), "nights": n_nights,
+            "workouts": len(workouts),
+            "skipped_units": ["%s in %r: %d records" % (hk, unit, n)
+                              for (hk, unit), n in sorted(skipped_units.items())]}
+
+
+WORKOUT_TYPES = {
+    # HKWorkoutActivityType names as the export spells them → the label
+    # the Health app shows. Anything else is the name with the prefix off.
+    "HKWorkoutActivityTypeCycling": "Cycling",
+    "HKWorkoutActivityTypeRunning": "Running",
+    "HKWorkoutActivityTypeWalking": "Walking",
+    "HKWorkoutActivityTypeHiking": "Hiking",
+    "HKWorkoutActivityTypeSwimming": "Swimming",
+    "HKWorkoutActivityTypeYoga": "Yoga",
+    "HKWorkoutActivityTypeFunctionalStrengthTraining": "Functional Strength Training",
+    "HKWorkoutActivityTypeTraditionalStrengthTraining": "Traditional Strength Training",
+    "HKWorkoutActivityTypeHighIntensityIntervalTraining": "HIIT",
+    "HKWorkoutActivityTypeDownhillSkiing": "Downhill Skiing",
+    "HKWorkoutActivityTypeSnowboarding": "Snowboarding",
+    "HKWorkoutActivityTypeElliptical": "Elliptical",
+    "HKWorkoutActivityTypeRowing": "Rowing",
+    "HKWorkoutActivityTypeOther": "Other",
+}
+
+
+def workout_label(hk):
+    if hk in WORKOUT_TYPES:
+        return WORKOUT_TYPES[hk]
+    bare = (hk or "").replace("HKWorkoutActivityType", "")
+    return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", bare) or "Workout"
+
+
+def shape_workout(elem, archive, base_dir):
+    """One <Workout>. ⚠️ Two shapes: before iOS 16 the distance and energy
+    were attributes (`totalDistance`, `totalEnergyBurned`); since then they
+    are <WorkoutStatistics> children with a `sum`, and the attributes are
+    absent. Both are read; the child wins when both exist."""
+    start = parse_when(elem.get("startDate"))
+    end = parse_when(elem.get("endDate"))
+    duration = number(elem.get("duration"))
+    if duration is not None:
+        unit = elem.get("durationUnit") or "min"
+        duration = duration * {"min": 60.0, "s": 1.0, "hr": 3600.0}.get(unit, 60.0)
+    elif start and end:
+        duration = (end - start).total_seconds()
+    distance = energy = heart_rate = None
+    if elem.get("totalDistance"):
+        try:
+            distance = canonical(number(elem.get("totalDistance")), elem.get("totalDistanceUnit"), "m")
+        except (ValueError, TypeError):
+            distance = None
+    if elem.get("totalEnergyBurned"):
+        try:
+            energy = canonical(number(elem.get("totalEnergyBurned")), elem.get("totalEnergyBurnedUnit"), "kcal")
+        except (ValueError, TypeError):
+            energy = None
+    route = None
+    for child in elem:
+        if child.tag == "WorkoutStatistics":
+            kind = child.get("type") or ""
+            try:
+                if kind.startswith("HKQuantityTypeIdentifierDistance") and child.get("sum"):
+                    distance = canonical(number(child.get("sum")), child.get("unit"), "m")
+                elif kind == "HKQuantityTypeIdentifierActiveEnergyBurned" and child.get("sum"):
+                    energy = canonical(number(child.get("sum")), child.get("unit"), "kcal")
+                elif kind == "HKQuantityTypeIdentifierHeartRate" and child.get("average"):
+                    heart_rate = number(child.get("average"))
+            except (ValueError, TypeError):
+                pass
+        elif child.tag == "WorkoutRoute":
+            ref = child.find("FileReference")
+            if ref is not None:
+                route = ref.get("path")
+    lat, lon = first_route_point(archive, base_dir, route)
+    source = elem.get("sourceName") or ""
+    return {
+        "id": "%s|%s|%s" % (elem.get("workoutActivityType"), iso(start), source),
+        "type": workout_label(elem.get("workoutActivityType")),
+        "start": iso(start), "end": iso(end), "duration": duration,
+        "distance": distance, "energy": energy, "heart_rate": heart_rate,
+        "source": source, "latitude": lat, "longitude": lon, "route": route,
+    }
+
+
+# --------------------------------------------------------------------------
+# reading the store
+# --------------------------------------------------------------------------
+
+def day_rows(db, start, end):
+    """{date: {metric: value, ..., 'sleep': {...}}} between two dates."""
+    days = {}
+    for r in db.execute("SELECT date, metric, value, source, partial FROM day "
+                        "WHERE date >= ? AND date <= ? ORDER BY date", (start, end)):
+        day = days.setdefault(r["date"], {"date": r["date"], "sources": set(), "partial": False})
+        day[r["metric"]] = round(r["value"], 2)
+        day["sources"].add(r["source"])
+        day["partial"] = day["partial"] or bool(r["partial"])
+    for r in db.execute("SELECT * FROM sleep WHERE date >= ? AND date <= ?", (start, end)):
+        day = days.setdefault(r["date"], {"date": r["date"], "sources": set(), "partial": False})
+        day["sleep"] = {k: (round(r[k], 1) if isinstance(r[k], float) else r[k])
+                        for k in ("start", "end", "asleep", "in_bed", "core", "deep", "rem", "awake", "samples")}
+        day["sources"].add(r["source"])
+    for day in days.values():
+        day["sources"] = sorted(day["sources"])
+    return days
+
+
+def describe_day(day):
+    """The lines a day's record body carries, and the plain listing shows."""
+    lines = []
+    if "steps" in day:
+        lines.append("%s steps" % format(int(round(day["steps"])), ","))
+    if "walk_run_distance" in day:
+        lines.append("walked %s" % km_mi(day["walk_run_distance"]))
+    if day.get("cycling_distance"):
+        lines.append("cycled %s" % km_mi(day["cycling_distance"]))
+    if day.get("swimming_distance"):
+        lines.append("swam %d m" % day["swimming_distance"])
+    if "active_energy" in day:
+        lines.append("%d kcal active" % day["active_energy"])
+    if "exercise_minutes" in day:
+        lines.append("%d min exercise" % day["exercise_minutes"])
+    if "stand_minutes" in day:
+        lines.append("%d min standing" % day["stand_minutes"])
+    if day.get("flights"):
+        lines.append("%d flights climbed" % day["flights"])
+    if "resting_heart_rate" in day:
+        lines.append("resting heart rate %d bpm" % day["resting_heart_rate"])
+    if "walking_heart_rate" in day:
+        lines.append("walking heart rate %d bpm" % day["walking_heart_rate"])
+    if "hrv" in day:
+        lines.append("heart rate variability %d ms" % day["hrv"])
+    if "oxygen_saturation" in day:
+        value = day["oxygen_saturation"]
+        lines.append("oxygen saturation %d%%" % (value * 100 if value <= 1 else value))
+    if "vo2_max" in day:
+        lines.append("VO2 max %.1f" % day["vo2_max"])
+    if "weight" in day:
+        lines.append("weight %.1f kg (%.1f lb)" % (day["weight"], day["weight"] / 0.453592))
+    sleep = day.get("sleep")
+    if sleep:
+        extra = ", in bed %s" % human_minutes(sleep["in_bed"]) if sleep.get("in_bed") else ""
+        stages = [("%s %s" % (name, human_minutes(sleep[k])))
+                  for k, name in (("deep", "deep"), ("core", "core"), ("rem", "REM"), ("awake", "awake"))
+                  if sleep.get(k)]
+        lines.append("slept %s%s" % (human_minutes(sleep["asleep"]), extra))
+        if stages:
+            lines.append("sleep stages: " + ", ".join(stages))
+    if day.get("partial"):
+        lines.append("day not over when written")
+    return lines
+
+
+def day_title(day):
+    bits = []
+    if "steps" in day:
+        bits.append("%s steps" % format(int(round(day["steps"])), ","))
+    if day.get("cycling_distance"):
+        bits.append("%.1f km bike" % (day["cycling_distance"] / 1000.0))
+    if day.get("sleep"):
+        bits.append("slept %s" % human_minutes(day["sleep"]["asleep"]))
+    when = dt.datetime.strptime(day["date"], "%Y-%m-%d")
+    return "%s: %s" % (when.strftime("%a %-d %b %Y"), ", ".join(bits) if bits else "health")
+
+
+def workout_rows(db, start, end):
+    rows = []
+    for r in db.execute("SELECT * FROM workout WHERE substr(start, 1, 10) >= ? "
+                        "AND substr(start, 1, 10) <= ? ORDER BY start", (start, end)):
+        rows.append({k: r[k] for k in r.keys()})
+    return rows
+
+
+def describe_workout(w):
+    lines = [w["type"]]
+    if w["duration"]:
+        lines.append("%s" % human_minutes(w["duration"] / 60.0))
+    if w["distance"]:
+        lines.append(km_mi(w["distance"]))
+    if w["energy"]:
+        lines.append("%d kcal" % w["energy"])
+    if w["heart_rate"]:
+        lines.append("average heart rate %d bpm" % w["heart_rate"])
+    if w["source"]:
+        lines.append("recorded by %s" % w["source"])
+    return lines
+
+
+def workout_title(w):
+    bits = [w["type"]]
+    if w["duration"]:
+        bits.append(human_minutes(w["duration"] / 60.0))
+    if w["distance"]:
+        bits.append("%.1f km" % (w["distance"] / 1000.0))
+    return ", ".join(bits)
+
+
+def date_window(opts, default_days):
+    today = dt.date.today()
+    if getattr(opts, "from_", None):
+        start = opts.from_[:10]
+    else:
+        start = (today - dt.timedelta(days=opts.since if opts.since is not None else default_days)).isoformat()
+    end = opts.to[:10] if getattr(opts, "to", None) else today.isoformat()
+    return start, end
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+def cmd_manifest(opts):
+    print(json.dumps(MANIFEST, indent=2))
+
+
+def cmd_status(opts):
+    """What is on disk, and what the store holds. Never writes."""
+    report = {"tool": NAME, "hosts": [], "usable": False, "status": "unconfigured",
+              "advice": None, "folders": folders(opts), "store": store_path()}
+    present = [f for f in report["folders"] if os.path.isdir(f)]
+    files = daily_files(opts)
+    report["daily_files"] = len(files)
+    report["newest_daily_file"] = os.path.basename(files[-1]) if files else None
+    if os.path.isfile(store_path()):
+        db = sqlite3.connect(store_path())
+        db.row_factory = sqlite3.Row
+        try:
+            row = db.execute("SELECT count(DISTINCT date) AS days, min(date) AS first, max(date) AS last FROM day").fetchone()
+            report["days"] = row["days"]
+            report["first_day"] = row["first"]
+            report["last_day"] = row["last"]
+            report["workouts"] = db.execute("SELECT count(*) FROM workout").fetchone()[0]
+            report["nights"] = db.execute("SELECT count(*) FROM sleep").fetchone()[0]
+            report["exports"] = [r["path"] for r in db.execute("SELECT path FROM file WHERE kind = 'export'")]
+        except sqlite3.DatabaseError:
+            report["days"] = 0
+        db.close()
+    else:
+        report["days"] = 0
+    if files or report["days"]:
+        report["status"] = "ok"
+        report["usable"] = True
+        if not files and not report.get("exports"):
+            report["status"] = "ok"
+    if not files:
+        report["advice"] = ("no daily file yet. Install the shortcut (apple health shortcut) and "
+                            "run it on the iPhone; it saves into iCloud Drive/%s. "
+                            "For the history, apple health import export.zip." % "apple-tools/health")
+        if not report["days"]:
+            report["status"] = "unconfigured"
+            report["usable"] = False
+    if opts.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print("health: %s" % report["status"])
+        print("  folders: %s" % ", ".join(present or report["folders"]))
+        print("  daily files: %d%s" % (len(files), " (newest %s)" % report["newest_daily_file"] if files else ""))
+        print("  store: %d days, %d nights, %d workouts%s" % (
+            report.get("days", 0), report.get("nights", 0), report.get("workouts", 0),
+            " (%s – %s)" % (report["first_day"], report["last_day"]) if report.get("first_day") else ""))
+        if report["advice"]:
+            print("  %s" % report["advice"])
+    sys.exit(0 if report["usable"] or opts.json else 1)
+
+
+def cmd_import(opts):
+    db = open_store()
+    try:
+        report = import_export(db, opts.path, opts)
+    except (OSError, ValueError, zipfile.BadZipFile, ET.ParseError) as error:
+        die("%s: %s" % (opts.path, error), 65)
+    if opts.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print("read %s records from %s" % (format(report["records"], ","), report["member"]))
+        print("  days: %d written, %d kept from the shortcut" % (report["days_written"], report["days_kept_from_shortcut"]))
+        print("  nights: %d" % report["nights"])
+        print("  workouts: %d" % report["workouts"])
+        for line in report["skipped_units"]:
+            print("  ⚠️  skipped %s" % line)
+
+
+def cmd_sync(opts):
+    db = open_store()
+    report = sync(db, opts, quiet=opts.json)
+    if opts.json:
+        print(json.dumps(report, indent=2))
+        return
+    if not report["files"]:
+        print("nothing new in %s" % ", ".join(report["folders"]))
+    for f in report["files"]:
+        print("read %s: %d days (%s – %s), %d nights" % (
+            os.path.basename(f["path"]), f["days"], f["first"], f["last"], f["nights"]))
+
+
+def cmd_days(opts):
+    db = open_store()
+    sync(db, opts, quiet=True)
+    start, end = date_window(opts, 14)
+    days = day_rows(db, start, end)
+    if opts.json:
+        print(json.dumps([days[d] for d in sorted(days)], indent=2))
+        return
+    if not days:
+        print("no days between %s and %s" % (start, end))
+        return
+    for date in sorted(days):
+        day = days[date]
+        print("%s  %s" % (date, "; ".join(describe_day(day))))
+
+
+def cmd_workouts(opts):
+    db = open_store()
+    start, end = date_window(opts, 90)
+    rows = workout_rows(db, start, end)
+    if opts.type:
+        rows = [w for w in rows if opts.type.lower() in w["type"].lower()]
+    if opts.json:
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("no workouts between %s and %s%s" % (
+            start, end, "" if db.execute("SELECT count(*) FROM workout").fetchone()[0]
+            else " — workouts come only from the export archive: apple health import export.zip"))
+        return
+    total_m = sum(w["distance"] or 0 for w in rows)
+    for w in rows:
+        when = parse_when(w["start"])
+        print("%s  %-28s %s" % (when.strftime("%Y-%m-%d %H:%M") if when else "?",
+                                w["type"], "  ".join(describe_workout(w)[1:3])))
+    if total_m:
+        print("%d workouts, %s" % (len(rows), km_mi(total_m)))
+
+
+def cmd_shortcut(opts):
+    """Copy the signed shortcut somewhere the user can open it from the
+    phone. The file ships beside this plugin."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    source = os.path.join(here, SHORTCUT_NAME + ".shortcut")
+    if not os.path.isfile(source):
+        die("the shortcut file is not beside this plugin: %s" % source, 66)
+    target_dir = os.path.expanduser(opts.to) if opts.to else os.path.join(ICLOUD, "apple-tools")
+    os.makedirs(target_dir, exist_ok=True)
+    target = os.path.join(target_dir, SHORTCUT_NAME + ".shortcut")
+    shutil.copyfile(source, target)
+    if opts.json:
+        print(json.dumps({"path": target}))
+        return
+    print("copied to %s" % target)
+    print("On the iPhone: open Files → iCloud Drive → apple-tools, tap the file, tap Add Shortcut.")
+    print("Then run it. It saves health-<date>.txt into iCloud Drive/apple-tools/health.")
+
+
+def _epoch_noon(date):
+    """Noon, this Mac's zone, so the day survives `_local_day` in either
+    direction of a zone change."""
+    return dt.datetime.strptime(date + " 12:00", "%Y-%m-%d %H:%M").timestamp()
+
+
+def cmd_index(opts):
+    """NDJSON records for apple-index: one per day, one per workout."""
+    db = open_store()
+    sync(db, opts, quiet=True)
+    out = sys.stdout
+    start = "0000-00-00"
+    if opts.since is not None:
+        start = (dt.date.today() - dt.timedelta(days=opts.since)).isoformat()
+    end = "9999-99-99"
+    days = day_rows(db, start, end)
+    for date in sorted(days):
+        day = days[date]
+        lines = describe_day(day)
+        out.write(json.dumps({
+            "uid": "health:day:%s" % date,
+            "tool": NAME, "kind": "day", "native_id": date, "url": None,
+            "title": day_title(day),
+            "container": date[:4],
+            "created": None, "modified": None,
+            "occurred": _epoch_noon(date),
+            "latitude": None, "longitude": None,
+            "people": [],
+            "body": "\n".join(lines),
+            "rev": "|".join("%s=%s" % (k, day[k]) for k in sorted(day) if k not in ("date", "sources")),
+        }) + "\n")
+    for w in workout_rows(db, start, end):
+        when = parse_when(w["start"])
+        lines = describe_workout(w)
+        out.write(json.dumps({
+            "uid": "health:workout:%s" % re.sub(r"[^A-Za-z0-9|:+-]", "", w["id"]),
+            "tool": NAME, "kind": "workout", "native_id": w["id"], "url": None,
+            "title": workout_title(w),
+            "container": w["start"][:4],
+            "created": None, "modified": None,
+            "occurred": when.timestamp() if when else None,
+            "latitude": w["latitude"], "longitude": w["longitude"],
+            "people": [],
+            "body": "\n".join(lines),
+            "rev": "%s|%s|%s|%s" % (w["end"], w["duration"], w["distance"], w["energy"]),
+        }) + "\n")
+    out.flush()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="apple health", description=__doc__.split("\n\n")[0])
+    parser.add_argument("--version", action="version", version="apple-plugin-health %s" % VERSION)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--folder", help="where the daily files are; overrides the configured one")
+    common.add_argument("--json", action="store_true")
+    ranged = argparse.ArgumentParser(add_help=False)
+    ranged.add_argument("--since", type=int, metavar="DAYS")
+    ranged.add_argument("--from", dest="from_", metavar="DATE")
+    ranged.add_argument("--to", metavar="DATE")
+
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("manifest", parents=[common]).set_defaults(func=cmd_manifest)
+    sub.add_parser("status", parents=[common]).set_defaults(func=cmd_status)
+
+    p = sub.add_parser("import", parents=[common], help="read a Health export archive")
+    p.add_argument("path", help="export.zip, export.xml, or the unzipped folder")
+    p.set_defaults(func=cmd_import)
+
+    p = sub.add_parser("sync", parents=[common], help="read new daily files from the shortcut")
+    p.set_defaults(func=cmd_sync)
+
+    p = sub.add_parser("days", parents=[common, ranged], help="one line per day")
+    p.set_defaults(func=cmd_days)
+
+    p = sub.add_parser("workouts", parents=[common, ranged], help="workouts from the export")
+    p.add_argument("--type", help="only workouts whose type contains this")
+    p.set_defaults(func=cmd_workouts)
+
+    p = sub.add_parser("shortcut", parents=[common], help="put the iPhone shortcut where you can install it")
+    p.add_argument("--to", help="directory; default iCloud Drive/apple-tools")
+    p.set_defaults(func=cmd_shortcut)
+
+    p = sub.add_parser("index", parents=[common, ranged], help="NDJSON records for apple-index")
+    p.add_argument("--full", action="store_true", help="accepted; index always emits everything")
+    p.set_defaults(func=cmd_index)
+
+    opts = parser.parse_args(argv)
+    if not opts.command:
+        parser.print_help()
+        return 0
+    opts.func(opts)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

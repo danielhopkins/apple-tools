@@ -22,7 +22,9 @@ sync service, no API keys.
    reads a self-hosted location server. It runs only after `apple plugins
    enable <name>`, and one that makes a connection has to declare its hosts
    in its manifest, which `apple plugins list` and `apple status` print.
-   Nothing in this repo enables one. See the Plugins section.
+   Nothing in this repo enables one. The second, `health`, declares no
+   host: it reads files an iPhone puts in iCloud Drive. See the Plugins
+   section.
 
 ## Quick reference
 
@@ -102,6 +104,10 @@ installed via `make install`.
 | Turn one on | `apple plugins config dawarich url=… api_key=…` then `apple plugins enable dawarich` |
 | How long was I at a place (Dawarich) | `apple dawarich visits --since 30 --json` → `duration_seconds` |
 | Where was I at three (Dawarich) | `apple dawarich points --from "2026-09-10 14:00" --to "2026-09-10 16:00" --json` |
+| Steps, sleep, heart rate by day (Health) | `apple health days --since 14 --json` |
+| How far did I bike (Health) | `apple health workouts --since 90 --type cycling --json` |
+| Get the iPhone half of Health | `apple health shortcut` then run it on the phone |
+| Load the Health history | `apple health import ~/Downloads/export.zip` |
 
 **Every tool supports `--json`.** Prefer it — the plain output is for humans and
 its shape is not stable. Use `apple --which` to see which binary each name
@@ -1725,6 +1731,59 @@ What it adds over `apple maps`, and the traps:
   asks on first use now that it carries `NSLocalNetworkUsageDescription`.
   `apple dawarich status` in a terminal cannot see the app's state.
 
+### health — `apple health`
+
+🛑 **There is no Health data on a Mac** — HealthKit refuses every call, no
+signing changes it, no local store exists
+([`docs/apple-health.md`](docs/apple-health.md)). So this plugin reads two
+files the **iPhone** puts in iCloud Drive, keeps them in its own SQLite
+store, and makes no connection at all. Python, stdlib only, in
+`plugins/health/`; tested offline by `plugins/health/test-health.py`.
+
+```
+apple health shortcut [--to DIR]       # the signed iPhone shortcut, into iCloud Drive
+apple health import export.zip         # the Health export archive: history + workouts
+apple health sync [--json]             # read new daily files the shortcut wrote
+apple health days [--since DAYS | --from DATE --to DATE] [--json]
+apple health workouts [--since DAYS | --from DATE --to DATE] [--type TEXT] [--json]
+apple health status [--json]
+apple health index [--since DAYS]      # what apple-index calls; runs sync first
+```
+
+- 🛑 **The daily file comes from a shortcut the USER runs on the phone.**
+  `plugins/health/build-shortcut.py` builds and signs "Apple Tools Health
+  Export"; it reads Health's own daily totals for 14 types plus raw Sleep
+  samples for the last 8 days and saves `health-<date>.txt` into iCloud
+  Drive → `apple-tools/health/`. Nothing on a Mac can trigger it. The
+  serialization was read out of a real iOS export and the iOS 27 ActionKit
+  binary in the simulator runtime, never run here — the doc says what was
+  and was not measured.
+- 🛑 **No shortcut can read WORKOUTS.** The Shortcuts health sample wraps a
+  quantity or a category sample and nothing else; the picker has no
+  Workouts row (list read in full from the binary). Workouts come only from
+  the export archive: Health → profile → Export All Health Data → AirDrop
+  `export.zip` → `apple health import`. `workouts` says so when the store
+  has none.
+- 🛑 **A day's steps in the export are NOT the sum of its step records.**
+  The iPhone and the Watch both count the same walk. `import` sums per
+  source per day and takes the largest source; the shortcut's number is
+  Health's own total and always wins for a day it covers.
+- **A night belongs to the morning.** A sleep sample is filed under the
+  date of its end shifted six hours forward — Health's 18:00-to-18:00 sleep
+  day — so a stage ending at 23:10 joins the night that ends at 06:30.
+  `asleep` is every asleep stage together; `in_bed` and `awake` sit beside
+  it. The export keeps one source per night, the one with the most sleep.
+- ⚠️ **Units follow the phone.** `mi` here, `km` elsewhere; the plugin
+  stores metres, kcal, minutes, bpm, ms and kg, and a unit it does not know
+  fails the line naming it. A number arrives in the phone's locale
+  (`8,412`) and commas are stripped.
+- ⚠️ **Today is partial** until tomorrow's file replaces it; the record
+  body says "day not over when written". `sync` names every type a file
+  carried no line for, which is how a wrong picker label shows up on the Mac.
+- **Index kinds are `day` and `workout`**, never `place`, so `places` and
+  `whereabouts` do not read it. A workout carries its route's first point
+  as a coordinate; nothing joins it to a place yet.
+
 ## Layout
 
 ```
@@ -1734,6 +1793,11 @@ bin/apple-plugins         the plugin manager: discovery, enable/disable,
                           config, and the Keychain for secrets
 plugins/dawarich/         the first plugin, and the reference for the
                           contract. Python, stdlib only
+plugins/health/           the second: reads the files an iPhone shortcut and
+                          the Health export write, keeps its own store.
+                          build-shortcut.py makes the signed .shortcut that
+                          ships beside it — 🛑 the only Health data a Mac
+                          ever sees is what the phone writes to iCloud Drive
 swift/                    one Swift package, seven binaries
   Sources/reminders/      + RemindersLibrary/ (+ Tags.swift, the tag read/write
                           face and the per-listing tag cache)
@@ -1840,7 +1904,7 @@ tool you are changing before you change it — every claim in there was paid for
 | `apple-calendar-caldav-403.md` | the two ways a calendar write reports success and never reaches the server. Neither is reproducible on demand |
 | `apple-contacts-writes.md` | the note wall, the group/account rules, the `--url` split, the address parser, deaths, and relation inverses |
 | `apple-contacts-move.md` | no public API changes a contact's container; the private call that lies, the one that works, and what a move costs |
-| `apple-health.md` | 🛑 there is no Health data on a Mac: what was measured, why signing does not help, and the four routes off the iPhone |
+| `apple-health.md` | 🛑 there is no Health data on a Mac: what was measured, why signing does not help, the four routes off the iPhone, and the two the `health` plugin built — how the shortcut's serialization was read out of the iOS binary, why workouts are export-only, and the per-source step rule |
 | `apple-findmy.md` | 🛑 nothing reads Find My, and people are the hardest half: the encrypted caches, the empty App Intents bundle, the four ungrantable entitlements |
 | `prior-art.md` | other projects solving this; check before building |
 | `todo-deep-links.md` | planned: a `url` on every entity, so anything we name can be opened and cross-linked |

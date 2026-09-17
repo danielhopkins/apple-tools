@@ -223,7 +223,7 @@ dist: set-version completions
 	@# user's decision, and the first plugin here talks to a server.
 	mkdir -p $(DIST)/plugins
 	cp -R plugins/* $(DIST)/plugins/
-	rm -f $(DIST)/plugins/*/test-*.py
+	rm -f $(DIST)/plugins/*/test-*.py $(DIST)/plugins/*/*.unsigned.shortcut
 	@# Prove each shipped plugin answers the contract from where it landed.
 	@for plugin in $(DIST)/plugins/*/apple-plugin-*; do \
 		PYTHONDONTWRITEBYTECODE=1 "$$plugin" manifest --json >/dev/null \

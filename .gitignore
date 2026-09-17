@@ -26,3 +26,4 @@ app/AppleTools.xcodeproj/
 app/build/
 app/Info.plist
 app/AppleTools.entitlements
+plugins/health/*.unsigned.shortcut

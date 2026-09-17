@@ -283,6 +283,42 @@ The plugin is Python, stdlib only, on `/usr/bin/python3`, like `apple-notes`.
 manager against a temp config and temp Keychain file. Nothing in it reaches
 the network or the user's configuration.
 
+## Health, the second plugin
+
+The first plugin exists because data lives on a server; the second because
+it lives on a phone. 🛑 **There is no Health data on a Mac** — HealthKit
+refuses every call, and no signing changes it
+([`apple-health.md`](apple-health.md)) — so `apple-plugin-health` reads two
+files the iPhone puts in iCloud Drive, and nothing else:
+
+- **A daily file**, written by the shortcut `plugins/health/build-shortcut.py`
+  builds. One line per day per type, Health's own daily totals, for the last
+  eight days. The user runs it on the phone; nothing on a Mac can trigger it.
+- **The export archive**, `export.zip`, made by hand in the Health app. Every
+  record ever, and the workouts.
+
+It declares no hosts, so `apple plugins list` prints no network line and
+`apple status` shows it as local. It is the reference for a plugin that keeps
+its own store: `~/Library/Application Support/apple-tools/health/health.sqlite`,
+so a 2 GB export is streamed once and `index` reads rows.
+
+Three things the second plugin settled that the first did not exercise:
+
+- **A plugin with no required config.** `folder` is optional and defaults
+  to the two places Save File has been seen to write. `enable` needs nothing
+  set first.
+- **A plugin whose records have no place.** Its kinds are `day` and
+  `workout`, never `place`, so `merged_places` and `whereabouts` leave it
+  alone: `plugin_tools` there is "tools with a `place` record". A workout
+  carries the first point of its GPX route as a coordinate, and nothing reads
+  it yet.
+- **`refresh_args` of `["--full"]` alone.** The store is local, a full run
+  costs 0.2 s, and today's totals change until tomorrow's file arrives, so a
+  reconcile every refresh is the right default.
+
+What the shortcut can and cannot read, and how its serialization was found,
+is in [`apple-health.md`](apple-health.md).
+
 ## Writing one
 
 1. Make `apple-plugin-<name>` executable and answer `manifest --json`.
@@ -296,7 +332,8 @@ the network or the user's configuration.
    enable <name>` → `apple-index ingest --source <name>`.
 
 `lab/test-plugins.py` is the reference for what the adapter accepts;
-`plugins/dawarich/` is the reference for the rest.
+`plugins/dawarich/` is the reference for a plugin that talks to a server,
+`plugins/health/` for one that reads files and keeps its own store.
 
 ## Not done
 
