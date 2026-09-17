@@ -6,7 +6,7 @@ its own iCloud container. The Mac plugin, `../apple-plugin-health`, reads
 them from
 
 ```
-~/Library/Mobile Documents/iCloud~com~boulderhopkins~apple-tools-health/Documents/health/
+~/Library/Mobile Documents/iCloud~com~boulderhopkins~apple-tools~health/Documents/health/
 ```
 
 Nothing here talks to anything but Health and iCloud Drive. It never writes

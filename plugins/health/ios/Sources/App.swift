@@ -111,7 +111,7 @@ struct ContentView: View {
                 } header: {
                     Text("Files go to")
                 } footer: {
-                    Text("On the Mac: ~/Library/Mobile Documents/iCloud~com~boulderhopkins~apple-tools-health/Documents/health, which `apple health sync` reads.")
+                    Text("On the Mac: ~/Library/Mobile Documents/iCloud~com~boulderhopkins~apple-tools~health/Documents/health, which `apple health sync` reads.")
                 }
 
                 Section {

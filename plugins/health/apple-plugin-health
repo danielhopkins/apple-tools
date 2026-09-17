@@ -54,7 +54,7 @@ ICLOUD = os.path.join(HOME, "Library", "Mobile Documents", "com~apple~CloudDocs"
 # seen to write (iCloud Drive's root on some iOS versions, its `Shortcuts`
 # folder on others). All three are read.
 APP_CONTAINER = os.path.join(HOME, "Library", "Mobile Documents",
-                             "iCloud~com~boulderhopkins~apple-tools-health", "Documents", "health")
+                             "iCloud~com~boulderhopkins~apple-tools~health", "Documents", "health")
 DEFAULT_FOLDERS = [APP_CONTAINER,
                    os.path.join(ICLOUD, "apple-tools", "health"),
                    os.path.join(ICLOUD, "Shortcuts", "apple-tools", "health")]
@@ -352,6 +352,7 @@ def read_daily(path):
     if version != FORMAT_VERSION:
         raise ValueError("format %s; this plugin reads %s" % (version, FORMAT_VERSION))
     generated = None
+    window = None
     days = {}
     sleep = []
     workouts = []
@@ -366,6 +367,7 @@ def read_daily(path):
             generated = parse_when(parts[1]) if len(parts) > 1 else None
             continue
         if head == "window":
+            window = number(parts[1]) if len(parts) > 1 else None
             continue
         if head == "source":
             continue
@@ -419,10 +421,12 @@ def read_daily(path):
     # no data for, or one whose label the shortcut got wrong — the editor
     # shows an empty Type, and the run produces nothing for it. Named, so a
     # wrong label is visible on the Mac.
+    # Only for a short window: a year file from 2015 has no cycling, no
+    # Watch and no sleep, and that is history, not a wrong label.
     absent = [label for _, label, _, _, _ in METRICS if label not in seen]
     if "Sleep" not in seen:
         absent.append("Sleep")
-    if absent:
+    if absent and (window is None or window <= 31):
         problems.append("no lines for: %s" % ", ".join(absent))
     return days, sleep, workouts, generated, problems
 

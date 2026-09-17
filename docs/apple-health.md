@@ -116,7 +116,7 @@ half of the plugin; the routes below are what it replaced or kept.
   daily totals, `HKSampleQuery` gives sleep stages and workouts,
   `HKWorkoutRouteQuery` gives a route's first point.
 - **It writes into its own iCloud container**, a fixed path on the Mac
-  (`iCloud~com~boulderhopkins~apple-tools-health/Documents/health/`), where
+  (`iCloud~com~boulderhopkins~apple-tools~health/Documents/health/`), where
   the shortcut's Save File could land in two places or, measured
   2026-09-17, nowhere visible.
 - **It keeps a log** in the app and in `log.txt` beside the files, which is
