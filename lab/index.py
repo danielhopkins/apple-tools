@@ -4641,6 +4641,19 @@ def merged_places(db):
     for tool in plugin_tools:
         plugin_counts[tool + "_visits"] = (tool, count_by_spot(tool, "visit"))
         plugin_counts[tool + "_suggested"] = (tool, count_by_spot(tool, "suggested"))
+    # A tool with located workouts (health) gets `<tool>_workouts`: the
+    # workouts that STARTED at the place, off the route's first point. A
+    # fourth unit beside days, arrivals and stays, and it is never added to
+    # them. A workout makes no place of its own; it counts at places the
+    # other sources know.
+    # ⚠️ Counted AFTER the merge, within 250 m, not by grid cell: a ride's
+    # first GPS fix is in the driveway or down the street, one cell over
+    # from the house, and a cell-keyed count put 0 workouts at a home that
+    # hundreds of rides start from.
+    workout_tools = [row["tool"] for row in db.execute(
+        "SELECT DISTINCT tool FROM record WHERE kind = 'workout' AND latitude IS NOT NULL")]
+    for tool in workout_tools:
+        plugin_counts[tool + "_workouts"] = (tool, {})
 
     addresses = contact_addresses(_me_handles(db))
     places = []
@@ -4750,6 +4763,28 @@ def merged_places(db):
                 break
         else:
             merged.append(spot)
+
+    if workout_tools:
+        grid = {}
+        for spot in merged:
+            grid.setdefault((round(spot["latitude"], 2), round(spot["longitude"], 2)), []).append(spot)
+        marks = ",".join("?" * len(workout_tools))
+        for row in db.execute(
+                "SELECT tool, latitude, longitude FROM record "
+                " WHERE kind = 'workout' AND latitude IS NOT NULL AND tool IN (%s)" % marks,
+                workout_tools):
+            best, best_d = None, 250.0
+            for dlat in (-0.01, 0.0, 0.01):
+                for dlon in (-0.01, 0.0, 0.01):
+                    for spot in grid.get((round(row["latitude"] + dlat, 2),
+                                          round(row["longitude"] + dlon, 2)), []):
+                        d = photos_metres({"latitude": row["latitude"], "longitude": row["longitude"]}, spot)
+                        if d < best_d:
+                            best, best_d = spot, d
+            if best is not None:
+                best[row["tool"] + "_workouts"] += 1
+                if row["tool"] not in best["sources"]:
+                    best["sources"].append(row["tool"])
     return merged, plugin_tools, weight
 
 
@@ -4826,6 +4861,7 @@ def cmd_places(opts):
 
 STAY_RE = re.compile(r"stayed (?:(\d+)d )?(?:(\d+)h )?(?:(\d+)m)?")
 CONFIDENCE_RE = re.compile(r"confidence (\d+)")
+WORKOUT_LEN_RE = re.compile(r"^(?:(\d+)h )?(\d+)m$", re.M)
 
 # 🛑 THESE WEIGHTS ARE ASSUMPTIONS, AND EVERY REPORT PRINTS THEM. No source
 # here is ground truth, so nothing can measure how often a source is RIGHT;
@@ -4844,6 +4880,8 @@ BELIEF_WEIGHT = {
     "calendar": 0.20,        # a plan
     "calendar_kept": 0.45,   # a plan with the user's GPS at the place within 3 h
     "overlap": 0.30,         # two GPS-or-photo sources within 3 h of each other
+    "workout": 0.90,         # a workout the user's own watch recorded with a
+                             # GPS route: the route's first point, at a time
 }
 # A dawarich stay is worth up to this, scaled by the server's own confidence
 # (0-100; 42-62 on real stays here) and by how long the stay was: a 5-minute
@@ -4908,7 +4946,11 @@ def _belief(evidence, plugin_tools):
     weights = {}
     windows = {}          # source -> [(start, end)] for the overlap test
     for source, ev in evidence.items():
-        if source in plugin_tools:
+        if ev.get("workouts"):
+            # A workout tool (health). Several workouts at one place on one
+            # day are ONE source, like stays.
+            weights[source] = BELIEF_WEIGHT["workout"]
+        elif source in plugin_tools:
             stays = ev.get("stays") or []
             weights[source] = max((s["weight"] for s in stays), default=0.0)
         elif source == "maps":
@@ -4989,12 +5031,20 @@ def cmd_whereabouts(opts):
                         best, best_d = spot, d
         return best
 
-    located_tools = ["maps", "photos", "calendar"] + plugin_tools
+    # 🛑 A WORKOUT WITH A ROUTE IS PRESENCE FROM THE USER'S OWN WRIST. The
+    # health plugin indexes one record per workout, with the route's first
+    # point as its coordinate; a ride that starts at home puts the user at
+    # home at 07:24 with nothing else needed. Any tool with `workout`
+    # records is read, and it counts as a presence source beside maps and
+    # the stays.
+    workout_tools = [r["tool"] for r in db.execute(
+        "SELECT DISTINCT tool FROM record WHERE kind = 'workout' AND latitude IS NOT NULL")]
+    located_tools = ["maps", "photos", "calendar"] + plugin_tools + workout_tools
     marks = ",".join("?" * len(located_tools))
     rows = db.execute(
         "SELECT tool, kind, title, body, people, occurred, latitude, longitude "
         "  FROM record WHERE occurred >= ? AND occurred < ? "
-        "   AND tool IN (%s) AND kind IN ('visit','suggested','day','event') "
+        "   AND tool IN (%s) AND kind IN ('visit','suggested','day','event','workout') "
         " ORDER BY occurred" % marks, [start, end] + located_tools).fetchall()
 
     me = _me_handles(db)
@@ -5053,6 +5103,13 @@ def cmd_whereabouts(opts):
                                                "_start": row["occurred"]})
             ev.setdefault("_times", []).append((row["occurred"],
                                                 row["occurred"] + 60 * (minutes or 0)))
+        elif row["kind"] == "workout":
+            # The body's own line for the length ("1h 02m" or "45m"), so the
+            # overlap window covers the whole workout.
+            match = WORKOUT_LEN_RE.search(row["body"] or "")
+            minutes = (int(match.group(1) or 0) * 60 + int(match.group(2))) if match else 0
+            ev.setdefault("workouts", []).append({"at": when, "title": row["title"]})
+            ev.setdefault("_times", []).append((row["occurred"], row["occurred"] + 60 * minutes))
         elif source == "maps":
             ev.setdefault("arrivals", []).append(when)
             ev.setdefault("_times", []).append((row["occurred"], row["occurred"]))
@@ -5216,7 +5273,10 @@ def cmd_whereabouts(opts):
             order = ["maps"] + plugin_tools + ["photos", "calendar"]
             for source in sorted(p["sources"], key=lambda t: order.index(t) if t in order else 99):
                 ev = p["evidence"][source]
-                if source in plugin_tools:
+                if ev.get("workouts"):
+                    bits.append("%s " % source + "; ".join(
+                        "%s %s" % (w["at"], w["title"]) for w in ev["workouts"][:2]))
+                elif source in plugin_tools:
                     mins = ev.get("minutes")
                     bits.append("%s %d stay%s%s" % (source, ev["count"], "" if ev["count"] == 1 else "s",
                                                    " (%s)" % human_minutes(mins) if mins else ""))

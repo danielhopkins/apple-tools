@@ -35,6 +35,12 @@ targets:
           workout data to write it into a text file in your own iCloud Drive,
           where the apple-tools index on your Mac reads it. Nothing is sent
           anywhere else.
+        NSHealthClinicalHealthRecordsShareUsageDescription: >-
+          AppleTools Health reads your clinical records — lab results,
+          immunizations, medications, conditions, allergies and procedures —
+          to write them into a text file in your own iCloud Drive, where the
+          apple-tools index on your Mac reads them. Nothing is sent anywhere
+          else.
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
@@ -52,7 +58,8 @@ targets:
       path: AppleToolsHealth.entitlements
       properties:
         com.apple.developer.healthkit: true
-        com.apple.developer.healthkit.access: []
+        com.apple.developer.healthkit.access:
+          - health-records
         com.apple.developer.healthkit.background-delivery: true
         com.apple.developer.icloud-container-identifiers:
           - iCloud.com.boulderhopkins.apple-tools.health

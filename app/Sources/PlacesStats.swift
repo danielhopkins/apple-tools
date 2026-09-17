@@ -48,6 +48,10 @@ struct Place: Identifiable, Equatable {
     /// `<plugin>_suggested`; only the plugins the index holds appear.
     let pluginVisits: [String: Int]
     let pluginSuggested: [String: Int]
+    /// Workouts that STARTED within 250 m, off the route's first point, from
+    /// a plugin with located workouts (health). A fifth unit: a ride from
+    /// home is neither a day, an arrival nor a stay.
+    let pluginWorkouts: [String: Int]
     let first: Date?
     let last: Date?
 
@@ -138,12 +142,15 @@ enum PlacesReader {
                   let lon = $0["longitude"] as? Double else { return nil }
             var pluginVisits: [String: Int] = [:]
             var pluginSuggested: [String: Int] = [:]
+            var pluginWorkouts: [String: Int] = [:]
             for (key, value) in $0 {
                 guard let n = value as? Int, key != "visits" else { continue }
                 if key.hasSuffix("_visits") {
                     pluginVisits[String(key.dropLast("_visits".count))] = n
                 } else if key.hasSuffix("_suggested") {
                     pluginSuggested[String(key.dropLast("_suggested".count))] = n
+                } else if key.hasSuffix("_workouts") {
+                    pluginWorkouts[String(key.dropLast("_workouts".count))] = n
                 }
             }
             return Place(
@@ -160,6 +167,7 @@ enum PlacesReader {
                 photoDaysShared: $0["photo_days_shared"] as? Int ?? 0,
                 visits: $0["visits"] as? Int ?? 0,
                 pluginVisits: pluginVisits, pluginSuggested: pluginSuggested,
+                pluginWorkouts: pluginWorkouts,
                 first: date($0["first"]), last: date($0["last"]))
         }
         stats.loaded = true

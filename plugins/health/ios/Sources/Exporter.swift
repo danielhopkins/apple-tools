@@ -18,6 +18,8 @@ struct ExportReport {
     var days = 0
     var sleepSamples = 0
     var workouts = 0
+    var raw = 0
+    var clinical = 0
     var files: [String] = []
 }
 
@@ -40,6 +42,8 @@ final class Exporter: ObservableObject {
         set.insert(HKWorkoutType.workoutType())
         set.insert(HKSeriesType.workoutRoute())
         set.insert(HKQuantityType(.heartRate))
+        for r in RawType.all { set.insert(HKQuantityType(r.type)) }
+        for c in clinicalTypes { set.insert(HKClinicalType(c)) }
         return set
     }()
 
@@ -79,16 +83,24 @@ final class Exporter: ObservableObject {
         for year in firstYear...thisYear {
             let start = Calendar.current.date(from: DateComponents(year: year, month: 1, day: 1))!
             let end = Calendar.current.date(from: DateComponents(year: year + 1, month: 1, day: 1))!
-            if let report = await export(from: start, to: min(end, Date().addingTimeInterval(86400)),
-                                         window: 366, fileName: "health-\(year).txt") {
+            let until = min(end, Date().addingTimeInterval(86400))
+            if let report = await export(from: start, to: until, window: 366, fileName: "health-\(year).txt") {
                 total.days += report.days
                 total.sleepSamples += report.sleepSamples
                 total.workouts += report.workouts
                 total.files += report.files
             }
+            if let report = await exportRaw(from: start, to: until, window: 366, fileName: "raw-\(year).txt") {
+                total.raw += report.raw
+                total.files += report.files
+            }
+        }
+        if let report = await exportClinical() {
+            total.clinical += report.clinical
+            total.files += report.files
         }
         lastReport = total
-        log.add("full export done: \(total.days) day rows, \(total.sleepSamples) sleep samples, \(total.workouts) workouts, \(total.files.count) files")
+        log.add("full export done: \(total.days) day rows, \(total.sleepSamples) sleep samples, \(total.workouts) workouts, \(total.raw) raw samples, \(total.clinical) clinical records, \(total.files.count) files")
         markRun()
     }
 
@@ -97,11 +109,19 @@ final class Exporter: ObservableObject {
         running = true
         defer { running = false }
         log.add("export \(name): \(Format.days.string(from: start)) to \(Format.days.string(from: end))")
-        if let report = await export(from: start, to: end, window: window, fileName: fileName) {
-            lastReport = report
-            log.add("wrote \(fileName): \(report.days) day rows, \(report.sleepSamples) sleep samples, \(report.workouts) workouts")
-            markRun()
+        guard var report = await export(from: start, to: end, window: window, fileName: fileName) else { return }
+        log.add("wrote \(fileName): \(report.days) day rows, \(report.sleepSamples) sleep samples, \(report.workouts) workouts")
+        let rawName = fileName.replacingOccurrences(of: "health-", with: "raw-")
+        if let raw = await exportRaw(from: start, to: end, window: window, fileName: rawName) {
+            report.raw = raw.raw
+            report.files += raw.files
         }
+        if let clinical = await exportClinical() {
+            report.clinical = clinical.clinical
+            report.files += clinical.files
+        }
+        lastReport = report
+        markRun()
     }
 
     private func markRun() {
@@ -167,6 +187,95 @@ final class Exporter: ObservableObject {
             return nil
         }
         return report
+    }
+
+    /// Every reading of every raw type in the window, one file.
+    private func exportRaw(from start: Date, to end: Date, window: Int, fileName: String) async -> ExportReport? {
+        guard let dir = Store.container() else { return nil }
+        var text = Format.header(window: window)
+        var report = ExportReport()
+        for raw in RawType.all {
+            do {
+                let samples = try await quantitySamples(HKQuantityType(raw.type), from: start, to: end)
+                for s in samples {
+                    text += Format.raw(type: raw.type.rawValue, start: s.startDate, end: s.endDate,
+                                       value: s.quantity.doubleValue(for: raw.unit), unit: raw.unitText,
+                                       source: s.sourceRevision.source.name)
+                }
+                report.raw += samples.count
+            } catch {
+                log.add("\(raw.type.rawValue): \(error.localizedDescription)", error: true)
+            }
+        }
+        let url = dir.appendingPathComponent(fileName)
+        do {
+            try text.data(using: .utf8)!.write(to: url, options: .atomic)
+            report.files.append(fileName)
+            log.add("wrote \(fileName): \(report.raw) raw samples")
+        } catch {
+            log.add("could not write \(fileName): \(error.localizedDescription)", error: true)
+            return nil
+        }
+        return report
+    }
+
+    /// Every clinical record Health holds, all types, one file. There is no
+    /// window: the set is small and a record's date is when the provider
+    /// filed it. ⚠️ Empty when no provider is connected in the Health app,
+    /// or when the account is outside the US; the log says how many came.
+    private func exportClinical() async -> ExportReport? {
+        guard let dir = Store.container() else { return nil }
+        var text = Format.header(window: 0)
+        var report = ExportReport()
+        for type in clinicalTypes {
+            do {
+                let records = try await clinicalRecords(HKClinicalType(type))
+                for r in records {
+                    guard let fhir = r.fhirResource,
+                          let object = try? JSONSerialization.jsonObject(with: fhir.data),
+                          let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
+                          let json = String(data: data, encoding: .utf8) else { continue }
+                    text += Format.clinical(type: type.rawValue, date: r.startDate, name: r.displayName,
+                                            resourceType: fhir.resourceType.rawValue, id: fhir.identifier, json: json)
+                    report.clinical += 1
+                }
+            } catch {
+                log.add("\(type.rawValue): \(error.localizedDescription)", error: true)
+            }
+        }
+        let url = dir.appendingPathComponent("clinical.txt")
+        do {
+            try text.data(using: .utf8)!.write(to: url, options: .atomic)
+            report.files.append("clinical.txt")
+            log.add("wrote clinical.txt: \(report.clinical) clinical records")
+        } catch {
+            log.add("could not write clinical.txt: \(error.localizedDescription)", error: true)
+            return nil
+        }
+        return report
+    }
+
+    private func quantitySamples(_ type: HKQuantityType, from start: Date, to end: Date) async throws -> [HKQuantitySample] {
+        let predicate = HKQuery.predicateForSamples(withStart: start, end: end, options: [])
+        return try await withCheckedThrowingContinuation { cont in
+            let query = HKSampleQuery(sampleType: type, predicate: predicate, limit: HKObjectQueryNoLimit,
+                                      sortDescriptors: [NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)]) { _, samples, error in
+                if let error = error { cont.resume(throwing: error); return }
+                cont.resume(returning: (samples as? [HKQuantitySample]) ?? [])
+            }
+            store.execute(query)
+        }
+    }
+
+    private func clinicalRecords(_ type: HKClinicalType) async throws -> [HKClinicalRecord] {
+        try await withCheckedThrowingContinuation { cont in
+            let query = HKSampleQuery(sampleType: type, predicate: nil, limit: HKObjectQueryNoLimit,
+                                      sortDescriptors: [NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)]) { _, samples, error in
+                if let error = error { cont.resume(throwing: error); return }
+                cont.resume(returning: (samples as? [HKClinicalRecord]) ?? [])
+            }
+            store.execute(query)
+        }
     }
 
     // MARK: queries

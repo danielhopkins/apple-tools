@@ -78,7 +78,7 @@ struct ContentView: View {
                         LabeledContent("Last export", value: last.formatted(date: .abbreviated, time: .shortened))
                     }
                     if let report = exporter.lastReport {
-                        LabeledContent("Rows", value: "\(report.days) days · \(report.sleepSamples) sleep · \(report.workouts) workouts")
+                        LabeledContent("Rows", value: "\(report.days) days · \(report.sleepSamples) sleep · \(report.workouts) workouts · \(report.raw) raw · \(report.clinical) clinical")
                     }
                 }
 

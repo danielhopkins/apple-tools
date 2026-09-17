@@ -203,7 +203,30 @@ ask the plugin, never `search`:
 ```
 apple health days --since 7 --json            # steps, distance, sleep, heart rate, weight
 apple health workouts --since 90 --type cycling --json
+apple health trend steps --since 365 --by month     # "how have my steps changed this year"
+apple health trend hrv --since 90 --by week         # "how does my HRV look"
+apple health samples --type heart_rate --from 2026-09-15 --to 2026-09-15 --json
+apple health clinical --type labs --since 365       # "how did my labs look"
+apple health clinical --type vaccines               # "are my vaccines up to date"
+apple health sql "SELECT date, value FROM day WHERE metric='resting_heart_rate' ORDER BY date DESC LIMIT 30"
 ```
+
+- **`trend` is the answer to "how has X changed"**: mean, min, max and
+  the number of days per period, in the metric's unit. Say the unit and
+  the number of days behind each period; a month with 3 days is not a
+  month.
+- **`sql` answers what the commands do not.** `apple health sql --schema`
+  prints the five tables. It is read-only and refuses anything but SELECT.
+- **Vaccines: `clinical --type vaccines` lists what a connected provider
+  filed**, with the vaccine name and the date given. Whether one is "up
+  to date" is a judgement about schedules this tool does not make; list
+  the shots and their dates, and say the list is only what the provider
+  sent to Health.
+- **Labs: each record carries `value`, `reference` (the lab's own range)
+  and `interpretation` when the FHIR has them.** Report the value with
+  its range; never call a value normal or abnormal without the range.
+- **An empty `clinical` table means no provider is connected in the
+  Health app**, not that the user has no records.
 
 - 🛑 **Workouts exist only if the iPhone app exported them** (or the export
   archive was imported). If `workouts` says the store has none, say so, and

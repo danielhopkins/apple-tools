@@ -69,19 +69,24 @@ MANIFEST = {
     # No hosts. Nothing here connects anywhere; `apple plugins list` prints
     # an empty network line and `apple status` shows the plugin as local.
     "network": {"hosts": [], "writes": False},
-    "commands": ["status", "import", "sync", "days", "workouts", "log", "shortcut", "index"],
+    "commands": ["status", "import", "sync", "days", "workouts", "samples", "trend",
+                 "clinical", "sql", "log", "shortcut", "index"],
     "index": {
-        "kinds": ["day", "workout"],
+        "kinds": ["day", "workout", "lab", "immunization", "medication", "condition",
+                  "allergy", "procedure", "vital", "coverage"],
         # `index` reads its own store, so a full run costs nothing; and a
         # day's totals change when a later daily file carries the same day
         # (today is partial until tomorrow's run), so a reconcile is right.
         "refresh_args": ["--full"],
         "container_label": "By year",
         "footnote": "A record is one day's totals — steps, distance, energy, "
-                    "heart rate, sleep, weight — or one workout. Both come "
-                    "from the AppleTools Health app on the iPhone, which "
-                    "writes them into its iCloud Drive folder; the Mac "
-                    "cannot read Health itself.",
+                    "heart rate, sleep, weight — one workout, or one clinical "
+                    "record: a lab result, an immunization, a medication, a "
+                    "condition. All come from the AppleTools Health app on the "
+                    "iPhone, which writes them into its iCloud Drive folder; "
+                    "the Mac cannot read Health itself. Raw samples — every "
+                    "heart-rate reading — are in the plugin's store and not "
+                    "in the index.",
     },
     "config": [
         {"key": "folder", "required": False, "secret": False,
@@ -243,6 +248,25 @@ CREATE TABLE IF NOT EXISTS workout (
     route     TEXT,               -- the GPX path inside the archive
     file      TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS sample (
+    type     TEXT NOT NULL,       -- HealthKit identifier, HKQuantityTypeIdentifierHeartRate …
+    start    TEXT NOT NULL, "end" TEXT NOT NULL,   -- ISO with offset
+    value    REAL NOT NULL,       -- in `unit`, the canonical one the app wrote
+    unit     TEXT NOT NULL,
+    source   TEXT NOT NULL,       -- the device or app that recorded it
+    file     TEXT NOT NULL,
+    PRIMARY KEY (type, start, "end", source)
+);
+CREATE INDEX IF NOT EXISTS sample_type_start ON sample (type, start);
+CREATE TABLE IF NOT EXISTS clinical (
+    id       TEXT PRIMARY KEY,    -- the FHIR resource id, per provider
+    type     TEXT NOT NULL,       -- HKClinicalTypeIdentifierLabResultRecord …
+    date     TEXT NOT NULL,       -- ISO with offset; when the provider filed it
+    name     TEXT NOT NULL,       -- Health's display name
+    resource TEXT NOT NULL,       -- FHIR resource type: Observation, Immunization …
+    fhir     TEXT NOT NULL,       -- the FHIR resource, JSON
+    file     TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS file (
     path     TEXT PRIMARY KEY,
     mtime    REAL NOT NULL, size INTEGER NOT NULL,
@@ -356,6 +380,8 @@ def read_daily(path):
     days = {}
     sleep = []
     workouts = []
+    raw = []
+    clinical = []
     problems = []
     seen = set()
     for lineno, line in enumerate(lines[1:], 2):
@@ -375,6 +401,33 @@ def read_daily(path):
             w = parse_workout_row(parts, lineno, problems)
             if w:
                 workouts.append(w)
+            continue
+        if head == "raw":
+            if len(parts) < 7:
+                problems.append("line %d: raw row has %d fields, want 7" % (lineno, len(parts)))
+                continue
+            _, hk, start_text, end_text, value_text, unit, source = parts[:7]
+            start, end, value = parse_when(start_text), parse_when(end_text), number(value_text)
+            if start is None or end is None or value is None:
+                problems.append("line %d: raw row: bad date or value" % lineno)
+                continue
+            raw.append((hk, iso(start), iso(end), value, unit, source))
+            continue
+        if head == "clinical":
+            if len(parts) < 7:
+                problems.append("line %d: clinical row has %d fields, want 7" % (lineno, len(parts)))
+                continue
+            _, hk, date_text, name, resource, rid, fhir = parts[:7]
+            date = parse_when(date_text)
+            if date is None:
+                problems.append("line %d: clinical row: bad date %r" % (lineno, date_text))
+                continue
+            try:
+                json.loads(fhir)
+            except ValueError:
+                problems.append("line %d: clinical row: FHIR is not JSON" % lineno)
+                continue
+            clinical.append((rid or "%s|%s|%s" % (hk, iso(date), name), hk, iso(date), name, resource, fhir))
             continue
         if head not in ("day", "sample"):
             problems.append("line %d: unknown row %r" % (lineno, head))
@@ -426,9 +479,11 @@ def read_daily(path):
     absent = [label for _, label, _, _, _ in METRICS if label not in seen]
     if "Sleep" not in seen:
         absent.append("Sleep")
-    if absent and (window is None or window <= 31):
+    # A raw or clinical file carries no day rows at all, and that is its shape.
+    if absent and (window is None or window <= 31) and not raw and not clinical:
         problems.append("no lines for: %s" % ", ".join(absent))
-    return days, sleep, workouts, generated, problems
+    return {"days": days, "sleep": sleep, "workouts": workouts, "raw": raw,
+            "clinical": clinical, "generated": generated, "problems": problems}
 
 
 def parse_workout_row(parts, lineno, problems):
@@ -501,6 +556,16 @@ def store_workouts(db, path, workouts):
                     w.get("route"), path))
 
 
+def store_raw(db, path, raw):
+    db.executemany("INSERT OR REPLACE INTO sample (type, start, \"end\", value, unit, source, file) "
+                   "VALUES (?, ?, ?, ?, ?, ?, ?)", [r + (path,) for r in raw])
+
+
+def store_clinical(db, path, clinical):
+    db.executemany("INSERT OR REPLACE INTO clinical (id, type, date, name, resource, fhir, file) "
+                   "VALUES (?, ?, ?, ?, ?, ?, ?)", [c + (path,) for c in clinical])
+
+
 def store_daily(db, path, days, sleep_samples, source):
     """Write one file's days over what is there. The newest file wins for a
     day it carries, because a later run of the shortcut has the whole day
@@ -523,8 +588,12 @@ def daily_files(opts):
     found = []
     for folder in folders(opts):
         if os.path.isdir(folder):
+            # Year files sort before day files within each prefix, so the
+            # newest day always writes last for a day both carry.
             found += sorted(glob.glob(os.path.join(folder, "health-*.txt")))
             found += sorted(glob.glob(os.path.join(folder, "health*.txt")))
+            found += sorted(glob.glob(os.path.join(folder, "raw-*.txt")))
+            found += sorted(glob.glob(os.path.join(folder, "clinical*.txt")))
     seen, out = set(), []
     for path in found:
         if path not in seen:
@@ -555,27 +624,35 @@ def sync(db, opts, quiet=False):
         if not unread(db, path, "daily"):
             continue
         try:
-            days, sleep_samples, workouts, generated, problems = read_daily(path)
+            parsed = read_daily(path)
         except (OSError, ValueError) as error:
             report["problems"].append("%s: %s" % (os.path.basename(path), error))
             continue
+        days, sleep_samples, workouts = parsed["days"], parsed["sleep"], parsed["workouts"]
+        generated, problems = parsed["generated"], parsed["problems"]
         # Files are read oldest first by name, and a file is (re)read when
         # it changes, so the newest run always writes last. ⚠️ The app's
         # yearly history files sort before its daily ones (`health-2024.txt`
         # < `health-2026-09-17.txt`), so a daily file always wins a day.
         n_nights = store_daily(db, path, days, sleep_samples, "shortcut")
         store_workouts(db, path, workouts)
+        store_raw(db, path, parsed["raw"])
+        store_clinical(db, path, parsed["clinical"])
         dates = sorted({d for d, _ in days} | set(nights(sleep_samples)))
-        mark_read(db, path, "daily", lines=len(days) + len(sleep_samples) + len(workouts),
+        mark_read(db, path, "daily", lines=len(days) + len(sleep_samples) + len(workouts)
+                  + len(parsed["raw"]) + len(parsed["clinical"]),
                   days=len(dates), workouts=len(workouts))
         db.commit()
         report["files"].append({"path": path, "days": len(dates), "nights": n_nights,
-                                "workouts": len(workouts), "generated": iso(generated),
+                                "workouts": len(workouts), "raw": len(parsed["raw"]),
+                                "clinical": len(parsed["clinical"]), "generated": iso(generated),
                                 "first": dates[0] if dates else None,
                                 "last": dates[-1] if dates else None})
         report["days"] += len(dates)
         report["nights"] += n_nights
         report["workouts"] = report.get("workouts", 0) + len(workouts)
+        report["raw"] = report.get("raw", 0) + len(parsed["raw"])
+        report["clinical"] = report.get("clinical", 0) + len(parsed["clinical"])
         for problem in problems:
             report["problems"].append("%s: %s" % (os.path.basename(path), problem))
     if not quiet:
@@ -1002,6 +1079,8 @@ def cmd_status(opts):
             report["last_day"] = row["last"]
             report["workouts"] = db.execute("SELECT count(*) FROM workout").fetchone()[0]
             report["nights"] = db.execute("SELECT count(*) FROM sleep").fetchone()[0]
+            report["samples"] = db.execute("SELECT count(*) FROM sample").fetchone()[0]
+            report["clinical"] = db.execute("SELECT count(*) FROM clinical").fetchone()[0]
             report["exports"] = [r["path"] for r in db.execute("SELECT path FROM file WHERE kind = 'export'")]
         except sqlite3.DatabaseError:
             report["days"] = 0
@@ -1027,8 +1106,9 @@ def cmd_status(opts):
         print("health: %s" % report["status"])
         print("  folders: %s" % ", ".join(present or report["folders"]))
         print("  daily files: %d%s" % (len(files), " (newest %s)" % report["newest_daily_file"] if files else ""))
-        print("  store: %d days, %d nights, %d workouts%s" % (
+        print("  store: %d days, %d nights, %d workouts, %s raw samples, %d clinical records%s" % (
             report.get("days", 0), report.get("nights", 0), report.get("workouts", 0),
+            format(report.get("samples", 0), ","), report.get("clinical", 0),
             " (%s – %s)" % (report["first_day"], report["last_day"]) if report.get("first_day") else ""))
         if report["advice"]:
             print("  %s" % report["advice"])
@@ -1061,9 +1141,13 @@ def cmd_sync(opts):
     if not report["files"]:
         print("nothing new in %s" % ", ".join(report["folders"]))
     for f in report["files"]:
-        print("read %s: %d days (%s – %s), %d nights, %d workouts" % (
-            os.path.basename(f["path"]), f["days"], f["first"], f["last"], f["nights"],
-            f["workouts"]))
+        if f["raw"] or f["clinical"]:
+            print("read %s: %d raw samples, %d clinical records" % (
+                os.path.basename(f["path"]), f["raw"], f["clinical"]))
+        else:
+            print("read %s: %d days (%s – %s), %d nights, %d workouts" % (
+                os.path.basename(f["path"]), f["days"], f["first"], f["last"], f["nights"],
+                f["workouts"]))
 
 
 def cmd_days(opts):
@@ -1124,6 +1208,349 @@ def cmd_shortcut(opts):
     print("Then run it. It saves health-<date>.txt into iCloud Drive/apple-tools/health.")
 
 
+# --------------------------------------------------------------------------
+# the raw store: samples, trends, clinical records, and any SQL
+# --------------------------------------------------------------------------
+
+# Short names an agent will type, to the HealthKit identifiers in `sample`.
+SAMPLE_ALIASES = {
+    "heart_rate": "HKQuantityTypeIdentifierHeartRate",
+    "resting_heart_rate": "HKQuantityTypeIdentifierRestingHeartRate",
+    "walking_heart_rate": "HKQuantityTypeIdentifierWalkingHeartRateAverage",
+    "hrv": "HKQuantityTypeIdentifierHeartRateVariabilitySDNN",
+    "heart_rate_recovery": "HKQuantityTypeIdentifierHeartRateRecoveryOneMinute",
+    "spo2": "HKQuantityTypeIdentifierOxygenSaturation",
+    "oxygen_saturation": "HKQuantityTypeIdentifierOxygenSaturation",
+    "respiratory_rate": "HKQuantityTypeIdentifierRespiratoryRate",
+    "systolic": "HKQuantityTypeIdentifierBloodPressureSystolic",
+    "diastolic": "HKQuantityTypeIdentifierBloodPressureDiastolic",
+    "weight": "HKQuantityTypeIdentifierBodyMass",
+    "body_fat": "HKQuantityTypeIdentifierBodyFatPercentage",
+    "bmi": "HKQuantityTypeIdentifierBodyMassIndex",
+    "lean_mass": "HKQuantityTypeIdentifierLeanBodyMass",
+    "glucose": "HKQuantityTypeIdentifierBloodGlucose",
+    "temperature": "HKQuantityTypeIdentifierBodyTemperature",
+    "wrist_temperature": "HKQuantityTypeIdentifierAppleSleepingWristTemperature",
+    "vo2_max": "HKQuantityTypeIdentifierVO2Max",
+    "walking_steadiness": "HKQuantityTypeIdentifierAppleWalkingSteadiness",
+    "environmental_audio": "HKQuantityTypeIdentifierEnvironmentalAudioExposure",
+    "headphone_audio": "HKQuantityTypeIdentifierHeadphoneAudioExposure",
+    "daylight": "HKQuantityTypeIdentifierTimeInDaylight",
+}
+CLINICAL_KINDS = {
+    "HKClinicalTypeIdentifierLabResultRecord": "lab",
+    "HKClinicalTypeIdentifierImmunizationRecord": "immunization",
+    "HKClinicalTypeIdentifierMedicationRecord": "medication",
+    "HKClinicalTypeIdentifierConditionRecord": "condition",
+    "HKClinicalTypeIdentifierAllergyRecord": "allergy",
+    "HKClinicalTypeIdentifierProcedureRecord": "procedure",
+    "HKClinicalTypeIdentifierVitalSignRecord": "vital",
+    "HKClinicalTypeIdentifierCoverageRecord": "coverage",
+}
+CLINICAL_ALIASES = {"labs": "lab", "lab": "lab", "immunizations": "immunization", "vaccines": "immunization",
+                    "immunization": "immunization", "medications": "medication", "medication": "medication",
+                    "meds": "medication", "conditions": "condition", "condition": "condition",
+                    "allergies": "allergy", "allergy": "allergy", "procedures": "procedure",
+                    "procedure": "procedure", "vitals": "vital", "vital": "vital", "coverage": "coverage"}
+
+
+def sample_type(text):
+    if text in SAMPLE_ALIASES:
+        return SAMPLE_ALIASES[text]
+    if text.startswith("HKQuantityTypeIdentifier"):
+        return text
+    die("unknown sample type %r. One of: %s, or a HealthKit identifier"
+        % (text, ", ".join(sorted(SAMPLE_ALIASES))), 64)
+
+
+def iso_window(opts, default_days):
+    start, end = date_window(opts, default_days)
+    return start, end + "T23:59:59"
+
+
+def cmd_samples(opts):
+    db = open_store()
+    hk = sample_type(opts.type)
+    start, end = iso_window(opts, 30)
+    rows = db.execute("SELECT type, start, \"end\", value, unit, source FROM sample "
+                      "WHERE type = ? AND start >= ? AND start <= ? ORDER BY start",
+                      (hk, start, end)).fetchall()
+    total = len(rows)
+    if opts.limit and total > opts.limit:
+        rows = rows[-opts.limit:]
+        print("showing the last %d of %d samples" % (opts.limit, total), file=sys.stderr)
+    out = [dict(r) for r in rows]
+    if opts.json:
+        print(json.dumps(out, indent=2))
+        return
+    if not out:
+        print("no %s samples between %s and %s%s" % (
+            opts.type, start[:10], end[:10],
+            "" if db.execute("SELECT count(*) FROM sample").fetchone()[0]
+            else " — the store has no raw samples yet; run Export everything in the app"))
+        return
+    for r in out:
+        print("%s  %8.1f %-10s %s" % (r["start"][:16].replace("T", " "), r["value"], r["unit"], r["source"]))
+
+
+def _period(date, by):
+    if by == "year":
+        return date[:4]
+    if by == "month":
+        return date[:7]
+    if by == "week":
+        d = dt.date.fromisoformat(date[:10])
+        monday = d - dt.timedelta(days=d.weekday())
+        return monday.isoformat()
+    return date[:10]
+
+
+def cmd_trend(opts):
+    """A metric averaged per week, month or year. Reads the `day` table —
+    Health's own daily figures — or `sleep` for asleep minutes, or a raw
+    sample type when the metric is not a daily one."""
+    db = open_store()
+    start, end = date_window(opts, 365)
+    metric = opts.metric
+    keys = {key for key, _, _, _, _ in METRICS}
+    if metric == "sleep":
+        rows = [(r["date"], r["asleep"]) for r in db.execute(
+            "SELECT date, asleep FROM sleep WHERE date >= ? AND date <= ? ORDER BY date", (start, end))]
+        unit = "min"
+    elif metric in keys:
+        rows = [(r["date"], r["value"]) for r in db.execute(
+            "SELECT date, value FROM day WHERE metric = ? AND date >= ? AND date <= ? ORDER BY date",
+            (metric, start, end))]
+        unit = {key: unit for key, _, _, _, unit in METRICS}[metric]
+    else:
+        hk = sample_type(metric)
+        rows = [(r["start"][:10], r["value"]) for r in db.execute(
+            "SELECT start, value FROM sample WHERE type = ? AND start >= ? AND start <= ? ORDER BY start",
+            (hk, start, end + "T23:59:59"))]
+        unit = db.execute("SELECT unit FROM sample WHERE type = ? LIMIT 1", (hk,)).fetchone()
+        unit = unit[0] if unit else "?"
+    buckets = {}
+    for date, value in rows:
+        b = buckets.setdefault(_period(date, opts.by), {"period": _period(date, opts.by), "values": [], "days": set()})
+        b["values"].append(value)
+        b["days"].add(date)
+    out = []
+    for period in sorted(buckets):
+        b = buckets[period]
+        values = b["values"]
+        out.append({"period": period, "mean": round(sum(values) / len(values), 2),
+                    "min": round(min(values), 2), "max": round(max(values), 2),
+                    "days": len(b["days"]), "samples": len(values), "unit": unit})
+    if opts.json:
+        print(json.dumps({"metric": metric, "by": opts.by, "from": start, "to": end,
+                          "unit": unit, "periods": out}, indent=2))
+        return
+    if not out:
+        print("no %s between %s and %s" % (metric, start, end))
+        return
+    print("%s per %s, %s (mean, min–max, days)" % (metric, opts.by, unit))
+    for b in out:
+        print("%-10s %10.1f   %7.1f – %-7.1f  %3d" % (b["period"], b["mean"], b["min"], b["max"], b["days"]))
+
+
+def _text(node):
+    """FHIR CodeableConcept → its text, else the first coding's display."""
+    if not isinstance(node, dict):
+        return None
+    if node.get("text"):
+        return node["text"]
+    for coding in node.get("coding") or []:
+        if coding.get("display"):
+            return coding["display"]
+    return None
+
+
+def _quantity(node):
+    if not isinstance(node, dict) or node.get("value") is None:
+        return None
+    return "%s %s" % (node["value"], node.get("unit") or node.get("code") or "")
+
+
+def clinical_summary(resource, fhir):
+    """The lines that say what a record is, from its FHIR resource. ⚠️ FHIR
+    DSTU2 and R4 spell things differently (medicationOrder vs
+    medicationRequest, effectiveDateTime vs effectivePeriod); every field is
+    read from wherever it is and a resource with none of them still gets
+    its display name."""
+    r = fhir
+    lines = []
+    if resource == "Observation":
+        value = _quantity(r.get("valueQuantity")) or _text(r.get("valueCodeableConcept")) or r.get("valueString")
+        if value:
+            lines.append("value %s" % value)
+        for comp in r.get("component") or []:
+            v = _quantity(comp.get("valueQuantity")) or _text(comp.get("valueCodeableConcept"))
+            if v:
+                lines.append("%s %s" % (_text(comp.get("code")) or "component", v))
+        for rng in r.get("referenceRange") or []:
+            low, high = _quantity(rng.get("low")), _quantity(rng.get("high"))
+            text = rng.get("text")
+            if low or high or text:
+                lines.append("reference %s" % (text or "%s – %s" % (low or "", high or "")))
+        for interp in ([r.get("interpretation")] if isinstance(r.get("interpretation"), dict)
+                       else r.get("interpretation") or []):
+            t = _text(interp)
+            if t:
+                lines.append("interpretation %s" % t)
+        if r.get("status"):
+            lines.append("status %s" % r["status"])
+    elif resource == "Immunization":
+        vaccine = _text(r.get("vaccineCode"))
+        if vaccine:
+            lines.append("vaccine %s" % vaccine)
+        when = r.get("occurrenceDateTime") or r.get("date")
+        if when:
+            lines.append("given %s" % when[:10])
+        if r.get("status"):
+            lines.append("status %s" % r["status"])
+        if r.get("lotNumber"):
+            lines.append("lot %s" % r["lotNumber"])
+    elif resource in ("MedicationOrder", "MedicationRequest", "MedicationStatement", "MedicationDispense"):
+        med = _text(r.get("medicationCodeableConcept")) or (r.get("medicationReference") or {}).get("display")
+        if med:
+            lines.append("medication %s" % med)
+        for d in r.get("dosageInstruction") or r.get("dosage") or []:
+            if d.get("text"):
+                lines.append("dose %s" % d["text"])
+        if r.get("status"):
+            lines.append("status %s" % r["status"])
+        when = r.get("authoredOn") or r.get("dateWritten")
+        if when:
+            lines.append("written %s" % when[:10])
+    elif resource == "Condition":
+        cs = r.get("clinicalStatus")
+        status = cs if isinstance(cs, str) else _text(cs)
+        if status:
+            lines.append("status %s" % status)
+        when = r.get("onsetDateTime") or r.get("recordedDate") or r.get("dateRecorded")
+        if when:
+            lines.append("onset %s" % when[:10])
+    elif resource == "AllergyIntolerance":
+        sub = _text(r.get("code")) or _text(r.get("substance"))
+        if sub:
+            lines.append("substance %s" % sub)
+        for reaction in r.get("reaction") or []:
+            for m in reaction.get("manifestation") or []:
+                t = _text(m)
+                if t:
+                    lines.append("reaction %s" % t)
+        if r.get("criticality"):
+            lines.append("criticality %s" % r["criticality"])
+    elif resource == "Procedure":
+        when = r.get("performedDateTime") or (r.get("performedPeriod") or {}).get("start")
+        if when:
+            lines.append("performed %s" % when[:10])
+        if r.get("status"):
+            lines.append("status %s" % r["status"])
+    elif resource == "Coverage":
+        payor = r.get("payor") or []
+        if payor and isinstance(payor[0], dict) and payor[0].get("display"):
+            lines.append("payor %s" % payor[0]["display"])
+    performer = r.get("performer")
+    if isinstance(performer, list) and performer and isinstance(performer[0], dict):
+        who = performer[0].get("display") or (performer[0].get("actor") or {}).get("display")
+        if who:
+            lines.append("by %s" % who)
+    return lines
+
+
+def clinical_rows(db, kind=None, start=None, end=None, search=None):
+    query = "SELECT id, type, date, name, resource, fhir FROM clinical WHERE 1=1"
+    args = []
+    if kind:
+        types = [hk for hk, k in CLINICAL_KINDS.items() if k == kind]
+        query += " AND type IN (%s)" % ",".join("?" * len(types))
+        args += types
+    if start:
+        query += " AND date >= ?"
+        args.append(start)
+    if end:
+        query += " AND date <= ?"
+        args.append(end + "T23:59:59")
+    query += " ORDER BY date"
+    out = []
+    for r in db.execute(query, args):
+        fhir = json.loads(r["fhir"])
+        row = {"id": r["id"], "kind": CLINICAL_KINDS.get(r["type"], r["type"]), "date": r["date"],
+               "name": r["name"], "resource": r["resource"],
+               "summary": clinical_summary(r["resource"], fhir)}
+        if search and search.lower() not in (row["name"] + " " + " ".join(row["summary"])).lower():
+            continue
+        out.append((row, fhir))
+    return out
+
+
+def cmd_clinical(opts):
+    db = open_store()
+    kind = CLINICAL_ALIASES.get(opts.type.lower()) if opts.type else None
+    if opts.type and kind is None:
+        die("unknown clinical type %r. One of: %s" % (opts.type, ", ".join(sorted(CLINICAL_ALIASES))), 64)
+    start = end = None
+    if opts.since is not None or opts.from_ or opts.to:
+        start, end = date_window(opts, 365)
+    rows = clinical_rows(db, kind, start, end, opts.search)
+    if opts.json:
+        out = []
+        for row, fhir in rows:
+            if opts.fhir:
+                row = dict(row, fhir=fhir)
+            out.append(row)
+        print(json.dumps(out, indent=2))
+        return
+    if not rows:
+        total = db.execute("SELECT count(*) FROM clinical").fetchone()[0]
+        print("no clinical records%s%s" % (
+            " of kind %s" % kind if kind else "",
+            "" if total else " in the store. Health holds them only when a provider is "
+                             "connected in the Health app; the app's clinical.txt was empty"))
+        return
+    for row, fhir in rows:
+        print("%s  %-12s %s" % (row["date"][:10], row["kind"], row["name"]))
+        for line in row["summary"]:
+            print("            %s" % line)
+        if opts.fhir:
+            print(json.dumps(fhir, indent=2))
+
+
+def cmd_sql(opts):
+    """Any read-only question against the store. The connection is opened
+    read-only and the statement must be a SELECT or a WITH, so an agent
+    cannot change the store through this command whatever it types."""
+    if opts.schema:
+        print(SCHEMA.strip())
+        return
+    if not opts.query:
+        die("give a SELECT, or --schema", 64)
+    statement = opts.query.strip().rstrip(";")
+    if not re.match(r"(?is)^\s*(select|with)\b", statement):
+        die("only SELECT (or WITH … SELECT) is allowed here", 64)
+    path = store_path()
+    if not os.path.isfile(path):
+        die("no store yet at %s" % path, 66)
+    db = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
+    db.row_factory = sqlite3.Row
+    try:
+        cursor = db.execute(statement)
+        rows = [dict(r) for r in cursor.fetchmany(opts.limit)] if opts.limit else [dict(r) for r in cursor]
+    except sqlite3.Error as error:
+        die("sql: %s" % error, 65)
+    if opts.json:
+        print(json.dumps(rows, indent=2, default=str))
+        return
+    if not rows:
+        print("no rows")
+        return
+    cols = list(rows[0].keys())
+    print("\t".join(cols))
+    for r in rows:
+        print("\t".join("" if r[c] is None else str(r[c]) for c in cols))
+
+
 def cmd_log(opts):
     """The iPhone app's own log, mirrored into its container as log.txt."""
     paths = [os.path.join(f, "log.txt") for f in folders(opts)]
@@ -1179,6 +1606,20 @@ def cmd_index(opts):
             "body": "\n".join(lines),
             "rev": "|".join("%s=%s" % (k, day[k]) for k in sorted(day) if k not in ("date", "sources")),
         }) + "\n")
+    for row, _ in clinical_rows(db, None, start if start != "0000-00-00" else None, None):
+        when = parse_when(row["date"])
+        out.write(json.dumps({
+            "uid": "health:%s:%s" % (row["kind"], re.sub(r"[^A-Za-z0-9._:+-]", "", row["id"])),
+            "tool": NAME, "kind": row["kind"], "native_id": row["id"], "url": None,
+            "title": row["name"],
+            "container": row["date"][:4],
+            "created": None, "modified": None,
+            "occurred": when.timestamp() if when else None,
+            "latitude": None, "longitude": None,
+            "people": [],
+            "body": "\n".join([row["kind"]] + row["summary"]),
+            "rev": "%s|%s" % (row["date"], "|".join(row["summary"])),
+        }) + "\n")
     for w in workout_rows(db, start, end):
         when = parse_when(w["start"])
         lines = describe_workout(w)
@@ -1225,6 +1666,28 @@ def main(argv=None):
     p = sub.add_parser("workouts", parents=[common, ranged], help="workouts from the export")
     p.add_argument("--type", help="only workouts whose type contains this")
     p.set_defaults(func=cmd_workouts)
+
+    p = sub.add_parser("samples", parents=[common, ranged], help="raw readings of one type")
+    p.add_argument("--type", required=True, help="heart_rate, hrv, spo2, weight … or a HealthKit identifier")
+    p.add_argument("--limit", type=int, default=0)
+    p.set_defaults(func=cmd_samples)
+
+    p = sub.add_parser("trend", parents=[common, ranged], help="a metric per week, month or year")
+    p.add_argument("metric", help="steps, hrv, resting_heart_rate, sleep, weight … or a raw type")
+    p.add_argument("--by", choices=["day", "week", "month", "year"], default="month")
+    p.set_defaults(func=cmd_trend)
+
+    p = sub.add_parser("clinical", parents=[common, ranged], help="labs, immunizations, medications, conditions …")
+    p.add_argument("--type", help="labs, immunizations, medications, conditions, allergies, procedures, vitals, coverage")
+    p.add_argument("--search", help="only records whose name or summary contains this")
+    p.add_argument("--fhir", action="store_true", help="include the full FHIR resource")
+    p.set_defaults(func=cmd_clinical)
+
+    p = sub.add_parser("sql", parents=[common], help="a read-only SELECT against the store")
+    p.add_argument("query", nargs="?")
+    p.add_argument("--schema", action="store_true", help="print the tables instead")
+    p.add_argument("--limit", type=int, default=1000)
+    p.set_defaults(func=cmd_sql)
 
     p = sub.add_parser("log", parents=[common], help="the iPhone app's log, as it wrote it")
     p.add_argument("--tail", type=int, default=50, metavar="N", help="last N lines; 0 for all")

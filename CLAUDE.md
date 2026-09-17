@@ -106,6 +106,11 @@ installed via `make install`.
 | Where was I at three (Dawarich) | `apple dawarich points --from "2026-09-10 14:00" --to "2026-09-10 16:00" --json` |
 | Steps, sleep, heart rate by day (Health) | `apple health days --since 14 --json` |
 | How far did I bike (Health) | `apple health workouts --since 90 --type cycling --json` |
+| How have my steps changed this year | `apple health trend steps --since 365 --by month` |
+| How does my HRV look | `apple health trend hrv --since 90 --by week` |
+| Every heart-rate reading of a day | `apple health samples --type heart_rate --from 2026-09-15 --to 2026-09-15 --json` |
+| My labs, my vaccines | `apple health clinical --type labs --since 365` / `--type vaccines` |
+| Any other health question | `apple health sql "SELECT …"` (read-only; `--schema` prints the tables) |
 | What the Health app on the phone did | `apple health log` |
 | Load the Health history | Export everything in AppleTools Health, or `apple health import export.zip` |
 
@@ -1742,6 +1747,11 @@ store, and makes no connection at all. Python, stdlib only, in
 
 ```
 apple health sync [--json]             # read new files the iPhone app wrote
+apple health samples --type T [--since DAYS | --from DATE --to DATE] [--limit N] [--json]
+apple health trend METRIC [--by day|week|month|year] [--since DAYS | --from DATE --to DATE] [--json]
+apple health clinical [--type labs|vaccines|medications|conditions|allergies|procedures|vitals|coverage]
+                      [--search TEXT] [--since DAYS] [--fhir] [--json]
+apple health sql "SELECT …" [--limit N] [--json]     # read-only; --schema prints the tables
 apple health log [--tail N] [--json]   # the iPhone app's own log, as it wrote it
 apple health import export.zip         # the Health export archive, the optional route
 apple health shortcut [--to DIR]       # the fallback shortcut, into iCloud Drive
@@ -1781,9 +1791,33 @@ apple health index [--since DAYS]      # what apple-index calls; runs sync first
 - ⚠️ **Today is partial** until tomorrow's file replaces it; the record
   body says "day not over when written". `sync` names every type a file
   carried no line for, which is how a wrong picker label shows up on the Mac.
-- **Index kinds are `day` and `workout`**, never `place`, so `places` and
-  `whereabouts` do not read it. A workout carries its route's first point
-  as a coordinate; nothing joins it to a place yet.
+- 🛑 **THE RAW STORE IS THE PLACE TO ANSWER A HEALTH QUESTION, not the
+  index.** `~/Library/Application Support/apple-tools/health/health.sqlite`
+  holds five tables: `day` (Health's own daily figures, one row per day
+  per metric), `sleep` (one row per night), `workout`, `sample` (every raw
+  reading — heart rate, HRV, SpO2, respiratory rate, blood pressure, weight,
+  body fat, glucose, temperature; measured here 2015–2026), and `clinical`
+  (labs, immunizations, medications, conditions, allergies, procedures,
+  vitals, coverage, each as its FHIR resource). `trend` averages a metric
+  per week, month or year; `samples` lists readings; `clinical` summarises
+  a record from its FHIR (value, reference range, vaccine, dose); `sql`
+  takes any SELECT, opens the store read-only, and refuses anything else.
+  ⚠️ `trend hrv` reads the DAILY figure; pass the HealthKit identifier
+  (`HKQuantityTypeIdentifierHeartRateVariabilitySDNN`) for the raw readings.
+- **Units in the store are canonical**: metres, kcal, minutes, count/min,
+  ms, kg, mmHg, mg/dL, degC, and `%` as Health returns it — oxygen
+  saturation is a fraction (0.95), body fat too. Say the unit.
+- **Clinical records exist only when a provider is connected in the
+  Health app**, and the entitlement is US-only. An empty `clinical` table
+  means no provider, not no health. The app's log says how many came.
+- **Index kinds**: `day`, `workout`, and one per clinical kind (`lab`,
+  `immunization`, `medication`, …), so "tetanus shot" is searchable. Raw
+  samples are never indexed. 🛑 **A workout with a route IS PRESENCE**:
+  `whereabouts` reads `workout` records as a source at weight 0.90 (the
+  user's own watch, a GPS route, a time), and `places` counts workouts that
+  started within 250 m of a place in `<tool>_workouts` — a fifth unit,
+  never added to days, arrivals or stays. Measured: 1,596 of 1,707 workouts
+  land on a known place, 1,156 of them at home.
 
 ## Layout
 
@@ -2273,7 +2307,8 @@ alone — never a presence), `reported` (somebody else's camera alone).
   else's camera 0.15; a calendar pin 0.20, or 0.45 when GPS puts the user
   there within 3 h; a dawarich stay up to 0.70 scaled by the server's own
   confidence and the stay's length (5 min at 42 ≈ 0.09, 6 h at 62 ≈ 0.43);
-  plus 0.30 when two presence sources fall within 3 h of each other. 🛑
+  a workout with a GPS route from the `health` plugin 0.90; plus 0.30 when
+  two presence sources fall within 3 h of each other. 🛑
   **THE WEIGHTS ARE ASSUMPTIONS.** No source is ground truth, so what was
   measured is how often each is *confirmed* by another (maps by dawarich
   35%, dawarich by maps 28%, an own-camera day by dawarich 48%, a shared
@@ -2335,6 +2370,11 @@ made once by adding emails to texts. Each row carries `visits` and
   over Aroostook County, Maine, between one over Long Island and the next
   in Amsterdam. The dot is true and it is not a place the user went. The
   order of the photos on the day is what says so; nothing here infers it.
+- **`<tool>_workouts` is a FIFTH unit** (health): workouts whose route
+  started within 250 m of the place. Counted after the merge and by
+  distance, not by grid cell — a ride's first GPS fix is in the driveway,
+  one cell over from the house, and a cell-keyed count put 0 rides at a
+  home 1,156 start from. The app shows it as `w`.
 - 🛑 **The app's map draws the top 400 places by weight AND one dot per
   region.** The top 400 are almost all within an hour of home, so those
   same three Dallas days — weight 1, rank ~1,200 — drew nothing and the map

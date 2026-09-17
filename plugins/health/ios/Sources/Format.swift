@@ -13,6 +13,8 @@
 //   day     <label>  <start>  <end>  <value>  <unit>
 //   sample  Sleep    <start>  <end>  <stage>  count
 //   workout <type>   <start>  <end>  <seconds>  <metres>  <kcal>  <avg bpm>  <source>  <lat>  <lon>
+//   raw     <HK identifier>  <start>  <end>  <value>  <unit>  <source>
+//   clinical <HK clinical type>  <date>  <display name>  <FHIR resource type>  <FHIR id>  <FHIR JSON, one line>
 //
 // Fields are tab-separated. Dates are `yyyy-MM-dd HH:mm:ss Z` in the
 // phone's zone, the same shape Health's own export.xml uses. A missing
@@ -66,7 +68,60 @@ enum Format {
             + "\(number(seconds))\t\(number(metres))\t\(number(kcal))\t\(number(bpm))\t\(clean)\t"
             + "\(number(lat))\t\(number(lon))\n"
     }
+
+    static func raw(type: String, start: Date, end: Date, value: Double, unit: String, source: String) -> String {
+        let clean = source.replacingOccurrences(of: "\t", with: " ").replacingOccurrences(of: "\n", with: " ")
+        return "raw\t\(type)\t\(dates.string(from: start))\t\(dates.string(from: end))\t\(number(value))\t\(unit)\t\(clean)\n"
+    }
+
+    static func clinical(type: String, date: Date, name: String, resourceType: String, id: String, json: String) -> String {
+        let cleanName = name.replacingOccurrences(of: "\t", with: " ").replacingOccurrences(of: "\n", with: " ")
+        // The JSON is already one line: JSONSerialization without .prettyPrinted
+        // emits none, and any newline inside a string is escaped as \n.
+        return "clinical\t\(type)\t\(dates.string(from: date))\t\(cleanName)\t\(resourceType)\t\(id)\t\(json)\n"
+    }
 }
+
+/// A raw sample type: every reading, not a daily figure. ⚠️ Heart rate is
+/// the big one — a Watch writes one every few minutes, tens of thousands a
+/// year — and it is what "how does my HRV look" and "resting heart rate
+/// over the year" need. The unit written is the plugin's canonical one.
+struct RawType {
+    let type: HKQuantityTypeIdentifier
+    let unit: HKUnit
+    let unitText: String
+
+    static let bpm = HKUnit.count().unitDivided(by: .minute())
+    static let all: [RawType] = [
+        RawType(type: .heartRate, unit: bpm, unitText: "count/min"),
+        RawType(type: .restingHeartRate, unit: bpm, unitText: "count/min"),
+        RawType(type: .walkingHeartRateAverage, unit: bpm, unitText: "count/min"),
+        RawType(type: .heartRateVariabilitySDNN, unit: .secondUnit(with: .milli), unitText: "ms"),
+        RawType(type: .heartRateRecoveryOneMinute, unit: bpm, unitText: "count/min"),
+        RawType(type: .oxygenSaturation, unit: .percent(), unitText: "%"),
+        RawType(type: .respiratoryRate, unit: bpm, unitText: "count/min"),
+        RawType(type: .bloodPressureSystolic, unit: .millimeterOfMercury(), unitText: "mmHg"),
+        RawType(type: .bloodPressureDiastolic, unit: .millimeterOfMercury(), unitText: "mmHg"),
+        RawType(type: .bodyMass, unit: .gramUnit(with: .kilo), unitText: "kg"),
+        RawType(type: .bodyFatPercentage, unit: .percent(), unitText: "%"),
+        RawType(type: .bodyMassIndex, unit: .count(), unitText: "count"),
+        RawType(type: .leanBodyMass, unit: .gramUnit(with: .kilo), unitText: "kg"),
+        RawType(type: .bloodGlucose, unit: HKUnit.gramUnit(with: .milli).unitDivided(by: .literUnit(with: .deci)), unitText: "mg/dL"),
+        RawType(type: .bodyTemperature, unit: .degreeCelsius(), unitText: "degC"),
+        RawType(type: .appleSleepingWristTemperature, unit: .degreeCelsius(), unitText: "degC"),
+        RawType(type: .vo2Max, unit: HKUnit.literUnit(with: .milli).unitDivided(by: HKUnit.gramUnit(with: .kilo).unitMultiplied(by: .minute())), unitText: "mL/min·kg"),
+        RawType(type: .appleWalkingSteadiness, unit: .percent(), unitText: "%"),
+        RawType(type: .environmentalAudioExposure, unit: .decibelAWeightedSoundPressureLevel(), unitText: "dBASPL"),
+        RawType(type: .headphoneAudioExposure, unit: .decibelAWeightedSoundPressureLevel(), unitText: "dBASPL"),
+        RawType(type: .timeInDaylight, unit: .minute(), unitText: "min"),
+    ]
+}
+
+/// The clinical record types Health can hold, when a provider is connected.
+let clinicalTypes: [HKClinicalTypeIdentifier] = [
+    .labResultRecord, .immunizationRecord, .medicationRecord, .conditionRecord,
+    .allergyRecord, .procedureRecord, .vitalSignRecord, .coverageRecord,
+]
 
 /// One daily metric: the plugin's label, the HealthKit type, how a day is
 /// made, and the unit written. ⚠️ Labels and units are the plugin's, verbatim.

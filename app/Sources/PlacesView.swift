@@ -305,12 +305,12 @@ private struct Legend: View {
         for plugin in place.plugins {
             let confirmed = place.pluginVisits[plugin] ?? 0
             let guessed = place.pluginSuggested[plugin] ?? 0
-            var piece = "\(plugin): "
-            if confirmed > 0 { piece += "\(confirmed) confirmed " + (confirmed == 1 ? "stay" : "stays") }
-            if guessed > 0 {
-                piece += (confirmed > 0 ? ", " : "") + "\(guessed) suggested"
-            }
-            if confirmed > 0 || guessed > 0 { parts.append(piece) }
+            let workouts = place.pluginWorkouts[plugin] ?? 0
+            var pieces: [String] = []
+            if confirmed > 0 { pieces.append("\(confirmed) confirmed " + (confirmed == 1 ? "stay" : "stays")) }
+            if guessed > 0 { pieces.append("\(guessed) suggested") }
+            if workouts > 0 { pieces.append("\(workouts) " + (workouts == 1 ? "workout" : "workouts") + " started here") }
+            if !pieces.isEmpty { parts.append("\(plugin): " + pieces.joined(separator: ", ")) }
         }
         if !place.where_.isEmpty, place.where_ != place.shown {
             parts.append(place.where_)
@@ -393,12 +393,19 @@ private struct TopPlaces: View {
                             .font(.system(size: 11, design: .monospaced))
                             .foregroundStyle(.green)
                     }
+                    let workouts = place.pluginWorkouts.values.reduce(0, +)
+                    if workouts > 0 {
+                        Text("\(workouts)w")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(.pink)
+                    }
                 }
                 .contentShape(Rectangle())
                 .onTapGesture { selected = place }
             }
             Text("d = days photographed · v = arrivals Maps recorded · "
-                 + "s = stays a plugin detected, confirmed or guessed. "
+                 + "s = stays a plugin detected, confirmed or guessed · "
+                 + "w = workouts that started here. "
                  + "Different units; not comparable.")
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)

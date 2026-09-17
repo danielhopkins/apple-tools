@@ -117,7 +117,7 @@ def main():
     manifest = json.loads(run(["manifest"], env).stdout)
     check("manifest name", manifest["name"], "health")
     check("manifest has no hosts", manifest["network"]["hosts"], [])
-    check("manifest kinds", manifest["index"]["kinds"], ["day", "workout"])
+    check("manifest kinds", manifest["index"]["kinds"][:3], ["day", "workout", "lab"])
     status = json.loads(run(["status", "--json"], env).stdout)
     check("empty status", (status["status"], status["usable"]), ("unconfigured", False))
     run(["status"], env, expect=1)
@@ -270,6 +270,75 @@ def main():
         f.write("2026-09-16 07:02:11 -0600\tinfo\tlaunched\n2026-09-16 07:02:30 -0600\terror\tSleep: denied\n")
     logged = json.loads(run(["log", "--json"], env).stdout)
     check("log read", (len(logged), logged[1]["level"], logged[1]["text"]), (2, "error", "Sleep: denied"))
+
+    # -- raw samples and clinical records ------------------------------------
+    lab = json.dumps({"resourceType": "Observation", "id": "obs-1", "status": "final",
+                      "code": {"text": "Hemoglobin A1c"}, "effectiveDateTime": "2026-08-02T09:00:00-06:00",
+                      "valueQuantity": {"value": 5.4, "unit": "%"},
+                      "referenceRange": [{"low": {"value": 4.0, "unit": "%"}, "high": {"value": 5.6, "unit": "%"}}]})
+    shot = json.dumps({"resourceType": "Immunization", "id": "imm-7", "status": "completed",
+                       "vaccineCode": {"coding": [{"display": "Tdap"}]}, "occurrenceDateTime": "2021-03-15"})
+    med = json.dumps({"resourceType": "MedicationRequest", "id": "med-2", "status": "active",
+                      "medicationCodeableConcept": {"text": "Atorvastatin 10 mg"},
+                      "dosageInstruction": [{"text": "1 tablet nightly"}]})
+    with open(os.path.join(folder, "raw-2026.txt"), "w") as f:
+        f.write("apple-tools health 1\ngenerated\t2026-09-16 07:02:11 -0600\nwindow\t366\nsource\tapp\n")
+        for i, v in enumerate([62, 65, 71, 58]):
+            f.write("raw\tHKQuantityTypeIdentifierHeartRate\t2026-09-15 0%d:00:00 -0600\t2026-09-15 0%d:00:00 -0600\t%d\tcount/min\tWatch\n" % (i, i, v))
+        f.write("raw\tHKQuantityTypeIdentifierHeartRateVariabilitySDNN\t2026-09-15 03:00:00 -0600\t2026-09-15 03:00:00 -0600\t44\tms\tWatch\n")
+        f.write("raw\tHKQuantityTypeIdentifierHeartRateVariabilitySDNN\t2026-08-15 03:00:00 -0600\t2026-08-15 03:00:00 -0600\t38\tms\tWatch\n")
+        f.write("raw\tHKQuantityTypeIdentifierHeartRate\tnot a date\t2026-09-15 03:00:00 -0600\t60\tcount/min\tWatch\n")
+    with open(os.path.join(folder, "clinical.txt"), "w") as f:
+        f.write("apple-tools health 1\ngenerated\t2026-09-16 07:02:11 -0600\nwindow\t0\nsource\tapp\n")
+        f.write("clinical\tHKClinicalTypeIdentifierLabResultRecord\t2026-08-02 09:00:00 -0600\tHemoglobin A1c\tObservation\tobs-1\t%s\n" % lab)
+        f.write("clinical\tHKClinicalTypeIdentifierImmunizationRecord\t2021-03-15 00:00:00 -0600\tTdap\tImmunization\timm-7\t%s\n" % shot)
+        f.write("clinical\tHKClinicalTypeIdentifierMedicationRecord\t2025-11-01 00:00:00 -0600\tAtorvastatin\tMedicationRequest\tmed-2\t%s\n" % med)
+    report = json.loads(run(["sync", "--json"], env).stdout)
+    check("raw and clinical read", (report["raw"], report["clinical"]), (6, 3))
+    check("bad raw row named", any("raw row" in p for p in report["problems"]), True)
+    check("no 'no lines' warning for a raw file", any("no lines for" in p and "raw-2026" in p for p in report["problems"]), False)
+
+    hr = json.loads(run(["samples", "--type", "heart_rate", "--from", "2026-09-01", "--to", "2026-09-30", "--json"], env).stdout)
+    check("heart rate samples", [r["value"] for r in hr], [62.0, 65.0, 71.0, 58.0])
+    run(["samples", "--type", "nonsense"], env, expect=64)
+    trend = json.loads(run(["trend", "hrv", "--from", "2026-08-01", "--to", "2026-09-30", "--by", "month", "--json"], env).stdout)
+    check("hrv trend reads the daily figure first", [(p["period"], p["mean"]) for p in trend["periods"]], [("2026-09", 41.0)])
+    trend = json.loads(run(["trend", "HKQuantityTypeIdentifierHeartRateVariabilitySDNN", "--from", "2026-08-01", "--to", "2026-09-30", "--by", "month", "--json"], env).stdout)
+    check("a HealthKit identifier reads raw samples", [(p["period"], p["mean"]) for p in trend["periods"]],
+          [("2026-08", 38.0), ("2026-09", 44.0)])
+    steps = json.loads(run(["trend", "steps", "--from", "2026-09-01", "--to", "2026-09-30", "--by", "week", "--json"], env).stdout)
+    check("steps trend from days per week", steps["periods"][0]["period"], "2026-09-07")
+    check("steps trend unit", steps["unit"], "count")
+    sleep = json.loads(run(["trend", "sleep", "--from", "2026-09-01", "--to", "2026-09-30", "--by", "month", "--json"], env).stdout)
+    check("sleep trend in minutes, two nights", (sleep["periods"][0]["mean"], sleep["periods"][0]["days"], sleep["unit"]), (435.0, 2, "min"))
+
+    labs = json.loads(run(["clinical", "--type", "labs", "--json"], env).stdout)
+    check("lab summary", labs[0]["summary"], ["value 5.4 %", "reference 4.0 % – 5.6 %", "status final"])
+    shots = json.loads(run(["clinical", "--type", "vaccines", "--json"], env).stdout)
+    check("vaccine summary", shots[0]["summary"], ["vaccine Tdap", "given 2021-03-15", "status completed"])
+    meds = json.loads(run(["clinical", "--search", "atorva", "--fhir", "--json"], env).stdout)
+    check("search and fhir", (len(meds), meds[0]["fhir"]["id"], meds[0]["summary"][1]), (1, "med-2", "dose 1 tablet nightly"))
+    run(["clinical", "--type", "nonsense"], env, expect=64)
+
+    rows = json.loads(run(["sql", "SELECT type, count(*) AS n FROM sample GROUP BY type ORDER BY n DESC", "--json"], env).stdout)
+    check("sql over samples", (rows[0]["n"], rows[1]["n"]), (4, 2))
+    run(["sql", "DELETE FROM sample"], env, expect=64)
+    run(["sql", "select 1; drop table sample"], env, expect=65)
+    still = json.loads(run(["sql", "SELECT count(*) AS n FROM sample", "--json"], env).stdout)
+    check("store untouched by refused statements", still[0]["n"], 6)
+    check("schema prints", "CREATE TABLE IF NOT EXISTS clinical" in run(["sql", "--schema"], env).stdout, True)
+
+    lines = [json.loads(l) for l in run(["index"], env).stdout.splitlines() if l.strip()]
+    kinds = {}
+    for rec in lines:
+        kinds[rec["kind"]] = kinds.get(rec["kind"], 0) + 1
+    check("clinical records indexed by kind", (kinds.get("lab"), kinds.get("immunization"), kinds.get("medication")), (1, 1, 1))
+    shot_rec = next(r for r in lines if r["kind"] == "immunization")
+    check("immunization record", (shot_rec["title"], shot_rec["container"], "vaccine Tdap" in shot_rec["body"]), ("Tdap", "2021", True))
+    check("raw samples are not indexed", any(r["kind"] == "sample" for r in lines), False)
+
+    status = json.loads(run(["status", "--json"], env).stdout)
+    check("status counts samples and clinical", (status["samples"], status["clinical"]), (6, 3))
 
     if FAILED:
         print("FAILED %d:" % len(FAILED))

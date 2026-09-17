@@ -128,6 +128,15 @@ row("maps:place:school", "maps", "place", "Columbine Elementary School", "2026-0
     body="Columbine Elementary School\n3130 Repplier St, Boulder, CO 80304, United States")
 row("maps:visit:school", "maps", "visit", "Columbine Elementary School", "2026-05-29", 15, SCHOOL)
 
+# Workouts from the health plugin: the route's first point, 120 m from home
+# (the driveway, one grid cell over), and one with no route at all.
+DRIVEWAY = (40.0361, -105.2400)
+row("health:workout:1", "health", "workout", "Cycling, 1h 02m, 20.5 km", "2026-05-30", 7,
+    DRIVEWAY, body="Cycling\n1h 02m\n20.5 km (12.7 mi)\nrecorded by Watch")
+row("health:workout:2", "health", "workout", "Walking, 25m, 2.0 km", "2026-05-30", 8,
+    DRIVEWAY, body="Walking\n25m\n2.0 km (1.2 mi)")
+row("health:workout:3", "health", "workout", "Yoga, 30m", "2026-05-30", 19, None, body="Yoga\n30m")
+
 with tempfile.TemporaryDirectory() as tmp:
     db = os.path.join(tmp, "index.db")
     contacts_path = os.path.join(tmp, "contacts.json")
@@ -240,6 +249,19 @@ with tempfile.TemporaryDirectory() as tmp:
           [x["name"] for x in places["Pearl Street Mall"]["people_at"]], ["Nicole Hurdle"])
     check("people_at carries the card", places["998 Strong Rd"]["people_at"][0]["contact_id"],
           "JON:ABPerson")
+
+    # workouts as presence
+    r = run("--from", "2026-05-30", "--to", "2026-05-30", "--json")
+    day = r["days"][0]
+    home = day["places"][0]
+    check("a workout with a route places the user", (day["state"], home["label"] or home["name"]), ("home", "Home"))
+    check("two workouts are one source at 0.90", (home["claim"], home["weights"]), ("single", {"health": 0.9}))
+    check("both workouts are listed", [w["title"] for w in home["evidence"]["health"]["workouts"]],
+          ["Cycling, 1h 02m, 20.5 km", "Walking, 25m, 2.0 km"])
+    check("a workout with no route places nobody", day["unplaced_stays"], 0)
+    text = run("--from", "2026-05-30", "--to", "2026-05-30")
+    check("plain output names the workout", "health 07:00 Cycling, 1h 02m, 20.5 km" in text, True)
+    check("home counts workouts within 250 m, not by grid cell", places["Home"]["health_workouts"], 2)
 
     r = run("--from", "2026-05-22", "--to", "2026-05-22", "--home", "%s,%s" % FAR, "--json")
     check("--home moves home", r["home"]["given"], True)
