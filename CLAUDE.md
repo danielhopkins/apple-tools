@@ -2257,6 +2257,17 @@ made once by adding emails to texts. Each row carries `visits` and
   Apple's placemark (`_subAdministrativeArea`); only Irving is in it — The
   Colony is Denton County and DFW is Tarrant — and nothing here invents a
   "Dallas–Fort Worth" the placemark does not carry.
+- 🛑 **`photo_days` is the user's OWN camera; `photo_days_shared` is
+  somebody else's.** A day whose every photo came from the iCloud Shared
+  Library is evidence that they were there. Six such photos in London,
+  Ontario, drew this user a dot for a trip a relative took. The app draws a
+  place only such days know as a HOLLOW grey dot with its own legend entry,
+  and it sizes and anchors nothing.
+- ⚠️ **A photo's coordinate is where the CAMERA was, and a camera can be at
+  35,000 feet.** Three Live Photos from a JFK→AMS window seat are tagged
+  over Aroostook County, Maine, between one over Long Island and the next
+  in Amsterdam. The dot is true and it is not a place the user went. The
+  order of the photos on the day is what says so; nothing here infers it.
 - 🛑 **The app's map draws the top 400 places by weight AND one dot per
   region.** The top 400 are almost all within an hour of home, so those
   same three Dallas days — weight 1, rank ~1,200 — drew nothing and the map

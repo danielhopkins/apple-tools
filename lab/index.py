@@ -4463,6 +4463,20 @@ def merged_places(db):
         return counts
 
     photo_days = count_by_spot("photos", "day")
+    # 🛑 SOMEBODY ELSE'S CAMERA IS COUNTED APART. A day whose every photo
+    # came from the iCloud Shared Library is evidence THEY were there — six
+    # photos in London, Ontario, drew a dot on this user's map for a trip a
+    # relative took. Those days come out of `photo_days` and into
+    # `photo_days_shared`, and they size and anchor nothing.
+    shared_days = {}
+    for row in db.execute(
+            "SELECT latitude, longitude FROM record "
+            " WHERE tool = 'photos' AND kind = 'day' AND latitude IS NOT NULL "
+            "   AND body LIKE '%from a shared camera%'"):
+        key = "%.3f,%.3f" % (row["latitude"], row["longitude"])
+        shared_days[key] = shared_days.get(key, 0) + 1
+    for key, n in shared_days.items():
+        photo_days[key] = photo_days.get(key, 0) - n
     visits = count_by_spot("maps", "visit")
     plugin_counts = {}
     for tool in plugin_tools:
@@ -4487,6 +4501,7 @@ def merged_places(db):
             "latitude": row["latitude"], "longitude": row["longitude"],
             "sources": [row["tool"]],
             "photo_days": photo_days.get(key, 0) if row["tool"] == "photos" else 0,
+            "photo_days_shared": shared_days.get(key, 0) if row["tool"] == "photos" else 0,
             "visits": visits.get(key, 0) if row["tool"] == "maps" else 0,
             "first": row["created"], "last": row["occurred"],
         }
@@ -4518,6 +4533,7 @@ def merged_places(db):
         for kept in merged:
             if photos_metres(spot, kept) <= 250.0:
                 kept["photo_days"] += spot["photo_days"]
+                kept["photo_days_shared"] += spot["photo_days_shared"]
                 kept["visits"] += spot["visits"]
                 for column in plugin_counts:
                     kept[column] += spot[column]

@@ -196,6 +196,23 @@ with tempfile.TemporaryDirectory() as tmp:
     home = [s for s in rep["places"] if "photos" in s["sources"] and "fakeloc" in s["sources"]]
     check("merged across sources", len(home), 1)
     check("a guess never names a place", home[0]["name"], "Home")
+    # somebody else's camera: a shared-only day 30 km away is its own place,
+    # counted apart, and it never becomes the user's photo days.
+    con = sqlite3.connect(db)
+    con.execute("INSERT INTO record (uid, tool, kind, native_id, title, container, "
+                "latitude, longitude, body, rev, seen_at, occurred) VALUES "
+                "('photos:place:y','photos','place','y','Their Lake','United States',"
+                "40.22,-105.17,'Their Lake','r',1,1)")
+    con.execute("INSERT INTO record (uid, tool, kind, native_id, title, "
+                "latitude, longitude, body, rev, seen_at, occurred) VALUES "
+                "('photos:day:y','photos','day','y','Their Lake',40.22,-105.17,"
+                "'Their Lake\nfrom a shared camera','r',1,1)")
+    con.commit(); con.close()
+    rep = json.loads(run(["places"]).stdout)
+    lake = [s for s in rep["places"] if s["name"] == "Their Lake"][0]
+    check("a shared-camera day is not the user's photo day", lake["photo_days"], 0)
+    check("it is counted apart", lake["photo_days_shared"], 1)
+    check("and home's own days are unchanged", home[0]["photo_days"], 2)
     check("but every guess is still counted", home[0]["fakeloc_suggested"], 3)
     check("and the confirmed one too", home[0]["fakeloc_visits"], 1)
 

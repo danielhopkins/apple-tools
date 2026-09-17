@@ -20,8 +20,14 @@ struct Place: Identifiable, Equatable {
     let longitude: Double
     /// Which sources know this place: "photos", "maps", or both.
     let sources: [String]
-    /// Days on which a photograph was taken here. 🛑 NOT a visit count.
+    /// Days on which a photograph was taken here BY THE USER'S OWN CAMERA.
+    /// 🛑 NOT a visit count.
     let photoDays: Int
+    /// Days on which every photograph here came from the iCloud Shared
+    /// Library — somebody else's camera. Evidence that THEY were here. Six
+    /// such photos in London, Ontario, once drew this user a dot for a trip
+    /// a relative took. Never added to `photoDays`, never sizes a dot.
+    let photoDaysShared: Int
     /// Arrivals Maps recorded here. 🛑 NOT a day count, and not comparable to
     /// `photoDays` — one is an arrival and the other is a calendar day.
     let visits: Int
@@ -36,6 +42,11 @@ struct Place: Identifiable, Equatable {
 
     /// The plugins that know this place, for the legend and the dot.
     var plugins: [String] { sources.filter { $0 != "maps" && $0 != "photos" }.sorted() }
+
+    /// Nothing but somebody else's camera puts anyone here.
+    var othersOnly: Bool {
+        sources == ["photos"] && photoDays == 0 && photoDaysShared > 0
+    }
 
     /// 🛑 FOR SIZING A DOT ONLY. It takes the larger of numbers that do not
     /// share a unit, which is not a measurement of anything. Never print it.
@@ -131,6 +142,7 @@ enum PlacesReader {
                 latitude: lat, longitude: lon,
                 sources: $0["sources"] as? [String] ?? [],
                 photoDays: $0["photo_days"] as? Int ?? 0,
+                photoDaysShared: $0["photo_days_shared"] as? Int ?? 0,
                 visits: $0["visits"] as? Int ?? 0,
                 pluginVisits: pluginVisits, pluginSuggested: pluginSuggested,
                 first: date($0["first"]), last: date($0["last"]))

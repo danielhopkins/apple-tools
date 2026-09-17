@@ -29,6 +29,7 @@ struct Places: View {
     private var stats: PlacesStats { model.places }
 
     static func color(for place: Place) -> Color {
+        if place.othersOnly { return .gray }
         if place.sources.count > 1 { return .purple }
         if place.sources.contains("maps") { return .orange }
         if place.sources.contains("photos") { return .blue }
@@ -140,8 +141,11 @@ private struct Dot: View {
     private var color: Color { Places.color(for: place) }
 
     var body: some View {
+        // ⚠️ HOLLOW for somebody else's camera. A filled dot says "you were
+        // here"; this one says "a photo of yours was taken here by someone
+        // else", which is a different fact and is drawn as one.
         Circle()
-            .fill(color.opacity(0.55))
+            .fill(color.opacity(place.othersOnly ? 0.0 : 0.55))
             .overlay(Circle().strokeBorder(color, lineWidth: isSelected ? 2.5 : 1))
             .frame(width: size, height: size)
             .help(place.name)
@@ -165,13 +169,15 @@ private struct Legend: View {
             let only = { (source: String) in
                 stats.places.filter { $0.sources == [source] }.count
             }
+            let others = stats.places.filter(\.othersOnly).count
             HStack(spacing: 14) {
-                Key(color: .blue, text: "photos only  \(only("photos"))")
+                Key(color: .blue, text: "photos only  \(only("photos") - others)")
                 Key(color: .orange, text: "Maps only  \(only("maps"))")
                 ForEach(stats.fromPlugins.keys.sorted(), id: \.self) { plugin in
                     Key(color: .green, text: "\(plugin) only  \(only(plugin))")
                 }
                 Key(color: .purple, text: "more than one  \(stats.places.filter { $0.sources.count > 1 }.count)")
+                Key(color: .gray, hollow: true, text: "someone else's camera  \(others)")
             }
             if let place = selected {
                 // 🛑 THE TWO NUMBERS ARE NAMED AND KEPT APART. A visit is an
@@ -196,6 +202,11 @@ private struct Legend: View {
         if place.photoDays > 0 {
             parts.append("\(place.photoDays) "
                          + (place.photoDays == 1 ? "day photographed" : "days photographed"))
+        }
+        if place.photoDaysShared > 0 {
+            parts.append("\(place.photoDaysShared) "
+                         + (place.photoDaysShared == 1 ? "day" : "days")
+                         + " on someone else's camera")
         }
         if place.visits > 0 {
             parts.append("\(place.visits) "
@@ -222,10 +233,11 @@ private struct Legend: View {
 
 private struct Key: View {
     let color: Color
+    var hollow = false
     let text: String
     var body: some View {
         HStack(spacing: 5) {
-            Circle().fill(color.opacity(0.55))
+            Circle().fill(color.opacity(hollow ? 0 : 0.55))
                 .overlay(Circle().strokeBorder(color, lineWidth: 1))
                 .frame(width: 9, height: 9)
             Text(text).font(.system(size: 11)).foregroundStyle(.secondary)
