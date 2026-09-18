@@ -66,5 +66,8 @@ stamp bin/apple 'APPLE_TOOLS_VERSION="[^"]*"' "APPLE_TOOLS_VERSION=\"$VERSION\""
 for plugin in plugins/*/apple-plugin-*; do
     stamp "$plugin" '\nVERSION = "[^"]*"' "\nVERSION = \"$VERSION\""
 done
+# The health plugin's iPhone app carries it too, so the phone and the Mac
+# report the same number.
+stamp plugins/health/ios/project.yml 'MARKETING_VERSION: "[^"]*"' "MARKETING_VERSION: \"$VERSION\""
 
 echo "Done. Rebuild with 'make build'."

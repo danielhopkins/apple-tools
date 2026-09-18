@@ -42,7 +42,7 @@ import sys
 import xml.etree.ElementTree as ET
 import zipfile
 
-VERSION = "26.917.0"
+VERSION = "26.918.0"
 NAME = "health"
 FORMAT_VERSION = "1"
 SHORTCUT_NAME = "Apple Tools Health Export"
