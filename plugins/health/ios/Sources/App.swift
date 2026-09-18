@@ -96,7 +96,7 @@ struct ContentView: View {
                         }
                     }
                 } footer: {
-                    Text("Runs the 8-day export when Health reports new steps and the last export is over 20 hours old. iOS decides the exact moment.")
+                    Text("Runs the 8-day export the first time the phone is unlocked after 20 hours have passed and Health reports new steps — the morning pickup, about two seconds. Health cannot be read while the phone is locked, so nothing runs overnight.")
                 }
 
                 Section {

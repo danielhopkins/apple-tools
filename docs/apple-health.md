@@ -133,7 +133,11 @@ half of the plugin; the routes below are what it replaced or kept.
   at 30 s, and every query after that failed — clinical records the first
   time, then 2024 and 2025 whole on the second run, written nearly empty
   over complete files. The app now keeps the screen on for a run and stops
-  at the first such error without writing a partial file.
+  at the first such error without writing a partial file. 🛑 **It also
+  means no export can run overnight on a locked phone, and no entitlement
+  changes that** — the "daily" export is the first unlock after 20 h,
+  when the next steps land, about two seconds at the morning pickup.
+  Background delivery is hourly so a locked attempt retries soon.
 - **Health dates a clinical record the day the provider sync filed it.**
   229 lab results over five draws all carried 2026-09-17. The FHIR
   resource's `effectiveDateTime` is the draw date, and the plugin uses it.

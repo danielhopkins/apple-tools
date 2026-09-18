@@ -2,16 +2,23 @@
 //
 // Two triggers, because neither is guaranteed:
 //   HKObserverQuery on step count, with background delivery enabled at
-//     `.daily` — Health wakes the app when new steps land, at most daily.
+//     `.hourly` — Health wakes the app when new steps land.
 //   BGAppRefreshTask, which iOS schedules when it feels like it.
 // Either one runs the 8-day export when the last run is older than 20 h,
-// and logs what it did. ⚠️ iOS decides when a background task runs; a
-// phone that is locked and idle may run it hours later than asked, and
-// the log is where to look before concluding it did not run.
+// and logs what it did.
+//
+// 🛑 THE HEALTH DATABASE IS ENCRYPTED WHILE THE PHONE IS LOCKED, and every
+// read fails until it is unlocked (HKErrorDatabaseInaccessible). No
+// entitlement changes that. So "once a day in the background" means: the
+// first time the phone is unlocked after 20 h have passed, when the next
+// steps land — in practice the morning pickup, a two-second run nobody
+// sees. An attempt that lands on a locked phone is skipped without a word
+// and retried within the hour; `lastRun` moves only when a run succeeds.
 
 import BackgroundTasks
 import Foundation
 import HealthKit
+import UIKit
 
 enum Background {
     static let taskID = "com.boulderhopkins.apple-tools.health.refresh"
@@ -52,10 +59,10 @@ enum Background {
             }
         }
         exporter.store.execute(query)
-        exporter.store.enableBackgroundDelivery(for: type, frequency: .daily) { ok, error in
+        exporter.store.enableBackgroundDelivery(for: type, frequency: .hourly) { ok, error in
             Task { @MainActor in
                 if ok {
-                    Log.shared.add("background delivery on: daily, on new steps")
+                    Log.shared.add("background delivery on: hourly, on new steps; runs once the phone is unlocked and 20 h have passed")
                 } else {
                     Log.shared.add("background delivery refused: \(error?.localizedDescription ?? "?")", error: true)
                 }
@@ -66,9 +73,11 @@ enum Background {
     @MainActor
     static func runIfDue(exporter: Exporter, trigger: String) async -> Bool {
         if let last = exporter.lastRun, Date().timeIntervalSince(last) < minimumGap {
-            Log.shared.add("\(trigger): skipped, last export \(Int(Date().timeIntervalSince(last) / 3600)) h ago")
             return false
         }
+        // Locked: Health would refuse every read. Not an error, not worth a
+        // line; the next hourly wake-up tries again.
+        guard UIApplication.shared.isProtectedDataAvailable else { return false }
         Log.shared.add("\(trigger): exporting")
         await exporter.exportRecent(days: window)
         return true
