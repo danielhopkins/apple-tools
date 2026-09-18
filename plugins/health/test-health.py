@@ -275,6 +275,7 @@ def main():
     lab = json.dumps({"resourceType": "Observation", "id": "obs-1", "status": "final",
                       "code": {"text": "Hemoglobin A1c"}, "effectiveDateTime": "2026-08-02T09:00:00-06:00",
                       "valueQuantity": {"value": 5.4, "unit": "%"},
+                      "interpretation": {"coding": [{"code": "N", "system": "http://hl7.org/fhir/v2/0078"}]},
                       "referenceRange": [{"low": {"value": 4.0, "unit": "%"}, "high": {"value": 5.6, "unit": "%"}}]})
     shot = json.dumps({"resourceType": "Immunization", "id": "imm-7", "status": "completed",
                        "vaccineCode": {"coding": [{"display": "Tdap"}]}, "occurrenceDateTime": "2021-03-15"})
@@ -290,7 +291,7 @@ def main():
         f.write("raw\tHKQuantityTypeIdentifierHeartRate\tnot a date\t2026-09-15 03:00:00 -0600\t60\tcount/min\tWatch\n")
     with open(os.path.join(folder, "clinical.txt"), "w") as f:
         f.write("apple-tools health 1\ngenerated\t2026-09-16 07:02:11 -0600\nwindow\t0\nsource\tapp\n")
-        f.write("clinical\tHKClinicalTypeIdentifierLabResultRecord\t2026-08-02 09:00:00 -0600\tHemoglobin A1c\tObservation\tobs-1\t%s\n" % lab)
+        f.write("clinical\tHKClinicalTypeIdentifierLabResultRecord\t2026-09-16 09:00:00 -0600\tHemoglobin A1c\tObservation\tobs-1\t%s\n" % lab)
         f.write("clinical\tHKClinicalTypeIdentifierImmunizationRecord\t2021-03-15 00:00:00 -0600\tTdap\tImmunization\timm-7\t%s\n" % shot)
         f.write("clinical\tHKClinicalTypeIdentifierMedicationRecord\t2025-11-01 00:00:00 -0600\tAtorvastatin\tMedicationRequest\tmed-2\t%s\n" % med)
     report = json.loads(run(["sync", "--json"], env).stdout)
@@ -313,9 +314,11 @@ def main():
     check("sleep trend in minutes, two nights", (sleep["periods"][0]["mean"], sleep["periods"][0]["days"], sleep["unit"]), (435.0, 2, "min"))
 
     labs = json.loads(run(["clinical", "--type", "labs", "--json"], env).stdout)
-    check("lab summary", labs[0]["summary"], ["value 5.4 %", "reference 4.0 % – 5.6 %", "status final"])
+    check("lab summary", labs[0]["summary"], ["value 5.4 %", "reference 4.0 % – 5.6 %", "interpretation normal", "status final"])
+    check("lab date comes from the FHIR, not Health", labs[0]["date"][:10], "2026-08-02")
     shots = json.loads(run(["clinical", "--type", "vaccines", "--json"], env).stdout)
     check("vaccine summary", shots[0]["summary"], ["vaccine Tdap", "given 2021-03-15", "status completed"])
+    check("vaccine date from occurrenceDateTime", shots[0]["date"][:10], "2021-03-15")
     meds = json.loads(run(["clinical", "--search", "atorva", "--fhir", "--json"], env).stdout)
     check("search and fhir", (len(meds), meds[0]["fhir"]["id"], meds[0]["summary"][1]), (1, "med-2", "dose 1 tablet nightly"))
     run(["clinical", "--type", "nonsense"], env, expect=64)

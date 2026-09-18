@@ -423,11 +423,16 @@ def read_daily(path):
                 problems.append("line %d: clinical row: bad date %r" % (lineno, date_text))
                 continue
             try:
-                json.loads(fhir)
+                resource_json = json.loads(fhir)
             except ValueError:
                 problems.append("line %d: clinical row: FHIR is not JSON" % lineno)
                 continue
-            clinical.append((rid or "%s|%s|%s" % (hk, iso(date), name), hk, iso(date), name, resource, fhir))
+            # 🛑 HEALTH'S OWN DATE IS WHEN THE RECORD ARRIVED, NOT WHEN IT
+            # HAPPENED. Measured: 229 lab results across five draws over
+            # two years all carried 2026-09-17, the day the provider sync
+            # ran. The FHIR resource carries the real date.
+            when = fhir_date(resource_json) or date
+            clinical.append((rid or "%s|%s|%s" % (hk, iso(when), name), hk, iso(when), name, resource, fhir))
             continue
         if head not in ("day", "sample"):
             problems.append("line %d: unknown row %r" % (lineno, head))
@@ -621,7 +626,7 @@ def sync(db, opts, quiet=False):
     """Read every daily file not read yet. Returns a report dict."""
     report = {"folders": folders(opts), "files": [], "days": 0, "nights": 0, "problems": []}
     for path in daily_files(opts):
-        if not unread(db, path, "daily"):
+        if not getattr(opts, "all", False) and not unread(db, path, "daily"):
             continue
         try:
             parsed = read_daily(path)
@@ -1353,6 +1358,29 @@ def cmd_trend(opts):
         print("%-10s %10.1f   %7.1f – %-7.1f  %3d" % (b["period"], b["mean"], b["min"], b["max"], b["days"]))
 
 
+def fhir_date(r):
+    """The date a FHIR resource says its event happened, whichever field
+    its version and type use. None when it carries none."""
+    for key in ("effectiveDateTime", "occurrenceDateTime", "date", "authoredOn", "dateWritten",
+                "onsetDateTime", "recordedDate", "dateRecorded", "performedDateTime", "issued"):
+        value = r.get(key)
+        if isinstance(value, str) and len(value) >= 10:
+            when = parse_when(value) or parse_when(value[:10] + "T00:00:00+00:00")
+            if when:
+                return when
+    for key in ("effectivePeriod", "performedPeriod", "period"):
+        start = (r.get(key) or {}).get("start")
+        if isinstance(start, str):
+            when = parse_when(start) or parse_when(start[:10] + "T00:00:00+00:00")
+            if when:
+                return when
+    return None
+
+
+INTERPRETATION = {"H": "high", "L": "low", "N": "normal", "A": "abnormal", "HH": "critically high",
+                  "LL": "critically low", "AA": "critically abnormal", "POS": "positive", "NEG": "negative"}
+
+
 def _text(node):
     """FHIR CodeableConcept → its text, else the first coding's display."""
     if not isinstance(node, dict):
@@ -1395,6 +1423,9 @@ def clinical_summary(resource, fhir):
         for interp in ([r.get("interpretation")] if isinstance(r.get("interpretation"), dict)
                        else r.get("interpretation") or []):
             t = _text(interp)
+            if not t:
+                codes = [c.get("code") for c in interp.get("coding") or [] if c.get("code")]
+                t = ", ".join(INTERPRETATION.get(c, c) for c in codes)
             if t:
                 lines.append("interpretation %s" % t)
         if r.get("status"):
@@ -1657,7 +1688,8 @@ def main(argv=None):
     p.add_argument("path", help="export.zip, export.xml, or the unzipped folder")
     p.set_defaults(func=cmd_import)
 
-    p = sub.add_parser("sync", parents=[common], help="read new daily files from the shortcut")
+    p = sub.add_parser("sync", parents=[common], help="read new files from the iPhone")
+    p.add_argument("--all", action="store_true", help="re-read every file, not only new or changed ones")
     p.set_defaults(func=cmd_sync)
 
     p = sub.add_parser("days", parents=[common, ranged], help="one line per day")
