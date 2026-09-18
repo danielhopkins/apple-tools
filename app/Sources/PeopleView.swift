@@ -1109,7 +1109,10 @@ private struct PeopleNote: View {
     var tint: Color = .secondary
     init(_ text: String, tint: Color = .secondary) { self.text = text; self.tint = tint }
     var body: some View {
+        // Same workaround as StatusView's Note: `.fixedSize` draws a wrapped
+        // Text upside down inside a ScrollView on macOS 27.
         Text(text).font(.caption).foregroundStyle(tint)
-            .fixedSize(horizontal: false, vertical: true)
+            .lineLimit(nil)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

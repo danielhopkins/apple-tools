@@ -221,7 +221,8 @@ struct Sources: View {
                 HStack(spacing: 10) {
                     Text(reason(for: line))
                         .font(.caption)
-                        .fixedSize(horizontal: false, vertical: true)
+                        .lineLimit(nil)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     Spacer(minLength: 12)
                     if let pane = line.permission?.pane,
                        let fragment = Grants.settingsFragment(for: pane) {
@@ -1362,7 +1363,14 @@ struct Note: View {
     var tint: Color = .secondary
     init(_ text: String, tint: Color = .secondary) { self.text = text; self.tint = tint }
     var body: some View {
+        // ⚠️ NOT `.fixedSize(horizontal: false, vertical: true)`. On macOS 27
+        // (26A5416b) a Text with that modifier inside a ScrollView draws
+        // UPSIDE DOWN once it wraps to a second line — a dawarich error long
+        // enough to wrap was the first note to show it (2026-09-18). A
+        // leading full-width frame wraps the same and renders the right way
+        // up.
         Text(text).font(.caption).foregroundStyle(tint)
-            .fixedSize(horizontal: false, vertical: true)
+            .lineLimit(nil)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
