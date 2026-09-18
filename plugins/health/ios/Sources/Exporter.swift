@@ -80,6 +80,14 @@ final class Exporter: ObservableObject {
         let thisYear = Calendar.current.component(.year, from: Date())
         log.add("full export: \(firstYear) to \(thisYear), earliest sample \(Format.days.string(from: earliest))")
         var total = ExportReport()
+        // 🛑 CLINICAL RECORDS FIRST. They sit under full data protection and
+        // read only while the phone is unlocked; the first full export here
+        // asked for them last, 45 s in, after the screen had locked, and
+        // every type answered "Protected health data is inaccessible".
+        if let report = await exportClinical() {
+            total.clinical += report.clinical
+            total.files += report.files
+        }
         for year in firstYear...thisYear {
             let start = Calendar.current.date(from: DateComponents(year: year, month: 1, day: 1))!
             let end = Calendar.current.date(from: DateComponents(year: year + 1, month: 1, day: 1))!
@@ -95,10 +103,6 @@ final class Exporter: ObservableObject {
                 total.files += report.files
             }
         }
-        if let report = await exportClinical() {
-            total.clinical += report.clinical
-            total.files += report.files
-        }
         lastReport = total
         log.add("full export done: \(total.days) day rows, \(total.sleepSamples) sleep samples, \(total.workouts) workouts, \(total.raw) raw samples, \(total.clinical) clinical records, \(total.files.count) files")
         markRun()
@@ -111,14 +115,14 @@ final class Exporter: ObservableObject {
         log.add("export \(name): \(Format.days.string(from: start)) to \(Format.days.string(from: end))")
         guard var report = await export(from: start, to: end, window: window, fileName: fileName) else { return }
         log.add("wrote \(fileName): \(report.days) day rows, \(report.sleepSamples) sleep samples, \(report.workouts) workouts")
+        if let clinical = await exportClinical() {
+            report.clinical = clinical.clinical
+            report.files += clinical.files
+        }
         let rawName = fileName.replacingOccurrences(of: "health-", with: "raw-")
         if let raw = await exportRaw(from: start, to: end, window: window, fileName: rawName) {
             report.raw = raw.raw
             report.files += raw.files
-        }
-        if let clinical = await exportClinical() {
-            report.clinical = clinical.clinical
-            report.files += clinical.files
         }
         lastReport = report
         markRun()
@@ -240,7 +244,9 @@ final class Exporter: ObservableObject {
                     report.clinical += 1
                 }
             } catch {
-                log.add("\(type.rawValue): \(error.localizedDescription)", error: true)
+                let hint = error.localizedDescription.contains("Protected")
+                    ? " — the phone was locked; clinical records read only while it is unlocked" : ""
+                log.add("\(type.rawValue): \(error.localizedDescription)\(hint)", error: true)
             }
         }
         let url = dir.appendingPathComponent("clinical.txt")
