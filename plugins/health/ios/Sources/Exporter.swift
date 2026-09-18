@@ -13,6 +13,7 @@
 import CoreLocation
 import Foundation
 import HealthKit
+import UIKit
 
 struct ExportReport {
     var days = 0
@@ -29,6 +30,10 @@ final class Exporter: ObservableObject {
     @Published var running = false
     @Published var lastReport: ExportReport?
     @Published var lastRun: Date? = UserDefaults.standard.object(forKey: "lastRun") as? Date
+    /// Set when a query answered "Protected health data is inaccessible":
+    /// the phone locked mid-run. Every later query fails the same way, so
+    /// the run stops here and writes nothing partial.
+    private var locked = false
 
     let store = HKHealthStore()
     private let log = Log.shared
@@ -63,6 +68,32 @@ final class Exporter: ObservableObject {
         }
     }
 
+    /// True for the error Health returns once the phone has locked.
+    /// 🛑 MEASURED 2026-09-17: a full export locked the screen 30 s in, and
+    /// every type from then on — 2024 and 2025 whole — failed with it. The
+    /// app still wrote the files, nearly empty, over complete ones.
+    private func isProtected(_ error: Error) -> Bool {
+        // HKErrorDatabaseInaccessible (6): "Protected health data is
+        // inaccessible". The message is matched too, in case the code moves.
+        ((error as NSError).domain == HKError.errorDomain && (error as NSError).code == 6)
+            || error.localizedDescription.contains("Protected health data")
+    }
+
+    private func noteProtected(_ what: String) {
+        if !locked {
+            locked = true
+            log.add("\(what): the phone locked; Health refuses every read until it is unlocked. Stopped here — nothing partial was written. Unlock and run again.", error: true)
+        }
+    }
+
+    /// The screen must stay on for a full export: auto-lock is what cut the
+    /// first one. Restored when the run ends, whichever way it ends.
+    private func awake<T>(_ body: () async -> T) async -> T {
+        UIApplication.shared.isIdleTimerDisabled = true
+        defer { UIApplication.shared.isIdleTimerDisabled = false }
+        return await body()
+    }
+
     /// The last `days` days, into one file named for today.
     func exportRecent(days: Int) async {
         let end = Calendar.current.startOfDay(for: Date().addingTimeInterval(86400))
@@ -74,7 +105,12 @@ final class Exporter: ObservableObject {
     func exportAll() async {
         guard !running else { return }
         running = true
+        locked = false
         defer { running = false }
+        await awake { await exportAllBody() }
+    }
+
+    private func exportAllBody() async {
         let earliest = await earliestDate() ?? Calendar.current.date(byAdding: .year, value: -5, to: Date())!
         let firstYear = Calendar.current.component(.year, from: earliest)
         let thisYear = Calendar.current.component(.year, from: Date())
@@ -89,6 +125,7 @@ final class Exporter: ObservableObject {
             total.files += report.files
         }
         for year in firstYear...thisYear {
+            if locked { break }
             let start = Calendar.current.date(from: DateComponents(year: year, month: 1, day: 1))!
             let end = Calendar.current.date(from: DateComponents(year: year + 1, month: 1, day: 1))!
             let until = min(end, Date().addingTimeInterval(86400))
@@ -98,20 +135,30 @@ final class Exporter: ObservableObject {
                 total.workouts += report.workouts
                 total.files += report.files
             }
+            if locked { break }
             if let report = await exportRaw(from: start, to: until, window: 366, fileName: "raw-\(year).txt") {
                 total.raw += report.raw
                 total.files += report.files
             }
         }
         lastReport = total
-        log.add("full export done: \(total.days) day rows, \(total.sleepSamples) sleep samples, \(total.workouts) workouts, \(total.raw) raw samples, \(total.clinical) clinical records, \(total.files.count) files")
-        markRun()
+        if locked {
+            log.add("full export stopped by the lock after \(total.files.count) complete files; run it again for the rest")
+        } else {
+            log.add("full export done: \(total.days) day rows, \(total.sleepSamples) sleep samples, \(total.workouts) workouts, \(total.raw) raw samples, \(total.clinical) clinical records, \(total.files.count) files")
+            markRun()
+        }
     }
 
     private func run(name: String, from start: Date, to end: Date, window: Int, fileName: String) async {
         guard !running else { return }
         running = true
+        locked = false
         defer { running = false }
+        await awake { await runBody(name: name, from: start, to: end, window: window, fileName: fileName) }
+    }
+
+    private func runBody(name: String, from start: Date, to end: Date, window: Int, fileName: String) async {
         log.add("export \(name): \(Format.days.string(from: start)) to \(Format.days.string(from: end))")
         guard var report = await export(from: start, to: end, window: window, fileName: fileName) else { return }
         log.add("wrote \(fileName): \(report.days) day rows, \(report.sleepSamples) sleep samples, \(report.workouts) workouts")
@@ -143,6 +190,7 @@ final class Exporter: ObservableObject {
         var report = ExportReport()
 
         for metric in Metric.all {
+            if locked { return nil }
             do {
                 let rows = try await dailyTotals(metric, from: start, to: end)
                 for (dayStart, dayEnd, value) in rows {
@@ -150,6 +198,7 @@ final class Exporter: ObservableObject {
                 }
                 report.days += rows.count
             } catch {
+                if isProtected(error) { noteProtected(metric.label); return nil }
                 log.add("\(metric.label): \(error.localizedDescription)", error: true)
             }
         }
@@ -163,6 +212,7 @@ final class Exporter: ObservableObject {
                 }
             }
         } catch {
+            if isProtected(error) { noteProtected("Sleep"); return nil }
             log.add("Sleep: \(error.localizedDescription)", error: true)
         }
 
@@ -179,6 +229,7 @@ final class Exporter: ObservableObject {
                 report.workouts += 1
             }
         } catch {
+            if isProtected(error) { noteProtected("Workouts"); return nil }
             log.add("Workouts: \(error.localizedDescription)", error: true)
         }
 
@@ -199,6 +250,7 @@ final class Exporter: ObservableObject {
         var text = Format.header(window: window)
         var report = ExportReport()
         for raw in RawType.all {
+            if locked { return nil }
             do {
                 let samples = try await quantitySamples(HKQuantityType(raw.type), from: start, to: end)
                 for s in samples {
@@ -208,6 +260,7 @@ final class Exporter: ObservableObject {
                 }
                 report.raw += samples.count
             } catch {
+                if isProtected(error) { noteProtected(raw.type.rawValue); return nil }
                 log.add("\(raw.type.rawValue): \(error.localizedDescription)", error: true)
             }
         }
@@ -244,9 +297,8 @@ final class Exporter: ObservableObject {
                     report.clinical += 1
                 }
             } catch {
-                let hint = error.localizedDescription.contains("Protected")
-                    ? " — the phone was locked; clinical records read only while it is unlocked" : ""
-                log.add("\(type.rawValue): \(error.localizedDescription)\(hint)", error: true)
+                if isProtected(error) { noteProtected(type.rawValue); return nil }
+                log.add("\(type.rawValue): \(error.localizedDescription)", error: true)
             }
         }
         let url = dir.appendingPathComponent("clinical.txt")

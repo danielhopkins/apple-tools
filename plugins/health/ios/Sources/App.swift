@@ -72,7 +72,7 @@ struct ContentView: View {
                     }
                     .disabled(exporter.running)
                     if exporter.running {
-                        HStack { ProgressView(); Text("Reading Health…").foregroundStyle(.secondary) }
+                        HStack { ProgressView(); Text("Reading Health… the screen stays on until it is done").foregroundStyle(.secondary) }
                     }
                     if let last = exporter.lastRun {
                         LabeledContent("Last export", value: last.formatted(date: .abbreviated, time: .shortened))

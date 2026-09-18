@@ -127,6 +127,16 @@ half of the plugin; the routes below are what it replaced or kept.
 - `-allowProvisioningUpdates` registered the App ID with HealthKit and the
   iCloud container on the first build. The install needs the phone
   unlocked.
+- 🛑 **Health refuses every read while the phone is locked.**
+  `HKErrorDatabaseInaccessible` (code 6), "Protected health data is
+  inaccessible". Measured: a 90-second full export auto-locked the screen
+  at 30 s, and every query after that failed — clinical records the first
+  time, then 2024 and 2025 whole on the second run, written nearly empty
+  over complete files. The app now keeps the screen on for a run and stops
+  at the first such error without writing a partial file.
+- **Health dates a clinical record the day the provider sync filed it.**
+  229 lab results over five draws all carried 2026-09-17. The FHIR
+  resource's `effectiveDateTime` is the draw date, and the plugin uses it.
 
 ## The four remaining routes
 

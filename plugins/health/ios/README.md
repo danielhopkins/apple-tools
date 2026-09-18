@@ -25,6 +25,13 @@ to Health (`toShare: []`).
   daily background delivery, plus a `BGAppRefreshTask`. Either runs the
   8-day export when the last one is over 20 h old. ⚠️ iOS decides the
   moment. Read the log before concluding it did not run.
+- 🛑 **Health refuses every read while the phone is locked**
+  (`HKErrorDatabaseInaccessible`, "Protected health data is inaccessible").
+  Measured 2026-09-17: a full export auto-locked the screen 30 s in, and
+  2024 and 2025 came out nearly empty over complete files. So a run keeps
+  the screen on (`isIdleTimerDisabled`) and stops at the first such error
+  without writing the file it was on; the log names it. Files already
+  written stay complete. Run again for the rest.
 - **The log** — every run, every count, every error by name — in the app
   and mirrored to `log.txt` beside the files, so `apple health log` shows
   the same lines on the Mac.
