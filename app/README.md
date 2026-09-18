@@ -173,11 +173,21 @@ whether or not it was the thing being asked about. Two costs came out of that:
 A rail fixes both by construction. One pane is on screen, so nothing below it
 can be displaced, and a pane nobody selects is never built.
 
-⚠️ **ONE QUESTION PER PANE**, in the order a person asks them: **Sources** (can
-it read my data, and what did it read), **Index size** (how is it growing, what
-does it cost, what can I delete), **Advanced** (the search endpoint and the
-proxy switch) — then, under a divider, **Your relationships**, **Your places**
-and **Your emoji**.
+⚠️ **ONE QUESTION PER PANE**, in the order a person asks them: **Search**
+(did it index that — the one question that needed a terminal until 26.918),
+**Sources** (can it read my data, and what did it read), **Index size** (how
+is it growing, what does it cost, what can I delete), **Advanced** (the
+search endpoint and the proxy switch) — then, under a divider, **Your
+relationships**, **Your places** and **Your emoji**.
+
+- 🛑 **Search runs `apple-index search --json`, not a second ranker.** The
+  socket daemon serves the vector half only; the FTS half, the fusion and the
+  record lookup are in index.py, so the window and the CLI return the same
+  list in the same order. A hit opens on a click when it carries a deep link
+  (mail, contacts, files, a plugin's places); a note gets its `applenotes://`
+  link from `apple notes get-url` on demand; the rest offer the command that
+  reads them. ⚠️ **No body is shown.** The index holds the plaintext of every
+  email, and the window is not a second reader of it.
 
 🛑 **THE SECOND GROUP IS NOT A DIAGNOSTIC, AND THE DIVIDER SAYS SO.** Nothing in
 the first group depends on it, each costs seconds of subprocess to build, and

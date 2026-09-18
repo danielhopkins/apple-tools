@@ -34,6 +34,9 @@ final class AppModel: ObservableObject {
     /// press, never on the ticker. Asking an enabled plugin its status is a
     /// network call, and the window makes it only when a person is looking.
     let plugins = Plugins()
+    /// The Search pane's state, kept on the model so a query survives a
+    /// switch to another pane and back.
+    let searchModel = SearchModel()
 
     @Published private(set) var facts = IndexFacts()
     @Published private(set) var stats = IndexStats()

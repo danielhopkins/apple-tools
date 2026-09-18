@@ -16,7 +16,8 @@ sync service, no API keys.
    world at a region and a zoom, and is not handed the user's coordinates as
    data. What an observer could infer is the region being looked at. The map
    is built only while that panel is open, so a window never scrolled that far
-   makes no request. **No CLI makes this call**; it is the app alone.
+   makes no request. **No CLI makes this call**; it is the app alone. The
+   app's Search pane runs `apple-index search` and touches no network.
 3. **Plugins, which are opt-in twice.** A plugin is an external executable
    that reads something that is not an Apple store — the first, `dawarich`,
    reads a self-hosted location server. It runs only after `apple plugins

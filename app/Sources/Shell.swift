@@ -31,12 +31,13 @@ import SwiftUI
 /// 🛑 `String`-backed, because `@AppStorage` stores it directly. Changing a
 /// case's raw value orphans whatever a person had selected.
 enum Pane: String, CaseIterable, Identifiable {
-    case sources, size, advanced, people, places, emoji
+    case search, sources, size, advanced, people, places, emoji
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
+        case .search:   return "Search"
         case .sources:  return "Sources"
         case .size:     return "Index size"
         case .advanced: return "Advanced"
@@ -56,7 +57,9 @@ enum Pane: String, CaseIterable, Identifiable {
         }
     }
 
-    static let diagnostics: [Pane] = [.sources, .size, .advanced]
+    // Search first: it is the question the index exists to answer, and the
+    // one that needed a terminal until 26.918.
+    static let diagnostics: [Pane] = [.search, .sources, .size, .advanced]
     static let statistics: [Pane] = [.people, .places, .emoji]
 }
 
@@ -146,7 +149,7 @@ private struct Rail: View {
             if !diagnosis.appHasFullDiskAccess { return .orange }
             return diagnosis.blocked.isEmpty ? .green : .orange
         case .size:     return .green
-        case .advanced: return .secondary
+        case .search, .advanced: return .secondary
         default:        return .secondary
         }
     }
@@ -261,7 +264,7 @@ private struct Detail: View {
             switch pane {
             case .people, .emoji: model.refreshPeople()
             case .places:         model.refreshPlaces()
-            case .sources, .size, .advanced: break
+            case .search, .sources, .size, .advanced: break
             }
         }
     }
@@ -269,6 +272,7 @@ private struct Detail: View {
     @ViewBuilder
     private func body(for pane: Pane) -> some View {
         switch pane {
+        case .search:   SearchPane(model: model.searchModel)
         case .sources:  Sources(model: model)
         case .size:     IndexSize(model: model)
         case .advanced: Advanced(model: model)
