@@ -182,6 +182,7 @@ with tempfile.TemporaryDirectory() as tmp:
     costco = [x for x in v if x["id"] == 1][0]
     check("duration recomputed in seconds", costco["duration_seconds"], 5400)
     check("duration human", costco["duration"], "1h 30m")
+    check("visit date is its start", [x["date"] == x["started"] for x in v], [True, True])
     check("visit coordinates", (costco["latitude"], costco["longitude"]), (39.95, -105.17))
     sent = [q for path, q, _ in REQUESTS if path == "/api/v1/visits"][-1]
     check("visits window sent", (sent["start_at"], sent["end_at"]),
@@ -202,6 +203,7 @@ with tempfile.TemporaryDirectory() as tmp:
     pts = js(run([PLUGIN, "points", "--json", "--from", "2026-09-01", "--to", "2026-09-02",
                   "--limit", "0"] + direct, ISOLATED))
     check("points follow X-Total-Pages", len(pts), 7)
+    check("point date is its fix time", all(x["date"] == x["at"] for x in pts), True)
     check("points paged three times",
           [q["page"] for path, q, _ in REQUESTS if path == "/api/v1/points"], ["1", "2", "3"])
     check("points epoch window",

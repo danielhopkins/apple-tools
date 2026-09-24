@@ -44,7 +44,7 @@ ${H}USAGE:${R} ${C}apple${R} <tool> [args...]
 
 ${H}TOOLS:${R}
     ${G}notes${R}       Search, export, and link Apple Notes       (reads NoteStore.sqlite)
-    ${G}mail${R}        Search, export, and draft Apple Mail       (reads Mail's own store)
+    ${G}mail${R}        Search, export, and compose Apple Mail     (reads Mail's own store)
     ${G}messages${R}    Search and export iMessage/SMS history     (reads chat.db)
     ${G}phone${R}       Read call history and place calls          (reads CallHistory)
     ${G}maps${R}        Read visited places and guides             (reads MapsSync)
@@ -54,7 +54,9 @@ ${H}TOOLS:${R}
 
 Every tool supports --json. Run \`apple <tool> --help\` for its own options.
 
-${H}PLUGINS:${R}
+${H}PLUGINS:${R} enabled here — each takes --help and --json like a tool
+$(plugin_help_lines)
+
     ${G}apple plugins list${R}            Plugins found on this machine, and which are enabled
     ${G}apple plugins enable NAME${R}     Let \`apple NAME …\` run, and the index read it
     ${G}apple plugins config NAME k=v${R} Configure one; secrets go to the Keychain
@@ -72,7 +74,7 @@ ${H}EXAMPLES:${R}
     apple mail accounts --json                    # addresses for --from
     apple mail search "invoice" --json            # whole store, milliseconds
     apple mail search "budget" --field content    # full-text over bodies
-    apple mail draft --to a@b.com --subject "Hi" --body "text"
+    apple mail compose --to a@b.com --subject "Hi" --body "text"   # you paste, you send
     apple messages chats --json                   # conversations, recent first
     apple messages search "dinner" --since 30     # whole store, milliseconds
     apple messages export 8 --limit 50            # one conversation
@@ -87,6 +89,8 @@ ${H}EXAMPLES:${R}
     apple calendar add "Dentist" --start "tomorrow 2pm" --duration 45
     apple contacts search "smith"                 # JSON by default
     apple contacts groups                         # groups + member counts
+    apple health clinical --type labs             # plugin: lab results, newest last
+    apple dawarich visits --since 30 --json       # plugin: stays, with how long
 EOF
 }
 
@@ -181,6 +185,30 @@ except ValueError:
 for row in rows:
     print("%s\t%s" % (row["name"], row["path"]))
 ' 2>/dev/null || true
+}
+
+# One help line per ENABLED plugin, from its own manifest. Listing only the
+# generic `apple plugins …` commands hid them: a session asked for lab results
+# searched mail, never knowing `apple health clinical` held the whole answer.
+plugin_help_lines() {
+    local manager
+    manager="$(plugin_manager)" || { echo "    (none enabled)"; return 0; }
+    "$manager" enabled 2>/dev/null | G="$G" R="$R" python3 -c '
+import json, os, sys, textwrap
+try:
+    rows = json.load(sys.stdin)
+except ValueError:
+    rows = []
+g, r = os.environ.get("G", ""), os.environ.get("R", "")
+if not rows:
+    print("    (none enabled; `apple plugins list` shows what is installed)")
+for row in rows:
+    desc = (row.get("manifest") or {}).get("description") or ""
+    lines = textwrap.wrap(desc, 64, break_on_hyphens=False) or [""]
+    print("    %s%-11s%s %s" % (g, row["name"], r, lines[0]))
+    for more in lines[1:]:
+        print("                %s" % more)
+' 2>/dev/null || echo "    (could not list enabled plugins)"
 }
 
 # Collect every tool's `status --json` and render one report.

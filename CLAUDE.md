@@ -563,6 +563,16 @@ consent dialog `status` exists to avoid. 🛑 Read `automation: "unknown"` as "M
 is wedged", not as a grant problem — the permission API itself blocks for minutes
 against a wedged Mail and then answers wrongly.
 
+🛑 **`mail_app.probe_killed: true` means something OUTSIDE killed `osascript`,
+and says nothing about Mail.** `responsive` is then absent, not `false`. Measured
+2026-09-23 on macOS 27.2 beta 2: an `osascript` started in a **cmux** pane checks
+in to LaunchServices under cmux's bundle id the moment it reaches Mail's object
+model, and cmux's single-instance guard SIGTERMs it ~7 ms later — while `get
+name` still works. Every AppleScript path now names a signal it did not send
+instead of exiting 1 with an empty message, which is how `compose` failed
+silently. Confirm with `/usr/bin/log show --last 5m --predicate 'eventMessage
+CONTAINS "Killing process"'` (zsh's `log` builtin shadows the real one).
+
 🛑 **Custom IMAP keywords are not on this Mac**, and no tool here can expose them.
 Mail discards them on sync. Anything keying off one has to run server-side.
 
@@ -1805,6 +1815,12 @@ apple health index [--since DAYS]      # what apple-index calls; runs sync first
   takes any SELECT, opens the store read-only, and refuses anything else.
   ⚠️ `trend hrv` reads the DAILY figure; pass the HealthKit identifier
   (`HKQuantityTypeIdentifierHeartRateVariabilitySDNN`) for the raw readings.
+- **Every dated JSON record carries `date`**, in both plugins: a workout's and
+  a sample's equal `start`, a visit's `started`, a point's `at`. The source's
+  own names stay beside it. A caller's `jq '.[].date'` on workouts once read
+  `null` for all 327 and reported "workouts have no dates". Each subcommand's
+  `--help` ends with its JSON fields and units — keep those in step with the
+  output (`JSON_FIELDS` in each plugin).
 - **Units in the store are canonical**: metres, kcal, minutes, count/min,
   ms, kg, mmHg, mg/dL, degC, and `%` as Health returns it — oxygen
   saturation is a fraction (0.95), body fat too. Say the unit.

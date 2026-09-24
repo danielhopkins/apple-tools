@@ -166,6 +166,20 @@ enum NoteWriter {
         let stderrData = errors.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
 
+        // A signal nobody here sent: stderr is empty, so `explain` would only
+        // say "no error reported". On macOS 27.2 cmux kills an osascript started
+        // in its pane — see `externalKillMessage` in apple-mail.
+        if process.terminationReason == .uncaughtSignal {
+            throw RuntimeError("""
+                osascript was killed by signal \(process.terminationStatus) before \
+                Contacts.app answered, and apple-contacts did not send it. The note may \
+                or may not have been written; check with `apple contacts get \(id)`. \
+                A known cause is cmux, which kills processes that inherit its bundle \
+                identifier. See: /usr/bin/log show --last 5m --predicate \
+                'eventMessage CONTAINS "Killing process"'
+                """)
+        }
+
         guard process.terminationStatus == 0 else {
             let detail = String(data: stderrData, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""

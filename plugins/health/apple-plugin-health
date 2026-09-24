@@ -63,9 +63,10 @@ STORE_DIR = os.path.join(HOME, "Library", "Application Support", "apple-tools", 
 MANIFEST = {
     "name": NAME,
     "version": VERSION,
-    "description": "Daily steps, distance, energy, heart rate, sleep, weight and "
-                   "workouts, from the files the AppleTools Health iPhone app "
-                   "writes to iCloud Drive",
+    "description": "Daily steps, heart rate, sleep and weight, workouts, raw "
+                   "readings, and clinical records (labs, vaccines, medications), "
+                   "from the files the AppleTools Health iPhone app writes to "
+                   "iCloud Drive",
     # No hosts. Nothing here connects anywhere; `apple plugins list` prints
     # an empty network line and `apple status` shows the plugin as local.
     "network": {"hosts": [], "writes": False},
@@ -1178,7 +1179,10 @@ def cmd_workouts(opts):
     if opts.type:
         rows = [w for w in rows if opts.type.lower() in w["type"].lower()]
     if opts.json:
-        print(json.dumps(rows, indent=2))
+        # `date` duplicates `start` so every dated record answers to one name:
+        # `jq '.[].date'` on workouts returned null for all 327 and was read as
+        # "workouts have no dates".
+        print(json.dumps([dict(date=w["start"], **w) for w in rows], indent=2))
         return
     if not rows:
         print("no workouts between %s and %s%s" % (
@@ -1284,7 +1288,7 @@ def cmd_samples(opts):
     if opts.limit and total > opts.limit:
         rows = rows[-opts.limit:]
         print("showing the last %d of %d samples" % (opts.limit, total), file=sys.stderr)
-    out = [dict(r) for r in rows]
+    out = [dict(date=r["start"], **dict(r)) for r in rows]
     if opts.json:
         print(json.dumps(out, indent=2))
         return
@@ -1669,12 +1673,70 @@ def cmd_index(opts):
     out.flush()
 
 
+# What `--json` prints, per subcommand, for `--help`. A caller who has to run
+# the command to learn the field names guesses them instead, and jq answers a
+# wrong guess with null rather than an error.
+JSON_FIELDS = {
+    "days": """\
+JSON: a list, one object per day.
+  date                 YYYY-MM-DD (a night belongs to the morning it ends)
+  steps, flights       count
+  walk_run_distance, cycling_distance, swimming_distance   metres
+  active_energy        kcal
+  exercise_minutes, stand_minutes   minutes
+  resting_heart_rate, walking_heart_rate   bpm
+  hrv                  ms (SDNN)
+  oxygen_saturation    fraction, 0.95 = 95%
+  vo2_max, weight      mL/min·kg, kg
+  sleep                {start, end, asleep, in_bed, core, deep, rem, awake (minutes), samples}
+  partial              true while the day was not over when written
+  sources              devices the figures came from
+A metric absent from a day is absent from its object, never 0.""",
+    "workouts": """\
+JSON: a list, one object per workout.
+  date                 same as start, so every dated record has a `date`
+  start, end           ISO 8601 with the local offset
+  type                 Health's name: Cycling, Walking, Running …
+  duration             seconds
+  distance             metres, or null
+  energy               kcal, or null
+  heart_rate           average bpm, or null
+  latitude, longitude  the route's first point, or null
+  source               the recording device
+  id, route, file      identity, GPX path in the archive, file it came from""",
+    "samples": """\
+JSON: a list, one object per reading, oldest first.
+  date                 same as start
+  start, end           ISO 8601 with the local offset
+  type                 HealthKit identifier
+  value, unit          canonical units: count/min, ms, kg, mmHg, mg/dL, degC, %
+  source               the recording device""",
+    "trend": """\
+JSON: an object.
+  metric, unit, by, from, to
+  periods              list of {period, mean, min, max, days, samples, unit}
+                       period: YYYY-MM-DD for --by day, the Monday for week,
+                       YYYY-MM for month, YYYY for year""",
+    "clinical": """\
+JSON: a list, one object per record, oldest first.
+  date                 ISO 8601, when it was performed or recorded
+  kind                 lab, immunization, medication, condition, allergy,
+                       procedure, vital, coverage
+  name                 what the record is about
+  summary              list of lines: value, reference range, dose …
+  id, resource         identity and FHIR resource type
+  fhir                 the whole FHIR resource, with --fhir only""",
+    "log": """\
+JSON: a list of {when, level, text}, as the iPhone app wrote them.""",
+}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="apple health", description=__doc__.split("\n\n")[0])
     parser.add_argument("--version", action="version", version="apple-plugin-health %s" % VERSION)
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--folder", help="where the daily files are; overrides the configured one")
-    common.add_argument("--json", action="store_true")
+    common.add_argument("--json", action="store_true", help="print JSON; the fields are listed below")
     ranged = argparse.ArgumentParser(add_help=False)
     ranged.add_argument("--since", type=int, metavar="DAYS")
     ranged.add_argument("--from", dest="from_", metavar="DATE")
@@ -1732,6 +1794,10 @@ def main(argv=None):
     p = sub.add_parser("index", parents=[common, ranged], help="NDJSON records for apple-index")
     p.add_argument("--full", action="store_true", help="accepted; index always emits everything")
     p.set_defaults(func=cmd_index)
+
+    for name, text in JSON_FIELDS.items():
+        sub.choices[name].epilog = text
+        sub.choices[name].formatter_class = argparse.RawDescriptionHelpFormatter
 
     opts = parser.parse_args(argv)
     if not opts.command:

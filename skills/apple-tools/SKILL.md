@@ -1,6 +1,6 @@
 ---
 name: apple-tools
-description: Read and write the user's local Apple app data — Notes, Mail, Messages, Phone calls, Maps, Reminders, Calendar, Contacts — through the `apple` CLI. Also turns a place name into a coordinate, for location reminders ("remind me when I get to the store") and calendar events with a real map pin. Use whenever the user refers to their own notes, email, texts, iMessages, phone calls, missed calls, voicemail, reminders, todos, calendar, meetings, schedule, contacts, or places they have been ("what's on my calendar", "find that email from", "what did they text me", "who called me", "call Alice", "remind me to", "look up their number", "search my notes", "where have I been", "when was I last at", "what's in my Maps guide"). Everything runs locally against real data, so writes need care.
+description: Read and write the user's local Apple app data — Notes, Mail, Messages, Phone calls, Maps, Reminders, Calendar, Contacts — through the `apple` CLI. Also turns a place name into a coordinate, for location reminders ("remind me when I get to the store") and calendar events with a real map pin. Use whenever the user refers to their own notes, email, texts, iMessages, phone calls, missed calls, voicemail, reminders, todos, calendar, meetings, schedule, contacts, places they have been, or their health — steps, sleep, workouts, lab results, vaccines, medications ("what's on my calendar", "find that email from", "what did they text me", "who called me", "call Alice", "remind me to", "look up their number", "search my notes", "where have I been", "when was I last at", "what's in my Maps guide", "my latest lab results", "how far did I bike this year"). Everything runs locally against real data, so writes need care.
 ---
 
 # apple-tools
@@ -25,6 +25,36 @@ these tools is that the edge cases are already handled.
 | `apple reminders` | lists, items, due dates | **yes** |
 | `apple calendar` | calendars, events, **invitees with RSVP status** | **yes** — and `invite` **emails real people** |
 | `apple contacts` | names, emails, phones, addresses, notes | **yes** |
+
+## Plugins — check these too
+
+Plugins are extra tools that read something that is not an Apple store. They
+run as `apple <name> …`, exactly like the eight tools, but **only when
+enabled**. `apple --help` names the enabled ones under PLUGINS; `apple plugins
+list --json` says which exist and which are on. Check them before answering
+from mail or notes — a plugin often holds the whole answer.
+
+| Plugin | Holds | Example |
+|--------|-------|---------|
+| `apple health` | daily steps, sleep, heart rate, HRV, weight; workouts; raw readings; **clinical records — labs, immunizations, medications, conditions, allergies, procedures** | `apple health clinical --type labs --json` |
+| `apple dawarich` | a self-hosted location server: stays **with an end time and a duration**, named places, the raw GPS track | `apple dawarich visits --since 30 --json` |
+
+- **Lab results, vaccines and prescriptions are in `apple health clinical`**,
+  not in mail. They exist only when a provider is connected in the Health
+  app; an empty answer means no provider, not no health. `--search TEXT`
+  narrows, `--fhir` adds the full record.
+- **Every dated record has a `date` field** — workouts, samples, visits, GPS
+  points and clinical records alike. The source's own names (`start`/`end`,
+  `started`/`ended`, `at`) sit beside it.
+- **Each subcommand's `--help` ends with its JSON fields and their units.**
+  Read that rather than inferring the shape from one record: `jq` answers a
+  wrong field name with `null`, not an error. Health units are canonical —
+  metres, kcal, minutes, bpm, ms, kg — and a workout's `duration` is
+  **seconds**.
+- `apple health sql "SELECT …"` answers anything the subcommands do not;
+  `--schema` prints the tables. It is read-only.
+- 🛑 **Nearly every `apple dawarich` visit is the server's guess**
+  (`status: suggested`). Say so when you report one.
 
 ## Rules
 
@@ -53,7 +83,7 @@ these tools is that the edge cases are already handled.
 Each tool documents itself. Prefer this over guessing flags:
 
 ```bash
-apple --help              # the six tools
+apple --help              # the eight tools, and every enabled plugin
 apple calendar --help     # subcommands
 apple calendar add --help # every flag, with defaults
 ```

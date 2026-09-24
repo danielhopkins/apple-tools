@@ -224,6 +224,9 @@ def main():
     workouts = json.loads(run(["workouts", "--from", "2026-01-01", "--to", "2026-12-31", "--json"], env).stdout)
     check("workouts sorted", [w["type"] for w in workouts], ["Running", "Cycling", "Yoga", "Cycling"])
     ride = workouts[1]
+    # Every dated record answers to `date`; a caller's `.date` on workouts once
+    # returned null for all of them and was reported as "no dates".
+    check("workout date is its start", [w["date"] == w["start"] for w in workouts], [True] * 4)
     check("statistics child distance", ride["distance"], 20500.0)
     check("statistics energy", ride["energy"], 612.0)
     check("average heart rate", ride["heart_rate"], 141.0)
@@ -301,6 +304,7 @@ def main():
 
     hr = json.loads(run(["samples", "--type", "heart_rate", "--from", "2026-09-01", "--to", "2026-09-30", "--json"], env).stdout)
     check("heart rate samples", [r["value"] for r in hr], [62.0, 65.0, 71.0, 58.0])
+    check("sample date is its start", all(r["date"] == r["start"] for r in hr), True)
     run(["samples", "--type", "nonsense"], env, expect=64)
     trend = json.loads(run(["trend", "hrv", "--from", "2026-08-01", "--to", "2026-09-30", "--by", "month", "--json"], env).stdout)
     check("hrv trend reads the daily figure first", [(p["period"], p["mean"]) for p in trend["periods"]], [("2026-09", 41.0)])

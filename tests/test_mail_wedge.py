@@ -343,6 +343,11 @@ class TestPreflightWithMailUp(MailGuardTest):
             self.skipTest("Mail is wedged — quit and reopen Mail.app, then re-run")
         if payload["automation"] != "authorized":
             self.skipTest("Automation → Mail not granted, so status must not probe")
+        if payload["mail_app"].get("probe_killed"):
+            # The probe never reached Mail, so nothing here is about Mail. Seen
+            # under cmux on macOS 27.2, which SIGTERMs the osascript.
+            self.assertNotIn("responsive", payload["mail_app"])
+            self.skipTest("the probe was killed from outside (cmux?) — run from another terminal")
         # A healthy Mail answers; if this fails Mail really is wedged and the
         # rest of the suite is not what is broken.
         self.assertTrue(

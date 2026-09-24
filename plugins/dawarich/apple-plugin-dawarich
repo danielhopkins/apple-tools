@@ -296,6 +296,9 @@ def shape_visit(row):
         "name": row.get("name"),
         "status": row.get("status"),
         "confidence": row.get("confidence"),
+        # `date` duplicates `started`: every dated record across the plugins
+        # answers to one name, so `jq '.[].date'` never silently reads null.
+        "date": iso(started),
         "started": iso(started),
         "ended": iso(ended),
         "duration_seconds": seconds,
@@ -325,6 +328,7 @@ def shape_point(row):
     when = row.get("timestamp")
     return {
         "id": row.get("id"),
+        "date": iso(parse_when(when)) if when is not None else None,
         "at": iso(parse_when(when)) if when is not None else None,
         "latitude": _float(row.get("latitude")),
         "longitude": _float(row.get("longitude")),
@@ -560,6 +564,30 @@ def _epoch(text):
     return when.timestamp() if when else None
 
 
+# What `--json` prints, per subcommand, for `--help`: a caller should not have
+# to run a command to learn its field names.
+JSON_FIELDS = {
+    "visits": """\
+JSON: a list, one object per stay, newest first.
+  date                 same as started
+  started, ended       ISO 8601, UTC
+  duration_seconds     recomputed from the two times; `duration` is the same, for people
+  status               confirmed, or suggested (the server's guess)
+  confidence           the server's 0-100 score for a suggested stay
+  name, latitude, longitude, place_id, area_id
+                       latitude and longitude are null for an "Unknown Location" stay""",
+    "places": """\
+JSON: a list, one object per named place.
+  id, name, city, country, latitude, longitude, source
+  created, updated     when the place was saved on the server, not a visit""",
+    "points": """\
+JSON: a list, one object per GPS fix, oldest first.
+  date                 same as at
+  at                   ISO 8601, UTC
+  latitude, longitude, altitude, accuracy, velocity, battery, city, country""",
+}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="apple dawarich",
                                      description=__doc__.split("\n\n")[0])
@@ -567,7 +595,7 @@ def main(argv=None):
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--url", help="server, overrides the configured one")
     common.add_argument("--api-key", help="API key, overrides the Keychain")
-    common.add_argument("--json", action="store_true")
+    common.add_argument("--json", action="store_true", help="print JSON; the fields are listed below")
     ranged = argparse.ArgumentParser(add_help=False)
     ranged.add_argument("--since", type=int, metavar="DAYS")
     ranged.add_argument("--from", dest="from_", metavar="DATE")
@@ -593,6 +621,10 @@ def main(argv=None):
 
     p = sub.add_parser("index", parents=[common, ranged], help="NDJSON records for apple-index")
     p.set_defaults(func=cmd_index)
+
+    for name, text in JSON_FIELDS.items():
+        sub.choices[name].epilog = text
+        sub.choices[name].formatter_class = argparse.RawDescriptionHelpFormatter
 
     opts = parser.parse_args(argv)
     if not opts.command:

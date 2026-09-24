@@ -263,10 +263,18 @@ struct Status: AsyncParsableCommand {
     // A permission check that did not answer is itself proof Mail is not
     // answering, so say so rather than reporting `responsive` as unknown — and
     // do not then send a probe to a target we already know is not replying.
-    let responsive: Bool? =
-      code == nil
-      ? (mailRunning ? false : nil)
-      : ((automationOK && mailRunning) ? MailPreflight.isResponsive() : nil)
+    var probeKilled: String?
+    let responsive: Bool? = {
+      if code == nil { return mailRunning ? false : nil }
+      guard automationOK && mailRunning else { return nil }
+      switch MailPreflight.isResponsive() {
+      case .answered: return true
+      case .silent: return false
+      case .killed(let message):
+        probeKilled = message
+        return nil
+      }
+    }()
 
     let usable = fileSystemOK || automationOK
     let advice: String? = {
@@ -292,6 +300,7 @@ struct Status: AsyncParsableCommand {
 
       var mailApp: [String: Any] = ["running": mailRunning]
       if let responsive { mailApp["responsive"] = responsive }
+      if probeKilled != nil { mailApp["probe_killed"] = true }
 
       var payload: [String: Any] = [
         "status": fileSystemOK ? (automationOK ? "authorized" : "readOnly") : automation,
@@ -306,6 +315,7 @@ struct Status: AsyncParsableCommand {
           "Mail.app is running but not answering Apple Events — drafting and sending will "
           + "not work until it is restarted. \(wedgedAdvice)"
       }
+      if let probeKilled { payload["advice"] = probeKilled }
       let data = try? JSONSerialization.data(
         withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
       print(data.flatMap { String(data: $0, encoding: .utf8) } ?? "{}")
@@ -322,10 +332,13 @@ struct Status: AsyncParsableCommand {
       switch responsive {
       case true: print("Mail.app:                    running, answering Apple Events")
       case false: print("Mail.app:                    running but WEDGED — not answering")
+      case nil where probeKilled != nil:
+        print("Mail.app:                    running; the probe was KILLED from outside, state unknown")
       case nil: print("Mail.app:                    \(mailRunning ? "running" : "not running")")
       }
       if let advice { print(advice) }
       if responsive == false { print(wedgedAdvice) }
+      if let probeKilled { print(probeKilled) }
     }
   }
 }
@@ -1779,6 +1792,9 @@ enum MailPreflight {
         \(Int(probe))s — it is wedged. Not sending the real request on top of it.
         \(wedgedAdvice)
         """)
+    } catch let error as AppleScriptError where error.killedBy != nil {
+      // Not Mail's answer at all, and the real request would die the same way.
+      throw MailUnavailable(message: "\(action) needs Mail.app, and the probe could not reach it: \(error.message)")
     } catch {
       // A prompt refusal is Mail being healthy and saying no — a denied
       // Automation grant, or an account layout the probe did not expect. Pass
@@ -1801,10 +1817,23 @@ enum MailPreflight {
   /// Whether Mail is answering, for `status`. Never throws and never prompts —
   /// only call it once the Automation grant is known to be authorized, or the
   /// probe becomes the consent dialog `status` exists to avoid.
-  static func isResponsive() -> Bool {
-    guard isMailRunning() else { return false }
-    guard let answer = try? runAppleScript(probeScript, deadline: probe) else { return false }
-    return !answer.isEmpty
+  static func isResponsive() -> ProbeResult {
+    guard isMailRunning() else { return .silent }
+    do {
+      return try runAppleScript(probeScript, deadline: probe).isEmpty ? .silent : .answered
+    } catch let error as AppleScriptError where error.killedBy != nil {
+      return .killed(error.message)
+    } catch {
+      return .silent
+    }
+  }
+
+  enum ProbeResult {
+    case answered
+    case silent
+    /// The probe was killed from outside before Mail could answer, so whether
+    /// Mail is responsive is unknown — never report it as wedged.
+    case killed(String)
   }
 }
 
@@ -1874,6 +1903,14 @@ func runAppleScript(
       timedOut: true)
   }
 
+  // A signal we did not send. `terminationStatus` is then the signal number and
+  // stderr is empty, so the branch below would throw an error with no message at
+  // all — which is exactly how `compose` came to exit 1 printing nothing.
+  if process.terminationReason == .uncaughtSignal {
+    let signal = process.terminationStatus
+    throw AppleScriptError(message: externalKillMessage(signal), killedBy: signal)
+  }
+
   if process.terminationStatus != 0 {
     let errStr = String(data: collected.err, encoding: .utf8) ?? "Unknown AppleScript error"
     let trimmed = errStr.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1910,5 +1947,35 @@ struct AppleScriptError: LocalizedError {
   /// Whether the failure was a timeout — ours or Mail's -1712. Both mean "stop
   /// sending events", which a caller cannot infer from the message text.
   var timedOut: Bool = false
+  /// The signal that ended `osascript`, when something other than this tool sent
+  /// it. Says nothing about Mail: the script died before Mail could answer.
+  var killedBy: Int32? = nil
   var errorDescription: String? { message }
+}
+
+/// What to say when `osascript` is killed from outside.
+///
+/// 🛑 Measured 2026-09-23 on macOS 27.2 beta 2 with cmux 0.64.25: an `osascript`
+/// started in a cmux pane checks in to LaunchServices under cmux's own bundle
+/// identifier the moment it reaches into Mail's object model, and cmux's
+/// single-instance guard SIGTERMs it about 7 ms later. Mail answered the same
+/// probe normally from a process outside cmux's tree. So this must never be
+/// reported as a wedged Mail — restarting Mail changes nothing.
+func externalKillMessage(_ signal: Int32) -> String {
+  let name: String
+  switch signal {
+  case SIGTERM: name = "SIGTERM"
+  case SIGKILL: name = "SIGKILL"
+  case SIGINT: name = "SIGINT"
+  default: name = "signal \(signal)"
+  }
+  return """
+    osascript was killed by \(name) before it finished, and apple-mail did not send it. \
+    Another process stopped the script, so this says nothing about Mail itself — \
+    restarting Mail will not help.
+    Known cause: cmux kills any process LaunchServices registers under cmux's bundle \
+    identifier, and on macOS 27.2 an osascript started in a cmux pane inherits it. To see \
+    what sent the signal:
+      /usr/bin/log show --last 5m --predicate 'eventMessage CONTAINS "Killing process"'
+    """
 }
