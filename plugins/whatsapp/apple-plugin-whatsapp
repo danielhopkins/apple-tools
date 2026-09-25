@@ -21,7 +21,8 @@ number; `<n>@lid` is an opaque id newer WhatsApp uses instead, and carries
 none. ContactsV2 maps every @lid it knows (314 of 314 here) to the number.
 A handle this plugin reports is `+<digits>` when a number is known, the raw
 id when it is not — so a phone that is on a card in Contacts matches it,
-and one that is not is content, never a guessed person.
+and one that is not is content, never a guessed person — unless a card
+claims the @lid with a `WhatsApp: whatsapp-lid:<n>` URL (see LID_URL).
 
 It makes no connection. It opens every file read-only, through SQLite, so
 the write-ahead log — where WhatsApp keeps its newest messages — is read
@@ -38,6 +39,7 @@ chat, the shape `apple messages` gets, and one per call.
 """
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -246,6 +248,70 @@ def number_of(jid):
     return None
 
 
+# 🛑 A CARD CAN CLAIM AN @lid, because nothing else can. WhatsApp hides a
+# group member's number behind an @lid, and ContactsV2 maps one only for
+# people in the phone's address book. So the user writes the id on the card
+# as a URL labelled WhatsApp:
+#
+#     apple contacts edit <id> --add-url "WhatsApp:whatsapp-lid:63080235049176"
+#
+# It opens nothing — wa.me needs a number and no link format takes an @lid —
+# it is a claim. Every URL on every card is read, and one that names an
+# @lid gives that id the card's name and the card's handle: its first phone,
+# else its first email, so the record matches the card the way a mail does.
+LID_URL = re.compile(r"^(?:whatsapp-lid:(\d+)|(\d+)@lid)$", re.IGNORECASE)
+
+
+def card_phone(number):
+    digits = re.sub(r"\D", "", number or "")
+    if not digits:
+        return None
+    if (number or "").strip().startswith("+"):
+        return "+" + digits
+    if len(digits) == 10:
+        return "+1" + digits
+    return "+" + digits
+
+
+def card_links():
+    """@lid -> {name, handle, contact_id}, from the cards that claim one.
+
+    $WHATSAPP_CARDS names a JSON file standing in for `apple contacts list`,
+    for tests; the suite must never read the user's address book. A failed
+    read costs the links and says so, and never stops a command."""
+    path = os.environ.get("WHATSAPP_CARDS")
+    try:
+        if path:
+            with open(path, encoding="utf-8") as f:
+                cards = json.load(f)
+        else:
+            apple = shutil.which("apple")
+            if apple is None:
+                return {}
+            proc = subprocess.run([apple, "contacts", "list", "--limit", "1000000", "--json"],
+                                  capture_output=True, text=True, timeout=60)
+            if proc.returncode != 0:
+                note("whatsapp: could not read Contacts, so no card links: %s"
+                     % (proc.stderr.strip().splitlines() or ["exit %d" % proc.returncode])[-1])
+                return {}
+            cards = json.loads(proc.stdout)
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        note("whatsapp: could not read Contacts, so no card links: %s" % e)
+        return {}
+    links = {}
+    for card in cards:
+        for url in card.get("urls") or []:
+            m = LID_URL.match((url.get("url") or "").strip())
+            if not m:
+                continue
+            phones = [card_phone(p.get("number")) for p in card.get("phones") or []]
+            emails = [e.get("address") for e in card.get("emails") or [] if e.get("address")]
+            handle = next((x for x in phones if x), None) or (emails[0].lower() if emails else None)
+            links["%s@lid" % (m.group(1) or m.group(2))] = {
+                "name": card.get("name"), "handle": handle, "contact_id": card.get("id")}
+    return links
+
+
 class Store:
     """The three files, and the one question every command asks of them:
     who is this id."""
@@ -260,6 +326,12 @@ class Store:
         self.calls_db = connect(os.path.join(self.folder, "CallHistory.sqlite"))
         self._people = None
         self._chats = None
+        self._links = None
+
+    def links(self):
+        if self._links is None:
+            self._links = card_links()
+        return self._links
 
     # ---- people ----------------------------------------------------------
 
@@ -320,6 +392,12 @@ class Store:
             return ("?", "?")
         entry = self.people().get(jid) or {}
         phone = entry.get("phone") or number_of(jid)
+        if jid.endswith("@lid"):
+            card = self.links().get(jid)
+            if card:
+                # The card is the user's own word, so its name wins; a number
+                # WhatsApp knows still beats an email as the handle.
+                return (phone or card["handle"] or jid, card["name"] or phone or jid)
         handle = phone or jid
         return (handle, entry.get("name") or handle)
 
@@ -805,6 +883,12 @@ def cmd_index(opts):
                     people.append({"role": "handle", "name": m["sender"], "handle": m["handle"]})
             if chat["type"] == "chat" and chat.get("handle") and chat["handle"] not in seen:
                 people.append({"role": "handle", "name": chat["title"], "handle": chat["handle"]})
+            body = "\n".join("%s: %s" % (m["sender"], m["text"]) for m in block)
+            # 🛑 The rev covers the body AND the handles. A card that claims
+            # an @lid renames old messages without adding one, and a rev of
+            # count and last id left every renamed record unchanged.
+            rev = hashlib.sha1(json.dumps([body, people], ensure_ascii=False)
+                               .encode("utf-8")).hexdigest()[:16]
             out.write(json.dumps({
                 "uid": "whatsapp:chat:%s:%s" % (chat["jid"], first["guid"] or first["id"]),
                 "tool": NAME, "kind": "conversation", "native_id": chat["jid"], "url": url,
@@ -814,8 +898,8 @@ def cmd_index(opts):
                 "occurred": last["timestamp"],
                 "latitude": None, "longitude": None,
                 "people": people,
-                "body": "\n".join("%s: %s" % (m["sender"], m["text"]) for m in block),
-                "rev": "%d|%s" % (len(block), last["guid"] or last["id"]),
+                "body": body,
+                "rev": rev,
             }, ensure_ascii=False) + "\n")
     for c in calls(store, start):
         lines = [call_title(c)]
@@ -834,7 +918,8 @@ def cmd_index(opts):
             "people": [{"role": "handle", "name": p["name"], "handle": p["handle"]}
                        for p in c["participants"]],
             "body": "\n".join(lines),
-            "rev": "%s|%s|%s" % (c["missed"], c["duration"], len(c["participants"])),
+            "rev": "%s|%s|%s" % (c["missed"], c["duration"],
+                                 ",".join("%s=%s" % (p["handle"], p["name"]) for p in c["participants"])),
         }, ensure_ascii=False) + "\n")
     out.flush()
 

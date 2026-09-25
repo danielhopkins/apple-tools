@@ -1869,6 +1869,14 @@ apple whatsapp index [--since DAYS]        # what apple-index calls
   handle is `+digits` when a number is known and the raw id when not. It is
   treated as content: a number on a Contacts card matches, anything else is
   never guessed into a person.
+- 🛑 **A card can claim an `@lid`**, for someone whose number WhatsApp hides:
+  `apple contacts edit <id> --add-url "WhatsApp:whatsapp-lid:<n>"`. The URL
+  opens nothing — `wa.me` needs a number — it is a claim. The plugin reads
+  every card through `apple contacts list` (1.5s for 712 cards) and gives a
+  claimed id the card's name, and the card's first phone or else its first
+  email as the handle. `WHATSAPP_CARDS` stands in for the address book in
+  tests. ⚠️ **Never create a card just to link someone**; WhatsApp-only
+  people stay content.
 - ⚠️ **An unmapped `@lid` chat is titled with the number**, because WhatsApp
   lists a stranger under it. The plugin reads the number back out of the
   title. **WhatsApp wraps names in invisible bidi controls** (U+202A …

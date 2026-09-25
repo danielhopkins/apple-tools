@@ -58,7 +58,9 @@ from mail or notes — a plugin often holds the whole answer.
   was linked**, plus a thin sample from before. The full history is on the
   phone. An empty answer about an older chat means "not on this Mac", not
   "never said". A `handle` is `+digits` when a number is known and a raw
-  `…@lid` id when not; do not guess a person from one.
+  `…@lid` id when not; do not guess a person from one. A card that
+  already exists can claim one with `--add-url
+  "WhatsApp:whatsapp-lid:<n>"`; never create a card only to link someone.
 - 🛑 **Nearly every `apple dawarich` visit is the server's guess**
   (`status: suggested`). Say so when you report one.
 

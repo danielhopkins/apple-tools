@@ -347,7 +347,12 @@ What was measured on the first run, 2026-09-25, and what it decided:
   number (314 of 314). A chat with a stranger is titled with their number,
   which the plugin reads back. What stays unmapped keeps the raw id and a
   `~name` the person set themselves. Records are content first: a handle
-  joins a person only when a Contacts card carries the number.
+  joins a person only when a Contacts card carries the number, or when a
+  card claims the `@lid` with a `WhatsApp: whatsapp-lid:<n>` URL. Then the
+  card's name wins and its first phone, else its first email, is the
+  handle. 🛑 **A record's `rev` hashes its body and handles**: a claim
+  renames old messages without adding one, and a rev of count and last id
+  left every renamed record unchanged in the index.
 - **`ZMESSAGETYPE`**: 0 text, 1 image, 2 video, 3 voice, 4 contact, 5
   location, 6 group event, 7 link, 8 document, 10 system notice, 15
   sticker; 12, 41, 59, 75 and 76 were seen once each and are reported as

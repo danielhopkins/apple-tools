@@ -50,6 +50,7 @@ ANA_WA = "15550001111@s.whatsapp.net"
 BOB_LID = "333@lid"            # NOT in the address book; only his push name
 CARL_WA = "15550002222@s.whatsapp.net"
 DAVE_LID = "444@lid"           # unmapped, but his chat is titled with his number
+EVE_LID = "555@lid"            # unmapped; a card claims her id with a URL
 GROUP = "120363000000000001@g.us"
 
 
@@ -81,6 +82,7 @@ def build(folder):
     chat.executemany("INSERT INTO ZWAGROUPMEMBER VALUES (?,?,?,?,?)", [
         (1, 1, 1, "Ana Garcia", ANA_LID),
         (2, 1, 1, None, BOB_LID),
+        (3, 1, 1, None, EVE_LID),
     ])
     chat.execute("INSERT INTO ZWAPROFILEPUSHNAME VALUES (1, ?, 'Bobby')", (BOB_LID,))
     chat.executemany("INSERT INTO ZWAMEDIAITEM VALUES (?,?,?,?,?,?,?,?)", [
@@ -101,6 +103,7 @@ def build(folder):
         (7, 0, 0, 2, None, None, apple(3), CARL_WA, "S7", "Lunch Friday?"),
         (8, 0, 0, 3, None, None, apple(40), DAVE_LID, "S8", "Hi, is this Dan?"),
         (9, 0, 0, 5, None, None, apple(2), "15559999999@s.whatsapp.net", "S9", "gone"),
+        (10, 0, 0, 1, 3, None, apple(2, 14), GROUP, "S10", "I can bring the flyers"),
     ]
     # Eleven more in the group, so the chat makes two index blocks.
     for i in range(11):
@@ -149,13 +152,33 @@ def build(folder):
     return chat
 
 
+# What `apple contacts list --json` returns, trimmed to the keys read.
+CARDS = [
+    # Claims Eve's @lid; no phone, so her email becomes the handle.
+    {"id": "EVE:ABPerson", "name": "Eve Card", "emails": [{"address": "Eve@Example.org"}],
+     "urls": [{"label": "LinkedIn", "url": "https://linkedin.com/in/eve"},
+              {"label": "WhatsApp", "url": "whatsapp-lid:555"}]},
+    # Claims Ana's @lid, which ContactsV2 already maps to a number: the
+    # card's name wins, WhatsApp's number stays the handle.
+    {"id": "ANA:ABPerson", "name": "Ana (card)", "phones": [{"number": "(555) 000-9999"}],
+     "urls": [{"label": "WhatsApp", "url": "222@lid"}]},
+    # A URL that only looks like an id claims nothing.
+    {"id": "X:ABPerson", "name": "Not Bob", "urls": [{"label": "WhatsApp", "url": "whatsapp-lid:333x"}]},
+]
+
+
 def main():
     with tempfile.TemporaryDirectory() as folder:
         holder = build(folder)
         check("the WAL holds the newest message", os.path.getsize(
             os.path.join(folder, "ChatStorage.sqlite-wal")) > 0, True)
+        # 🛑 WHATSAPP_CARDS stands in for the address book. Without it the
+        # plugin runs `apple contacts list` against the user's real cards.
+        cards = os.path.join(folder, "cards.json")
+        with open(cards, "w") as f:
+            json.dump(CARDS, f)
         env = dict(os.environ, WHATSAPP_FOLDER=folder, APPLE_PLUGINS_BIN="/usr/bin/false",
-                   PYTHONDONTWRITEBYTECODE="1")
+                   WHATSAPP_CARDS=cards, PYTHONDONTWRITEBYTECODE="1")
 
         manifest = json.loads(run(["manifest", "--json"], env).stdout)
         check("manifest name", manifest["name"], "whatsapp")
@@ -173,7 +196,7 @@ def main():
 
         chats = {c["id"]: c for c in json.loads(run(["chats", "--json"], env).stdout)}
         check("a removed chat is not listed", 5 in chats, False)
-        check("group type and members", (chats[1]["type"], chats[1]["members"]), ("group", 2))
+        check("group type and members", (chats[1]["type"], chats[1]["members"]), ("group", 3))
         check("bidi controls are stripped", chats[3]["title"], "+1 (940) 290‑7669")
         check("an unmapped @lid chat takes the number in its title", chats[3]["handle"], "+19402907669")
         check("the year-4000 sentinel is no date", chats[4]["last_message"], None)
@@ -184,11 +207,20 @@ def main():
         msgs = export["messages"]
         by = {m["guid"]: m for m in msgs}
         check("events are left out by default", "S4" in by, False)
-        check("an @lid sender resolves through ContactsV2",
-              (by["S1"]["handle"], by["S1"]["sender"]), ("+15550001111", "Ana Garcia-Lopez"))
+        check("a card's name wins, WhatsApp's number stays the handle",
+              (by["S1"]["handle"], by["S1"]["sender"]), ("+15550001111", "Ana (card)"))
+        check("a card claims an unmapped @lid; its email is the handle",
+              (by["S10"]["handle"], by["S10"]["sender"]), ("eve@example.org", "Eve Card"))
         check("an unmapped sender falls back to ~push name",
               (by["S3"]["handle"], by["S3"]["sender"]), (BOB_LID, "~Bobby"))
         check("my own message", (by["S2"]["handle"], by["S2"]["from_me"]), ("me", True))
+        nocards = dict(env, WHATSAPP_CARDS=os.path.join(folder, "absent.json"))
+        plain = run(["export", "School Board", "--json"], nocards)
+        by_plain = {m["guid"]: m for m in json.loads(plain.stdout)["messages"]}
+        check("without cards, ContactsV2's name", by_plain["S1"]["sender"], "Ana Garcia-Lopez")
+        check("without cards, the raw id", by_plain["S10"]["handle"], EVE_LID)
+        check("an unreadable address book is said, not fatal",
+              "no card links" in plain.stderr, True)
         check("a caption from the media row", by["S3"]["text"], "[image] Budget slide from the training")
         check("an image's bogus latitude is not a location", "latitude" in by["S3"], False)
         check("a voice note carries its length", by["S5"]["text"], "[voice note 0:42]")
@@ -221,7 +253,7 @@ def main():
         check("calls newest first", [c["call_id"] for c in calls], ["C2", "C1"])
         check("a video call resolves its @lid participant",
               (calls[0]["video"], calls[0]["duration"], calls[0]["participants"][0]["name"]),
-              (True, 125, "Ana Garcia-Lopez"))
+              (True, 125, "Ana (card)"))
         check("a missed call", (calls[1]["missed"], calls[1]["connected"], calls[1]["direction"]),
               (True, False, "incoming"))
 
@@ -244,9 +276,13 @@ def main():
         check("a one-to-one chat links to WhatsApp",
               [r["url"] for r in records if r["native_id"] == CARL_WA], ["whatsapp://send?phone=15550002222"])
         check("people carry handles", {p["handle"] for p in group[0]["people"]},
-              {"+15550001111", BOB_LID, "me"})
+              {"+15550001111", BOB_LID, "eve@example.org", "me"})
         check("calls are indexed", sorted(r["uid"] for r in records if r["kind"] == "call"),
               ["whatsapp:call:C1", "whatsapp:call:C2"])
+        renamed = [json.loads(l) for l in run(["index"], nocards).stdout.splitlines() if l.strip()]
+        check("a card link changes the block's rev",
+              {r["uid"]: r["rev"] for r in records if r["native_id"] == GROUP} ==
+              {r["uid"]: r["rev"] for r in renamed if r["native_id"] == GROUP}, False)
         recent = [json.loads(l) for l in run(["index", "--since", "30"], env).stdout.splitlines() if l]
         check("index --since drops the 40-day-old chat",
               any(r["native_id"] == DAVE_LID for r in recent), False)
