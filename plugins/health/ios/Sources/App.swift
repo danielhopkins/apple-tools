@@ -15,6 +15,15 @@ struct AppleToolsHealthApp: App {
 
     init() {
         Background.register(exporter: .shared)
+        // 🛑 The observer query has to be started again on EVERY launch,
+        // background ones included. HealthKit wakes the app for new steps,
+        // but only a running query receives the update — and a background
+        // launch opens no window, so no view code runs. Started only from
+        // the toggle, it lived until iOS ended the process and the app
+        // never exported on its own (2026-09-18 to 09-24: zero runs).
+        if UserDefaults.standard.bool(forKey: "background") {
+            Background.enableObserver(exporter: .shared)
+        }
     }
 
     var body: some Scene {
