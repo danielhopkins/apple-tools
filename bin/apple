@@ -91,6 +91,7 @@ ${H}EXAMPLES:${R}
     apple contacts groups                         # groups + member counts
     apple health clinical --type labs             # plugin: lab results, newest last
     apple dawarich visits --since 30 --json       # plugin: stays, with how long
+    apple whatsapp search "board" --since 30      # plugin: WhatsApp chats and calls
 EOF
 }
 

@@ -437,6 +437,19 @@ apple health import ~/Downloads/export.zip   # the history, and the workouts
 apple health days --since 14
 ```
 
+The third, `whatsapp`, makes no connection either. WhatsApp Desktop keeps
+plain SQLite in its group container, and the plugin reads chats, group
+messages, captions and calls from it, read-only. The Mac holds only what
+WhatsApp Desktop has received since it was linked; the full history stays on
+the phone.
+
+```
+apple plugins enable whatsapp
+apple whatsapp chats
+apple whatsapp search "board meeting" --since 30
+apple whatsapp export "District Parent Council" --limit 50
+```
+
 ## Geocoding
 
 Three flags resolve a place name into a coordinate, and all three ask Apple Maps.

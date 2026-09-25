@@ -128,6 +128,7 @@ cp notes/shortcuts/*.shortcut "$STAGE/index/shortcuts/" 2>/dev/null || true
 for required in Helpers/apple Helpers/apple-plugins Helpers/apple-mail \
                 plugins/dawarich/apple-plugin-dawarich \
                 plugins/health/apple-plugin-health \
+                plugins/whatsapp/apple-plugin-whatsapp \
                 "plugins/health/Apple Tools Health Export.shortcut" notes/apple-notes \
                 notes/notestore.py notes/notestore.proto index/vec index/doctext \
                 index/models/vocab.txt \

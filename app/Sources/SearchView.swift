@@ -47,6 +47,7 @@ struct SearchHit: Identifiable, Equatable {
         case "maps":      return "apple maps places --search '\(title.replacingOccurrences(of: "'", with: ""))' --json"
         case "photos":    return "apple-index search '\(title.replacingOccurrences(of: "'", with: ""))' --tool photos --json"
         case "health":    return kind == "workout" ? "apple health workouts --json" : "apple health days --json"
+        case "whatsapp":  return kind == "call" ? "apple whatsapp calls --json" : "apple whatsapp export '\(recordID)'"
         default:          return "apple-index search --tool \(tool) --json"
         }
     }
@@ -64,7 +65,7 @@ final class SearchModel: ObservableObject {
     @Published private(set) var ran: String? = nil   // the query the hits answer
 
     static let tools = ["", "mail", "messages", "notes", "calendar", "contacts", "reminders",
-                        "maps", "photos", "files", "dawarich", "health"]
+                        "maps", "photos", "files", "dawarich", "health", "whatsapp"]
 
     func run() {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)

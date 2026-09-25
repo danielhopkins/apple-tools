@@ -1,0 +1,951 @@
+#!/usr/bin/env python3
+"""apple-plugin-whatsapp - WhatsApp chats and calls, from WhatsApp Desktop's own store.
+
+WhatsApp Desktop for Mac keeps its data in plain SQLite, Core Data style,
+in its group container. This plugin reads three of those files and writes
+nothing, anywhere:
+
+  ChatStorage.sqlite   chats, messages, group members, media captions
+  ContactsV2.sqlite    WhatsApp's copy of the address book: the only place
+                       that maps an @lid id to a phone number
+  CallHistory.sqlite   voice and video calls
+
+🛑 THE MAC HOLDS WHAT ARRIVED SINCE WHATSAPP DESKTOP WAS LINKED, and a thin
+sample from before. The full history lives on the phone and nothing on a
+Mac can read it. Measured on the first run: 157 messages in 20 chats, 138
+of them from the month the app was linked. The history grows only while
+the Desktop app stays linked.
+
+🛑 A PERSON HAS TWO KINDS OF ID. `<number>@s.whatsapp.net` carries a phone
+number; `<n>@lid` is an opaque id newer WhatsApp uses instead, and carries
+none. ContactsV2 maps every @lid it knows (314 of 314 here) to the number.
+A handle this plugin reports is `+<digits>` when a number is known, the raw
+id when it is not — so a phone that is on a card in Contacts matches it,
+and one that is not is content, never a guessed person.
+
+It makes no connection. It opens every file read-only, through SQLite, so
+the write-ahead log — where WhatsApp keeps its newest messages — is read
+too. `immutable=1` would skip it.
+
+    apple plugins enable whatsapp
+    apple whatsapp chats
+    apple whatsapp search "board meeting" --since 30
+    apple whatsapp export "District Parent Council" --limit 50
+    apple whatsapp calls --since 30
+
+`index` is what apple-index calls: one record per BLOCK of ten messages in a
+chat, the shape `apple messages` gets, and one per call.
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import urllib.parse
+
+VERSION = "26.924.0"
+NAME = "whatsapp"
+
+HOME = os.path.expanduser("~")
+DEFAULT_FOLDER = os.path.join(HOME, "Library", "Group Containers",
+                              "group.net.whatsapp.WhatsApp.shared")
+APPLE_EPOCH = 978307200
+BLOCK = 10          # messages per index record, the `apple messages` default
+
+MANIFEST = {
+    "name": NAME,
+    "version": VERSION,
+    "description": "WhatsApp chats, group messages, captions and calls, read from "
+                   "WhatsApp Desktop's store on this Mac",
+    # No hosts. The files are local and nothing here connects anywhere.
+    "network": {"hosts": [], "writes": False},
+    "commands": ["status", "chats", "search", "export", "calls", "index"],
+    "index": {
+        "kinds": ["conversation", "call"],
+        # The store is local and small, and a full run costs well under a
+        # second; a reconcile every refresh keeps a deleted chat out.
+        "refresh_args": ["--full"],
+        "container_label": "By chat",
+        "footnote": "A record is a block of ten messages in one chat, or one "
+                    "call. The Mac holds only what WhatsApp Desktop has "
+                    "received since it was linked, plus a small sample from "
+                    "before; the full history stays on the phone.",
+    },
+    "config": [
+        {"key": "folder", "required": False, "secret": False,
+         "help": "The folder holding ChatStorage.sqlite. Default: WhatsApp "
+                 "Desktop's group container"},
+    ],
+}
+
+# ZWAMESSAGE.ZMESSAGETYPE. Measured on this store, and matched against the
+# rows' own media: a caption in ZTITLE on 1, a duration on 2 and 3, a vCard
+# name on 4, a link title on 7, a file on 8.
+KINDS = {
+    0: "text", 1: "image", 2: "video", 3: "audio", 4: "contact", 5: "location",
+    6: "event", 7: "link", 8: "document", 10: "notice", 11: "gif",
+    14: "deleted", 15: "sticker", 46: "poll",
+}
+# 🛑 6 is a group event (joined, left, renamed) and 10 a system notice
+# (security code changed, a call placed). Neither was written by a person,
+# so both stay out unless --include-events asks, the `apple messages` rule.
+EVENTS = {"event", "notice"}
+
+# ZWACHATSESSION.ZSESSIONTYPE
+CHAT_TYPES = {0: "chat", 1: "group", 2: "broadcast", 3: "status"}
+
+
+def die(message, code=1):
+    print("error: %s" % message, file=sys.stderr)
+    sys.exit(code)
+
+
+def note(message):
+    print(message, file=sys.stderr)
+
+
+# --------------------------------------------------------------------------
+# configuration
+# --------------------------------------------------------------------------
+
+def plugin_manager():
+    if os.environ.get("APPLE_PLUGINS_BIN"):
+        return [os.environ["APPLE_PLUGINS_BIN"]]
+    here = os.path.dirname(os.path.realpath(__file__))
+    for candidate in (os.path.join(here, "..", "..", "bin", "apple-plugins"),
+                      os.path.join(here, "..", "..", "apple-plugins"),
+                      os.path.join(here, "..", "..", "..", "Helpers", "apple-plugins")):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return [candidate]
+    found = shutil.which("apple-plugins")
+    if found:
+        return [found]
+    found = shutil.which("apple")
+    if found:
+        return [found, "plugins"]
+    return None
+
+
+def stored_config():
+    manager = plugin_manager()
+    if manager is None:
+        return {}
+    try:
+        proc = subprocess.run(manager + ["config", NAME, "--json"],
+                              capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    try:
+        return json.loads(proc.stdout).get("config") or {}
+    except ValueError:
+        return {}
+
+
+def folder(opts):
+    """--folder, then $WHATSAPP_FOLDER, then the configured one, then the
+    group container. The config is asked for only when nothing nearer
+    answers, because asking costs a subprocess."""
+    if getattr(opts, "folder", None):
+        return os.path.expanduser(opts.folder)
+    if os.environ.get("WHATSAPP_FOLDER"):
+        return os.path.expanduser(os.environ["WHATSAPP_FOLDER"])
+    configured = stored_config().get("folder")
+    if configured:
+        return os.path.expanduser(configured)
+    return DEFAULT_FOLDER
+
+
+# --------------------------------------------------------------------------
+# the store
+# --------------------------------------------------------------------------
+
+class NoAccess(Exception):
+    pass
+
+
+def connect(path):
+    """Read-only, WAL included. None when the file does not exist."""
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "rb"):
+            pass
+    except PermissionError as e:
+        raise NoAccess(path) from e
+    uri = "file:%s?mode=ro" % urllib.parse.quote(path)
+    db = sqlite3.connect(uri, uri=True, timeout=5)
+    db.row_factory = sqlite3.Row
+    return db
+
+
+# ⚠️ WhatsApp's own "WhatsApp" chat carries a last-message date in the year
+# 4000, a sentinel. Anything more than a year ahead is read as no date.
+FAR_FUTURE = 366 * 86400
+
+
+def when(apple_seconds):
+    if apple_seconds is None:
+        return None
+    ts = float(apple_seconds) + APPLE_EPOCH
+    if ts > dt.datetime.now().timestamp() + FAR_FUTURE:
+        return None
+    return ts
+
+
+def iso(ts):
+    if ts is None:
+        return None
+    return dt.datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")
+
+
+def short(ts):
+    if ts is None:
+        return "?"
+    return dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def local_part(jid):
+    return (jid or "").split("@", 1)[0]
+
+
+# 🛑 WhatsApp wraps names and numbers in bidirectional-text controls — a
+# number shows as U+202A "+1 (940) 290‑7669" U+202C — so an exact match or a
+# `jq` test on a name fails on characters nobody can see.
+BIDI = re.compile("[\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def clean(text):
+    return BIDI.sub("", text).strip() if text else text
+
+
+PHONE_LIKE = re.compile(r"^\+[\d\s()\-\u2011.]{6,}$")
+
+
+def phone_in(name):
+    """A name that IS a number. WhatsApp lists someone outside the address
+    book under their number, so an @lid chat that ContactsV2 cannot map
+    still carries it in the chat's title."""
+    name = clean(name) or ""
+    if PHONE_LIKE.match(name):
+        return "+" + re.sub(r"\D", "", name)
+    return None
+
+
+def number_of(jid):
+    """+digits for a number id. `0@s.whatsapp.net` is WhatsApp itself."""
+    if (jid or "").endswith("@s.whatsapp.net"):
+        digits = local_part(jid)
+        if digits.isdigit() and len(digits) > 4:
+            return "+" + digits
+    return None
+
+
+class Store:
+    """The three files, and the one question every command asks of them:
+    who is this id."""
+
+    def __init__(self, opts):
+        self.folder = folder(opts)
+        self.chat_db = connect(os.path.join(self.folder, "ChatStorage.sqlite"))
+        if self.chat_db is None:
+            die("no ChatStorage.sqlite in %s. Is WhatsApp Desktop installed and "
+                "linked?" % self.folder, 66)
+        self.contacts_db = connect(os.path.join(self.folder, "ContactsV2.sqlite"))
+        self.calls_db = connect(os.path.join(self.folder, "CallHistory.sqlite"))
+        self._people = None
+        self._chats = None
+
+    # ---- people ----------------------------------------------------------
+
+    def people(self):
+        """jid -> {name, phone} from every source that names anyone.
+
+        Order is priority: the address book's own name, then the name the
+        chat is listed under, then the group-member row, then the name the
+        person set for themselves in WhatsApp, marked with `~` the way
+        WhatsApp itself marks one.
+        """
+        if self._people is not None:
+            return self._people
+        people = {}
+
+        def put(jid, name=None, phone=None):
+            if not jid:
+                return
+            name = clean(name)
+            entry = people.setdefault(jid, {"name": None, "phone": None})
+            if name and not entry["name"]:
+                entry["name"] = name
+            if phone and not entry["phone"]:
+                entry["phone"] = phone
+
+        if self.contacts_db is not None:
+            for r in self.contacts_db.execute(
+                    "SELECT ZLID, ZWHATSAPPID, ZPHONENUMBER, ZFULLNAME, ZBUSINESSNAME "
+                    "FROM ZWAADDRESSBOOKCONTACT"):
+                name = r["ZFULLNAME"] or r["ZBUSINESSNAME"]
+                phone = r["ZPHONENUMBER"]
+                if not phone and (r["ZWHATSAPPID"] or "").endswith("@s.whatsapp.net"):
+                    phone = "+" + local_part(r["ZWHATSAPPID"])
+                # 🛑 The @lid row is the ONLY bridge from an opaque id to a
+                # number. Measured: 314 of 314 rows here carry both.
+                put(r["ZLID"], name, phone)
+                put(r["ZWHATSAPPID"], name, phone)
+        db = self.chat_db
+        for r in db.execute("SELECT ZCONTACTJID, ZPARTNERNAME FROM ZWACHATSESSION "
+                            "WHERE ZSESSIONTYPE = 0"):
+            put(r["ZCONTACTJID"], r["ZPARTNERNAME"])
+        for r in db.execute("SELECT ZMEMBERJID, ZCONTACTNAME FROM ZWAGROUPMEMBER"):
+            put(r["ZMEMBERJID"], r["ZCONTACTNAME"])
+        for r in db.execute("SELECT ZJID, ZPUSHNAME FROM ZWAPROFILEPUSHNAME"):
+            if r["ZPUSHNAME"]:
+                put(r["ZJID"], "~" + r["ZPUSHNAME"])
+        # A number id carries its own phone, whether or not anything names it;
+        # an @lid one may carry it in its name.
+        for jid, entry in people.items():
+            if not entry["phone"]:
+                entry["phone"] = number_of(jid) or phone_in(entry["name"])
+        self._people = people
+        return people
+
+    def who(self, jid):
+        """(handle, name). The handle is +digits when a number is known."""
+        if not jid:
+            return ("?", "?")
+        entry = self.people().get(jid) or {}
+        phone = entry.get("phone") or number_of(jid)
+        handle = phone or jid
+        return (handle, entry.get("name") or handle)
+
+    # ---- chats -----------------------------------------------------------
+
+    def chats(self):
+        if self._chats is not None:
+            return self._chats
+        rows = self.chat_db.execute("""
+            SELECT s.Z_PK AS id, s.ZCONTACTJID AS jid, s.ZPARTNERNAME AS title,
+                   s.ZSESSIONTYPE AS type, s.ZARCHIVED AS archived,
+                   s.ZUNREADCOUNT AS unread, s.ZLASTMESSAGEDATE AS last,
+                   (SELECT count(*) FROM ZWAMESSAGE m WHERE m.ZCHATSESSION = s.Z_PK
+                      AND m.ZMESSAGETYPE NOT IN (6, 10)) AS message_count,
+                   (SELECT count(*) FROM ZWAGROUPMEMBER g WHERE g.ZCHATSESSION = s.Z_PK
+                      AND g.ZISACTIVE = 1) AS members
+            FROM ZWACHATSESSION s
+            WHERE coalesce(s.ZREMOVED, 0) = 0
+            ORDER BY s.ZLASTMESSAGEDATE DESC""").fetchall()
+        rows = sorted(rows, key=lambda r: when(r["last"]) or 0, reverse=True)
+        chats = []
+        for r in rows:
+            kind = CHAT_TYPES.get(r["type"], "other")
+            chat = {
+                "id": r["id"], "jid": r["jid"], "type": kind,
+                "title": clean(r["title"]) or r["jid"],
+                "message_count": r["message_count"],
+                "last_message": iso(when(r["last"])),
+                "date": iso(when(r["last"])),
+                "unread": r["unread"] or 0,
+                "archived": bool(r["archived"]),
+            }
+            if kind == "chat":
+                handle, name = self.who(r["jid"])
+                chat["handle"] = handle
+                chat["title"] = clean(r["title"]) or name
+            if kind == "group":
+                chat["members"] = r["members"]
+            chats.append(chat)
+        self._chats = chats
+        return chats
+
+    def chat(self, ref):
+        """A chat by id, jid, phone number or title. Ambiguous is an error,
+        not a guess — exporting the wrong conversation is a mistake nobody
+        notices until later."""
+        chats = self.chats()
+        ref = str(ref).strip()
+        if ref.isdigit():
+            hit = [c for c in chats if c["id"] == int(ref)]
+            if hit:
+                return hit[0]
+        hit = [c for c in chats if c["jid"] == ref]
+        if hit:
+            return hit[0]
+        digits = re.sub(r"\D", "", ref)
+        if ref.startswith("+") or (len(digits) >= 7 and len(digits) >= len(ref) - 4):
+            hit = [c for c in chats if re.sub(r"\D", "", c.get("handle") or "") == digits]
+            if len(hit) == 1:
+                return hit[0]
+        lowered = ref.lower()
+        exact = [c for c in chats if (c["title"] or "").lower() == lowered]
+        if len(exact) == 1:
+            return exact[0]
+        hit = exact or [c for c in chats if lowered in (c["title"] or "").lower()]
+        if len(hit) == 1:
+            return hit[0]
+        if not hit:
+            die("no chat matches %r. `apple whatsapp chats` lists them." % ref, 66)
+        die("%r matches %d chats; use an id:\n%s" % (
+            ref, len(hit), "\n".join("  %-6s %s" % (c["id"], c["title"]) for c in hit)), 64)
+
+    # ---- messages --------------------------------------------------------
+
+    def messages(self, chat_id=None, start=None, end=None, from_me=None):
+        """Every message, oldest first, with its sender resolved and its
+        media folded into one line of text."""
+        where, args = [], []
+        if chat_id is not None:
+            where.append("m.ZCHATSESSION = ?")
+            args.append(chat_id)
+        if start is not None:
+            where.append("m.ZMESSAGEDATE >= ?")
+            args.append(start - APPLE_EPOCH)
+        if end is not None:
+            where.append("m.ZMESSAGEDATE < ?")
+            args.append(end - APPLE_EPOCH)
+        if from_me is not None:
+            where.append("coalesce(m.ZISFROMME, 0) = ?")
+            args.append(1 if from_me else 0)
+        rows = self.chat_db.execute("""
+            SELECT m.Z_PK AS id, m.ZCHATSESSION AS chat, m.ZMESSAGETYPE AS type,
+                   m.ZISFROMME AS from_me, m.ZMESSAGEDATE AS date, m.ZTEXT AS text,
+                   m.ZFROMJID AS from_jid, m.ZSTANZAID AS stanza, m.ZSTARRED AS starred,
+                   g.ZMEMBERJID AS member_jid,
+                   i.ZTITLE AS media_title, i.ZVCARDNAME AS vcard_name,
+                   i.ZMEDIALOCALPATH AS media_path, i.ZLATITUDE AS lat,
+                   i.ZLONGITUDE AS lon, i.ZMOVIEDURATION AS duration,
+                   i.ZFILESIZE AS size
+            FROM ZWAMESSAGE m
+            LEFT JOIN ZWAGROUPMEMBER g ON g.Z_PK = m.ZGROUPMEMBER
+            LEFT JOIN ZWAMEDIAITEM i ON i.Z_PK = m.ZMEDIAITEM
+            %s
+            ORDER BY m.ZMESSAGEDATE, m.Z_PK""" % (
+                ("WHERE " + " AND ".join(where)) if where else ""), args).fetchall()
+        chats = {c["id"]: c for c in self.chats()}
+        out = []
+        for r in rows:
+            chat = chats.get(r["chat"])
+            if chat is None:
+                continue
+            out.append(self.shape(r, chat))
+        return out
+
+    def shape(self, r, chat):
+        kind = KINDS.get(r["type"], "other")
+        ts = when(r["date"])
+        if r["from_me"]:
+            handle, name = "me", "me"
+        else:
+            # In a group the member row names the sender, and ZFROMJID is the
+            # group. In a one-to-one chat ZFROMJID is the other person.
+            jid = r["member_jid"]
+            if not jid:
+                jid = r["from_jid"]
+                if not jid or jid.endswith("@g.us") or jid.endswith("@broadcast"):
+                    jid = chat["jid"] if chat["type"] == "chat" else jid
+            handle, name = self.who(jid)
+        message = {
+            "id": r["id"], "guid": r["stanza"], "chat_id": chat["id"],
+            "chat": chat["title"], "chat_type": chat["type"],
+            "date": iso(ts), "timestamp": ts,
+            "from_me": bool(r["from_me"]), "handle": handle, "sender": name,
+            "kind": kind, "type": r["type"],
+            "text": render(kind, r),
+        }
+        if r["starred"]:
+            message["starred"] = True
+        if r["media_path"]:
+            message["media_path"] = r["media_path"]
+        if kind == "location" and valid_coordinate(r["lat"], r["lon"]):
+            message["latitude"], message["longitude"] = r["lat"], r["lon"]
+        return message
+
+
+def valid_coordinate(lat, lon):
+    # ⚠️ ZLATITUDE is not always a latitude: an image row here carries 654.0.
+    return (lat is not None and lon is not None and -90 <= lat <= 90
+            and -180 <= lon <= 180 and (lat, lon) != (0.0, 0.0))
+
+
+def duration(seconds):
+    if not seconds:
+        return ""
+    seconds = int(seconds)
+    return " %d:%02d" % (seconds // 60, seconds % 60)
+
+
+def render(kind, r):
+    """One line of text for any message. A caption can sit in ZTEXT or in
+    the media row's ZTITLE depending on the type; both are read and a
+    repeat is dropped."""
+    text = (r["text"] or "").strip()
+    title = (r["media_title"] or "").strip()
+    words = [x for x in (text, title) if x]
+    if len(words) == 2 and words[0] == words[1]:
+        words = words[:1]
+    if kind in ("text", "other", "poll"):
+        return " · ".join(words)
+    if kind == "link":
+        if text and title:
+            return "%s [link: %s]" % (text, title)
+        return text or title
+    if kind == "contact":
+        return "[contact: %s]" % (r["vcard_name"] or title or text or "?")
+    if kind == "location":
+        tag = "[location]"
+        if valid_coordinate(r["lat"], r["lon"]):
+            tag = "[location %.5f,%.5f]" % (r["lat"], r["lon"])
+        return " ".join([tag] + words)
+    if kind in ("video", "audio"):
+        label = "voice note" if kind == "audio" else "video"
+        return " ".join(["[%s%s]" % (label, duration(r["duration"]))] + words)
+    if kind in EVENTS:
+        return " ".join(["(%s)" % kind] + words)
+    return " ".join(["[%s]" % kind] + words)
+
+
+PLACEHOLDER = re.compile(r"^(\[[^\]]*\]|\([^)]*\))$")
+
+
+def has_words(message):
+    """A message worth indexing: something beyond a bare `[image]`."""
+    text = (message["text"] or "").strip()
+    return bool(text) and not PLACEHOLDER.match(text)
+
+
+# --------------------------------------------------------------------------
+# search
+# --------------------------------------------------------------------------
+
+def terms(query):
+    """An AND of substring terms; double quotes keep a phrase together.
+    Exactly the `apple mail` and `apple messages` semantics."""
+    out = []
+    for phrase, word in re.findall(r'"([^"]+)"|(\S+)', query or ""):
+        term = (phrase or word).lower()
+        if term:
+            out.append(term)
+    return out
+
+
+def matches(message, wanted):
+    haystack = (message["text"] or "").lower()
+    return all(t in haystack for t in wanted)
+
+
+# --------------------------------------------------------------------------
+# calls
+# --------------------------------------------------------------------------
+
+def calls(store, start=None):
+    if store.calls_db is None:
+        return []
+    db = store.calls_db
+    parts = {}
+    for r in db.execute("SELECT Z1PARTICIPANTS AS event, ZJIDSTRING AS jid, ZOUTCOME AS outcome "
+                        "FROM ZWACDCALLEVENTPARTICIPANT"):
+        parts.setdefault(r["event"], []).append(r["jid"])
+    events = {}
+    for r in db.execute("SELECT Z_PK, Z1CALLEVENTS AS aggregate, ZDURATION AS duration, "
+                        "ZDATE AS date, ZOUTCOME AS outcome, ZGROUPJIDSTRING AS grp, "
+                        "ZCALLIDSTRING AS call_id FROM ZWACDCALLEVENT"):
+        events.setdefault(r["aggregate"], []).append(r)
+    out = []
+    for a in db.execute("SELECT Z_PK AS id, ZINCOMING AS incoming, ZMISSED AS missed, "
+                        "ZVIDEO AS video, ZFIRSTDATE AS first FROM ZWAAGGREGATECALLEVENT "
+                        "ORDER BY ZFIRSTDATE"):
+        ts = when(a["first"])
+        if start is not None and ts is not None and ts < start:
+            continue
+        legs = events.get(a["id"], [])
+        who = []
+        for leg in legs:
+            for jid in parts.get(leg["Z_PK"], []):
+                handle, name = store.who(jid)
+                if handle not in [w["handle"] for w in who]:
+                    who.append({"handle": handle, "name": name})
+        group = next((leg["grp"] for leg in legs if leg["grp"]), None)
+        seconds = sum(float(leg["duration"] or 0) for leg in legs)
+        out.append({
+            "id": a["id"],
+            "call_id": next((leg["call_id"] for leg in legs if leg["call_id"]), None),
+            "date": iso(ts), "timestamp": ts,
+            "direction": "incoming" if a["incoming"] else "outgoing",
+            "missed": bool(a["missed"]),
+            "connected": seconds > 0,
+            "video": bool(a["video"]),
+            "duration": int(round(seconds)),
+            "participants": who,
+            "group": store.who(group)[1] if group else None,
+        })
+    return out
+
+
+def call_title(c):
+    names = ", ".join(p["name"] for p in c["participants"]) or "?"
+    what = "video call" if c["video"] else "call"
+    if c["missed"]:
+        return "Missed WhatsApp %s %s %s" % (what, "from" if c["direction"] == "incoming" else "to", names)
+    return "WhatsApp %s %s %s" % (what, "from" if c["direction"] == "incoming" else "to", names)
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+def window(opts):
+    start = end = None
+    if getattr(opts, "since", None) is not None:
+        start = (dt.datetime.now() - dt.timedelta(days=opts.since)).timestamp()
+    if getattr(opts, "before", None) is not None:
+        end = (dt.datetime.now() - dt.timedelta(days=opts.before)).timestamp()
+    return start, end
+
+
+def public(message):
+    return {k: v for k, v in message.items() if k != "timestamp"}
+
+
+def print_messages(messages, show_chat):
+    for m in messages:
+        prefix = "%s  " % short(m["timestamp"])
+        if show_chat:
+            prefix += "[%s] " % m["chat"]
+        print("%s%s: %s" % (prefix, m["sender"], m["text"]))
+
+
+def cmd_manifest(opts):
+    print(json.dumps(MANIFEST, indent=2))
+
+
+def cmd_status(opts):
+    """What is on disk and whether it can be read. Never writes, never
+    prompts, and exits 0 with --json whatever it finds."""
+    path = folder(opts)
+    report = {"tool": NAME, "hosts": [], "usable": False, "status": "missing",
+              "advice": None, "folder": path,
+              "app_installed": os.path.isdir("/Applications/WhatsApp.app")}
+    chat_path = os.path.join(path, "ChatStorage.sqlite")
+    try:
+        db = connect(chat_path)
+    except NoAccess:
+        db = None
+        report["status"] = "denied"
+        report["advice"] = ("the store exists and cannot be read. Grant Full Disk Access "
+                            "to the terminal or app running this, in System Settings → "
+                            "Privacy & Security.")
+    if db is None and report["status"] == "missing":
+        report["advice"] = ("no ChatStorage.sqlite in %s. Install WhatsApp from the App "
+                            "Store and link it to the phone (WhatsApp on the phone → "
+                            "Settings → Linked Devices)." % path)
+    if db is not None:
+        try:
+            r = db.execute("SELECT count(*) AS n, min(ZMESSAGEDATE) AS first, "
+                           "max(ZMESSAGEDATE) AS last FROM ZWAMESSAGE").fetchone()
+            report["messages"] = r["n"]
+            report["first_message"] = iso(when(r["first"]))
+            report["last_message"] = iso(when(r["last"]))
+            report["chats"] = db.execute("SELECT count(*) FROM ZWACHATSESSION "
+                                         "WHERE coalesce(ZREMOVED, 0) = 0").fetchone()[0]
+            report["status"] = "ok"
+            report["usable"] = True
+        except sqlite3.DatabaseError as e:
+            report["status"] = "unreadable"
+            report["advice"] = "ChatStorage.sqlite did not answer: %s" % e
+        db.close()
+    for name, table, key in (("ContactsV2.sqlite", "ZWAADDRESSBOOKCONTACT", "address_book"),
+                             ("CallHistory.sqlite", "ZWAAGGREGATECALLEVENT", "calls")):
+        try:
+            other = connect(os.path.join(path, name))
+            report[key] = other.execute("SELECT count(*) FROM %s" % table).fetchone()[0] \
+                if other is not None else None
+        except (NoAccess, sqlite3.DatabaseError):
+            report[key] = None
+    if report["usable"]:
+        report["advice"] = ("the Mac holds what WhatsApp Desktop received since it was "
+                            "linked, plus a small sample from before; the rest of the "
+                            "history is on the phone only.")
+    if opts.json:
+        print(json.dumps(report, indent=2))
+        sys.exit(0)
+    print("whatsapp: %s" % report["status"])
+    print("  folder: %s" % path)
+    if report["usable"]:
+        print("  store: %d chats, %d messages (%s – %s), %s calls, %s address-book entries" % (
+            report["chats"], report["messages"],
+            (report["first_message"] or "?")[:10], (report["last_message"] or "?")[:10],
+            report.get("calls") if report.get("calls") is not None else "no",
+            report.get("address_book") if report.get("address_book") is not None else "no"))
+    if report["advice"]:
+        print("  %s" % report["advice"])
+    sys.exit(0 if report["usable"] else 1)
+
+
+def cmd_chats(opts):
+    store = Store(opts)
+    chats = store.chats()
+    if opts.search:
+        needle = opts.search.lower()
+        chats = [c for c in chats if needle in (c["title"] or "").lower()
+                 or needle in (c.get("handle") or "").lower()]
+    total = len(chats)
+    if opts.limit and total > opts.limit:
+        chats = chats[:opts.limit]
+        note("showing %d of %d chats" % (opts.limit, total))
+    if opts.json:
+        print(json.dumps(chats, indent=2, ensure_ascii=False))
+        return
+    for c in chats:
+        extra = c.get("handle") or ("%d members" % c["members"] if c.get("members") else c["type"])
+        print("%-5s %-16s %5d  %s  (%s)" % (c["id"], (c["last_message"] or "")[:16].replace("T", " "),
+                                           c["message_count"], c["title"], extra))
+
+
+def cmd_search(opts):
+    store = Store(opts)
+    wanted = terms(opts.query)
+    if not wanted:
+        die("an empty query matches everything; use `export` to read a chat", 64)
+    chat = store.chat(opts.chat) if opts.chat else None
+    start, end = window(opts)
+    from_me = True if opts.from_me else (False if opts.to_me else None)
+    hits = []
+    for m in reversed(store.messages(chat["id"] if chat else None, start, end, from_me)):
+        if m["kind"] in EVENTS and not opts.include_events:
+            continue
+        if matches(m, wanted):
+            hits.append(m)
+            if opts.limit and len(hits) >= opts.limit:
+                note("stopped at --limit %d; older matches may exist" % opts.limit)
+                break
+    if opts.json:
+        print(json.dumps([public(m) for m in hits], indent=2, ensure_ascii=False))
+        return
+    print_messages(hits, show_chat=chat is None)
+
+
+def cmd_export(opts):
+    store = Store(opts)
+    chat = store.chat(opts.chat)
+    rows = [m for m in store.messages(chat["id"])
+            if opts.include_events or m["kind"] not in EVENTS]
+    total = len(rows)
+    if opts.limit and total > opts.limit:
+        rows = rows[-opts.limit:]
+        note("showing the last %d of %d messages" % (opts.limit, total))
+    if opts.json:
+        text = json.dumps({"chat": chat, "messages": [public(m) for m in rows]},
+                          indent=2, ensure_ascii=False)
+    else:
+        lines = ["# %s" % chat["title"], ""]
+        for m in rows:
+            lines.append("%s  %s: %s" % (short(m["timestamp"]), m["sender"], m["text"]))
+        text = "\n".join(lines)
+    if opts.output:
+        with open(opts.output, "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+        note("wrote %d messages to %s" % (len(rows), opts.output))
+    else:
+        print(text)
+
+
+def cmd_calls(opts):
+    store = Store(opts)
+    start, _ = window(opts)
+    rows = calls(store, start)
+    if opts.missed:
+        rows = [c for c in rows if c["missed"]]
+    rows.reverse()
+    total = len(rows)
+    if opts.limit and total > opts.limit:
+        rows = rows[:opts.limit]
+        note("showing %d of %d calls" % (opts.limit, total))
+    if opts.json:
+        print(json.dumps([{k: v for k, v in c.items() if k != "timestamp"} for c in rows],
+                         indent=2, ensure_ascii=False))
+        return
+    for c in rows:
+        length = duration(c["duration"]).strip() or "-"
+        print("%s  %-8s %-6s %6s  %s" % (short(c["timestamp"]), c["direction"],
+                                         "missed" if c["missed"] else ("video" if c["video"] else ""),
+                                         length, ", ".join(p["name"] for p in c["participants"])))
+
+
+def cmd_index(opts):
+    """NDJSON for apple-index: one record per block of ten messages, one per call."""
+    store = Store(opts)
+    start, _ = window(opts)
+    out = sys.stdout
+    by_chat = {}
+    for m in store.messages():
+        if m["kind"] in EVENTS or not has_words(m):
+            continue
+        by_chat.setdefault(m["chat_id"], []).append(m)
+    chats = {c["id"]: c for c in store.chats()}
+    for chat_id, rows in by_chat.items():
+        chat = chats[chat_id]
+        url = None
+        if chat["type"] == "chat" and (chat.get("handle") or "").startswith("+"):
+            url = "whatsapp://send?phone=%s" % chat["handle"][1:]
+        # 🛑 Blocks are cut from the START of the chat, so a new message
+        # changes only the last block and every earlier uid stays put.
+        for i in range(0, len(rows), BLOCK):
+            block = rows[i:i + BLOCK]
+            first, last = block[0], block[-1]
+            if start is not None and last["timestamp"] < start:
+                continue
+            people, seen = [], set()
+            for m in block:
+                if m["handle"] not in seen:
+                    seen.add(m["handle"])
+                    people.append({"role": "handle", "name": m["sender"], "handle": m["handle"]})
+            if chat["type"] == "chat" and chat.get("handle") and chat["handle"] not in seen:
+                people.append({"role": "handle", "name": chat["title"], "handle": chat["handle"]})
+            out.write(json.dumps({
+                "uid": "whatsapp:chat:%s:%s" % (chat["jid"], first["guid"] or first["id"]),
+                "tool": NAME, "kind": "conversation", "native_id": chat["jid"], "url": url,
+                "title": "%s (%s)" % (chat["title"], (first["date"] or "")[:10]),
+                "container": chat["title"],
+                "created": first["timestamp"], "modified": None,
+                "occurred": last["timestamp"],
+                "latitude": None, "longitude": None,
+                "people": people,
+                "body": "\n".join("%s: %s" % (m["sender"], m["text"]) for m in block),
+                "rev": "%d|%s" % (len(block), last["guid"] or last["id"]),
+            }, ensure_ascii=False) + "\n")
+    for c in calls(store, start):
+        lines = [call_title(c)]
+        if c["connected"]:
+            lines.append("lasted%s" % duration(c["duration"]))
+        if c["group"]:
+            lines.append("in %s" % c["group"])
+        out.write(json.dumps({
+            "uid": "whatsapp:call:%s" % (c["call_id"] or c["id"]),
+            "tool": NAME, "kind": "call", "native_id": str(c["id"]), "url": None,
+            "title": call_title(c),
+            "container": "Calls",
+            "created": None, "modified": None,
+            "occurred": c["timestamp"],
+            "latitude": None, "longitude": None,
+            "people": [{"role": "handle", "name": p["name"], "handle": p["handle"]}
+                       for p in c["participants"]],
+            "body": "\n".join(lines),
+            "rev": "%s|%s|%s" % (c["missed"], c["duration"], len(c["participants"])),
+        }, ensure_ascii=False) + "\n")
+    out.flush()
+
+
+# What `--json` prints, per subcommand, for `--help`. A caller who has to run
+# the command to learn the field names guesses them, and jq answers a wrong
+# guess with null rather than an error.
+MESSAGE_FIELDS = """\
+  date                 ISO 8601 with the local offset
+  from_me              true for the user's own messages
+  handle               +digits when a number is known, else the WhatsApp id;
+                       "me" for the user
+  sender               the address-book name, the chat name, or ~the name
+                       the person set in WhatsApp
+  text                 the message; media is folded in as [image] caption,
+                       [voice note 0:30], [document] title, [link: title]
+  kind                 text, image, video, audio, contact, location, link,
+                       document, gif, sticker, deleted, poll, event, notice, other
+  type                 WhatsApp's raw ZMESSAGETYPE, for a kind shown as other
+  chat, chat_id, chat_type   where it was said
+  id, guid             store row and WhatsApp's own message id
+  media_path           relative to the folder's Message/ directory, when present
+  latitude, longitude  a shared location only"""
+
+JSON_FIELDS = {
+    "chats": """\
+JSON: a list, one object per chat, most recent first.
+  id                   what export and --chat take
+  jid                  WhatsApp's id for the chat
+  type                 chat, group, broadcast, status
+  title                the chat's name
+  handle               one-to-one only: +digits, or the id when no number is known
+  members              groups only: active members
+  message_count        messages, not counting events and notices
+  last_message, date   ISO 8601
+  unread, archived""",
+    "search": "JSON: a list, one object per message, newest first.\n" + MESSAGE_FIELDS,
+    "export": "JSON: {chat, messages}; messages oldest first.\n" + MESSAGE_FIELDS,
+    "calls": """\
+JSON: a list, one object per call, newest first.
+  date                 ISO 8601
+  direction            incoming or outgoing
+  missed, connected    connected means some time was spent on the call
+  video                true for a video call
+  duration             seconds
+  participants         list of {handle, name}
+  group                the group's name, for a group call
+  id, call_id""",
+}
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="apple whatsapp", description=__doc__.split("\n\n")[0])
+    parser.add_argument("--version", action="version", version="apple-plugin-whatsapp %s" % VERSION)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--folder", help="the folder holding ChatStorage.sqlite; overrides the configured one")
+    common.add_argument("--json", action="store_true", help="print JSON; the fields are listed below")
+    ranged = argparse.ArgumentParser(add_help=False)
+    ranged.add_argument("--since", type=int, metavar="DAYS")
+    ranged.add_argument("--before", type=int, metavar="DAYS")
+
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("manifest", parents=[common]).set_defaults(func=cmd_manifest)
+    sub.add_parser("status", parents=[common]).set_defaults(func=cmd_status)
+
+    p = sub.add_parser("chats", parents=[common], help="conversations, most recent first")
+    p.add_argument("search", nargs="?", help="only chats whose name or number contains this")
+    p.add_argument("--limit", type=int, default=100)
+    p.set_defaults(func=cmd_chats)
+
+    p = sub.add_parser("search", parents=[common, ranged], help="messages containing every term")
+    p.add_argument("query")
+    p.add_argument("--chat", help="an id, WhatsApp id, number or name from `chats`")
+    p.add_argument("--limit", type=int, default=50)
+    who = p.add_mutually_exclusive_group()
+    who.add_argument("--from-me", action="store_true")
+    who.add_argument("--to-me", action="store_true")
+    p.add_argument("--include-events", action="store_true", help="also joins, leaves and notices")
+    p.set_defaults(func=cmd_search)
+
+    p = sub.add_parser("export", parents=[common], help="one conversation")
+    p.add_argument("chat", help="an id, WhatsApp id, number or name from `chats`")
+    p.add_argument("--limit", type=int, default=0, help="the last N messages; 0 for all")
+    p.add_argument("--include-events", action="store_true", help="also joins, leaves and notices")
+    p.add_argument("-o", "--output", help="write to this file")
+    p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser("calls", parents=[common, ranged], help="voice and video calls")
+    p.add_argument("--missed", action="store_true")
+    p.add_argument("--limit", type=int, default=100)
+    p.set_defaults(func=cmd_calls)
+
+    p = sub.add_parser("index", parents=[common, ranged], help="NDJSON records for apple-index")
+    p.add_argument("--full", action="store_true", help="accepted; index always emits everything")
+    p.set_defaults(func=cmd_index)
+
+    for name, text in JSON_FIELDS.items():
+        sub.choices[name].epilog = text
+        sub.choices[name].formatter_class = argparse.RawDescriptionHelpFormatter
+
+    opts = parser.parse_args(argv)
+    if not opts.command:
+        parser.print_help()
+        return 0
+    try:
+        opts.func(opts)
+    except NoAccess as e:
+        die("cannot read %s. Grant Full Disk Access to the terminal or app running "
+            "this, in System Settings → Privacy & Security." % e, 77)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

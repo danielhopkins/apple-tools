@@ -319,6 +319,53 @@ Three things the second plugin settled that the first did not exercise:
 What the shortcut can and cannot read, and how its serialization was found,
 is in [`apple-health.md`](apple-health.md).
 
+## WhatsApp, the third plugin
+
+The third plugin reads another app's store rather than a server or a phone.
+WhatsApp Desktop for Mac is a Catalyst build of the iPhone app, and it keeps
+the iPhone's Core Data files in
+`~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/`, unencrypted.
+`apple-plugin-whatsapp` reads three of them and declares no host:
+
+| File | Tables read |
+|---|---|
+| `ChatStorage.sqlite` | `ZWACHATSESSION`, `ZWAMESSAGE`, `ZWAGROUPMEMBER`, `ZWAMEDIAITEM`, `ZWAPROFILEPUSHNAME` |
+| `ContactsV2.sqlite` | `ZWAADDRESSBOOKCONTACT` — the `@lid` to number map |
+| `CallHistory.sqlite` | `ZWAAGGREGATECALLEVENT` → `ZWACDCALLEVENT` → `ZWACDCALLEVENTPARTICIPANT` |
+
+What was measured on the first run, 2026-09-25, and what it decided:
+
+- 🛑 **The Mac holds what arrived since the Desktop app was linked.** 157
+  messages in 20 chats; 138 from September 2026, the month it was linked,
+  and 19 back to 2022 that the phone sent at linking. The phone keeps the
+  rest. An unencrypted local iPhone backup holds the phone's own
+  `ChatStorage.sqlite` in the same schema, and `--folder` or `apple plugins
+  config whatsapp folder=…` can point at one; nothing merges two stores yet.
+- 🛑 **Two kinds of person id.** `@s.whatsapp.net` ids carry the number;
+  `@lid` ids carry none, and 4 of 14 one-to-one chats and 15 of 157 messages
+  use them. `ContactsV2` maps every `@lid` in the phone's address book to a
+  number (314 of 314). A chat with a stranger is titled with their number,
+  which the plugin reads back. What stays unmapped keeps the raw id and a
+  `~name` the person set themselves. Records are content first: a handle
+  joins a person only when a Contacts card carries the number.
+- **`ZMESSAGETYPE`**: 0 text, 1 image, 2 video, 3 voice, 4 contact, 5
+  location, 6 group event, 7 link, 8 document, 10 system notice, 15
+  sticker; 12, 41, 59, 75 and 76 were seen once each and are reported as
+  `other` with the raw `type`. A caption sits in the media row's `ZTITLE`
+  for an image and in `ZTEXT` for a link, so both are read.
+- ⚠️ **`ZLATITUDE` is not always a latitude** — an image row carries
+  `654.0` — so a coordinate is reported only on a location message, in
+  range. ⚠️ **`ZPUSHNAME` on a message is an encoded token**, not a name;
+  names come from `ZWAPROFILEPUSHNAME`.
+- 🛑 **Read the WAL.** WhatsApp writes the newest messages to
+  `ChatStorage.sqlite-wal` and checkpoints later. Every file opens with
+  `mode=ro`; the test builds a store whose newest message exists only in
+  the WAL and fails when that open becomes `immutable=1`.
+- **One index record per block of ten messages**, cut from the start of the
+  chat so a new message rewrites only the last block — the `apple messages`
+  shape. Bare placeholders (`[image]` with no caption) are not indexed.
+  `refresh_args` is `["--full"]`: the whole run takes 0.12 s here.
+
 ## Writing one
 
 1. Make `apple-plugin-<name>` executable and answer `manifest --json`.
@@ -333,7 +380,8 @@ is in [`apple-health.md`](apple-health.md).
 
 `lab/test-plugins.py` is the reference for what the adapter accepts;
 `plugins/dawarich/` is the reference for a plugin that talks to a server,
-`plugins/health/` for one that reads files and keeps its own store.
+`plugins/health/` for one that reads files and keeps its own store, and
+`plugins/whatsapp/` for one that reads another app's SQLite in place.
 
 ## Not done
 

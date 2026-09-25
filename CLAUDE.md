@@ -24,8 +24,9 @@ sync service, no API keys.
    enable <name>`, and one that makes a connection has to declare its hosts
    in its manifest, which `apple plugins list` and `apple status` print.
    Nothing in this repo enables one. The second, `health`, declares no
-   host: it reads files an iPhone puts in iCloud Drive. See the Plugins
-   section.
+   host: it reads files an iPhone puts in iCloud Drive. The third,
+   `whatsapp`, declares none either: it reads WhatsApp Desktop's own
+   SQLite. See the Plugins section.
 
 ## Quick reference
 
@@ -113,6 +114,9 @@ installed via `make install`.
 | My labs, my vaccines | `apple health clinical --type labs --since 365` / `--type vaccines` |
 | Any other health question | `apple health sql "SELECT …"` (read-only; `--schema` prints the tables) |
 | What the Health app on the phone did | `apple health log` |
+| WhatsApp chats (WhatsApp) | `apple whatsapp chats --json` |
+| Search WhatsApp (WhatsApp) | `apple whatsapp search "board" --since 30 --json` |
+| Read a WhatsApp chat (WhatsApp) | `apple whatsapp export "School Board" --limit 50` |
 | Load the Health history | Export everything in AppleTools Health, or `apple health import export.zip` |
 
 **Every tool supports `--json`.** Prefer it — the plain output is for humans and
@@ -1836,6 +1840,52 @@ apple health index [--since DAYS]      # what apple-index calls; runs sync first
   never added to days, arrivals or stays. Measured: 1,596 of 1,707 workouts
   land on a known place, 1,156 of them at home.
 
+### whatsapp — `apple whatsapp`
+
+Reads WhatsApp Desktop's store in
+`~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/`: plain
+SQLite, Core Data style. 🛑 **Read-only, no connection, and nothing is
+written anywhere.** Python, stdlib only, in `plugins/whatsapp/`; tested
+offline by `plugins/whatsapp/test-whatsapp.py`, which builds its own store.
+
+```
+apple whatsapp status [--json]
+apple whatsapp chats [SEARCH] [--limit N] [--json]
+apple whatsapp search QUERY [--chat REF] [--since DAYS] [--before DAYS] [--limit N]
+                            [--from-me | --to-me] [--include-events] [--json]
+apple whatsapp export CHAT [--limit N] [--include-events] [-o FILE] [--json]
+apple whatsapp calls [--since DAYS] [--missed] [--limit N] [--json]
+apple whatsapp index [--since DAYS]        # what apple-index calls
+```
+
+- 🛑 **THE MAC HOLDS WHAT ARRIVED SINCE WHATSAPP DESKTOP WAS LINKED.**
+  Measured on the first run, 2026-09-25: 157 messages in 20 chats, 138 of
+  them from the month it was linked, 19 a thin sample back to 2022. The
+  full history is on the phone, and nothing on a Mac reads it. Say "not on
+  this Mac", never "never said".
+- 🛑 **A person has two kinds of id.** `<number>@s.whatsapp.net` carries a
+  phone; `<n>@lid` carries none. `ContactsV2.sqlite` maps an `@lid` to its
+  number for everyone in the phone's address book (314 of 314 here). A
+  handle is `+digits` when a number is known and the raw id when not. It is
+  treated as content: a number on a Contacts card matches, anything else is
+  never guessed into a person.
+- ⚠️ **An unmapped `@lid` chat is titled with the number**, because WhatsApp
+  lists a stranger under it. The plugin reads the number back out of the
+  title. **WhatsApp wraps names in invisible bidi controls** (U+202A …
+  U+202C, U+200E); every name is stripped of them.
+- 🛑 **The newest messages are in the write-ahead log.** Every file opens
+  `mode=ro` through SQLite, never `immutable=1`, which skips the WAL and
+  reads as a quiet chat. The test pins it with a WAL-only message.
+- ⚠️ **A caption lives in the media row (`ZTITLE`) or in `ZTEXT`,
+  depending on the type**, and both are read. Media is folded into the text
+  as `[image] caption`, `[voice note 0:42]`, `[link: title]`. **Group
+  events and system notices are left out** unless `--include-events`, the
+  `apple messages` rule. ⚠️ WhatsApp's own chat carries a year-4000
+  last-message date; it reads as no date.
+- **Index kinds**: `conversation`, one record per block of ten messages cut
+  from the start of the chat (the `apple messages` shape), and `call`. The
+  `people` report does not read it yet.
+
 ## Layout
 
 ```
@@ -1851,6 +1901,8 @@ plugins/health/           the second: reads the files the iPhone writes,
                           not shipped); build-shortcut.py the fallback
                           shortcut — 🛑 the only Health data a Mac ever
                           sees is what the phone writes to iCloud Drive
+plugins/whatsapp/         the third: reads WhatsApp Desktop's SQLite,
+                          read-only, WAL included. Python, stdlib only
 swift/                    one Swift package, seven binaries
   Sources/reminders/      + RemindersLibrary/ (+ Tags.swift, the tag read/write
                           face and the per-listing tag cache)
