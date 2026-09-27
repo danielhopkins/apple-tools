@@ -49,7 +49,7 @@ import subprocess
 import sys
 import urllib.parse
 
-VERSION = "26.924.0"
+VERSION = "26.927.0"
 NAME = "whatsapp"
 
 HOME = os.path.expanduser("~")
