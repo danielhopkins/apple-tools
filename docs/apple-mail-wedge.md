@@ -1,6 +1,6 @@
 # How Mail's scripting interface goes under, and the guards that keep it up
 
-`CLAUDE.md` keeps the rules. This file keeps the measurements. Mail's `.emlx`
+[`apple-mail.md`](apple-mail.md) keeps the rules. This file keeps the measurements. Mail's `.emlx`
 and Envelope Index layout is in [`apple-mail-store.md`](apple-mail-store.md); why
 nothing here writes a message body is in
 [`apple-mail-drafts.md`](apple-mail-drafts.md).

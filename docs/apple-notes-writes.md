@@ -1,6 +1,6 @@
 # Writing notes: the Shortcuts path, the picker trap, and delete
 
-`CLAUDE.md` keeps the rules. This file keeps the evidence. The Shortcuts build
+[`apple-notes.md`](apple-notes.md) keeps the rules. This file keeps the evidence. The Shortcuts build
 scripts and the AppIntents route are in
 [`apple-notes-shortcuts.md`](apple-notes-shortcuts.md); the AppleScript API and
 its verified bugs are in [`apple-notes-api.md`](apple-notes-api.md); the Markdown

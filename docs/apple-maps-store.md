@@ -116,7 +116,7 @@ retention. Never report one as the other.
 | IncidentReport | `ZINCIDENTREPORT` | 32 | incidents reported |
 | MixinMapItem | `ZMIXINMAPITEM` | 147 | the place blob behind a favorite or history item |
 
-`apple maps` reads the first five. The rest are documented in `CLAUDE.md` as
+`apple maps` reads the first five. The rest are documented in [`apple-maps.md`](apple-maps.md) as
 future commands.
 
 ## Visits

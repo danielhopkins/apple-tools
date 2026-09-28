@@ -1,6 +1,6 @@
 # Rendering a note body as Markdown
 
-`CLAUDE.md` keeps the rules. This file keeps the measurements behind them. The
+[`apple-notes.md`](apple-notes.md) keeps the rules. This file keeps the measurements behind them. The
 protobuf and the AppleScript API are in [`apple-notes-api.md`](apple-notes-api.md);
 table cells are in [`apple-notes-tables.md`](apple-notes-tables.md).
 
