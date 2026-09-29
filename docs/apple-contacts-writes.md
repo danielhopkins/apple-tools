@@ -1,7 +1,7 @@
 # Writing contacts: the walls, the fallbacks, and what lies
 
 Everything here was measured against a real address book (669 contacts, 52 of
-them carrying a note). `CLAUDE.md` keeps the operative rules; this file keeps
+them carrying a note). [`apple-contacts.md`](apple-contacts.md) keeps the operative rules; this file keeps
 the evidence and the history, so a future reader does not re-derive it.
 
 ## The note wall

@@ -1,6 +1,6 @@
 # EventKit: what it hides, what it clamps, and what it rebuilds
 
-`CLAUDE.md` keeps the operative rules for `apple calendar`. This file keeps the
+[`apple-calendar.md`](apple-calendar.md) keeps the operative rules for `apple calendar`. This file keeps the
 measurements behind them. The two calDAV/Exchange sync failures have their own
 file, [`apple-calendar-caldav-403.md`](apple-calendar-caldav-403.md); writing
 invitees has [`apple-calendar-invitees.md`](apple-calendar-invitees.md).

@@ -12,8 +12,8 @@
 
 **Status:** addressed in 26.818.0. `add` and `edit` now confirm the server took
 the write before reporting success, and four commands expose the sync state:
-`sync-status`, `unsynced`, `sync-errors`, `resync`. See the calendar section of
-`CLAUDE.md`.
+`sync-status`, `unsynced`, `sync-errors`, `resync`. See
+[`apple-calendar.md`](apple-calendar.md).
 
 ⚠️ **Addressed is not the same as fixed.** Nothing here stops the server
 returning a 403. The change makes the failure visible instead of silent, and
