@@ -56,7 +56,7 @@ raw, with no label.
 `Boulder Playgrounds` with 21 named parks and street addresses, plus one trip guide
 per work trip since 2020.
 
-- 🛑 **Places come through `Z_7PLACES`, never off `ZCOLLECTIONITEM`.** 12 of the 126
+- 🛑 **Places come through the Collection.places join, never off `ZCOLLECTIONITEM`.** 12 of the 126
   item rows belong to no guide, so listing that table invents saved places the user
   cannot see in Maps.app. The join is genuinely many-to-many.
 - ⚠️ **An ambiguous guide name is an error naming the candidates**, not a guess.

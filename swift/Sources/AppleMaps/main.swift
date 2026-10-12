@@ -551,6 +551,7 @@ struct Status: ParsableCommand {
     var databasePath: String?
     var stale = false
     var readError: String?
+    var caught: Error?
     var visitCount = 0
     var placeCount = 0
     var guideCount = 0
@@ -576,22 +577,44 @@ struct Status: ParsableCommand {
       guideCount = try guides.guides().count
       orphanItems = try guides.orphanedItemCount()
     } catch {
+      caught = error
       readError = error.localizedDescription
     }
 
-    let readable = readError == nil
-    let status = readable ? "authorized" : "denied"
-    let advice: String? =
-      readable
-      ? nil
-      : "Grant Full Disk Access to this terminal in System Settings → Privacy & Security → "
+    let failure = caught.map(MapsStoreError.accessFailure(for:))
+    let readable = failure == nil
+    // A schema mismatch is not a missing grant. We opened the file; its join
+    // table is just named from a different entity id than this binary once
+    // hard-coded. Blaming Full Disk Access sent people to the wrong pane.
+    let status: String
+    let hasFullDiskAccess: Bool
+    let advice: String?
+    switch failure {
+    case .none:
+      status = "authorized"
+      hasFullDiskAccess = true
+      advice = nil
+    case .some(.permission):
+      status = "denied"
+      hasFullDiskAccess = false
+      advice =
+        "Grant Full Disk Access to this terminal in System Settings → Privacy & Security → "
         + "Full Disk Access, then run this again."
+    case .some(.missing):
+      status = "denied"
+      hasFullDiskAccess = false
+      advice = nil
+    case .some(.schema):
+      status = "error"
+      hasFullDiskAccess = true
+      advice = nil
+    }
 
     if json {
       var payload: [String: Any] = [
         "status": status,
         "usable": readable,
-        "full_disk_access": readable,
+        "full_disk_access": hasFullDiskAccess,
         // No Automation key on purpose: Maps.app ships no scripting dictionary,
         // so there is nothing an Automation grant could unlock.
         "scriptable": false,
@@ -633,6 +656,12 @@ struct Status: ParsableCommand {
         print("  \(Style.dim("\(orphanItems) saved-place rows belong to no guide"))")
       }
       if stale { print("  \(Style.warning("write-ahead log not replayed; may be stale"))") }
+    } else if failure == .schema {
+      print(Style.warning("✗ Maps store schema — cannot read visits and guides"))
+      if let readError { print("  \(readError)") }
+    } else if failure == .missing {
+      print(Style.warning("✗ Maps store — not found"))
+      if let readError { print("  \(readError)") }
     } else {
       print(Style.warning("✗ Full Disk Access — cannot read the Maps store"))
       if let readError { print("  \(readError)") }

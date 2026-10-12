@@ -78,8 +78,9 @@ CloudKit mirrors it. The store carries 1,936 `NSCKRecordMetadata` rows, 1,241
 `NSCKEvent` rows and 6 record zones. It also carries Core Data triggers that
 maintain denormalised counters:
 
-- `Z_DA_Z_7PLACES_Collection_placesCount_*` keeps `ZCOLLECTION.ZPLACESCOUNT`
-  in step with the join table.
+- `Z_DA_Z_<n>PLACES_Collection_placesCount_*` keeps `ZCOLLECTION.ZPLACESCOUNT`
+  in step with the join table (`n` is the Collection entity id: 6 on
+  macOS 26, 7 on macOS 27).
 - `Z_DA_ZVISIT_VisitedLocation_latestVisitDate_*` keeps
   `ZVISITEDLOCATION.ZLATESTVISITDATE` in step with `ZVISIT`.
 
@@ -100,7 +101,11 @@ retention. Never report one as the other.
 
 ## Tables
 
-`Z_PRIMARYKEY` maps every entity id to its name. The ones with data here:
+`Z_PRIMARYKEY` maps every entity id to its name. **Those ids are per-store
+and shift between OS versions** — Collection is 6 on macOS 26 and 7 on
+macOS 27 — so anything named from an entity id has to be resolved at
+runtime, not hard-coded. The ones with data on the macOS 27 store this
+file was measured against:
 
 | Entity | Table | Rows | What it is |
 |---|---|---|---|
@@ -108,7 +113,7 @@ retention. Never report one as the other.
 | VisitedLocation | `ZVISITEDLOCATION` | 314 | one place |
 | Collection | `ZCOLLECTION` | 18 | a guide |
 | CollectionItem | `ZCOLLECTIONITEM` | 126 | a saved place |
-| — | `Z_7PLACES` | 115 | the guide-to-place join |
+| — | `Z_7PLACES` | 115 | the guide-to-place join (`Z_6PLACES` on macOS 26) |
 | HistoryItem | `ZHISTORYITEM` | 32 | searches, directions, dropped pins |
 | ReviewedPlace | `ZREVIEWEDPLACE` | 56 | places rated |
 | UserRoute | `ZUSERROUTE` | 3 | custom hikes, with geometry |
@@ -209,14 +214,20 @@ CREATE TABLE Z_7PLACES (
   Z_7COLLECTIONS INTEGER, Z_8PLACES INTEGER, PRIMARY KEY (...));
 ```
 
-`Z_7COLLECTIONS` is a `ZCOLLECTION.Z_PK`; `Z_8PLACES` is a
+On macOS 26 the same relationship is `Z_6PLACES` (`Z_6COLLECTIONS` /
+`Z_7PLACES`). Core Data names the table `Z_<Collection.Z_ENT>PLACES` and
+the columns from the two entity ids; `apple maps` reads those ids from
+`Z_PRIMARYKEY` (or, if that table is missing, from `sqlite_master`)
+instead of hard-coding either pair.
+
+`Z_<n>COLLECTIONS` is a `ZCOLLECTION.Z_PK`; `Z_<m>PLACES` is a
 `ZCOLLECTIONITEM.Z_PK`.
 
 ### 🛑 12 of 126 saved-place rows belong to no guide
 
 Same orphan pattern as the locations. Listing `ZCOLLECTIONITEM` directly invents
 saved places the user cannot see in Maps.app. Places must come through
-`Z_7PLACES`.
+the Collection.places join.
 
 ### The join is genuinely many-to-many
 
@@ -273,7 +284,9 @@ decoder would work the way `notestore.py` does for Notes bodies.
   header, and sqlite treats a 0- or 1-byte file as a valid empty database. A
   truncated store would read as "opened fine, you have never been anywhere", so
   `MapsDatabase` probes for `ZVISIT`, `ZVISITEDLOCATION` and `ZCOLLECTION`
-  before returning.
+  before returning, and resolves the Collection.places join from
+  `Z_PRIMARYKEY` or `sqlite_master`. A store that opens but has no such join
+  is a schema error, not a missing Full Disk Access grant.
 
 ## Seams for testing
 
