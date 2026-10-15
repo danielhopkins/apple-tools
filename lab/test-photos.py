@@ -118,6 +118,39 @@ check("a place with no infos still yields a city",
 check("garbage decodes to None", photos.reverse_geocode(b"not a plist"), None)
 check("empty decodes to None", photos.reverse_geocode(b""), None)
 
+# 🛑 ONE DECODE PER DISTINCT BLOB. 21,941 blobs here hold 2,003 distinct
+# values, and decoding each one was 4.5 s of every five-minute cycle.
+def _located(rows):
+    import sqlite3
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.execute("CREATE TABLE ZADDITIONALASSETATTRIBUTES "
+               "(Z_PK INTEGER PRIMARY KEY, ZREVERSELOCATIONDATA BLOB)")
+    db.execute("CREATE TABLE ZASSET (ZUUID TEXT, ZADDITIONALATTRIBUTES INTEGER)")
+    for pk, (uuid, blob) in enumerate(rows, start=1):
+        db.execute("INSERT INTO ZADDITIONALASSETATTRIBUTES VALUES (?,?)", (pk, blob))
+        db.execute("INSERT INTO ZASSET VALUES (?,?)", (uuid, pk))
+    calls = []
+    real_assets, real_decode = photos.assets, photos.reverse_geocode
+    photos.assets = lambda db, include_shared=True: (
+        {"uuid": uuid} for uuid, _ in rows)
+    photos.reverse_geocode = lambda blob: calls.append(blob) or real_decode(blob)
+    try:
+        out = list(photos.located_assets(db))
+    finally:
+        photos.assets, photos.reverse_geocode = real_assets, real_decode
+    return out, calls
+
+_out, _calls = _located([("a", BLOB), ("b", BLOB), ("c", NOT_HOME),
+                         ("d", BLOB), ("e", None)])
+check("a repeated blob is decoded once", len(_calls), 2)
+check("and every photo still gets its place",
+      [(a["uuid"], (a["place"] or {}).get("city")) for a in _out],
+      [("a", "Boulder"), ("b", "Boulder"), ("c", "Boulder"),
+       ("d", "Boulder"), ("e", None)])
+check("the shared answer is the full answer",
+      _out[3]["place"], photos.reverse_geocode(BLOB))
+
 
 # --------------------------------------------------------------------------
 # clustering

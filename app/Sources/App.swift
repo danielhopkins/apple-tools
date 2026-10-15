@@ -131,10 +131,10 @@ final class AppModel: ObservableObject {
     }
 
     private func beginTicking() {
-        // One second while a cycle runs, ten while it does not. The window is
-        // the only reader and it is usually closed.
+        // Every two seconds while the window is open, once a minute while it
+        // is closed. See `tick()`.
         ticker = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.reread() }
+            Task { @MainActor in self?.tick() }
         }
         // ⚠️ Give the endpoint a moment to bind before asking it anything. A
         // ping straight after launch races the bind and reports it dead.
@@ -149,12 +149,42 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// How often a CLOSED window's state is read: what the menu bar shows.
+    static let closedInterval: TimeInterval = 60
+    private var lastReread = Date.distantPast
+
+    /// 🛑 THE WINDOW IS THE ONLY READER OF MOST OF THIS, AND IT IS USUALLY
+    /// CLOSED. The ticker used to call `reread()` every two seconds whatever
+    /// the window was doing: four queries over the index on the main thread,
+    /// and `index.py stats` every 30 s at up to 380 MB. Measured 2026-10-14:
+    /// 47 CPU minutes in 9 hours with no window open.
+    ///
+    /// ⚠️ Closed, it still reads what the menu bar draws — the backlog, the
+    /// endpoint, the grants — once a minute, and never starts `stats`.
+    /// ⚠️ OPEN IS COUNTED FROM THE WINDOWS, like `DockPresence`, not from a
+    /// flag set in `onAppear`, which drifts.
+    private func tick() {
+        if DockPresence.windowOpen {
+            reread()
+        } else if Date().timeIntervalSince(lastReread) >= Self.closedInterval {
+            rereadForMenuBar()
+        }
+    }
+
+    /// Everything the window shows. Called by the ticker while it is open,
+    /// and by the window itself when it appears.
     func reread() {
-        facts = IndexReader.read()
+        rereadForMenuBar()
         // ⚠️ THROTTLED, because `stats` spawns python. The ticker runs every
         // two seconds; thirty python starts a minute to redraw a chart that
         // changes every five minutes is not a trade worth making.
         if Date().timeIntervalSince(statsRefreshed) > 30 { refreshStats() }
+    }
+
+    /// What the menu bar item and its menu draw: `glance` and `healthy`.
+    private func rereadForMenuBar() {
+        lastReread = Date()
+        facts = IndexReader.read()
         search.refreshPing()
         grants.read()
         loginItem.read()
@@ -282,12 +312,17 @@ enum DockPresence {
     /// nobody thought of, and the app is then either stuck in the Dock or
     /// unreachable behind another window.
     static func follow() {
-        let visible = NSApp.windows.contains {
-            $0.isVisible && $0.canBecomeMain && !($0 is NSPanel)
-        }
-        let wanted: NSApplication.ActivationPolicy = visible ? .regular : .accessory
+        let wanted: NSApplication.ActivationPolicy = windowOpen ? .regular : .accessory
         guard NSApp.activationPolicy() != wanted else { return }
         NSApp.setActivationPolicy(wanted)
+    }
+
+    /// Whether a real window is on screen. The menu bar's own windows are
+    /// panels, or cannot become main, so they do not count.
+    static var windowOpen: Bool {
+        NSApp.windows.contains {
+            $0.isVisible && $0.canBecomeMain && !($0 is NSPanel)
+        }
     }
 
     /// ⚠️ ONE RUNLOOP LATER, ALWAYS. Both edges need it, for opposite reasons:

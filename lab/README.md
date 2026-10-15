@@ -922,7 +922,10 @@ These are the experiment. Change them and see what happens.
   say" only works when the name appears in the text.
 - **Watermarks.** `source_state` has the column and nothing writes it. Ingest
   re-reads everything and skips unchanged records by `rev` hash. That is
-  correct but not cheap.
+  correct but not cheap. Two sources skip the read itself through the
+  `cursor` table: `messages` by chat revision, and `files` by each file's
+  mtime and size (`FILES_ADAPTER_REV` — bump it when the adapter renders a
+  file differently). Before that, `files` cost 85 s of CPU every cycle.
 - **Deletion detection** only runs with `--full`, which does a full id-set
   sweep. There is no incremental path.
 - **URLs.** Only mail and contacts emit one. `docs/todo-deep-links.md` is the
