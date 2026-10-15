@@ -4,8 +4,10 @@ import Foundation
 /// Apple Maps guides — the lists Maps.app calls "My Guides".
 ///
 /// Three tables carry them. `ZCOLLECTION` is the guide. `ZCOLLECTIONITEM` is a
-/// saved place. `Z_7PLACES` is the many-to-many join between them, and it is
-/// genuinely many-to-many: one place here belongs to two guides.
+/// saved place. The many-to-many join between them is named from the
+/// Collection entity id (`Z_6PLACES` on macOS 26, `Z_7PLACES` on macOS 27)
+/// and is resolved on the store we are reading. It is genuinely many-to-many:
+/// one place here belongs to two guides.
 
 public struct GuidePlace {
   public let id: Int
@@ -38,8 +40,9 @@ public struct Guide {
   public let title: String
   public let summary: String?
   /// The count Maps maintains on the row itself. Kept by a Core Data trigger on
-  /// `Z_7PLACES`, and it agreed exactly with the join on this store (115 both
-  /// ways), so a disagreement is worth reporting rather than hiding.
+  /// the Collection.places join, and it agreed exactly with the join on this
+  /// store (115 both ways), so a disagreement is worth reporting rather than
+  /// hiding.
   public let declaredCount: Int
   public let created: Date?
   public let modified: Date?
@@ -63,10 +66,12 @@ public final class GuideStore {
 
   /// Every guide, in the order Maps.app shows them, each with its places.
   ///
-  /// 🛑 **Places come through `Z_7PLACES`, never from `ZCOLLECTIONITEM`
-  /// directly.** 12 of the 126 item rows here belong to no guide at all — the
-  /// same orphan pattern `ZVISITEDLOCATION` shows. Listing the item table
-  /// directly invents saved places the user cannot see in Maps.app.
+  /// 🛑 **Places come through the Collection.places join, never from
+  /// `ZCOLLECTIONITEM` directly.** 12 of the 126 item rows here belong to no
+  /// guide at all — the same orphan pattern `ZVISITEDLOCATION` shows. Listing
+  /// the item table directly invents saved places the user cannot see in
+  /// Maps.app. The join table's name follows the Collection entity id and is
+  /// not the same on every macOS.
   public func guides(search: String? = nil) throws -> [Guide] {
     let items = try placesByGuide()
 
@@ -143,15 +148,16 @@ public final class GuideStore {
   // MARK: - Places
 
   private func placesByGuide() throws -> [Int: [GuidePlace]] {
+    let join = try quotedJoin()
     let rows = try database.query(
       """
-      SELECT p.Z_7COLLECTIONS AS guide_id,
+      SELECT p.\(join.collectionsColumn) AS guide_id,
              ci.Z_PK, ci.ZIDENTIFIER, ci.ZCUSTOMNAME, ci.ZMAPITEMNAME, ci.ZMAPITEMADDRESS,
              ci.ZMAPITEMCATEGORY, ci.ZLATITUDE, ci.ZLONGITUDE, ci.ZMUID, ci.ZPLACEITEMNOTE,
              ci.ZDROPPEDPINCOORDINATE, ci.ZCREATETIME
-      FROM Z_7PLACES p
-      JOIN ZCOLLECTIONITEM ci ON ci.Z_PK = p.Z_8PLACES
-      ORDER BY p.Z_7COLLECTIONS, ci.ZPOSITIONINDEX, ci.Z_PK
+      FROM \(join.table) p
+      JOIN ZCOLLECTIONITEM ci ON ci.Z_PK = p.\(join.placesColumn)
+      ORDER BY p.\(join.collectionsColumn), ci.ZPOSITIONINDEX, ci.Z_PK
       """)
 
     var byGuide: [Int: [GuidePlace]] = [:]
@@ -181,12 +187,22 @@ public final class GuideStore {
   /// `ZCOLLECTIONITEM` rows in no guide. Reported by `status` as the evidence
   /// for why the item count is higher than the sum of the guides.
   public func orphanedItemCount() throws -> Int {
+    let join = try quotedJoin()
     let rows = try database.query(
       """
       SELECT COUNT(*) AS n FROM ZCOLLECTIONITEM ci
-      WHERE NOT EXISTS (SELECT 1 FROM Z_7PLACES p WHERE p.Z_8PLACES = ci.Z_PK)
+      WHERE NOT EXISTS (
+        SELECT 1 FROM \(join.table) p WHERE p.\(join.placesColumn) = ci.Z_PK)
       """)
     return MapsColumn.int(rows.first?["n"]) ?? 0
+  }
+
+  private func quotedJoin() throws -> MapsGuideJoin {
+    let join = database.guideJoin
+    return MapsGuideJoin(
+      table: try MapsDatabase.sqlIdentifier(join.table),
+      collectionsColumn: try MapsDatabase.sqlIdentifier(join.collectionsColumn),
+      placesColumn: try MapsDatabase.sqlIdentifier(join.placesColumn))
   }
 
   private static func terms(_ search: String?) -> [String]? {

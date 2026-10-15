@@ -12,11 +12,18 @@ import XCTest
 /// The schema below is copied from a real `MapsSync_0.0.1`, trimmed to the
 /// columns the library reads. The traps being pinned are all in the *data*:
 /// NULL `ZHIDDEN`, locations with no visit, guide items in no guide.
+///
+/// The Collection.places join is named from Core Data entity ids, which moved
+/// between releases: `.macos26` builds the 26.6.2 join and `Z_PRIMARYKEY` rows.
 final class MapsFixture {
+  enum OS { case macos26, macos27 }
+
   let url: URL
+  let joinTable: String
   private let directory: URL
 
-  init(name: String = "maps-fixture") throws {
+  init(name: String = "maps-fixture", os: OS = .macos27) throws {
+    joinTable = os == .macos26 ? "Z_6PLACES" : "Z_7PLACES"
     directory = FileManager.default.temporaryDirectory
       .appendingPathComponent("apple-tools-maps-tests")
       .appendingPathComponent(UUID().uuidString)
@@ -28,7 +35,7 @@ final class MapsFixture {
       throw MapsStoreError.unavailable("could not create the fixture store")
     }
     defer { sqlite3_close_v2(db) }
-    try Self.exec(db, Self.schema)
+    try Self.exec(db, Self.schema + (os == .macos26 ? Self.macos26Join : Self.macos27Join))
   }
 
   deinit {
@@ -82,8 +89,20 @@ final class MapsFixture {
       ZMAPITEMADDRESS VARCHAR, ZMAPITEMCATEGORY VARCHAR, ZMAPITEMNAME VARCHAR,
       ZPLACEITEMNOTE VARCHAR, ZIDENTIFIER BLOB, ZORIGINALIDENTIFIER BLOB,
       ZDROPPEDPINCOORDINATE BLOB, ZTRANSITLINESTORAGE BLOB);
+    """
+
+  static let macos27Join = """
     CREATE TABLE Z_7PLACES (
       Z_7COLLECTIONS INTEGER, Z_8PLACES INTEGER, PRIMARY KEY (Z_7COLLECTIONS, Z_8PLACES));
+    """
+
+  /// On macOS 26.6.2, Collection is entity 6 and CollectionItem is 7.
+  static let macos26Join = """
+    CREATE TABLE Z_6PLACES (
+      Z_6COLLECTIONS INTEGER, Z_7PLACES INTEGER, PRIMARY KEY (Z_6COLLECTIONS, Z_7PLACES));
+    CREATE TABLE Z_PRIMARYKEY (
+      Z_ENT INTEGER PRIMARY KEY, Z_NAME VARCHAR, Z_SUPER INTEGER, Z_MAX INTEGER);
+    INSERT INTO Z_PRIMARYKEY (Z_ENT, Z_NAME) VALUES (6, 'Collection'), (7, 'CollectionItem');
     """
 
   /// Apple-epoch seconds for a date N days before a fixed "now".
@@ -184,6 +203,25 @@ final class MapsDatabaseTests: XCTestCase {
     let fixture = try MapsFixture()
     let database = try fixture.database()
     XCTAssertFalse(database.isStale)
+  }
+
+  /// 🛑 Hard-coding `Z_7PLACES` made `apple maps status` fail on macOS 26 with
+  /// `no such table` and blame Full Disk Access. Both shapes must resolve.
+  func testTheGuideJoinIsResolvedOnEitherOS() throws {
+    XCTAssertEqual(
+      try MapsFixture(os: .macos26).database().guideJoin,
+      MapsGuideJoin.derived(collectionEntity: 6, itemEntity: 7))
+    XCTAssertEqual(
+      try MapsFixture(os: .macos27).database().guideJoin,
+      MapsGuideJoin.derived(collectionEntity: 7, itemEntity: 8))
+  }
+
+  func testAStoreWithNoGuideJoinIsASchemaError() throws {
+    let fixture = try MapsFixture()
+    try fixture.run("DROP TABLE Z_7PLACES;")
+    XCTAssertThrowsError(try fixture.database()) { error in
+      XCTAssertEqual((error as? MapsStoreError)?.accessFailure, .schema, "\(error)")
+    }
   }
 }
 
@@ -445,8 +483,8 @@ final class GuideStoreTests: XCTestCase {
     super.tearDown()
   }
 
-  private func populated() throws -> MapsFixture {
-    let fixture = try MapsFixture()
+  private func populated(os: MapsFixture.OS = .macos27) throws -> MapsFixture {
+    let fixture = try MapsFixture(os: os)
     held = fixture
     try fixture.run(
       """
@@ -462,9 +500,9 @@ final class GuideStoreTests: XCTestCase {
         VALUES (2, 1, 'The good swings', 'Parkside Park');
       INSERT INTO ZCOLLECTIONITEM (Z_PK, ZPOSITIONINDEX, ZMAPITEMNAME) VALUES (3, 0, 'The Bean');
       INSERT INTO ZCOLLECTIONITEM (Z_PK, ZPOSITIONINDEX, ZMAPITEMNAME) VALUES (4, 0, 'Orphan');
-      INSERT INTO Z_7PLACES VALUES (1, 1);
-      INSERT INTO Z_7PLACES VALUES (1, 2);
-      INSERT INTO Z_7PLACES VALUES (2, 3);
+      INSERT INTO \(fixture.joinTable) VALUES (1, 1);
+      INSERT INTO \(fixture.joinTable) VALUES (1, 2);
+      INSERT INTO \(fixture.joinTable) VALUES (2, 3);
       """)
     return fixture
   }
@@ -579,6 +617,12 @@ final class GuideStoreTests: XCTestCase {
     XCTAssertEqual(
       try XCTUnwrap(guides.first { $0.id == 4 }).summary, "Where we went in 2026",
       "a real description must survive")
+  }
+
+  func testGuidesOnAMacOS26Store() throws {
+    let guides = try populated(os: .macos26).guides().guides()
+    XCTAssertEqual(guides.map(\.title), ["Boulder Playgrounds", "2024 Chicago"])
+    XCTAssertEqual(guides[0].places.map(\.name), ["Christensen Park", "The good swings"])
   }
 
   func testAnEmptyGuideIsListedRatherThanDropped() throws {
