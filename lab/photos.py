@@ -394,9 +394,23 @@ def located_assets(db, include_shared=True):
          WHERE x.ZREVERSELOCATIONDATA IS NOT NULL
     """):
         places[row["uuid"]] = row["blob"]
+    # 🛑 DECODE EACH DISTINCT BLOB ONCE. Photos taken at one spot carry the
+    # same blob byte for byte: 21,941 blobs here hold 2,003 distinct values.
+    # Decoding every one was 4.5 s of the 4.9 s survey, run every five-minute
+    # cycle, to rebuild the same 2,003 answers (measured 2026-10-15).
+    #
+    # ⚠️ THE CACHED DICT IS SHARED between every photo with that blob. Nothing
+    # downstream writes to `asset["place"]`; anything that starts to must copy
+    # it first.
+    decoded = {}
     for asset in assets(db, include_shared=include_shared):
         blob = places.get(asset["uuid"])
-        asset["place"] = reverse_geocode(blob) if blob else None
+        if not blob:
+            asset["place"] = None
+        else:
+            if blob not in decoded:
+                decoded[blob] = reverse_geocode(blob)
+            asset["place"] = decoded[blob]
         yield asset
 
 
@@ -423,7 +437,7 @@ def assign(clusters, radius_m=CLUSTER_RADIUS_M):
 
 
 def survey(include_shared=True, radius_m=CLUSTER_RADIUS_M):
-    """The whole library, as places and as days. One pass, about six seconds.
+    """The whole library, as places and as days. One pass, under a second.
 
     Returns `(places, days)`.
 
