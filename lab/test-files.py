@@ -461,6 +461,99 @@ check("an unparseable id is not charged to a real folder",
       {"(unknown)": {"": 1}})
 
 
+# --------------------------------------------------------------------------
+# an incremental run does not read a file that did not change
+# --------------------------------------------------------------------------
+#
+# 🛑 THE COST THIS PINS WAS 85 s OF CPU EVERY FIVE MINUTES. The adapter read
+# and extracted every file on every cycle, and `cmd_ingest` then threw nearly
+# all of it away on an equal rev. Nothing in the output said so: the run
+# reported `+0 ~0 -0` and looked cheap.
+
+class Opts:
+    def __init__(self, db, full=False):
+        self._db, self.full, self.limit = db, full, 0
+
+
+def ingest_db():
+    """The real schema in memory, so the cursor join is the real one."""
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.executescript(index.SCHEMA.replace("PRAGMA journal_mode = WAL;", ""))
+    return db
+
+
+def run(db, root, full=False):
+    """Drive the adapter the way `cmd_ingest` does. Returns the paths read."""
+    reads = []
+    real = index.file_body
+
+    def counting(path, *rest):
+        reads.append(os.path.basename(path))
+        return real(path, *rest)
+
+    saved = index.files_roots, index.file_body
+    index.files_roots = lambda: [root]
+    index.file_body = counting
+    try:
+        for record in index.ingest_files(Opts(db, full)):
+            # ⚠️ What `cmd_ingest` does with a new record, minus the chunks.
+            db.execute("INSERT OR REPLACE INTO record (uid, tool, kind, "
+                       "native_id, rev, seen_at) VALUES (?,?,?,?,?,0)",
+                       (record["uid"], "files", record["kind"],
+                        record["native_id"], record["rev"]))
+            db.commit()
+    finally:
+        index.files_roots, index.file_body = saved
+    return sorted(reads)
+
+
+folder = tempfile.mkdtemp(prefix="apple-index-incremental-")
+for name, text in (("a.md", "alpha"), ("b.md", "bravo"), ("empty.md", "")):
+    with open(os.path.join(folder, name), "w") as handle:
+        handle.write(text)
+incremental_root = {"path": folder, "name": "inc", "exclude": []}
+db = ingest_db()
+
+check("the first run reads every file",
+      run(db, incremental_root), ["a.md", "b.md", "empty.md"])
+check("the second run reads none of them", run(db, incremental_root), [])
+
+# ⚠️ mtime is the signal, so move it forward explicitly. Two writes inside one
+# filesystem tick would otherwise look like no change at all.
+with open(os.path.join(folder, "a.md"), "w") as handle:
+    handle.write("alpha, edited")
+later = os.stat(os.path.join(folder, "a.md")).st_mtime + 10
+os.utime(os.path.join(folder, "a.md"), (later, later))
+check("a changed file is read again, and only it",
+      run(db, incremental_root), ["a.md"])
+
+# 🛑 A CURSOR WITHOUT ITS RECORD DOES NOT SKIP. Otherwise a record deleted by a
+# sweep would never come back while the file stayed untouched.
+db.execute("DELETE FROM record WHERE uid = 'files:inc:b.md'")
+db.commit()
+check("a file whose record is gone is read again",
+      run(db, incremental_root), ["b.md"])
+
+# ⚠️ An empty file never gets a record, and is still not re-read each cycle.
+check("a file that read as nothing is not read again",
+      "empty.md" in run(db, incremental_root), False)
+
+check("--full reads everything",
+      run(db, incremental_root, full=True), ["a.md", "b.md", "empty.md"])
+
+# 🛑 THE BUMP IS HOW A RENDERING FIX REACHES FILES THAT NEVER CHANGE.
+saved_rev = index.FILES_ADAPTER_REV
+index.FILES_ADAPTER_REV = saved_rev + "-test"
+try:
+    check("a new adapter rev reads everything again",
+          run(db, incremental_root), ["a.md", "b.md", "empty.md"])
+finally:
+    index.FILES_ADAPTER_REV = saved_rev
+
+shutil.rmtree(folder, ignore_errors=True)
+
+
 if FAILED:
     print("%d failed\n" % len(FAILED))
     for line in FAILED:

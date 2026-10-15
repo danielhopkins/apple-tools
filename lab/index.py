@@ -1650,6 +1650,13 @@ FILE_MAX_TEXT = 2 * 1024 * 1024
 # that happens to end in .docx.
 FILE_MAX_BYTES = 200 * 1024 * 1024
 
+# 🛑 BUMP THIS WHEN THE `files` ADAPTER RENDERS A FILE DIFFERENTLY — a new
+# frontmatter rule, a better Office or PDF reader, a new title rule. An
+# incremental run skips every file whose mtime and size match its cursor, so
+# without a bump an improvement reaches only files that change, plus whatever
+# the weekly `--full` sweep re-reads.
+FILES_ADAPTER_REV = "1"
+
 # ⚠️ Two layouts, exactly as VEC above: a SwiftPM build product in the
 # checkout, or a sibling in an install.
 DOCTEXT = next((candidate for candidate in
@@ -1940,13 +1947,59 @@ def ingest_files(opts):
         return
 
     candidates = files_candidates(roots, opts.limit)
-    pdf_texts = pdf_text([path for _, path, _, _, _ in candidates
-                          if path.lower().endswith(".pdf")])
 
-    for root, path, relative, stat, vault in candidates:
+    # 🛑 SKIP A FILE WHOSE mtime AND SIZE DID NOT MOVE, BEFORE READING IT.
+    # Without this, every five-minute cycle extracted the text of all 9,377
+    # files again — 5,400 docx and 2,543 PDFs — only for the rev check in
+    # `cmd_ingest` to discard nearly all of it: 85 s at 90% CPU and 480 MB,
+    # measured 2026-10-14. The cursor holds a rev of the file's STAT, and
+    # `rev` below still hashes the rendered body, so the two jobs stay apart:
+    # the cursor decides whether to read, the rev decides whether to write.
+    #
+    # ⚠️ A CURSOR COUNTS ONLY WHILE ITS RECORD EXISTS. A record deleted by a
+    # sweep or by hand must be read again, not skipped forever. A file that
+    # read as nothing has no record, so its cursor carries `:empty` instead;
+    # a scanned PDF with no text is otherwise re-extracted every cycle.
+    #
+    # ⚠️ `--full` reads everything. It is the weekly sweep, and it is how a
+    # rendering fix reaches files that never change.
+    db = getattr(opts, "_db", None)
+    known = {}
+    if db is not None and not opts.full:
+        known = {row[0]: (row[1], row[2]) for row in db.execute(
+            "SELECT c.key, c.rev, r.rid IS NOT NULL FROM cursor c "
+            "LEFT JOIN record r ON r.uid = c.key WHERE c.tool = 'files'")}
+
+    todo, skipped = [], 0
+    for candidate in candidates:
+        root, path, relative, stat, vault = candidate
+        uid = "files:%s:%s" % (root["name"], relative)
+        stat_rev = rev_of(FILES_ADAPTER_REV, str(stat.st_mtime_ns),
+                          str(stat.st_size), "vault" if vault else "")
+        cursor, has_record = known.get(uid, (None, False))
+        if (cursor == stat_rev and has_record) or cursor == stat_rev + ":empty":
+            skipped += 1
+            continue
+        todo.append((candidate, uid, stat_rev))
+
+    pdf_texts = pdf_text([c[1] for c, _, _ in todo
+                          if c[1].lower().endswith(".pdf")])
+
+    def remember(uid, rev):
+        if db is None:
+            return
+        db.execute("INSERT INTO cursor (tool, key, rev) VALUES ('files', ?, ?) "
+                   "ON CONFLICT(tool, key) DO UPDATE SET rev = ?",
+                   (uid, rev, rev))
+        # ⚠️ No commit here. `cmd_ingest` commits after every changed record,
+        # and the end of this generator commits the rest. A cursor lost to a
+        # crash costs one re-read, never a skipped change.
+
+    for (root, path, relative, stat, vault), uid, stat_rev in todo:
         extension = os.path.splitext(path)[1].lower()
         read = file_body(path, extension, vault, pdf_texts)
         if read is None:
+            remember(uid, stat_rev + ":empty")
             continue
         fields, body, kind = read
 
@@ -1987,7 +2040,7 @@ def ingest_files(opts):
         folder = os.path.dirname(relative)
         rendered = ("\n".join(meta_lines) + "\n\n" + body).strip()
         yield {
-            "uid": "files:%s:%s" % (root["name"], relative),
+            "uid": uid,
             "latitude": None, "longitude": None,
             "tool": "files",
             # ⚠️ `note` and `file` keep their old meanings so existing records
@@ -2019,6 +2072,16 @@ def ingest_files(opts):
             # nothing, because the body is already in memory.
             "rev": rev_of(title, folder, rendered),
         }
+        # 🛑 AFTER THE YIELD. `cmd_ingest` has written the record by the time
+        # this generator resumes, so a cursor never claims a record that is
+        # not there.
+        remember(uid, stat_rev)
+
+    if db is not None:
+        db.commit()
+    if skipped:
+        sys.stderr.write("  files: skipped %d unchanged, read %d\n"
+                         % (skipped, len(todo)))
 
 ADAPTERS = {
     "notes": ingest_notes,
