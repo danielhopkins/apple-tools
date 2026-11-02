@@ -209,6 +209,7 @@ class AppleTools < Formula
     assert_match "dawarich", shell_output("#{bin}/apple plugins manifest dawarich")
     assert_match "health", shell_output("#{bin}/apple plugins manifest health")
     assert_match "whatsapp", shell_output("#{bin}/apple plugins manifest whatsapp")
+    assert_match "shopping", shell_output("#{bin}/apple plugins manifest shopping")
 
     # --help must work without any TCC grant, so it is safe in a sandbox.
     calendar_help = shell_output("#{bin}/apple-calendar --help")

@@ -1,0 +1,1410 @@
+#!/usr/bin/env python3
+"""apple-plugin-shopping - shopping lists, read from the app that keeps them.
+
+The commands and the JSON say nothing about which app holds the lists. A
+BACKEND does: it finds the store, reads it, and knows how to make it
+current. There are two, both for Milk for Us (de.danielrinser.milkforus):
+
+  milkforus-server   Pulls from Milk for Us's own sync server, read-only,
+                     into a store of this plugin's own. Needs `setup` once.
+                     `agent install` pulls every two minutes, and the app
+                     never has to run. The default once `setup` has run.
+  milkforus          Reads the Core Data store of the iPhone app installed
+                     on this Mac. Only as new as the last time the app ran
+                     here: `sync` starts it hidden, waits, and stops it.
+
+🛑 THE SERVER IS NOT A PUBLIC API. Milk for Us syncs with Ensembles over
+WebDAV at sync.milkforus.com: one baseline file holding every object, and
+one JSON file per change set after it. The app gets its WebDAV login from
+api.milkforus.com and its HTTP cache keeps that answer, which is where
+`setup` reads it. This plugin only lists (PROPFIND) and downloads (GET);
+it never uploads, deletes or registers, so it cannot change the lists or
+the sync state. Measured 2026-11-02: the baseline plus 102 change sets,
+replayed in order, matched the app's own store row for row.
+
+    apple plugins enable shopping
+    apple shopping setup          # once: the login, into the Keychain
+    apple shopping agent install  # pull every two minutes
+    apple shopping items Grocery
+    apple shopping history --since 30
+
+`index` is what apple-index calls: one record per list, holding what is on
+it and what was checked off.
+"""
+import argparse
+import base64
+import datetime as dt
+import fcntl
+import hashlib
+import http.client
+import json
+import os
+import plistlib
+import re
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.parse
+import xml.etree.ElementTree as ET
+
+VERSION = "26.1102.0"
+NAME = "shopping"
+
+HOME = os.path.expanduser("~")
+APPLE_EPOCH = 978307200
+SUPPORT = os.path.join(HOME, "Library", "Application Support", "apple-tools")
+AGENT_LABEL = "com.boulderhopkins.apple-tools.shopping"
+
+MANIFEST = {
+    "name": NAME,
+    "version": VERSION,
+    "description": "Shopping lists, what is on them and how often each thing is "
+                   "bought, from Milk for Us: its sync server, or its store on this Mac",
+    # 🛑 With the milkforus-server backend this plugin connects, read-only.
+    # With milkforus, `sync` starts the app, and the app connects.
+    "network": {"hosts": ["sync.milkforus.com"], "writes": False,
+                "via": "this plugin, PROPFIND and GET only (milkforus-server); "
+                       "the Milk for Us app, started by `sync` (milkforus)"},
+    "commands": ["status", "setup", "sync", "agent", "lists", "items", "history", "index"],
+    "index": {
+        "kinds": ["list"],
+        # The store is local and small; a reconcile every refresh keeps a
+        # deleted list out.
+        "refresh_args": ["--full"],
+        "container_label": "By list",
+        "footnote": "A record is one shopping list: what is on it, and what was "
+                    "checked off. It is as new as the last pull from the server, "
+                    "every two minutes with `apple shopping agent install`.",
+    },
+    "config": [
+        {"key": "backend", "required": False, "secret": False,
+         "help": "milkforus-server (pull from the sync server) or milkforus (the app "
+                 "on this Mac). Default: milkforus; `setup` sets milkforus-server"},
+        {"key": "folder", "required": False, "secret": False,
+         "help": "The folder holding the backend's store. Default: the app's container "
+                 "(milkforus), or apple-tools/shopping/milkforus (milkforus-server)"},
+        {"key": "webdav_url", "required": False, "secret": False,
+         "help": "milkforus-server: the account's WebDAV folder. Set by `setup`"},
+        {"key": "webdav_user", "required": False, "secret": False,
+         "help": "milkforus-server: the WebDAV user name. Set by `setup`"},
+        {"key": "webdav_password", "required": False, "secret": True,
+         "help": "milkforus-server: the WebDAV password. Set by `setup`"},
+    ],
+}
+
+
+def die(message, code=1):
+    print("error: %s" % message, file=sys.stderr)
+    sys.exit(code)
+
+
+def note(message):
+    print(message, file=sys.stderr)
+
+
+# --------------------------------------------------------------------------
+# configuration
+# --------------------------------------------------------------------------
+
+def plugin_manager():
+    if os.environ.get("APPLE_PLUGINS_BIN"):
+        return [os.environ["APPLE_PLUGINS_BIN"]]
+    here = os.path.dirname(os.path.realpath(__file__))
+    for candidate in (os.path.join(here, "..", "..", "bin", "apple-plugins"),
+                      os.path.join(here, "..", "..", "apple-plugins"),
+                      os.path.join(here, "..", "..", "..", "Helpers", "apple-plugins")):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return [candidate]
+    found = shutil.which("apple-plugins")
+    if found:
+        return [found]
+    found = shutil.which("apple")
+    if found:
+        return [found, "plugins"]
+    return None
+
+
+_CONFIG = {}
+
+
+def stored_config(reveal=False):
+    """The manager's view of this plugin's config. --reveal costs a Keychain
+    read, so it is asked for only by the backend that needs the password."""
+    if reveal in _CONFIG:
+        return _CONFIG[reveal]
+    _CONFIG[reveal] = {}
+    manager = plugin_manager()
+    if manager is None:
+        return _CONFIG[reveal]
+    try:
+        proc = subprocess.run(manager + ["config", NAME, "--json"] + (["--reveal"] if reveal else []),
+                              capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return _CONFIG[reveal]
+    if proc.returncode == 0:
+        try:
+            parsed = json.loads(proc.stdout)
+            _CONFIG[reveal] = parsed.get("config") or {}
+            _CONFIG["enabled"] = bool(parsed.get("enabled"))
+        except ValueError:
+            pass
+    return _CONFIG[reveal]
+
+
+def set_config(assignments):
+    manager = plugin_manager()
+    if manager is None:
+        die("no apple-plugins found to store the config in")
+    proc = subprocess.run(manager + ["config", NAME] + assignments,
+                          capture_output=True, text=True, timeout=30)
+    if proc.returncode != 0:
+        die("apple plugins config failed: %s" % proc.stderr.strip())
+    _CONFIG.clear()
+
+
+def enabled():
+    if os.environ.get("SHOPPING_ASSUME_ENABLED"):
+        return True
+    stored_config()
+    return _CONFIG.get("enabled", False)
+
+
+def setting(opts, key, env, reveal=False):
+    """--<key>, then $<env>, then the configured value. The config is asked
+    for only when nothing nearer answers, because asking costs a subprocess."""
+    if getattr(opts, key, None):
+        return getattr(opts, key)
+    if os.environ.get(env):
+        return os.environ[env]
+    return stored_config(reveal).get(key)
+
+
+# --------------------------------------------------------------------------
+# time
+# --------------------------------------------------------------------------
+
+def iso(ts):
+    if ts is None:
+        return None
+    return dt.datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")
+
+
+def short(ts):
+    if ts is None:
+        return "?"
+    return dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def age(ts):
+    if ts is None:
+        return "never"
+    seconds = max(0, time.time() - ts)
+    if seconds < 90:
+        return "%d seconds ago" % seconds
+    if seconds < 5400:
+        return "%d minutes ago" % (seconds / 60)
+    if seconds < 172800:
+        return "%d hours ago" % (seconds / 3600)
+    return "%d days ago" % (seconds / 86400)
+
+
+def mtime(path):
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return None
+
+
+def write_atomic(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as handle:
+        handle.write(data)
+    os.replace(tmp, path)
+
+
+# --------------------------------------------------------------------------
+# the Milk for Us store, as the app writes it
+# --------------------------------------------------------------------------
+
+class NoAccess(Exception):
+    pass
+
+
+class MilkForUs:
+    """Milk for Us 1.6.1, an iPhone app running on the Mac.
+
+    db.sqlite, in the group container, is plain Core Data:
+
+      ZSHOPPINGLIST       a list: ZNAME, ZSORTORDER, ZCOLORSTRING
+      ZSHOPPINGLISTITEM   a thing on a list: ZPRODUCT, ZSHOPPINGLIST,
+                          ZCHECKED (0 open, 1 checked off), ZNOTE
+      ZPRODUCT            what the thing is: ZNAME, ZCATEGORY
+      ZPRODUCTCATEGORY    an aisle: ZNAME, ZDEFAULTSORTORDER
+      ZPRODUCTUSAGE       one row per product per list: ZLASTUSED, the last
+                          time it was put on that list, and ZTIMESUSED
+
+    ⚠️ An item row carries no date of its own. The time it went on the list
+    is ZPRODUCTUSAGE.ZLASTUSED for the same product and list.
+    ⚠️ ZSIMPERIUMKEY is the stable id: a UUID, or 32 hex digits on a list
+    made by an older version. List names can carry a trailing space.
+    """
+
+    name = "milkforus"
+    app = "Milk for Us"
+    bundle_id = "de.danielrinser.milkforus"
+    app_path = "/Applications/Milk for Us.app"
+    # A copy older than this is said to be stale on stderr, by every read.
+    stale_after = 6 * 3600
+    default_folder = os.path.join(HOME, "Library", "Group Containers",
+                                  "group.de.danielrinser.milkforus")
+    # The app's own container, where the sync engine keeps its state.
+    container = os.path.join(HOME, "Library", "Containers", "de.danielrinser.milkforus",
+                             "Data", "Library")
+
+    def __init__(self, opts):
+        folder = setting(opts, "folder", "SHOPPING_FOLDER")
+        self.folder = os.path.expanduser(folder) if folder else self.default_folder
+        self.path = os.path.join(self.folder, "db.sqlite")
+        self.engine = os.environ.get("SHOPPING_MILKFORUS_ENGINE") or os.path.join(
+            self.container, "Application Support", "de.danielrinser.milkforus",
+            "com.mentalfaculty.ensembles.eventdata", "milkforus")
+        self._db = None
+
+    # -- the store ---------------------------------------------------------
+
+    def db(self):
+        if self._db is not None:
+            return self._db
+        if not os.path.isfile(self.path):
+            return None
+        try:
+            with open(self.path, "rb"):
+                pass
+        except PermissionError as e:
+            raise NoAccess(self.path) from e
+        # mode=ro, never immutable=1: the app writes its newest rows to the
+        # write-ahead log, and immutable skips it.
+        uri = "file:%s?mode=ro" % urllib.parse.quote(self.path)
+        self._db = sqlite3.connect(uri, uri=True, timeout=5)
+        self._db.row_factory = sqlite3.Row
+        return self._db
+
+    def missing_advice(self):
+        return "no %s store at %s. Install %s and open it once." % (
+            self.app, self.path, self.app)
+
+    def _need(self):
+        db = self.db()
+        if db is None:
+            die(self.missing_advice(), 69)
+        return db
+
+    @staticmethod
+    def when(apple_seconds):
+        if apple_seconds is None:
+            return None
+        return float(apple_seconds) + APPLE_EPOCH
+
+    def lists(self):
+        rows = self._need().execute("""
+            SELECT l.Z_PK AS pk, l.ZSIMPERIUMKEY AS key, l.ZNAME AS name,
+                   l.ZSORTORDER AS sort, l.ZCOLORSTRING AS color
+            FROM ZSHOPPINGLIST l ORDER BY l.ZSORTORDER, l.Z_PK""").fetchall()
+        return [{"id": r["key"] or str(r["pk"]), "pk": r["pk"],
+                 "name": (r["name"] or "").strip(), "sort": r["sort"],
+                 "color": ("#" + r["color"]) if r["color"] else None} for r in rows]
+
+    def items(self):
+        lists = {l["pk"]: l for l in self.lists()}
+        rows = self._need().execute("""
+            SELECT i.Z_PK AS pk, i.ZSIMPERIUMKEY AS key, i.ZSHOPPINGLIST AS list,
+                   i.ZCHECKED AS checked, i.ZNOTE AS note,
+                   p.ZNAME AS product, c.ZNAME AS category, c.ZDEFAULTSORTORDER AS aisle,
+                   u.ZLASTUSED AS last_used, u.ZTIMESUSED AS times
+            FROM ZSHOPPINGLISTITEM i
+            LEFT JOIN ZPRODUCT p ON p.Z_PK = i.ZPRODUCT
+            LEFT JOIN ZPRODUCTCATEGORY c ON c.Z_PK = p.ZCATEGORY
+            LEFT JOIN ZPRODUCTUSAGE u ON u.ZPRODUCT = i.ZPRODUCT
+                                     AND u.ZSHOPPINGLIST = i.ZSHOPPINGLIST
+            ORDER BY u.ZLASTUSED DESC""").fetchall()
+        out, seen = [], set()
+        for r in rows:
+            # ⚠️ One product had two usage rows for the same list; the join
+            # then returns the item twice. Keep the first, which the ORDER BY
+            # makes the newest.
+            if r["pk"] in seen or r["list"] not in lists:
+                continue
+            seen.add(r["pk"])
+            out.append({
+                "id": r["key"] or str(r["pk"]),
+                "list": lists[r["list"]]["name"],
+                "list_id": lists[r["list"]]["id"],
+                "name": (r["product"] or "").strip(),
+                "note": (r["note"] or "").strip() or None,
+                "category": r["category"],
+                "aisle": r["aisle"],
+                "checked": bool(r["checked"]),
+                "last_added": self.when(r["last_used"]),
+                "times_added": r["times"],
+            })
+        return out
+
+    def history(self):
+        lists = {l["pk"]: l for l in self.lists()}
+        rows = self._need().execute("""
+            SELECT u.ZSHOPPINGLIST AS list, u.ZLASTUSED AS last_used, u.ZTIMESUSED AS times,
+                   p.ZNAME AS product, c.ZNAME AS category
+            FROM ZPRODUCTUSAGE u
+            JOIN ZPRODUCT p ON p.Z_PK = u.ZPRODUCT
+            LEFT JOIN ZPRODUCTCATEGORY c ON c.Z_PK = p.ZCATEGORY
+            ORDER BY u.ZLASTUSED DESC""").fetchall()
+        return [{"name": (r["product"] or "").strip(),
+                 "list": lists[r["list"]]["name"] if r["list"] in lists else None,
+                 "list_id": lists[r["list"]]["id"] if r["list"] in lists else None,
+                 "category": r["category"],
+                 "last_added": self.when(r["last_used"]),
+                 "times_added": r["times"]} for r in rows]
+
+    # -- freshness and sync ------------------------------------------------
+
+    def _data_files(self):
+        return [self.path, self.path + "-wal",
+                os.path.join(self.engine, "events.sqlite"),
+                os.path.join(self.engine, "events.sqlite-wal")]
+
+    def _check_file(self):
+        # 🛑 The sync engine rewrites store.plist each time it asks the
+        # server for changes: at launch, and every ~16 s while the app runs
+        # (measured 2026-11-02). Its mtime is the last sync check.
+        return os.path.join(self.engine, "store.plist")
+
+    def freshness(self):
+        modified = [m for m in (mtime(f) for f in self._data_files()[:2]) if m]
+        return {
+            "store_modified": max(modified) if modified else None,
+            "last_sync": mtime(self._check_file()),
+            "app_running": self.pid() is not None,
+        }
+
+    def stale(self, fresh):
+        # A running app keeps its copy current by itself: an item added on
+        # the phone reached the Mac in 22 s (measured 2026-11-02).
+        if fresh.get("app_running"):
+            return False
+        last = fresh["last_sync"] or fresh["store_modified"]
+        return last is None or time.time() - last > self.stale_after
+
+    def stale_advice(self, fresh):
+        return ("the copy on this Mac was last synced %s. Run `apple shopping sync`, "
+                "which starts %s hidden, waits for it to pull, and stops it." % (
+                    age(fresh["last_sync"] or fresh["store_modified"]), self.app))
+
+    def pid(self):
+        """The running app's pid, or None. `lsappinfo` knows it by bundle id
+        even though the wrapped iPhone app reports bundleID NULL."""
+        if os.environ.get("SHOPPING_MILKFORUS_NO_APP"):
+            return None
+        try:
+            proc = subprocess.run(["/usr/bin/lsappinfo", "info", "-only", "pid",
+                                   "-app", self.bundle_id],
+                                  capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        m = re.search(r"pid\s*=\s*(\d+)", proc.stdout)
+        return int(m.group(1)) if m else None
+
+    def _stop(self, pid):
+        """SIGTERM, then wait. 🛑 AppleScript `quit` does not work: the
+        wrapped iPhone app never answers it, and osascript waits two minutes
+        for AppleEvent timed out (-1712). SIGTERM ends it in about a second,
+        and the store passes quick_check after."""
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return True
+        for _ in range(20):
+            time.sleep(0.5)
+            if self.pid() is None:
+                return True
+        return False
+
+    def sync(self, opts):
+        timeout = getattr(opts, "timeout", None) or 90
+        keep_running = getattr(opts, "keep_running", False)
+        restart = getattr(opts, "restart", False)
+        quiet = 5
+        if not os.path.isdir(self.app_path):
+            die("%s is not installed in /Applications." % self.app, 69)
+        report = {"backend": self.name, "app_was_running": False, "launched": False,
+                  "stopped": False, "synced": False, "changed": False}
+        pid = self.pid()
+        report["app_was_running"] = pid is not None
+        if pid is not None and restart:
+            if not self._stop(pid):
+                die("%s did not stop after SIGTERM." % self.app)
+            pid = None
+
+        def snap():
+            return [mtime(f) for f in self._data_files()]
+        before = snap()
+        t0 = time.time()
+        if pid is None:
+            # -g: do not bring it forward. -j: launch it hidden.
+            subprocess.run(["/usr/bin/open", "-g", "-j", "-b", self.bundle_id], check=False)
+            report["launched"] = True
+        # 🛑 A fresh launch checks the server twice in its first ~20 s, and
+        # a long gap pulls for longer: 3.5 months of changes took 23 s to
+        # land and 54 s to settle. So wait for TWO sync checks after a
+        # launch, ONE when the app was already running, and then for the
+        # data files to stay quiet.
+        wanted = 2 if report["launched"] else 1
+        checks, last_check = 0, mtime(self._check_file())
+        last_change, current = t0, before
+        while time.time() - t0 < timeout:
+            time.sleep(1)
+            check = mtime(self._check_file())
+            if check and check != last_check and check >= t0 - 1:
+                checks += 1
+                last_check = check
+            now = snap()
+            if now != current:
+                current, last_change = now, time.time()
+            if checks >= wanted and time.time() - last_change >= quiet:
+                report["synced"] = True
+                break
+        report["seconds"] = round(time.time() - t0, 1)
+        report["changed"] = current != before
+        if report["launched"] and not keep_running:
+            pid = self.pid()
+            if pid is not None:
+                report["stopped"] = self._stop(pid)
+        fresh = self.freshness()
+        report.update({"store_modified": iso(fresh["store_modified"]),
+                       "last_sync": iso(fresh["last_sync"]),
+                       "app_running": fresh["app_running"]})
+        return report
+
+    def sync_summary(self, r):
+        if r["synced"]:
+            line = "synced in %ss: %s" % (r["seconds"], "changes arrived" if r["changed"]
+                                          else "no changes")
+        else:
+            line = "no completed sync in %ss; the copy may be old" % r["seconds"]
+        if r["launched"]:
+            line += "\n  started %s hidden; %s" % (
+                self.app, "stopped it again" if r["stopped"] else "left it running")
+        return line
+
+    def status(self):
+        report = {"backend": self.name, "app": self.app, "folder": self.folder,
+                  "store": self.path, "app_installed": os.path.isdir(self.app_path)}
+        try:
+            db = self.db()
+        except NoAccess:
+            report["status"] = "denied"
+            report["advice"] = ("the store exists and cannot be read. Grant Full Disk "
+                                "Access to the terminal or app running this, in System "
+                                "Settings → Privacy & Security.")
+            return report
+        if db is None:
+            report["status"] = "missing"
+            report["advice"] = self.missing_advice()
+            return report
+        try:
+            items = self.items()
+            report["lists"] = len(self.lists())
+            report["open_items"] = sum(1 for i in items if not i["checked"])
+            report["checked_items"] = sum(1 for i in items if i["checked"])
+            report["status"] = "ok"
+        except sqlite3.DatabaseError as e:
+            report["status"] = "unreadable"
+            report["advice"] = "the store did not answer: %s" % e
+        return report
+
+
+# --------------------------------------------------------------------------
+# the Milk for Us sync server
+# --------------------------------------------------------------------------
+
+class Unauthorized(Exception):
+    pass
+
+
+class WebDAV:
+    """PROPFIND and GET, nothing else. One connection, kept alive.
+
+    🛑 The server answers 401 with `WWW-Authenticate: Basic realm="Milk for
+    Us Sync"`, so the login goes with every request. A client that waits
+    for the challenge pays a second round trip on each: 103 files took
+    130 s that way, about 1.3 s each."""
+
+    def __init__(self, url, user, password, timeout=30):
+        parts = urllib.parse.urlsplit(url.rstrip("/"))
+        if parts.scheme not in ("https", "http"):
+            raise ValueError("webdav_url must be http or https: %r" % url)
+        self.scheme, self.host, self.root = parts.scheme, parts.netloc, parts.path
+        self.timeout = timeout
+        token = base64.b64encode(("%s:%s" % (user, password)).encode("utf-8")).decode("ascii")
+        self.auth = "Basic " + token
+        self.conn = None
+        self.requests = 0
+        self.bytes = 0
+
+    def _connect(self):
+        cls = http.client.HTTPSConnection if self.scheme == "https" else http.client.HTTPConnection
+        self.conn = cls(self.host, timeout=self.timeout)
+
+    def _request(self, method, path, body=None, headers=None):
+        target = urllib.parse.quote(self.root + "/" + path.lstrip("/"))
+        head = {"Authorization": self.auth, "User-Agent": "apple-plugin-shopping/%s" % VERSION}
+        head.update(headers or {})
+        for attempt in (1, 2):
+            if self.conn is None:
+                self._connect()
+            try:
+                self.conn.request(method, target, body=body, headers=head)
+                resp = self.conn.getresponse()
+                data = resp.read()
+                break
+            except (http.client.HTTPException, OSError):
+                # A kept-alive connection the server closed: one retry on a
+                # fresh one.
+                self.conn.close()
+                self.conn = None
+                if attempt == 2:
+                    raise
+        self.requests += 1
+        self.bytes += len(data)
+        if resp.status == 401:
+            raise Unauthorized(path)
+        if resp.status not in (200, 207):
+            raise OSError("%s %s: HTTP %d" % (method, path, resp.status))
+        return data
+
+    def list(self, folder):
+        """File names in a folder, one level."""
+        body = (b'<?xml version="1.0" encoding="utf-8"?><D:propfind xmlns:D="DAV:">'
+                b'<D:prop><D:resourcetype/><D:getcontentlength/></D:prop></D:propfind>')
+        raw = self._request("PROPFIND", folder + "/", body=body,
+                            headers={"Depth": "1", "Content-Type": "application/xml"})
+        ns = {"D": "DAV:"}
+        names = []
+        for r in ET.fromstring(raw).findall("D:response", ns):
+            if r.find(".//D:resourcetype/D:collection", ns) is not None:
+                continue
+            href = urllib.parse.unquote(r.findtext("D:href", default="", namespaces=ns))
+            name = href.rstrip("/").rsplit("/", 1)[-1]
+            if name:
+                names.append(name)
+        return names
+
+    def get(self, folder, name):
+        return self._request("GET", "%s/%s" % (folder, name))
+
+    def close(self):
+        if self.conn is not None:
+            self.conn.close()
+
+
+SAFE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+# What the read queries need, so a table exists with these columns even when
+# the server never sent a row or a field for it.
+COLUMNS = {
+    "ShoppingList": ["simperiumKey", "name", "sortOrder", "colorString"],
+    "ShoppingListItem": ["simperiumKey", "checked", "note", "product", "shoppingList"],
+    "Product": ["simperiumKey", "name", "category"],
+    "ProductCategory": ["simperiumKey", "name", "defaultSortOrder"],
+    "ProductUsage": ["simperiumKey", "product", "shoppingList", "lastUsed", "timesUsed"],
+}
+
+
+def count_of(name):
+    """The global count at the start of a file name: `20994_<store>_<rev>`."""
+    head = name.split("_", 1)[0]
+    return int(head) if head.isdigit() else -1
+
+
+class Replay:
+    """Objects from a baseline and the change sets after it.
+
+    A change set is JSON: changesByEntity → entity → a list of changes,
+    each {globalIdentifier, type, properties}. Change type 100 inserts,
+    200 updates (only the properties listed), 300 deletes. Property type
+    0 is an attribute (`value`; absent means null), 1 a to-one
+    (`relatedIdentifier`), 2 a to-many, which is skipped: the to-one on the
+    other side holds the same link. A date is ["date", milliseconds since
+    1970]; the store keeps Core Data's seconds since 2001."""
+
+    def __init__(self):
+        self.objects = {}
+
+    def apply(self, event):
+        for entity, changes in (event.get("changesByEntity") or {}).items():
+            if not SAFE.match(entity):
+                continue
+            table = self.objects.setdefault(entity, {})
+            for c in changes:
+                gid = c.get("globalIdentifier")
+                if not gid:
+                    continue
+                kind = c.get("type")
+                if kind == 300:
+                    table.pop(gid, None)
+                    continue
+                if kind == 100:
+                    row = table[gid] = {}
+                else:
+                    row = table.setdefault(gid, {})
+                for p in c.get("properties") or []:
+                    prop = p.get("propertyName") or ""
+                    if not SAFE.match(prop):
+                        continue
+                    if p.get("type") == 0:
+                        row[prop] = self.value(p.get("value"))
+                    elif p.get("type") == 1:
+                        row[prop] = ("ref", p.get("relatedIdentifier"))
+
+    @staticmethod
+    def value(v):
+        if isinstance(v, list) and len(v) == 2 and v[0] == "date" and isinstance(v[1], (int, float)):
+            return v[1] / 1000.0 - APPLE_EPOCH
+        if isinstance(v, bool):
+            return int(v)
+        if isinstance(v, (list, dict)):
+            return json.dumps(v)
+        return v
+
+    def write(self, path):
+        """A SQLite file with the app's own table and column names, so the
+        reads are the same queries on both backends. Written beside, then
+        renamed over, so a reader never sees half of one."""
+        tmp = path + ".tmp"
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        db = sqlite3.connect(tmp)
+        pks = {}
+        for entity, table in self.objects.items():
+            for n, gid in enumerate(sorted(table), 1):
+                pks[gid] = n
+        for entity in sorted(set(self.objects) | set(COLUMNS)):
+            table = self.objects.get(entity, {})
+            props = set(COLUMNS.get(entity, []))
+            for row in table.values():
+                props.update(row)
+            props = sorted(props)
+            cols = ["Z" + p.upper() for p in props]
+            db.execute('CREATE TABLE "Z%s" (Z_PK INTEGER PRIMARY KEY%s)' % (
+                entity.upper(), "".join(', "%s"' % c for c in cols)))
+            rows = []
+            for gid in sorted(table):
+                row = table[gid]
+                values = [pks[gid]]
+                for p in props:
+                    v = row.get(p)
+                    if isinstance(v, tuple):
+                        v = pks.get(v[1])
+                    if p == "simperiumKey" and not v:
+                        v = gid
+                    values.append(v)
+                rows.append(values)
+            db.executemany('INSERT INTO "Z%s" VALUES (%s)' % (
+                entity.upper(), ",".join("?" * (len(props) + 1))), rows)
+        db.commit()
+        db.close()
+        os.replace(tmp, path)
+
+
+class MilkForUsServer(MilkForUs):
+    """Pulls from sync.milkforus.com into a store of its own.
+
+      <folder>/baseline/   the newest baseline file, one
+      <folder>/events/     every change set after it
+      <folder>/store.sqlite  the replay, in the app's own schema
+      <folder>/state.json  last pull, last change, last error
+
+    🛑 The app makes a new baseline from time to time and deletes the change
+    sets it covers (one on 2026-10-22 here). A pull that finds a newer
+    baseline downloads it and keeps only the change sets after it.
+    🛑 Every change set after the baseline is replayed in global-count
+    order on every change. A late one from a phone that was offline can
+    carry a count lower than one already applied; replaying all of them
+    puts it in its place. 102 of them replay in well under a second."""
+
+    name = "milkforus-server"
+    stale_after = 15 * 60
+    default_folder = os.path.join(SUPPORT, "shopping", "milkforus")
+
+    def __init__(self, opts):
+        folder = setting(opts, "folder", "SHOPPING_FOLDER")
+        self.folder = os.path.expanduser(folder) if folder else self.default_folder
+        self.path = os.path.join(self.folder, "store.sqlite")
+        self.state_path = os.path.join(self.folder, "state.json")
+        self.opts = opts
+        self._db = None
+
+    def missing_advice(self):
+        if not self.login(required=False):
+            return "no login yet. Run `apple shopping setup`."
+        return "nothing pulled yet. Run `apple shopping sync`."
+
+    def login(self, required=True):
+        url = setting(self.opts, "webdav_url", "SHOPPING_WEBDAV_URL")
+        user = setting(self.opts, "webdav_user", "SHOPPING_WEBDAV_USER")
+        if url and user:
+            password = os.environ.get("SHOPPING_WEBDAV_PASSWORD") or \
+                stored_config(reveal=True).get("webdav_password")
+            if password:
+                return url, user, password
+        if required:
+            die("no login for the Milk for Us sync server. Run `apple shopping setup`.", 78)
+        return None
+
+    def state(self):
+        try:
+            with open(self.state_path) as handle:
+                return json.load(handle)
+        except (OSError, ValueError):
+            return {}
+
+    def save_state(self, state):
+        write_atomic(self.state_path, json.dumps(state, indent=2).encode("utf-8"))
+
+    def freshness(self):
+        s = self.state()
+        return {"store_modified": s.get("last_change"), "last_sync": s.get("last_pull"),
+                "app_running": None}
+
+    def stale(self, fresh):
+        last = fresh["last_sync"]
+        return last is None or time.time() - last > self.stale_after
+
+    def stale_advice(self, fresh):
+        agent = "" if os.path.isfile(agent_plist()) else \
+            " `apple shopping agent install` pulls every two minutes."
+        return "the last pull from the server was %s. Run `apple shopping sync`.%s" % (
+            age(fresh["last_sync"]), agent)
+
+    def sync(self, opts):
+        os.makedirs(os.path.join(self.folder, "baseline"), exist_ok=True)
+        os.makedirs(os.path.join(self.folder, "events"), exist_ok=True)
+        lock = open(os.path.join(self.folder, ".lock"), "w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # Another pull (the agent's, most likely) is running. Wait for it
+            # rather than download the same files twice.
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        t0 = time.time()
+        state = self.state()
+        report = {"backend": self.name, "synced": False, "changed": False,
+                  "baseline": state.get("baseline"), "downloaded": 0, "dropped": 0}
+        dav = WebDAV(*self.login())
+        try:
+            report.update(self._pull(dav, state))
+            report["synced"] = True
+            state["last_pull"] = time.time()
+            state["last_error"] = None
+            if report["changed"]:
+                state["last_change"] = state["last_pull"]
+        except Unauthorized:
+            state["last_error"] = ("the server refused the login. Open Milk for Us once, "
+                                   "then run `apple shopping setup` again.")
+        except (OSError, ValueError, ET.ParseError, http.client.HTTPException) as e:
+            state["last_error"] = "%s: %s" % (type(e).__name__, e)
+        finally:
+            dav.close()
+        state["last_attempt"] = time.time()
+        self.save_state(state)
+        report["error"] = state["last_error"]
+        report["requests"] = dav.requests
+        report["bytes"] = dav.bytes
+        report["seconds"] = round(time.time() - t0, 1)
+        fresh = self.freshness()
+        report["store_modified"] = iso(fresh["store_modified"])
+        report["last_sync"] = iso(fresh["last_sync"])
+        return report
+
+    def _pull(self, dav, state):
+        base_dir = os.path.join(self.folder, "baseline")
+        event_dir = os.path.join(self.folder, "events")
+        out = {"changed": False, "downloaded": 0, "dropped": 0}
+        baselines = [n for n in dav.list("milkforus/baselines") if count_of(n) >= 0]
+        if not baselines:
+            raise ValueError("the server holds no baseline")
+        newest = max(baselines, key=lambda n: (count_of(n), n))
+        if state.get("baseline") != newest or not os.path.isfile(os.path.join(base_dir, newest)):
+            data = dav.get("milkforus/baselines", newest)
+            json.loads(data)          # refuse a file that is not JSON before keeping it
+            write_atomic(os.path.join(base_dir, newest), data)
+            for old in os.listdir(base_dir):
+                if old != newest:
+                    os.remove(os.path.join(base_dir, old))
+            state["baseline"] = newest
+            out["downloaded"] += 1
+            out["changed"] = True
+        floor = count_of(newest)
+        wanted = {n for n in dav.list("milkforus/events") if count_of(n) > floor}
+        have = {n for n in os.listdir(event_dir) if not n.endswith(".tmp")}
+        for name in sorted(wanted - have, key=lambda n: (count_of(n), n)):
+            data = dav.get("milkforus/events", name)
+            json.loads(data)
+            write_atomic(os.path.join(event_dir, name), data)
+            out["downloaded"] += 1
+            out["changed"] = True
+        for name in have - wanted:
+            os.remove(os.path.join(event_dir, name))
+            out["dropped"] += 1
+            out["changed"] = True
+        out["baseline"] = newest
+        out["events"] = len(wanted)
+        if out["changed"] or not os.path.isfile(self.path):
+            self.rebuild(newest, sorted(wanted, key=lambda n: (count_of(n), n)))
+            out["changed"] = True
+        return out
+
+    def rebuild(self, baseline, events):
+        replay = Replay()
+        with open(os.path.join(self.folder, "baseline", baseline), "rb") as handle:
+            replay.apply(json.load(handle))
+        loaded = []
+        for name in events:
+            with open(os.path.join(self.folder, "events", name), "rb") as handle:
+                loaded.append((count_of(name), json.load(handle), name))
+        # Global count, then the event's own timestamp, then the name: the
+        # order the sync engine merges in.
+        loaded.sort(key=lambda e: (e[0], e[1].get("timestamp") or 0, e[2]))
+        for _, event, _ in loaded:
+            replay.apply(event)
+        if self._db is not None:
+            self._db.close()
+            self._db = None
+        replay.write(self.path)
+
+    def sync_summary(self, r):
+        if not r["synced"]:
+            return "pull failed: %s" % r["error"]
+        return "pulled in %ss: %s (%d requests, %d bytes)" % (
+            r["seconds"], "%d files downloaded" % r["downloaded"] if r["changed"]
+            else "no changes", r["requests"], r["bytes"])
+
+    def status(self):
+        report = MilkForUs.status(self)
+        s = self.state()
+        report.pop("app_installed", None)
+        report["login"] = self.login(required=False) is not None
+        report["baseline"] = s.get("baseline")
+        report["last_error"] = s.get("last_error")
+        report["last_attempt"] = iso(s.get("last_attempt"))
+        report["agent"] = os.path.isfile(agent_plist())
+        if report["status"] == "ok" and s.get("last_error"):
+            report["status"] = "error"
+            report["advice"] = "the last pull failed: %s" % s["last_error"]
+        return report
+
+
+BACKENDS = {"milkforus": MilkForUs, "milkforus-server": MilkForUsServer}
+
+
+def backend(opts):
+    name = setting(opts, "backend", "SHOPPING_BACKEND") or "milkforus"
+    if name not in BACKENDS:
+        die("unknown backend %r; known: %s" % (name, ", ".join(sorted(BACKENDS))))
+    return BACKENDS[name](opts)
+
+
+# --------------------------------------------------------------------------
+# what every read shares
+# --------------------------------------------------------------------------
+
+def fold(text):
+    """For matching a list name: case, the trailing space the app keeps, and
+    the curly apostrophe in "Trader Joe’s" that nobody types."""
+    return (text or "").strip().casefold().replace("’", "'").replace("‘", "'")
+
+
+def find_list(store, ref):
+    lists = store.lists()
+    want = fold(ref)
+    for l in lists:
+        if l["id"] == ref or fold(l["name"]) == want:
+            return l
+    hits = [l for l in lists if want in fold(l["name"])]
+    if len(hits) == 1:
+        return hits[0]
+    if hits:
+        die("%r matches %s; say which" % (ref, ", ".join(l["name"] for l in hits)))
+    die("no list %r; lists: %s" % (ref, ", ".join(l["name"] for l in lists)))
+
+
+def prepare(opts):
+    """The backend, synced first when --sync asks, with a note on stderr
+    when the copy is stale. Every read goes through here."""
+    store = backend(opts)
+    if getattr(opts, "sync", False):
+        r = store.sync(opts)
+        if not r["synced"]:
+            note("warning: the sync did not finish (%s); reading what is on disk"
+                 % (r.get("error") or "%ss" % r["seconds"]))
+    fresh = store.freshness()
+    if store.stale(fresh):
+        note("note: %s" % store.stale_advice(fresh))
+    return store
+
+
+def public(row):
+    out = dict(row)
+    out.pop("pk", None)
+    out.pop("aisle", None)
+    if "last_added" in out:
+        out["last_added"] = iso(out["last_added"])
+    return out
+
+
+# --------------------------------------------------------------------------
+# the agent
+# --------------------------------------------------------------------------
+
+def agent_plist():
+    folder = os.environ.get("SHOPPING_LAUNCH_AGENTS") or os.path.join(HOME, "Library", "LaunchAgents")
+    return os.path.join(folder, AGENT_LABEL + ".plist")
+
+
+def launchctl(*args):
+    tool = os.environ.get("SHOPPING_LAUNCHCTL") or "/bin/launchctl"
+    return subprocess.run([tool] + list(args), capture_output=True, text=True)
+
+
+def agent_program(path=None):
+    """The path the agent runs. 🛑 Under Homebrew, realpath is
+    Cellar/apple-tools/<version>/..., which the next upgrade deletes; the
+    agent would then fail every 2 minutes. opt/apple-tools follows upgrades."""
+    path = path or os.path.realpath(__file__)
+    parts = path.split(os.sep)
+    if "Cellar" in parts:
+        at = parts.index("Cellar")
+        if len(parts) > at + 3:
+            stable = os.sep.join(parts[:at] + ["opt", parts[at + 1]] + parts[at + 3:])
+            if os.path.realpath(stable) == path:
+                return stable
+    return path
+
+
+def cmd_agent(opts):
+    path = agent_plist()
+    domain = "gui/%d" % os.getuid()
+    log = os.path.join(HOME, "Library", "Logs", "apple-tools", "shopping.log")
+    if opts.action == "install":
+        if not enabled():
+            die("the shopping plugin is not enabled. Run: apple plugins enable shopping")
+        if setting(opts, "backend", "SHOPPING_BACKEND") != "milkforus-server":
+            die("the agent pulls from the server; run `apple shopping setup` first")
+        MilkForUsServer(opts).login()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        plist = {
+            "Label": AGENT_LABEL,
+            # 🛑 /usr/bin/python3, not the shebang: launchd's PATH may not
+            # reach whichever python3 a shell finds first.
+            "ProgramArguments": ["/usr/bin/python3", agent_program(), "sync", "--agent"],
+            "StartInterval": opts.every * 60,
+            "RunAtLoad": True,
+            "ProcessType": "Background",
+            "LowPriorityIO": True,
+            "StandardOutPath": log,
+            "StandardErrorPath": log,
+        }
+        with open(path, "wb") as handle:
+            plistlib.dump(plist, handle)
+        launchctl("bootout", "%s/%s" % (domain, AGENT_LABEL))
+        r = launchctl("bootstrap", domain, path)
+        if r.returncode != 0:
+            die("launchctl bootstrap failed: %s" % (r.stderr.strip() or r.returncode))
+        print("installed %s: pulls every %d minutes; log in %s" % (AGENT_LABEL, opts.every, log))
+        return
+    if opts.action == "remove":
+        launchctl("bootout", "%s/%s" % (domain, AGENT_LABEL))
+        if os.path.isfile(path):
+            os.remove(path)
+            print("removed %s" % AGENT_LABEL)
+        else:
+            print("no agent installed")
+        return
+    report = {"installed": os.path.isfile(path), "plist": path, "log": log}
+    if report["installed"]:
+        with open(path, "rb") as handle:
+            report["every_minutes"] = plistlib.load(handle).get("StartInterval", 0) // 60
+        r = launchctl("print", "%s/%s" % (domain, AGENT_LABEL))
+        report["loaded"] = r.returncode == 0
+        m = re.search(r"last exit code = (\S+)", r.stdout)
+        report["last_exit"] = m.group(1) if m else None
+    if opts.json:
+        print(json.dumps(report, indent=2))
+        return
+    if not report["installed"]:
+        print("no agent installed. `apple shopping agent install` pulls every two minutes.")
+        return
+    print("%s: every %d minutes, %s, last exit %s" % (
+        AGENT_LABEL, report["every_minutes"], "loaded" if report["loaded"] else "NOT loaded",
+        report["last_exit"]))
+    print("  log: %s" % log)
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+def cmd_manifest(opts):
+    print(json.dumps(MANIFEST, indent=2))
+
+
+def cmd_status(opts):
+    """What is on disk and whether it can be read. Never writes, never
+    connects, never starts the app, and exits 0 with --json whatever it finds."""
+    store = backend(opts)
+    report = {"tool": NAME, "hosts": MANIFEST["network"]["hosts"], "usable": False}
+    report.update(store.status())
+    report["usable"] = report["status"] == "ok"
+    fresh = store.freshness()
+    report["store_modified"] = iso(fresh["store_modified"])
+    report["last_sync"] = iso(fresh["last_sync"])
+    if fresh["app_running"] is not None:
+        report["app_running"] = fresh["app_running"]
+    report.setdefault("advice", None)
+    if report["usable"]:
+        report["stale"] = store.stale(fresh)
+        if report["stale"]:
+            report["advice"] = store.stale_advice(fresh)
+    if opts.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        sys.exit(0)
+    print("shopping: %s (%s)" % (report["status"], store.name))
+    print("  store: %s" % store.path)
+    if "lists" in report:
+        print("  %d lists, %d open items, %d checked off" % (
+            report["lists"], report["open_items"], report["checked_items"]))
+        line = "  last sync: %s" % age(fresh["last_sync"])
+        if fresh["app_running"] is not None:
+            line += "; app %s" % ("running" if fresh["app_running"] else "not running")
+        if "agent" in report:
+            line += "; agent %s" % ("installed" if report["agent"] else "not installed")
+        print(line)
+    if report["advice"]:
+        print("  %s" % report["advice"])
+    sys.exit(0 if report["usable"] else 1)
+
+
+def cmd_setup(opts):
+    """Copy the WebDAV login out of the app's HTTP cache, into the config
+    and the Keychain, and make milkforus-server the backend. The password is
+    never printed."""
+    cache = os.environ.get("SHOPPING_MILKFORUS_CACHE") or os.path.join(
+        MilkForUs.container, "Caches", "de.danielrinser.milkforus", "Cache.db")
+    if not os.path.isfile(cache):
+        die("no HTTP cache at %s. Open Milk for Us once, signed in to sync." % cache, 69)
+    try:
+        db = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(cache), uri=True)
+        row = db.execute(
+            "SELECT d.receiver_data FROM cfurl_cache_response r "
+            "JOIN cfurl_cache_receiver_data d ON d.entry_ID = r.entry_ID "
+            "WHERE r.request_key LIKE '%/v1/users/webdav_sync_authorization%' "
+            "ORDER BY r.time_stamp DESC LIMIT 1").fetchone()
+    except sqlite3.DatabaseError as e:
+        if "authorization denied" in str(e) or "unable to open" in str(e):
+            raise NoAccess(cache) from e
+        die("the app's HTTP cache did not answer: %s" % e)
+    if row is None or not row[0]:
+        die("the app's HTTP cache holds no sync login. Open Milk for Us, check that "
+            "sync is on, and run this again.", 69)
+    try:
+        login = json.loads(row[0])
+        url, user, password = (login["webdav_base_url"], login["webdav_username"],
+                               login["webdav_password"])
+    except (ValueError, KeyError, TypeError):
+        die("the cached sync login is not in the shape measured on 2026-11-02")
+    # Prove it before keeping it.
+    dav = WebDAV(url, user, password)
+    try:
+        dav.list("milkforus/baselines")
+    except Unauthorized:
+        die("the server refused the cached login. Open Milk for Us once and run this again.")
+    except (OSError, http.client.HTTPException) as e:
+        die("could not reach %s: %s" % (urllib.parse.urlsplit(url).netloc, e))
+    finally:
+        dav.close()
+    set_config(["webdav_url=%s" % url, "webdav_user=%s" % user,
+                "webdav_password=%s" % password, "backend=milkforus-server"])
+    print("stored the sync login (password in the Keychain); backend is now milkforus-server")
+    if not opts.no_pull:
+        store = MilkForUsServer(opts)
+        print(store.sync_summary(store.sync(opts)))
+
+
+def cmd_sync(opts):
+    if opts.agent and not enabled():
+        # Disabling the plugin stops the agent's network use at once, even
+        # before the agent is removed.
+        note("%s: the shopping plugin is not enabled; not pulling" % iso(time.time()))
+        return
+    store = backend(opts)
+    r = store.sync(opts)
+    if opts.agent:
+        # One line per run in the log, and only when something happened.
+        if not r["synced"] or r.get("changed"):
+            note("%s %s" % (iso(time.time()), store.sync_summary(r).replace("\n", ";")))
+        sys.exit(0 if r["synced"] else 1)
+    if opts.json:
+        print(json.dumps(r, indent=2))
+    else:
+        print(store.sync_summary(r))
+    sys.exit(0 if r["synced"] else 1)
+
+
+def cmd_lists(opts):
+    store = prepare(opts)
+    items = store.items()
+    rows = []
+    for l in store.lists():
+        mine = [i for i in items if i["list_id"] == l["id"]]
+        added = [i["last_added"] for i in mine if i["last_added"]]
+        rows.append({"id": l["id"], "name": l["name"], "color": l["color"],
+                     "open": sum(1 for i in mine if not i["checked"]),
+                     "checked": sum(1 for i in mine if i["checked"]),
+                     "last_added": iso(max(added)) if added else None})
+    if opts.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return
+    for r in rows:
+        print("%-20s %3d open  %3d checked   last added %s" % (
+            r["name"], r["open"], r["checked"], (r["last_added"] or "?")[:16].replace("T", " ")))
+
+
+def cmd_items(opts):
+    store = prepare(opts)
+    items = store.items()
+    if opts.list:
+        wanted = find_list(store, opts.list)["id"]
+        items = [i for i in items if i["list_id"] == wanted]
+    if opts.checked:
+        items = [i for i in items if i["checked"]]
+    elif not opts.all:
+        items = [i for i in items if not i["checked"]]
+    if opts.search:
+        want = fold(opts.search)
+        items = [i for i in items if want in fold(i["name"]) or want in fold(i["note"])]
+    order = {l["id"]: n for n, l in enumerate(store.lists())}
+    # The app's own order: list, then aisle, then name. An item with no
+    # category goes first, as the app shows it.
+    items.sort(key=lambda i: (order.get(i["list_id"], 0), i["checked"],
+                              -1 if i["aisle"] is None else i["aisle"], fold(i["name"])))
+    if opts.json:
+        print(json.dumps([public(i) for i in items], indent=2, ensure_ascii=False))
+        return
+    current = None
+    for i in items:
+        if i["list"] != current:
+            if current is not None:
+                print()
+            current = i["list"]
+            print("%s" % current)
+        line = "  %s %s" % ("✓" if i["checked"] else "•", i["name"])
+        if i["note"]:
+            line += " (%s)" % i["note"]
+        if i["category"]:
+            line += "  — %s" % i["category"]
+        print(line)
+    if not items:
+        note("nothing on %s" % (opts.list or "any list"))
+
+
+def cmd_history(opts):
+    store = prepare(opts)
+    rows = store.history()
+    if opts.list:
+        wanted = find_list(store, opts.list)["id"]
+        rows = [r for r in rows if r["list_id"] == wanted]
+    if opts.since:
+        start = time.time() - opts.since * 86400
+        rows = [r for r in rows if r["last_added"] and r["last_added"] >= start]
+    if opts.search:
+        want = fold(opts.search)
+        rows = [r for r in rows if want in fold(r["name"])]
+    if opts.most:
+        rows.sort(key=lambda r: -(r["times_added"] or 0))
+    if opts.limit and len(rows) > opts.limit:
+        note("showing %d of %d; --limit 0 for all" % (opts.limit, len(rows)))
+        rows = rows[:opts.limit]
+    if opts.json:
+        print(json.dumps([public(r) for r in rows], indent=2, ensure_ascii=False))
+        return
+    for r in rows:
+        print("%s  %4dx  %-30s %s" % (short(r["last_added"]), r["times_added"] or 0,
+                                      r["name"][:30], r["list"] or ""))
+
+
+def cmd_index(opts):
+    """NDJSON for apple-index: one record per list. Never syncs: the agent
+    does that, and an index refresh must not start an app or connect."""
+    store = backend(opts)
+    if store.db() is None:
+        return
+    items = store.items()
+    start = time.time() - opts.since * 86400 if opts.since else None
+    out = sys.stdout
+    for l in store.lists():
+        mine = sorted((i for i in items if i["list_id"] == l["id"]),
+                      key=lambda i: (-1 if i["aisle"] is None else i["aisle"], fold(i["name"])))
+        added = [i["last_added"] for i in mine if i["last_added"]]
+        occurred = max(added) if added else None
+        if start is not None and (occurred is None or occurred < start):
+            continue
+
+        def line(i):
+            s = i["name"]
+            if i["note"]:
+                s += " (%s)" % i["note"]
+            return s
+        open_items = [line(i) for i in mine if not i["checked"]]
+        done = [line(i) for i in mine if i["checked"]]
+        body = "%s shopping list\nTo buy: %s\nChecked off: %s" % (
+            l["name"], ", ".join(open_items) or "nothing",
+            ", ".join(done) or "nothing")
+        out.write(json.dumps({
+            "uid": "%s:list:%s" % (NAME, l["id"]),
+            "tool": NAME, "kind": "list", "native_id": l["name"], "url": None,
+            "title": "%s shopping list (%d to buy)" % (l["name"], len(open_items)),
+            "container": l["name"],
+            "created": None, "modified": occurred, "occurred": occurred,
+            "latitude": None, "longitude": None,
+            "people": [],
+            "body": body,
+            "rev": hashlib.sha1(body.encode("utf-8")).hexdigest()[:16],
+        }, ensure_ascii=False) + "\n")
+    out.flush()
+
+
+# What `--json` prints, per subcommand, for `--help`.
+JSON_FIELDS = {
+    "lists": """\
+JSON: a list, one object per shopping list, in the app's order.
+  id                   the backend's stable id; items and history take it or the name
+  name                 the list's name
+  color                #rrggbb, the app's colour for the list
+  open, checked        how many items are still to buy, and checked off
+  last_added           ISO 8601: when the newest item went on the list""",
+    "items": """\
+JSON: a list, one object per item, in the app's order (list, aisle, name).
+  id                   the backend's stable id for the item
+  list, list_id        the list it is on
+  name                 what to buy
+  note                 the note on the item, or null
+  category             the aisle, or null
+  checked              true once it is checked off
+  last_added           ISO 8601: the last time this product went on this list
+  times_added          how many times it has gone on this list""",
+    "history": """\
+JSON: a list, one object per product per list, newest first (--most: most often first).
+  name, category       the product
+  list, list_id        the list it went on
+  last_added           ISO 8601
+  times_added          how many times, all time""",
+    "sync": """\
+JSON: one object.
+  synced               true when the copy is now current
+  changed              true when the copy changed
+  store_modified       ISO 8601: the last change to the copy
+  last_sync            ISO 8601: the last time it was made current
+milkforus-server:
+  downloaded, dropped  files fetched, and old change sets let go
+  baseline, events     the baseline file, and how many change sets follow it
+  requests, bytes      what the pull cost
+  error                why it failed, or null
+milkforus:
+  launched, stopped    whether this started the app, and stopped it again
+  app_was_running      it was running before; then it is left running
+  seconds              how long it took""",
+}
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="apple shopping", description=__doc__.split("\n\n")[0])
+    parser.add_argument("--version", action="version", version="apple-plugin-shopping %s" % VERSION)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--backend", help="milkforus-server or milkforus")
+    common.add_argument("--folder", help="the folder holding the backend's store")
+    common.add_argument("--json", action="store_true", help="print JSON; the fields are listed below")
+    reads = argparse.ArgumentParser(add_help=False)
+    reads.add_argument("--sync", action="store_true", help="make the copy current first")
+
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("manifest", parents=[common]).set_defaults(func=cmd_manifest)
+    sub.add_parser("status", parents=[common]).set_defaults(func=cmd_status)
+
+    p = sub.add_parser("setup", parents=[common],
+                       help="copy the app's sync login into the Keychain; use the server")
+    p.add_argument("--no-pull", action="store_true", help="do not pull after storing the login")
+    p.set_defaults(func=cmd_setup)
+
+    p = sub.add_parser("sync", parents=[common],
+                       help="make the copy current: pull from the server, or run the app")
+    p.add_argument("--timeout", type=int, default=90, metavar="SECONDS",
+                   help="milkforus: how long to wait for the app")
+    p.add_argument("--keep-running", action="store_true",
+                   help="milkforus: leave the app running hidden")
+    p.add_argument("--restart", action="store_true",
+                   help="milkforus: stop the app first when it is already running")
+    p.add_argument("--agent", action="store_true", help=argparse.SUPPRESS)
+    p.set_defaults(func=cmd_sync)
+
+    p = sub.add_parser("agent", parents=[common], help="a launchd agent that pulls on a timer")
+    p.add_argument("action", choices=["install", "remove", "status"], nargs="?", default="status")
+    p.add_argument("--every", type=int, default=2, metavar="MINUTES")
+    p.set_defaults(func=cmd_agent)
+
+    p = sub.add_parser("lists", parents=[common, reads], help="every list and how much is on it")
+    p.set_defaults(func=cmd_lists)
+
+    p = sub.add_parser("items", parents=[common, reads], help="what is on the lists; open items by default")
+    p.add_argument("list", nargs="?", help="a list's name or id; every list when omitted")
+    state = p.add_mutually_exclusive_group()
+    state.add_argument("--checked", action="store_true", help="only items checked off")
+    state.add_argument("--all", action="store_true", help="open and checked off")
+    p.add_argument("--search", help="only items whose name or note contains this")
+    p.set_defaults(func=cmd_items)
+
+    p = sub.add_parser("history", parents=[common, reads],
+                       help="every product ever put on a list, newest first")
+    p.add_argument("--list", help="a list's name or id")
+    p.add_argument("--since", type=int, metavar="DAYS")
+    p.add_argument("--search", help="only products whose name contains this")
+    p.add_argument("--most", action="store_true", help="most often added first")
+    p.add_argument("--limit", type=int, default=50)
+    p.set_defaults(func=cmd_history)
+
+    p = sub.add_parser("index", parents=[common], help="NDJSON records for apple-index")
+    p.add_argument("--since", type=int, metavar="DAYS")
+    p.add_argument("--full", action="store_true", help="accepted; index always emits everything")
+    p.set_defaults(func=cmd_index)
+
+    for name, text in JSON_FIELDS.items():
+        sub.choices[name].epilog = text
+        sub.choices[name].formatter_class = argparse.RawDescriptionHelpFormatter
+
+    opts = parser.parse_args(argv)
+    if not opts.command:
+        parser.print_help()
+        return 0
+    if opts.command == "agent" and opts.every < 1:
+        die("--every must be at least 1 minute")
+    try:
+        opts.func(opts)
+    except NoAccess as e:
+        die("cannot read %s. Grant Full Disk Access to the terminal or app running "
+            "this, in System Settings → Privacy & Security." % e, 77)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

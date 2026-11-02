@@ -371,6 +371,30 @@ What was measured on the first run, 2026-09-25, and what it decided:
   shape. Bare placeholders (`[image]` with no caption) are not indexed.
   `refresh_args` is `["--full"]`: the whole run takes 0.12 s here.
 
+## Shopping, the fourth plugin
+
+The fourth plugin is named for what it holds, not for the app that holds
+it. `apple-plugin-shopping` reads shopping lists through a **backend**, and
+`backend` in its config picks one. The first is `milkforus`, the Milk for
+Us iPhone app installed on the Mac, whose store is Core Data SQLite in its
+group container. Details are in [`plugin-shopping.md`](plugin-shopping.md).
+
+Two things it settled that the first three did not exercise:
+
+- **A store that is only current while its app runs.** Milk for Us syncs
+  through its own server and only while it is open; the Mac copy was 3.5
+  months old on the first run. The plugin's `sync` starts the app hidden,
+  waits for it to pull, and stops it. Every read warns on stderr when the
+  copy is stale, and `status --json` carries `stale`.
+- **Two backends behind one name.** `milkforus` reads the app's store and
+  connects nowhere; its `sync` starts the app, which does. `milkforus-server`
+  pulls from the app's sync server itself, read-only, on a launchd agent
+  every two minutes. The manifest declares `sync.milkforus.com` with a `via`
+  that says who connects in each case.
+- **A plugin with its own agent.** `apple shopping agent install` refuses
+  while the plugin is disabled, and the agent's run does nothing once it is
+  disabled, so `apple plugins disable` stays the one switch.
+
 ## Writing one
 
 1. Make `apple-plugin-<name>` executable and answer `manifest --json`.
@@ -386,7 +410,8 @@ What was measured on the first run, 2026-09-25, and what it decided:
 `lab/test-plugins.py` is the reference for what the adapter accepts;
 `plugins/dawarich/` is the reference for a plugin that talks to a server,
 `plugins/health/` for one that reads files and keeps its own store, and
-`plugins/whatsapp/` for one that reads another app's SQLite in place.
+`plugins/whatsapp/` for one that reads another app's SQLite in place, and
+`plugins/shopping/` for one that hides its source behind a backend.
 
 ## Not done
 

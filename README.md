@@ -450,6 +450,21 @@ apple whatsapp search "board meeting" --since 30
 apple whatsapp export "District Parent Council" --limit 50
 ```
 
+The fourth, `shopping`, reads shopping lists. The commands name no app; a
+backend does the reading. Both backends are for Milk for Us. `milkforus-server`
+pulls from the app's own sync server, `sync.milkforus.com`, read-only, every
+two minutes from a launchd agent, using the login the app keeps in its HTTP
+cache. `milkforus` reads the app's store on the Mac, which is current only
+while the app runs. Neither ever writes to a list.
+
+```
+apple plugins enable shopping
+apple shopping setup                   # the sync login, into the Keychain
+apple shopping agent install           # pull every two minutes
+apple shopping items Grocery
+apple shopping history --most --limit 20
+```
+
 ## Geocoding
 
 Three flags resolve a place name into a coordinate, and all three ask Apple Maps.

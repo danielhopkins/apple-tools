@@ -196,7 +196,7 @@ def main():
         f.write("day\tSteps\t2026-09-16 00:00:00 -0600\t2026-09-17 00:00:00 -0600\t4,000\tcount\n")
     report = json.loads(run(["sync", "--json"], env).stdout)
     check("changed file re-read", len(report["files"]), 1)
-    days = {d["date"]: d for d in json.loads(run(["days", "--since", "30", "--json"], env).stdout)}
+    days = {d["date"]: d for d in json.loads(run(["days", "--from", "2026-09-01", "--to", "2026-09-30", "--json"], env).stdout)}
     check("later line wins", days["2026-09-16"]["steps"], 4000.0)
 
     # -- the export archive ----------------------------------------------------
