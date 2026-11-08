@@ -435,8 +435,10 @@ main() {
     if [ "$want" != never ] \
        && { [ "$want" = always ] || ! terminal_can_read; } \
        && proxy="$(proxy_client)"; then
-        "$proxy" "$tool" "$@"
-        local status=$?
+        # `|| status=$?` keeps the call in a condition context. A bare call
+        # lets `set -e` exit on the 250 before the fall-through below runs.
+        status=0
+        "$proxy" "$tool" "$@" || status=$?
         # 250 means the app did not answer. Fall through and let the real tool
         # produce its own error, rather than inventing a different one.
         [ "$status" -ne 250 ] && exit "$status"
@@ -456,6 +458,13 @@ terminal_can_read() {
 # The signed client inside the app bundle. 🛑 Only this binary passes the app's
 # code-signature check on the socket; a shell or Python client cannot.
 proxy_client() {
+    # APPLE_TOOLS_PROXY_CLIENT names another client. It exists for
+    # tests/test-apple-proxy.py, which needs a stub in its place.
+    if [ -n "${APPLE_TOOLS_PROXY_CLIENT:-}" ]; then
+        [ -x "$APPLE_TOOLS_PROXY_CLIENT" ] || return 1
+        echo "$APPLE_TOOLS_PROXY_CLIENT"
+        return 0
+    fi
     local candidate
     for candidate in \
         "/Applications/AppleTools.app/Contents/Helpers/apple-proxy" \
