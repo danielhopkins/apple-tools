@@ -171,6 +171,8 @@ test:
 	@# a temp plugins.json and a temp Keychain file. Nothing here reaches the
 	@# user's configuration or the network.
 	@for t in plugins/*/test-*.py; do /usr/bin/python3 "$$t" || exit 1; done
+	@# bin/apple's proxy fall-through, with a stub proxy and tool.
+	/usr/bin/python3 tests/test-apple-proxy.py
 
 ## Smoke-check that every tool answers --help and produces JSON
 check: debug
